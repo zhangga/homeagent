@@ -80,7 +80,7 @@ function fmtTime(ms?: number): string {
 }
 
 function flash(msg?: string): HtmlEscapedString | Promise<HtmlEscapedString> | string {
-  return msg ? html`<div class="flash">${msg}</div>` : "";
+  return msg ? html`<div class="flash" role="status" aria-live="polite">${msg}</div>` : "";
 }
 
 /** A friendly label for a space: its display name, else the id. */
@@ -2115,34 +2115,89 @@ export interface SettingsData {
   webPort: number;
 }
 
+export interface SettingsFormValues {
+  defaultProvider: string;
+  defaultModel: string;
+  dailyBudgetUsd: string;
+  dreamHour: string;
+  rawRetentionDays: string;
+  webPort: string;
+}
+
+export type SettingsFieldErrors = Partial<Record<keyof SettingsFormValues, string>>;
+
 export function settingsView(
   s: SettingsData,
   providers: DetectedProvider[],
   models: Record<string, string[]>,
   flashMsg?: string,
+  submitted?: SettingsFormValues,
+  errors: SettingsFieldErrors = {},
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
+  const values: SettingsFormValues = submitted ?? {
+    defaultProvider: s.defaultProvider,
+    defaultModel: s.defaultModel,
+    dailyBudgetUsd: String(s.dailyBudgetUsd),
+    dreamHour: String(s.dreamHour),
+    rawRetentionDays: String(s.rawRetentionDays),
+    webPort: String(s.webPort),
+  };
   // Default provider: only CLIs; available ones selectable, others greyed.
   const providerOptions = providers.map((p) => {
-    const sel = p.id === s.defaultProvider ? "selected" : "";
+    const sel = p.id === values.defaultProvider ? "selected" : "";
     const disabled = p.available ? "" : "disabled";
     const suffix = p.available ? `（${p.detail}）` : `（不可用：${p.detail}）`;
     return html`<option value="${p.id}" ${sel} ${disabled}>${p.name}${suffix}</option>`;
   });
-  const initialModels = models[s.defaultProvider] ?? [];
+  const initialModels = models[values.defaultProvider] ?? [];
   const modelOpts = [
-    html`<option value="" ${s.defaultModel === "" ? "selected" : ""}>（CLI 自身默认）</option>`,
-    ...initialModels.map((m) => html`<option value="${m}" ${m === s.defaultModel ? "selected" : ""}>${m}</option>`),
+    html`<option value="" ${values.defaultModel === "" ? "selected" : ""}>（CLI 自身默认）</option>`,
+    ...initialModels.map((m) => html`<option value="${m}" ${m === values.defaultModel ? "selected" : ""}>${m}</option>`),
   ];
-  if (s.defaultModel && !initialModels.includes(s.defaultModel)) {
-    modelOpts.push(html`<option value="${s.defaultModel}" selected>${s.defaultModel}（自定义）</option>`);
+  if (values.defaultModel && !initialModels.includes(values.defaultModel)) {
+    modelOpts.push(html`<option value="${values.defaultModel}" selected>${values.defaultModel}（自定义）</option>`);
   }
+  const submittedHour = Number(values.dreamHour);
+  const hourIsValid = Number.isInteger(submittedHour) && submittedHour >= 0 && submittedHour <= 23;
+  const hourOptions = [
+    ...(hourIsValid
+      ? []
+      : [html`<option value="${values.dreamHour}" selected>${values.dreamHour}（无效值）</option>`]),
+    ...Array.from(
+      { length: 24 },
+      (_, hour) => html`<option value="${hour}" ${String(hour) === values.dreamHour ? "selected" : ""}>${String(hour).padStart(2, "0")}:00</option>`,
+    ),
+  ];
+  const fieldIds: Record<keyof SettingsFormValues, string> = {
+    defaultProvider: "default-provider",
+    defaultModel: "default-model",
+    dailyBudgetUsd: "daily-budget",
+    dreamHour: "dream-hour",
+    rawRetentionDays: "raw-retention-days",
+    webPort: "web-port",
+  };
+  const errorEntries = Object.entries(errors) as Array<[keyof SettingsFormValues, string]>;
+  const errorSummary = errorEntries.length > 0
+    ? html`<div class="form-error-summary" role="alert" tabindex="-1" autofocus>
+        <strong>有 ${errorEntries.length} 项设置需要修改</strong>
+        <ul>
+          ${errorEntries.map(([field, message]) => html`<li><a href="#${fieldIds[field]}">${message}</a></li>`)}
+        </ul>
+      </div>`
+    : "";
+  const errorMessage = (field: keyof SettingsFormValues, id: string) =>
+    errors[field] ? html`<p class="field-error" id="${id}">${errors[field]}</p>` : "";
+  const describedBy = (field: keyof SettingsFormValues, helpId: string, errorId: string) =>
+    errors[field] ? `${helpId} ${errorId}` : helpId;
   const catalogJson = JSON.stringify(models);
-  const modelScript = raw(`<script>
+  const settingsScript = raw(`<script>
 (function(){
   var CATALOG = ${catalogJson};
+  var form = document.querySelector('[data-settings-form]');
   var prov = document.getElementById('default-provider');
   var model = document.getElementById('default-model');
-  if (!prov || !model) return;
+  if (!form || !prov || !model) return;
+  var initialModelOptions = model.innerHTML;
   prov.addEventListener('change', function(){
     var list = CATALOG[prov.value] || [];
     var cur = model.value;
@@ -2157,28 +2212,125 @@ export function settingsView(
       model.appendChild(o);
     });
   });
+
+  var cancel = form.querySelector('[data-settings-cancel]');
+  var save = form.querySelector('[data-settings-save]');
+  var initial = new URLSearchParams(new FormData(form)).toString();
+  var dirty = false;
+  function updateDirtyState(){
+    dirty = new URLSearchParams(new FormData(form)).toString() !== initial;
+    cancel.disabled = !dirty;
+    save.disabled = !dirty;
+  }
+  form.addEventListener('input', updateDirtyState);
+  form.addEventListener('change', updateDirtyState);
+  form.addEventListener('reset', function(){
+    setTimeout(function(){
+      model.innerHTML = initialModelOptions;
+      updateDirtyState();
+    }, 0);
+  });
+  form.addEventListener('submit', function(){
+    dirty = false;
+    save.disabled = true;
+    save.textContent = '保存中…';
+  });
+  window.addEventListener('beforeunload', function(event){
+    if (!dirty) return;
+    event.preventDefault();
+    event.returnValue = '';
+  });
+  updateDirtyState();
 })();
 </script>`);
 
   return html`<h1>设置</h1>
-    <p class="subtitle">全局默认配置。默认 Provider / Model、预算、提炼时刻即时生效；端口需重启生效。</p>
+    <p class="subtitle">配置未指定 Agent 时的执行方式，以及全局运行、数据和服务参数。</p>
     ${flash(flashMsg)}
-    <form method="post" action="/settings" class="stack card">
-      <h2 style="margin-top:0">默认 Agent（未指定时使用）</h2>
-      <div class="grid2">
-        <div class="field"><label>默认 Provider <span class="hint">本机 CLI</span></label>
-          <select name="defaultProvider" id="default-provider">${providerOptions}</select></div>
-        <div class="field"><label>默认 Model <span class="hint">随 Provider 变化</span></label>
-          <select name="defaultModel" id="default-model">${modelOpts}</select></div>
+    ${errorSummary}
+    <form method="post" action="/settings" class="stack settings-form" data-settings-form>
+      <fieldset class="settings-section">
+        <legend>默认 Agent</legend>
+        <p class="settings-section-description">仅在 Agent 没有单独指定执行配置时使用。</p>
+        <div class="grid2">
+          <div class="field">
+            <label for="default-provider">默认 Provider</label>
+            <select name="defaultProvider" id="default-provider"
+              aria-describedby="${describedBy("defaultProvider", "default-provider-help", "default-provider-error")}"
+              aria-invalid="${errors.defaultProvider ? "true" : "false"}">${providerOptions}</select>
+            <p class="field-help" id="default-provider-help">选择本机可用的 CLI；Agent 自身配置优先。</p>
+            ${errorMessage("defaultProvider", "default-provider-error")}
+          </div>
+          <div class="field">
+            <label for="default-model">默认 Model</label>
+            <select name="defaultModel" id="default-model"
+              aria-describedby="${describedBy("defaultModel", "default-model-help", "default-model-error")}"
+              aria-invalid="${errors.defaultModel ? "true" : "false"}">${modelOpts}</select>
+            <p class="field-help" id="default-model-help">随 Provider 变化；留空时使用该 CLI 自身的默认模型。</p>
+            ${errorMessage("defaultModel", "default-model-error")}
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset class="settings-section">
+        <legend>运行策略</legend>
+        <p class="settings-section-description">控制调用预算和每日提炼任务的执行时间。</p>
+        <div class="grid2">
+          <div class="field">
+            <label for="daily-budget">每日预算</label>
+            <div class="input-with-unit">
+              <input id="daily-budget" type="number" step="0.01" min="0" name="dailyBudgetUsd" value="${values.dailyBudgetUsd}"
+                aria-describedby="${describedBy("dailyBudgetUsd", "daily-budget-help", "daily-budget-error")}"
+                aria-invalid="${errors.dailyBudgetUsd ? "true" : "false"}" />
+              <span class="input-unit">USD / 天</span>
+            </div>
+            <p class="field-help" id="daily-budget-help">仅对可计费的 Provider 生效；本机 CLI 不受影响。</p>
+            ${errorMessage("dailyBudgetUsd", "daily-budget-error")}
+          </div>
+          <div class="field">
+            <label for="dream-hour">提炼时刻</label>
+            <select id="dream-hour" name="dreamHour"
+              aria-describedby="${describedBy("dreamHour", "dream-hour-help", "dream-hour-error")}"
+              aria-invalid="${errors.dreamHour ? "true" : "false"}">${hourOptions}</select>
+            <p class="field-help" id="dream-hour-help">每天按 Asia/Shanghai 时区执行。</p>
+            ${errorMessage("dreamHour", "dream-hour-error")}
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset class="settings-section">
+        <legend>数据与系统</legend>
+        <p class="settings-section-description">控制原始消息保留周期和管理后台监听端口。</p>
+        <div class="grid2">
+          <div class="field">
+            <label for="raw-retention-days">原始消息保留</label>
+            <div class="input-with-unit">
+              <input id="raw-retention-days" type="number" min="0" max="36500" name="rawRetentionDays" value="${values.rawRetentionDays}"
+                aria-describedby="${describedBy("rawRetentionDays", "raw-retention-days-help", "raw-retention-days-error")}"
+                aria-invalid="${errors.rawRetentionDays ? "true" : "false"}" />
+              <span class="input-unit">天</span>
+            </div>
+            <p class="field-help" id="raw-retention-days-help">0 表示永久保留；只清理已经完成提炼的原始消息。</p>
+            ${errorMessage("rawRetentionDays", "raw-retention-days-error")}
+          </div>
+          <div class="field">
+            <div class="field-label-row">
+              <label for="web-port">后台端口</label>
+              <span class="effect-badge">需重启生效</span>
+            </div>
+            <input id="web-port" type="number" min="1" max="65535" name="webPort" value="${values.webPort}"
+              aria-describedby="${describedBy("webPort", "web-port-help", "web-port-error")}"
+              aria-invalid="${errors.webPort ? "true" : "false"}" />
+            <p class="field-help" id="web-port-help">保存只更新配置，不会自动重启 HomeAgent 服务。</p>
+            ${errorMessage("webPort", "web-port-error")}
+          </div>
+        </div>
+      </fieldset>
+
+      <div class="actions settings-actions">
+        <button type="reset" class="secondary" data-settings-cancel>取消</button>
+        <button type="submit" data-settings-save>保存更改</button>
       </div>
-      <h2>运行</h2>
-      <div class="grid2">
-        <div class="field"><label>每日预算 (USD) <span class="hint">仅对可计费的 provider 有意义</span></label><input type="number" step="0.01" min="0" name="dailyBudgetUsd" value="${s.dailyBudgetUsd}" /></div>
-        <div class="field"><label>提炼时刻 <span class="hint">0-23，Asia/Shanghai</span></label><input type="number" min="0" max="23" name="dreamHour" value="${s.dreamHour}" /></div>
-        <div class="field"><label>原始消息保留（天） <span class="hint">0 = 永久保留；仅清理已提炼消息</span></label><input type="number" min="0" max="36500" name="rawRetentionDays" value="${s.rawRetentionDays}" /></div>
-        <div class="field"><label>后台端口 <span class="hint">重启生效</span></label><input type="number" min="1" max="65535" name="webPort" value="${s.webPort}" /></div>
-      </div>
-      <div class="actions"><button type="submit">保存设置</button></div>
     </form>
-    ${modelScript}`;
+    ${settingsScript}`;
 }

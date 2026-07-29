@@ -2299,6 +2299,126 @@ describe("management backend (read-write)", () => {
     expect(page).not.toContain("消息监听已就绪");
   });
 
+  test("settings page groups fields and exposes an accessible save workflow", async () => {
+    const response = await app.request("/settings?ok=已保存设置");
+    expect(response.status).toBe(200);
+    const view = await response.text();
+
+    expect(view).toContain("<legend>默认 Agent</legend>");
+    expect(view).toContain("<legend>运行策略</legend>");
+    expect(view).toContain("<legend>数据与系统</legend>");
+    expect(view).toContain('<label for="default-provider">默认 Provider</label>');
+    expect(view).toContain('aria-describedby="default-provider-help"');
+    expect(view).toContain('<label for="dream-hour">提炼时刻</label>');
+    expect(view).toContain('<option value="3" selected>03:00</option>');
+    expect(view).toContain('data-settings-form');
+    expect(view).toContain('type="reset"');
+    expect(view).toContain("取消");
+    expect(view).toContain("保存更改");
+    expect(view).toContain('role="status"');
+    expect(view).toContain('aria-live="polite"');
+  });
+
+  test("management shell exposes accessible narrow-screen navigation controls", async () => {
+    const response = await app.request("/settings");
+    expect(response.status).toBe(200);
+    const view = await response.text();
+
+    expect(view).toContain('aria-controls="primary-navigation"');
+    expect(view).toContain('aria-expanded="false"');
+    expect(view).toContain('id="primary-navigation"');
+    expect(view).toContain('aria-label="主导航"');
+    expect(view).toContain('data-nav-scrim');
+    expect(view).toContain("Escape");
+  });
+
+  test("settings POST rejects an invalid budget without persisting other fields", async () => {
+    const response = await app.request("/settings", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        defaultProvider: "trae-cli",
+        defaultModel: "openrouter-3o",
+        dailyBudgetUsd: "-1",
+        dreamHour: "5",
+        webPort: "4000",
+        rawRetentionDays: "30",
+      }).toString(),
+    });
+
+    expect(response.status).toBe(400);
+    const view = await response.text();
+    expect(view).toContain("每日预算不能小于 0");
+    expect(view).toContain('value="-1"');
+    expect(view).toContain('aria-invalid="true"');
+    expect(view).toContain('value="trae-cli" selected');
+    expect(view).toContain('value="4000"');
+    expect(readSettings(dir)).toEqual({});
+  });
+
+  test("settings POST rejects a distillation hour outside 0 through 23", async () => {
+    const response = await app.request("/settings", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        defaultProvider: "claude",
+        defaultModel: "sonnet",
+        dailyBudgetUsd: "5",
+        dreamHour: "24",
+        webPort: "3000",
+        rawRetentionDays: "90",
+      }).toString(),
+    });
+
+    expect(response.status).toBe(400);
+    const view = await response.text();
+    expect(view).toContain("提炼时刻必须是 0 到 23 的整数");
+    expect(view).toContain('<option value="24" selected>24（无效值）</option>');
+    expect(readSettings(dir)).toEqual({});
+  });
+
+  test("settings POST rejects retention above 36500 days", async () => {
+    const response = await app.request("/settings", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        defaultProvider: "claude",
+        defaultModel: "",
+        dailyBudgetUsd: "5",
+        dreamHour: "3",
+        webPort: "3000",
+        rawRetentionDays: "36501",
+      }).toString(),
+    });
+
+    expect(response.status).toBe(400);
+    const view = await response.text();
+    expect(view).toContain("保留天数必须是 0 到 36500 的整数");
+    expect(view).toContain('value="36501"');
+    expect(readSettings(dir)).toEqual({});
+  });
+
+  test("settings POST rejects a port outside 1 through 65535", async () => {
+    const response = await app.request("/settings", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        defaultProvider: "claude",
+        defaultModel: "",
+        dailyBudgetUsd: "5",
+        dreamHour: "3",
+        webPort: "65536",
+        rawRetentionDays: "90",
+      }).toString(),
+    });
+
+    expect(response.status).toBe(400);
+    const view = await response.text();
+    expect(view).toContain("后台端口必须是 1 到 65535 的整数");
+    expect(view).toContain('value="65536"');
+    expect(readSettings(dir)).toEqual({});
+  });
+
   test("settings POST persists default provider/model + config and reflects it back", async () => {
     const form = new URLSearchParams({
       defaultProvider: "trae-cli",

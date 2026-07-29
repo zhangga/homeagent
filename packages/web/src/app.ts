@@ -79,6 +79,8 @@ import {
   rawListView,
   remindersView,
   settingsView,
+  type SettingsFieldErrors,
+  type SettingsFormValues,
   spaceDetailView,
   spaceGovernanceView,
   spaceListView,
@@ -130,6 +132,66 @@ function checkbox(body: Record<string, unknown>, name: string): boolean {
 function str(body: Record<string, unknown>, name: string): string {
   const v = body[name];
   return typeof v === "string" ? v : "";
+}
+
+function parseSettingsForm(body: Record<string, unknown>): {
+  values: SettingsFormValues;
+  errors: SettingsFieldErrors;
+  patch?: PersistedSettings;
+} {
+  const values: SettingsFormValues = {
+    defaultProvider: str(body, "defaultProvider"),
+    defaultModel: str(body, "defaultModel"),
+    dailyBudgetUsd: str(body, "dailyBudgetUsd"),
+    dreamHour: str(body, "dreamHour"),
+    rawRetentionDays: str(body, "rawRetentionDays"),
+    webPort: str(body, "webPort"),
+  };
+  const errors: SettingsFieldErrors = {};
+  const budget = Number(values.dailyBudgetUsd);
+  if (values.dailyBudgetUsd.trim() === "" || !Number.isFinite(budget)) {
+    errors.dailyBudgetUsd = "每日预算必须是有效数字";
+  } else if (budget < 0) {
+    errors.dailyBudgetUsd = "每日预算不能小于 0";
+  }
+  const hour = Number(values.dreamHour);
+  if (
+    values.dreamHour.trim() === ""
+    || !Number.isInteger(hour)
+    || hour < 0
+    || hour > 23
+  ) {
+    errors.dreamHour = "提炼时刻必须是 0 到 23 的整数";
+  }
+  const retentionDays = Number(values.rawRetentionDays);
+  if (
+    values.rawRetentionDays.trim() === ""
+    || !Number.isInteger(retentionDays)
+    || retentionDays < 0
+    || retentionDays > 36_500
+  ) {
+    errors.rawRetentionDays = "保留天数必须是 0 到 36500 的整数";
+  }
+  const port = Number(values.webPort);
+  if (
+    values.webPort.trim() === ""
+    || !Number.isInteger(port)
+    || port < 1
+    || port > 65_535
+  ) {
+    errors.webPort = "后台端口必须是 1 到 65535 的整数";
+  }
+  if (Object.keys(errors).length > 0) return { values, errors };
+
+  const patch: PersistedSettings = {
+    defaultProvider: values.defaultProvider,
+    defaultModel: values.defaultModel,
+    dailyBudgetUsd: budget,
+    dreamHour: hour,
+    rawRetentionDays: retentionDays,
+    webPort: port,
+  };
+  return { values, errors, patch };
 }
 
 function parseGroupParticipationLevel(body: Record<string, unknown>): GroupParticipationLevel {
@@ -2113,21 +2175,34 @@ export function createWebApp(opts: WebOptions): Hono {
 
   app.post("/settings", async (c) => {
     const body = await c.req.parseBody();
-    const patch: PersistedSettings = {
-      defaultProvider: str(body, "defaultProvider"),
-      defaultModel: str(body, "defaultModel"),
-    };
-    const budget = Number(str(body, "dailyBudgetUsd"));
-    if (Number.isFinite(budget)) patch.dailyBudgetUsd = budget;
-    const hour = Number(str(body, "dreamHour"));
-    if (Number.isFinite(hour)) patch.dreamHour = Math.max(0, Math.min(23, Math.trunc(hour)));
-    const retentionDays = Number(str(body, "rawRetentionDays"));
-    if (Number.isFinite(retentionDays)) {
-      patch.rawRetentionDays = Math.max(0, Math.min(36_500, Math.trunc(retentionDays)));
+    const parsed = parseSettingsForm(body);
+    if (!parsed.patch) {
+      const cfg = config();
+      return c.html(
+        await layout(
+          "设置",
+          [{ label: "设置" }],
+          await settingsView(
+            {
+              defaultProvider: cfg.defaultProvider,
+              defaultModel: cfg.defaultModel,
+              dailyBudgetUsd: cfg.dailyBudgetUsd,
+              dreamHour: cfg.dreamHour,
+              rawRetentionDays: cfg.rawRetentionDays,
+              webPort: cfg.webPort,
+            },
+            await getProviders(),
+            await getModels(),
+            undefined,
+            parsed.values,
+            parsed.errors,
+          ),
+          "settings",
+        ),
+        400,
+      );
     }
-    const port = Number(str(body, "webPort"));
-    if (Number.isFinite(port)) patch.webPort = Math.trunc(port);
-    saveSettings(patch);
+    saveSettings(parsed.patch);
     return c.redirect(`/settings?ok=${encodeURIComponent("已保存设置")}`);
   });
 

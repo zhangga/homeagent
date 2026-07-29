@@ -38,6 +38,7 @@ const STYLE = `
   nav.rail .ico { width:18px; text-align:center; opacity:.9; }
   nav.rail .spacer { flex:1; }
   nav.rail .foot { font-size:12px; color:#6b7280; padding:8px 12px; }
+  .mobile-bar, .nav-close, .nav-scrim { display:none; }
 
   /* content */
   .content { flex:1; min-width:0; }
@@ -80,11 +81,33 @@ const STYLE = `
   input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
   button, .btn { background:var(--accent); color:#fff; border:none; border-radius:8px; padding:8px 16px; font-size:14px; cursor:pointer; }
   button:hover { filter:brightness(.95); }
+  button:disabled { cursor:not-allowed; opacity:.45; filter:none; }
   button.secondary, .btn.secondary { background:#f3f4f6; color:#374151; border:1px solid var(--border); }
   button.danger { background:var(--danger); }
   .actions { display:flex; gap:8px; align-items:center; }
   .inline-form { display:inline; }
   form.stack { display:block; }
+  .settings-form { display:grid; gap:16px; }
+  .settings-section { margin:0; padding:18px; border:1px solid var(--border); border-radius:10px; background:var(--card); }
+  .settings-section legend { padding:0 6px; margin-left:-6px; font-size:16px; font-weight:700; color:var(--fg); }
+  .settings-section-description { margin:0 0 16px; color:var(--muted); font-size:13px; }
+  .settings-section .field { margin-bottom:0; }
+  .field-help { min-height:18px; margin:0; color:var(--muted); font-size:12px; font-weight:400; }
+  .field-error { margin:0; color:#b91c1c; font-size:12px; font-weight:600; }
+  [aria-invalid="true"] { border-color:#dc2626 !important; }
+  .form-error-summary { padding:12px 14px; border:1px solid #fecaca; border-radius:8px;
+                        background:#fef2f2; color:#991b1b; font-size:13px; }
+  .form-error-summary:focus { outline:3px solid #fee2e2; outline-offset:2px; }
+  .form-error-summary ul { margin:6px 0 0; padding-left:20px; }
+  .form-error-summary a { color:#991b1b; text-decoration:underline; }
+  .input-with-unit { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:stretch; }
+  .input-with-unit input { border-radius:8px 0 0 8px; }
+  .input-unit { display:flex; align-items:center; padding:0 11px; border:1px solid var(--border); border-left:0;
+                border-radius:0 8px 8px 0; background:#f8fafc; color:var(--muted); font-size:12px; white-space:nowrap; }
+  .field-label-row { min-height:20px; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .effect-badge { display:inline-flex; align-items:center; min-height:20px; padding:1px 8px; border-radius:999px;
+                  background:var(--warn-soft); color:var(--warn); font-size:11px; font-weight:600; }
+  .settings-actions { justify-content:flex-end; padding-top:2px; }
 
   /* two-pane (agents) */
   .split { display:grid; grid-template-columns:240px 1fr; gap:20px; align-items:start; }
@@ -111,10 +134,37 @@ const STYLE = `
   .switch input:checked + .slider { background:var(--accent); }
   .switch input:checked + .slider:before { transform:translateX(18px); }
   .toggle-row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 0; }
+  @media (max-width:900px) {
+    body { display:block; overflow-x:hidden; }
+    nav.rail { width:100%; min-width:0; min-height:auto; }
+    html.js .mobile-bar { position:sticky; top:0; z-index:60; min-height:56px; display:flex; align-items:center;
+                          justify-content:space-between; gap:16px; padding:8px 16px; background:var(--nav-bg); color:#fff; }
+    .mobile-brand { display:flex; align-items:center; gap:8px; font-weight:700; }
+    .mobile-nav-toggle { min-height:40px; padding:7px 12px; border:1px solid #374151; background:#1f232b; }
+    html.js nav.rail { position:fixed; inset:0 auto 0 0; z-index:80; width:min(280px, 86vw); min-width:0;
+                       min-height:100dvh; transform:translateX(-100%); transition:transform .2s ease-out;
+                       box-shadow:12px 0 32px rgba(0,0,0,.22); }
+    html.js body.nav-open nav.rail { transform:translateX(0); }
+    html.js .nav-close { min-height:40px; display:block; margin:0 12px 12px; border:1px solid #374151; background:#1f232b; }
+    html.js .nav-scrim { position:fixed; inset:0; z-index:70; width:100%; height:100%; padding:0; border:0;
+                         border-radius:0; background:rgba(15,23,42,.52); }
+    html.js .nav-scrim:not([hidden]) { display:block; }
+    body.nav-open { overflow:hidden; }
+    .content { width:100%; }
+    main { width:100%; padding:24px 20px 56px; }
+  }
   @media (max-width:720px) {
+    main { padding:20px 16px 48px; }
+    .grid2 { grid-template-columns:1fr; gap:16px; }
+    input[type=text], input[type=password], input[type=number], select, textarea, button, .btn { min-height:44px; }
+    .settings-section { padding:16px; }
+    .settings-actions { display:grid; grid-template-columns:1fr 1fr; }
     .integration-row { grid-template-columns:1fr; gap:12px; }
     .integration-actions { justify-content:flex-start; }
     .connection-pill { min-width:0; width:100%; }
+  }
+  @media (prefers-reduced-motion:reduce) {
+    html.js nav.rail { transition:none; }
   }
 `;
 
@@ -162,19 +212,31 @@ export function layout(
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>${title} · homeagent</title>
+    <script>document.documentElement.classList.add("js");</script>
     <style>${raw(STYLE)}</style>
   </head>
   <body>
-    <nav class="rail">
+    <header class="mobile-bar">
+      <span class="mobile-brand">${brandMark({
+        variant: "dark",
+        size: 24,
+        decorative: true,
+      })}homeagent</span>
+      <button type="button" class="mobile-nav-toggle" data-nav-toggle
+        aria-controls="primary-navigation" aria-expanded="false">导航</button>
+    </header>
+    <nav class="rail" id="primary-navigation" aria-label="主导航">
       <div class="brand">${brandMark({
         variant: "dark",
         size: 28,
         decorative: true,
       })}homeagent</div>
+      <button type="button" class="nav-close" data-nav-close>关闭导航</button>
       ${navLinks}
       <div class="spacer"></div>
       <div class="foot">管理后台 · 内网自用</div>
     </nav>
+    <button type="button" class="nav-scrim" data-nav-scrim hidden aria-label="关闭主导航"></button>
     <div class="content">
       <main class="${active === "agents" ? "agent-page" : ""}">
         <div class="crumbs">${trail}</div>
@@ -185,6 +247,54 @@ export function layout(
       </main>
     </div>
     <script>
+      (function () {
+        var query = window.matchMedia("(max-width: 900px)");
+        var body = document.body;
+        var nav = document.getElementById("primary-navigation");
+        var content = document.querySelector(".content");
+        var toggle = document.querySelector("[data-nav-toggle]");
+        var closeButton = document.querySelector("[data-nav-close]");
+        var scrim = document.querySelector("[data-nav-scrim]");
+        if (!nav || !content || !toggle || !closeButton || !scrim) return;
+
+        function setClosedState(returnFocus) {
+          body.classList.remove("nav-open");
+          toggle.setAttribute("aria-expanded", "false");
+          scrim.hidden = true;
+          content.inert = false;
+          if (query.matches) {
+            nav.inert = true;
+            nav.setAttribute("aria-hidden", "true");
+          } else {
+            nav.inert = false;
+            nav.removeAttribute("aria-hidden");
+          }
+          if (returnFocus) toggle.focus();
+        }
+
+        function openNavigation() {
+          if (!query.matches) return;
+          body.classList.add("nav-open");
+          toggle.setAttribute("aria-expanded", "true");
+          scrim.hidden = false;
+          content.inert = true;
+          nav.inert = false;
+          nav.removeAttribute("aria-hidden");
+          closeButton.focus();
+        }
+
+        toggle.addEventListener("click", openNavigation);
+        closeButton.addEventListener("click", function () { setClosedState(true); });
+        scrim.addEventListener("click", function () { setClosedState(true); });
+        document.addEventListener("keydown", function (event) {
+          if (event.key === "Escape" && body.classList.contains("nav-open")) {
+            setClosedState(true);
+          }
+        });
+        query.addEventListener("change", function () { setClosedState(false); });
+        setClosedState(false);
+      })();
+
       fetch("/readyz", { cache: "no-store" })
         .then(function (response) {
           if (!response.ok) document.getElementById("runtime-health-alert").hidden = false;
