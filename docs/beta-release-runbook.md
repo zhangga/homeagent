@@ -17,6 +17,7 @@ bun run verify:beta
 
 - 版本号和发布输入文件；
 - 工作树是否干净；
+- 品牌 SVG、飞书头像与 macOS iconset 的自动化校验（`bun run verify:brand`）；
 - 全量离线测试；
 - TypeScript 类型检查；
 - 固定 AI 质量评测，以及基于 FTS 覆盖率的检索策略建议；
@@ -30,8 +31,9 @@ bun run verify:beta
 必要时跳转知识页人工纠错，再加入待校准评测集并记录处理说明。导出的候选 JSON 仍需人工确认标准答案
 和正确引用后才能并入仓库固定评测集；不得把错误答案自动学习回知识库。
 
-命令成功时仍会明确列出尚未完成的外部门禁。它不代表签名、公证、全新 Mac 安装或真实飞书
-Soak 已经完成，也不能替代 GitHub Release 工作流和发布记录。
+命令成功时仍会把品牌资产自动校验与人工视觉验收分开报告。它不代表 Finder、Dock、DMG、
+飞书圆形裁切、签名、公证、全新 Mac 安装或真实飞书 Soak 已经完成，也不能替代 GitHub Release
+工作流和发布记录。
 
 在开发中的脏工作树仅用于临时自检：
 
@@ -73,6 +75,9 @@ Homebrew 或 lark-cli。
 8. 在同一空间创建一个禁用的研究任务、一个未来提醒和一个学习计划，记下各自名称或 ID。
 9. 在后台确认知识、任务、提醒和学习计划均可查看。
 10. 运行 `"/Applications/HomeAgent.app/Contents/MacOS/homeagent" doctor --json`，保存脱敏结果到发布记录。
+11. 分别在 DMG、Finder 和 Dock 中检查 HomeAgent 图标，确认屋檐与智能火花居中、清晰且没有被系统遮罩裁掉。
+12. 在“飞书连接”下载品牌头像 PNG，到飞书开放平台手动上传，并在圆形裁切预览和真实聊天中检查安全边距。
+    HomeAgent 不会自动改动已有飞书应用，未执行手动上传时原头像必须保持不变。
 
 构建机还应对最终 app 执行：
 
@@ -226,6 +231,7 @@ Soak 默认要求 `/healthz` 和 `/readyz` 同时成功，并记录延迟、失�
 只有以下条件全部满足才发布或扩大测试范围：
 
 - push / PR CI 在 Linux 和 macOS 全绿；
+- `bun run verify:brand` 全绿，且 Finder、Dock、DMG 与飞书圆形头像的人工视觉记录已归档；
 - 两个架构的签名、公证和 DMG smoke 全绿；
 - 至少一个全新用户环境完成无终端安装；
 - 自动与真实崩溃恢复均通过；

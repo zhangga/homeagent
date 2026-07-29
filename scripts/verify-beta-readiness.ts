@@ -1,6 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { smokeMacOSBundle } from "./smoke-macos-bundle.ts";
+import {
+  inspectMacOSBundle,
+  smokeMacOSBundle,
+} from "./smoke-macos-bundle.ts";
 
 const REQUIRED_FILES = [
   "bun.lock",
@@ -10,6 +13,9 @@ const REQUIRED_FILES = [
   ".github/workflows/release-macos.yml",
   "docs/beta-release-runbook.md",
   "quality/evaluation-cases.json",
+  "assets/brand/homeagent-mark.svg",
+  "assets/brand/homeagent-glyph.svg",
+  "assets/brand/homeagent-feishu-avatar-512.png",
 ] as const;
 
 const SIGNING_ENVIRONMENT = [
@@ -46,8 +52,10 @@ export interface BetaReadinessReport {
   version: string;
   commands: string[];
   localChecksPassed: boolean;
+  automatedBrandAssetsVerified: boolean;
   appSmokeTested: boolean;
   signingEnvironmentChecked: boolean;
+  manualVisualChecksPending: string[];
   externalGatesPending: string[];
 }
 
@@ -108,6 +116,7 @@ export async function verifyBetaReadiness(
   const commands: string[] = [];
   if (!options.checksOnly) {
     for (const argv of [
+      ["bun", "run", "verify:brand"],
       ["bun", "test"],
       ["bun", "run", "typecheck"],
       ["bun", "run", "evaluate:quality"],
@@ -118,20 +127,32 @@ export async function verifyBetaReadiness(
     }
   }
   if (options.appPath) {
-    if (process.platform !== "darwin") {
-      throw new Error("a macOS app smoke test must run on macOS");
+    const appPath = resolve(options.appPath);
+    inspectMacOSBundle(appPath);
+    if (!options.checksOnly) {
+      if (process.platform !== "darwin") {
+        throw new Error("a macOS app smoke test must run on macOS");
+      }
+      await (options.smoke ?? smokeMacOSBundle)(appPath);
     }
-    await (options.smoke ?? smokeMacOSBundle)(resolve(options.appPath));
   }
   return {
     scope: options.checksOnly ? "structure-only" : "local-preflight",
     version: pkg.version,
     commands,
     localChecksPassed: !options.checksOnly,
-    appSmokeTested: options.appPath !== undefined,
+    automatedBrandAssetsVerified: !options.checksOnly,
+    appSmokeTested: options.appPath !== undefined && !options.checksOnly,
     signingEnvironmentChecked: options.requireSigningEnvironment ?? false,
+    manualVisualChecksPending: [
+      "macos-finder-dock-dmg",
+      "admin-setup-restarting",
+      "feishu-circular-avatar-crop",
+    ],
     externalGatesPending: [
-      ...(!options.appPath ? ["packaged-app-crash-smoke"] : []),
+      ...(!options.appPath || options.checksOnly
+        ? ["packaged-app-crash-smoke"]
+        : []),
       "signed-and-notarized-release-artifacts",
       "fresh-mac-no-terminal-install",
       "real-feishu-24-48h-soak",

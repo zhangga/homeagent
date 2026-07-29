@@ -53,6 +53,9 @@ data/workspaces/<dir>/
 Homebrew 或全局 CLI。知识数据保存在 `~/Library/Application Support/HomeAgent`，日志保存在
 `~/Library/Logs/HomeAgent`；替换应用版本不会覆盖知识数据。
 
+需要统一飞书机器人头像时，可在 HomeAgent 的“飞书连接”页面下载本地品牌头像 PNG，再到飞书开放平台手动上传。
+HomeAgent 不会自动修改任何已有飞书应用；上传后请在飞书的圆形裁切预览中确认屋檐与智能火花完整可见。
+
 > 当前仓库提供 beta 构建与发布流水线。面向外部分发的 DMG 仍须由维护者配置 Apple Developer ID
 > 签名/公证凭据，并完成 Bun 等二进制再分发审查；未经签名的本地构建仅供开发验证。
 
@@ -108,6 +111,7 @@ HOMEAGENT_LIVE=1 bun test packages/llm/src/gateway.live.test.ts   # 真调网关
 HOMEAGENT_LIVE=1 bun test packages/core/src/dream.live.test.ts    # 真跑提炼
 HOMEAGENT_LIVE=1 bun test packages/core/src/ask.live.test.ts      # 真跑问答
 bunx tsc -p tsconfig.json --noEmit    # 类型检查
+bun run verify:brand                  # 品牌 SVG、头像与 macOS iconset 离线校验
 bun run evaluate:quality              # 固定 AI 质量评测 + 检索策略建议
 bun run verify:crash-recovery         # SIGKILL 后知识/任务/提醒/学习恢复验收
 bun run verify:beta                   # 干净候选树的本地预检（不代替外部发布门禁）

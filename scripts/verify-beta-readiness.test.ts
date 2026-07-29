@@ -16,6 +16,9 @@ const required = [
   ".github/workflows/release-macos.yml",
   "docs/beta-release-runbook.md",
   "quality/evaluation-cases.json",
+  "assets/brand/homeagent-mark.svg",
+  "assets/brand/homeagent-glyph.svg",
+  "assets/brand/homeagent-feishu-avatar-512.png",
 ];
 
 const roots: string[] = [];
@@ -52,6 +55,7 @@ describe("beta readiness verification", () => {
 
     expect(calls).toEqual([
       ["git", "status", "--porcelain"],
+      ["bun", "run", "verify:brand"],
       ["bun", "test"],
       ["bun", "run", "typecheck"],
       ["bun", "run", "evaluate:quality"],
@@ -61,14 +65,21 @@ describe("beta readiness verification", () => {
       scope: "local-preflight",
       version: "0.1.0-beta.1",
       commands: [
+        "bun run verify:brand",
         "bun test",
         "bun run typecheck",
         "bun run evaluate:quality",
         "bun run verify:crash-recovery",
       ],
       localChecksPassed: true,
+      automatedBrandAssetsVerified: true,
       appSmokeTested: false,
       signingEnvironmentChecked: false,
+      manualVisualChecksPending: [
+        "macos-finder-dock-dmg",
+        "admin-setup-restarting",
+        "feishu-circular-avatar-crop",
+      ],
       externalGatesPending: [
         "packaged-app-crash-smoke",
         "signed-and-notarized-release-artifacts",
@@ -89,6 +100,63 @@ describe("beta readiness verification", () => {
     await expect(verifyBetaReadiness({ repoRoot: root, runner })).rejects.toThrow(
       "working tree must be clean",
     );
+  });
+
+  test("requires canonical brand assets as beta release inputs", async () => {
+    const root = repo();
+    rmSync(join(root, "assets", "brand", "homeagent-mark.svg"));
+
+    await expect(verifyBetaReadiness({
+      repoRoot: root,
+      allowDirty: true,
+      checksOnly: true,
+    })).rejects.toThrow(
+      "missing beta release input: assets/brand/homeagent-mark.svg",
+    );
+  });
+
+  test("preflights packaged icon, plist reference, and avatar in checks-only mode", async () => {
+    const root = repo();
+    const app = join(root, "HomeAgent.app");
+    for (const dir of [
+      "Contents/MacOS",
+      "Contents/Resources/app",
+      "Contents/Resources/bin",
+      "Contents/Resources/brand",
+    ]) {
+      mkdirSync(join(app, dir), { recursive: true });
+    }
+    for (const file of [
+      "Contents/MacOS/homeagent",
+      "Contents/Resources/app/homeagent.js",
+      "Contents/Resources/bin/bun",
+      "Contents/Resources/bin/lark-cli",
+      "Contents/Resources/bin/attachment-extract",
+      "Contents/Resources/HomeAgent.icns",
+      "Contents/Resources/brand/homeagent-feishu-avatar-512.png",
+    ]) {
+      writeFileSync(join(app, file), file);
+    }
+    writeFileSync(
+      join(app, "Contents/Info.plist"),
+      "<plist><dict><key>CFBundleIconFile</key><string>HomeAgent</string></dict></plist>",
+    );
+
+    const report = await verifyBetaReadiness({
+      repoRoot: root,
+      allowDirty: true,
+      checksOnly: true,
+      appPath: app,
+    });
+    expect(report.appSmokeTested).toBeFalse();
+
+    rmSync(join(app, "Contents/Resources/HomeAgent.icns"));
+    await expect(verifyBetaReadiness({
+      repoRoot: root,
+      allowDirty: true,
+      checksOnly: true,
+      appPath: app,
+    })).rejects.toThrow("missing Contents/Resources/HomeAgent.icns");
   });
 
   test("reports missing signing variable names without exposing values", async () => {
