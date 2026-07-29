@@ -105,6 +105,13 @@ Offer:
 A successfully replaced bot remains visibly `needs_restart` until the running
 connector identity matches. The UI must not imply that hot switching occurred.
 
+Disconnect is a HomeAgent-local disable operation. It stops Feishu consumers
+and outbound delivery but deliberately keeps the `lark-cli` application and
+user authorization in the system keychain. HomeAgent must not implement this
+action with `lark-cli config remove`, because that command clears the complete
+application configuration and all tokens, including user authorization used for
+document access.
+
 ### Feishu groups
 
 Show a primary **Connect group** action and compact connected-group rows.
@@ -218,7 +225,7 @@ available --connect--> active --disconnect--> disconnected
   existing space.
 - When the verified current app differs from `boundAppId`, the service computes
   or persists `needs_reconnect`; it never silently transfers the binding.
-- Removing the active bot leaves knowledge intact and makes prior bindings
+- Disabling the active bot leaves knowledge intact and makes prior bindings
   require reconnection.
 
 ## Component Boundaries
@@ -329,6 +336,14 @@ application. The page marks it as awaiting restart until the running connector
 identity matches. Bindings created for the previous `appId` become
 `needs_reconnect`; HomeAgent does not claim the new bot belongs to those chats.
 
+### Disconnect the bot
+
+Persist the current app ID as locally disabled, mark its bindings
+`needs_reconnect`, stop the event consumers, and reject Feishu outbound
+deliveries. Keep `lark-cli` credentials untouched. Reverification or connection
+of a bot clears the local-disabled marker, but activating its consumers still
+follows the explicit restart path.
+
 ## Permission and Capability Behavior
 
 `mentions_only` is always selectable when the base group-mention capability is
@@ -374,6 +389,9 @@ Retain and route through `FeishuIntegrationService`:
 All mutating routes retain the management authentication boundary. Bot
 disconnect and group disconnect require explicit UI confirmation. Public error
 messages are fixed or sanitized and never echo subprocess output.
+
+`POST /integrations/bot/disconnect` changes HomeAgent state only; it never calls
+`lark-cli config remove`.
 
 ## Failure Handling
 
