@@ -13,8 +13,15 @@
  */
 import { Hono } from "hono";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { readdirSync, readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import {
+  accessSync,
+  constants as fsConstants,
+  readdirSync,
+  readFileSync,
+  existsSync,
+  statSync,
+} from "node:fs";
+import { isAbsolute, join } from "node:path";
 import {
   config,
   logger,
@@ -94,6 +101,8 @@ const log = logger.child("web");
 
 export interface WebOptions {
   engine: KnowledgeEngine;
+  /** Fixed local HomeAgent avatar file; request data never selects this path. */
+  brandAvatarPath?: string;
   /** protects all management routes; liveness/readiness probes remain public */
   adminToken?: string;
   /** process-level health reporter; production wires all runtime components */
@@ -288,6 +297,16 @@ function requestHostname(request: Request): string {
   }
 }
 
+function isReadableBrandAvatar(path?: string): boolean {
+  if (!path || !isAbsolute(path)) return false;
+  try {
+    accessSync(path, fsConstants.R_OK);
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 export function createWebApp(opts: WebOptions): Hono {
   const { engine } = opts;
   const app = new Hono();
@@ -310,6 +329,26 @@ export function createWebApp(opts: WebOptions): Hono {
   app.use("*", async (c, next) => {
     if (isCrossSiteMutation(c.req.raw)) return c.text("Forbidden", 403);
     return next();
+  });
+
+  app.get("/brand/homeagent-feishu-avatar.png", (c) => {
+    if (!isReadableBrandAvatar(opts.brandAvatarPath)) {
+      return c.text("HomeAgent Feishu avatar is unavailable.", 404);
+    }
+    try {
+      const bytes = readFileSync(opts.brandAvatarPath!);
+      return new Response(bytes, {
+        headers: {
+          "cache-control": "no-store",
+          "content-disposition":
+            'attachment; filename="HomeAgent-Feishu-Avatar.png"',
+          "content-type": "image/png",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    } catch {
+      return c.text("HomeAgent Feishu avatar is unavailable.", 404);
+    }
   });
 
   // Detect local agent CLIs once, lazily, then cache (probing spawns processes).
@@ -1933,6 +1972,7 @@ export function createWebApp(opts: WebOptions): Hono {
           groups,
           agents,
           integration,
+          brandAvatarAvailable: isReadableBrandAvatar(opts.brandAvatarPath),
           flashMsg: ok,
         }),
         "integrations",

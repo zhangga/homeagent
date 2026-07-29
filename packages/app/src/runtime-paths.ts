@@ -6,6 +6,7 @@ export interface RuntimePaths {
   bundled: boolean;
   appRoot: string;
   resourceDir: string;
+  brandAssetDir: string;
   dataDir: string;
   logDir: string;
   larkBin: string;
@@ -31,6 +32,9 @@ export function resolveRuntimePaths(input: {
   const resourceDir = bundled
     ? join(appRoot, "Contents", "Resources")
     : join(appRoot, "packages", "orchestrator", "src");
+  const brandAssetDir = bundled
+    ? join(resourceDir, "brand")
+    : join(appRoot, "assets", "brand");
   const dataDir = resolve(
     brandedEnv(env, "DATA_DIR") ??
       (bundled
@@ -46,6 +50,7 @@ export function resolveRuntimePaths(input: {
     bundled,
     appRoot,
     resourceDir,
+    brandAssetDir,
     dataDir,
     logDir,
     larkBin:
@@ -55,4 +60,13 @@ export function resolveRuntimePaths(input: {
       ? join(resourceDir, "bin", "attachment-extract")
       : undefined,
   };
+}
+
+export const HOMEAGENT_FEISHU_AVATAR_FILENAME =
+  "homeagent-feishu-avatar-512.png";
+
+export function homeAgentFeishuAvatarPath(
+  paths: Pick<RuntimePaths, "brandAssetDir">,
+): string {
+  return join(paths.brandAssetDir, HOMEAGENT_FEISHU_AVATAR_FILENAME);
 }

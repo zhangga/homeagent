@@ -30,7 +30,10 @@ import { TaskScheduler } from "./task-scheduler.ts";
 import { LearningScheduler, learningNotification } from "./learning-scheduler.ts";
 import { ReminderScheduler } from "./reminder-scheduler.ts";
 import { createSystemHealthReporter } from "./health.ts";
-import { resolveRuntimePaths } from "./runtime-paths.ts";
+import {
+  homeAgentFeishuAvatarPath,
+  resolveRuntimePaths,
+} from "./runtime-paths.ts";
 import { launchDesktop } from "./desktop.ts";
 import { createDefaultService, runServiceCli } from "./service-cli.ts";
 import {
@@ -234,6 +237,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   });
   const app = createWebApp({
     engine,
+    brandAvatarPath: homeAgentFeishuAvatarPath(runtimePaths),
     adminToken: cfg.webAdminToken,
     health: reportHealth,
     larkSetup,

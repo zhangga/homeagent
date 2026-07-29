@@ -19,6 +19,7 @@
 import { assertSafeWebBinding, brandedEnv, config, type SpaceId } from "@homeagent/shared";
 import { KnowledgeEngine } from "@homeagent/core";
 import { detectProviders, type ProviderId } from "@homeagent/llm";
+import { resolve } from "node:path";
 import { createWebApp } from "./app.ts";
 
 const realCli = brandedEnv(process.env, "DEV_REAL_CLI") === "1";
@@ -68,7 +69,14 @@ if (engine.agents.list().length === 0) {
   console.log(`检测到本地可用 provider: ${usable.length ? usable.join(", ") : "无（未装 CLI）"}`);
 }
 
-const app = createWebApp({ engine, adminToken: cfg.webAdminToken });
+const app = createWebApp({
+  engine,
+  adminToken: cfg.webAdminToken,
+  brandAvatarPath: resolve(
+    import.meta.dir,
+    "../../../assets/brand/homeagent-feishu-avatar-512.png",
+  ),
+});
 // Real local CLI calls may take well over Bun's 10-second default timeout.
 const server = Bun.serve({ hostname: cfg.webHost, port: cfg.webPort, fetch: app.fetch, idleTimeout: 120 });
 // eslint-disable-next-line no-console

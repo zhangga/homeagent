@@ -1671,6 +1671,22 @@ function externalSharingControl(
   </div>`;
 }
 
+function feishuAvatarControl(
+  available: boolean,
+): HtmlEscapedString | Promise<HtmlEscapedString> {
+  return html`<div class="integration-row">
+    <div>
+      <strong>HomeAgent 品牌头像</strong>
+      <div class="muted">下载后请在飞书开放平台手动上传；HomeAgent 不会自动修改当前飞书应用。</div>
+    </div>
+    ${available
+      ? html`<a class="btn secondary"
+          href="/brand/homeagent-feishu-avatar.png"
+          download="HomeAgent-Feishu-Avatar.png">下载头像 PNG</a>`
+      : html`<span class="muted">本地头像资源不可用，请检查安装资源。</span>`}
+  </div>`;
+}
+
 export function feishuGroupConnectView(input: {
   candidates: LarkChatSummary[];
   capability: LarkCapabilityState;
@@ -1749,6 +1765,7 @@ export interface IntegrationsViewInput {
   externalSharing: FeishuExternalSharingStatus;
   groups: SpaceMeta[];
   agents: Agent[];
+  brandAvatarAvailable: boolean;
   integration?: FeishuIntegrationSnapshot;
   flashMsg?: string;
 }
@@ -1883,6 +1900,7 @@ export function integrationsView(
         </div>
         ${externalSharingControl(externalSharing)}
       </div>` : ""}
+      ${feishuAvatarControl(input.brandAvatarAvailable)}
       <div class="integration-detail">
         <div class="muted">首次确认会申请完整权限：消息收发、群消息读取、附件、表情、群信息和两条事件订阅。企业管理员可能需要在这次确认中批准敏感权限；上述权限无需事后进入开放平台补配置。手动连接已有应用时仍需自行确认权限。对外共享由飞书限制在版本发布流程中：创建版本时开启“允许机器人被添加到外部群中使用”和“允许外部用户与机器人单聊”，再提交发布并完成管理员审批。</div>
       </div>
@@ -1998,6 +2016,7 @@ function integrationsControlCenterView(
       ${snapshot.restartRequired
         ? html`<div class="degraded-note">Bot 配置已变化或刚恢复连接，需要重启服务后消息消费者才会使用当前身份。</div>`
         : ""}
+      ${feishuAvatarControl(input.brandAvatarAvailable)}
       ${setup.state === "ready" && setup.verified && setup.brand !== "lark"
         ? html`<div class="integration-row"><div><strong>对外共享</strong><div class="muted">允许加入外部群和接受外部用户私聊。</div></div>${externalSharingControl(input.externalSharing)}</div>`
         : ""}

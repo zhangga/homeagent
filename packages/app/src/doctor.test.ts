@@ -10,6 +10,7 @@ const paths: RuntimePaths = {
   bundled: true,
   appRoot: "/Applications/HomeAgent.app",
   resourceDir: "/Applications/HomeAgent.app/Contents/Resources",
+  brandAssetDir: "/Applications/HomeAgent.app/Contents/Resources/brand",
   dataDir: "/Users/example/Library/Application Support/HomeAgent",
   logDir: "/Users/example/Library/Logs/HomeAgent",
   larkBin: "/Applications/HomeAgent.app/Contents/Resources/bin/lark-cli",

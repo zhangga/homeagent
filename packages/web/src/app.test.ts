@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Hono } from "hono";
@@ -77,6 +77,59 @@ afterEach(() => {
 });
 
 describe("web backend (read-only)", () => {
+  test("serves only the injected HomeAgent Feishu avatar with manual-upload guidance", async () => {
+    const avatarPath = join(dir, "homeagent-feishu-avatar-512.png");
+    const avatarBytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);
+    writeFileSync(avatarPath, avatarBytes);
+    writeFileSync(join(dir, "request-controlled.png"), new Uint8Array([9, 9, 9]));
+    const avatarApp = createWebApp({ engine, brandAvatarPath: avatarPath });
+
+    const download = await avatarApp.request(
+      "/brand/homeagent-feishu-avatar.png?filename=request-controlled.png",
+    );
+    expect(download.status).toBe(200);
+    expect(download.headers.get("content-type")).toBe("image/png");
+    expect(download.headers.get("content-disposition")).toBe(
+      'attachment; filename="HomeAgent-Feishu-Avatar.png"',
+    );
+    expect(download.headers.get("cache-control")).toBe("no-store");
+    expect(new Uint8Array(await download.arrayBuffer())).toEqual(avatarBytes);
+
+    const integrations = await (
+      await avatarApp.request("/integrations")
+    ).text();
+    expect(integrations).toContain(
+      'href="/brand/homeagent-feishu-avatar.png"',
+    );
+    expect(integrations).toContain("手动上传");
+    expect(integrations).toContain("不会自动修改当前飞书应用");
+  });
+
+  test("reports a missing local avatar without leaking its absolute path", async () => {
+    const missingPath = join(dir, "missing-private-avatar.png");
+    const missingAvatarApp = createWebApp({
+      engine,
+      brandAvatarPath: missingPath,
+    });
+
+    const download = await missingAvatarApp.request(
+      "/brand/homeagent-feishu-avatar.png",
+    );
+    expect(download.status).not.toBe(200);
+    const body = await download.text();
+    expect(body).toContain("HomeAgent Feishu avatar is unavailable");
+    expect(body).not.toContain(missingPath);
+
+    const integrations = await (
+      await missingAvatarApp.request("/integrations")
+    ).text();
+    expect(integrations).toContain("本地头像资源不可用");
+    expect(integrations).not.toContain(
+      'href="/brand/homeagent-feishu-avatar.png"',
+    );
+    expect(integrations).not.toContain(missingPath);
+  });
+
   test("health endpoints distinguish liveness from readiness", async () => {
     const snapshot: SystemHealthSnapshot = {
       status: "degraded",

@@ -40,6 +40,7 @@ describe("service CLI", () => {
         bundled: true,
         appRoot: "/Applications/HomeAgent.app",
         resourceDir: "/Applications/HomeAgent.app/Contents/Resources",
+        brandAssetDir: "/Applications/HomeAgent.app/Contents/Resources/brand",
         dataDir: "/Users/test/Library/Application Support/HomeAgent",
         logDir: "/Users/test/Library/Logs/HomeAgent",
         larkBin: "/Applications/HomeAgent.app/Contents/Resources/bin/lark-cli",

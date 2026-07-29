@@ -1,10 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { join } from "node:path";
-import { resolveRuntimePaths } from "./runtime-paths.ts";
+import { join, resolve } from "node:path";
+import {
+  homeAgentFeishuAvatarPath,
+  resolveRuntimePaths,
+} from "./runtime-paths.ts";
 
 describe("resolveRuntimePaths", () => {
   test("resolves mutable data and bundled executables outside the repository", () => {
     const home = "/Users/example";
+    const appRoot = resolve("/Applications/HomeAgent.app");
+    const resourceDir = join(appRoot, "Contents", "Resources");
     const paths = resolveRuntimePaths({
       execPath: "/Applications/HomeAgent.app/Contents/MacOS/homeagent",
       homeDir: home,
@@ -13,13 +18,13 @@ describe("resolveRuntimePaths", () => {
 
     expect(paths).toEqual({
       bundled: true,
-      appRoot: "/Applications/HomeAgent.app",
-      resourceDir: "/Applications/HomeAgent.app/Contents/Resources",
-      dataDir: join(home, "Library", "Application Support", "HomeAgent"),
-      logDir: join(home, "Library", "Logs", "HomeAgent"),
-      larkBin: "/Applications/HomeAgent.app/Contents/Resources/bin/lark-cli",
-      attachmentHelper:
-        "/Applications/HomeAgent.app/Contents/Resources/bin/attachment-extract",
+      appRoot,
+      resourceDir,
+      brandAssetDir: join(resourceDir, "brand"),
+      dataDir: resolve(home, "Library", "Application Support", "HomeAgent"),
+      logDir: resolve(home, "Library", "Logs", "HomeAgent"),
+      larkBin: join(resourceDir, "bin", "lark-cli"),
+      attachmentHelper: join(resourceDir, "bin", "attachment-extract"),
     });
   });
 
@@ -31,15 +36,17 @@ describe("resolveRuntimePaths", () => {
     });
 
     expect(paths.bundled).toBe(true);
-    expect(paths.appRoot).toBe("/Applications/HomeAgent.app");
-    expect(paths.larkBin).toBe("/Applications/HomeAgent.app/Contents/Resources/bin/lark-cli");
+    expect(paths.appRoot).toBe(resolve("/Applications/HomeAgent.app"));
+    expect(paths.larkBin).toBe(join(paths.resourceDir, "bin", "lark-cli"));
   });
 
   test("keeps source mode repository-local while honoring executable and data overrides", () => {
+    const repoRoot = resolve("/work/homeagent");
+    const dataDir = resolve("/var/tmp/homeagent-data");
     const paths = resolveRuntimePaths({
       execPath: "/opt/bun/bin/bun",
       homeDir: "/Users/example",
-      repoRoot: "/work/homeagent",
+      repoRoot,
       env: {
         HOMEAGENT_DATA_DIR: "/var/tmp/homeagent-data",
         HOMEAGENT_LARK_BIN: "/opt/lark/bin/lark-cli",
@@ -48,10 +55,11 @@ describe("resolveRuntimePaths", () => {
 
     expect(paths).toEqual({
       bundled: false,
-      appRoot: "/work/homeagent",
-      resourceDir: "/work/homeagent/packages/orchestrator/src",
-      dataDir: "/var/tmp/homeagent-data",
-      logDir: "/var/tmp/homeagent-data/logs",
+      appRoot: repoRoot,
+      resourceDir: join(repoRoot, "packages", "orchestrator", "src"),
+      brandAssetDir: join(repoRoot, "assets", "brand"),
+      dataDir,
+      logDir: join(dataDir, "logs"),
       larkBin: "/opt/lark/bin/lark-cli",
       attachmentHelper: undefined,
     });
@@ -69,8 +77,24 @@ describe("resolveRuntimePaths", () => {
       },
     });
 
-    expect(paths.dataDir).toBe("/var/tmp/legacy-data");
-    expect(paths.logDir).toBe("/var/tmp/legacy-logs");
+    expect(paths.dataDir).toBe(resolve("/var/tmp/legacy-data"));
+    expect(paths.logDir).toBe(resolve("/var/tmp/legacy-logs"));
     expect(paths.larkBin).toBe("/opt/legacy/lark-cli");
+  });
+
+  test("forms the Feishu avatar path from the fixed repository-owned filename", () => {
+    const repoRoot = resolve("/work/homeagent");
+    const source = resolveRuntimePaths({
+      execPath: "/opt/bun/bin/bun",
+      repoRoot,
+      env: {
+        HOMEAGENT_BRAND_ASSET_DIR: "/tmp/request-controlled-assets",
+      },
+    });
+
+    expect(source.brandAssetDir).toBe(join(repoRoot, "assets", "brand"));
+    expect(homeAgentFeishuAvatarPath(source)).toBe(
+      join(repoRoot, "assets", "brand", "homeagent-feishu-avatar-512.png"),
+    );
   });
 });
