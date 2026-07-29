@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpaceId } from "@homeagent/shared";
@@ -123,5 +123,92 @@ describe("TaskRunStore", () => {
       startedAt: 100,
     });
     expect(run.startedAt).toBe(100);
+  });
+
+  test("persists the Agent execution selected when a run starts", () => {
+    const store = new TaskRunStore(dir);
+
+    const run = store.start({
+      task: TASK,
+      trigger: "manual",
+      distill: false,
+      agentId: "agent_codex",
+      provider: "codex",
+      model: "gpt-5.6-luna",
+    });
+
+    expect(new TaskRunStore(dir).get(run.id)).toEqual(expect.objectContaining({
+      agentId: "agent_codex",
+      provider: "codex",
+      model: "gpt-5.6-luna",
+    }));
+  });
+
+  test("lists only exact Agent runs newest first with a bounded limit", () => {
+    const store = new TaskRunStore(dir);
+    store.start({
+      task: TASK,
+      trigger: "manual",
+      distill: false,
+      agentId: "agent_other",
+      provider: "claude",
+      startedAt: 10,
+    });
+    const older = store.start({
+      task: TASK,
+      trigger: "manual",
+      distill: false,
+      agentId: "agent_codex",
+      provider: "codex",
+      startedAt: 20,
+    });
+    const newer = store.start({
+      task: TASK,
+      trigger: "manual",
+      distill: false,
+      agentId: "agent_codex",
+      provider: "codex",
+      startedAt: 30,
+    });
+
+    expect(store.listByAgent("agent_codex", 1).map((run) => run.id)).toEqual([newer.id]);
+    expect(store.listByAgent("agent_codex", 1000).map((run) => run.id)).toEqual([
+      newer.id,
+      older.id,
+    ]);
+    const listed = store.listByAgent("agent_codex");
+    listed[0]!.taskName = "mutated";
+    expect(store.get(newer.id)?.taskName).toBe(TASK.name);
+  });
+
+  test("loads version 2 history but rejects unknown file versions and providers", () => {
+    const store = new TaskRunStore(dir);
+    const run = store.start({
+      task: TASK,
+      trigger: "manual",
+      distill: false,
+      agentId: "agent_legacy",
+      provider: "codex",
+    });
+    const path = join(dir, "config", "task-runs.json");
+    const legacy = JSON.parse(readFileSync(path, "utf8")) as {
+      version: number;
+      runs: Record<string, Record<string, unknown>>;
+    };
+    legacy.version = 2;
+    delete legacy.runs[run.id]!.agentId;
+    delete legacy.runs[run.id]!.provider;
+    writeFileSync(path, JSON.stringify(legacy), "utf8");
+    expect(new TaskRunStore(dir).get(run.id)).toBeDefined();
+
+    legacy.version = 3;
+    legacy.runs[run.id]!.provider = "gateway";
+    writeFileSync(path, JSON.stringify(legacy), "utf8");
+    expect(new TaskRunStore(dir).get(run.id)).toBeUndefined();
+
+    legacy.version = 99;
+    delete legacy.runs[run.id]!.provider;
+    writeFileSync(path, JSON.stringify(legacy), "utf8");
+    expect(new TaskRunStore(dir).list()).toEqual([]);
   });
 });

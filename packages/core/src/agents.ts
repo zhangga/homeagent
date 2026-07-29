@@ -205,9 +205,9 @@ export class AgentStore {
     return map;
   }
 
-  private persist(): void {
+  private persist(agents = this.agents): void {
     mkdirSync(join(this.configPath, ".."), { recursive: true });
-    const obj: AgentsFile = { agents: Object.fromEntries(this.agents) };
+    const obj: AgentsFile = { agents: Object.fromEntries(agents) };
     writeFileSync(this.configPath, JSON.stringify(obj, null, 2), "utf8");
   }
 
@@ -268,9 +268,12 @@ export class AgentStore {
   }
 
   remove(id: string): boolean {
-    const ok = this.agents.delete(id);
-    if (ok) this.persist();
-    return ok;
+    if (!this.agents.has(id)) return false;
+    const candidate = new Map(this.agents);
+    candidate.delete(id);
+    this.persist(candidate);
+    this.agents = candidate;
+    return true;
   }
 
   /** Restore an exact archived agent only when that id is not already present. */

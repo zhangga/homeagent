@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { isCliProvider, type ProviderId } from "@homeagent/llm";
 import { isSpaceId, type SpaceId } from "@homeagent/shared";
 import type { Task } from "./tasks.ts";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
@@ -33,6 +34,9 @@ export interface TaskRun {
   space: SpaceId;
   topic: string;
   trigger: TaskRunTrigger;
+  agentId?: string;
+  provider?: ProviderId;
+  model?: string;
   retryOf?: string;
   distill: boolean;
   notify?: boolean;
@@ -50,13 +54,16 @@ export interface TaskRun {
 }
 
 interface TaskRunsFile {
-  version: 2;
+  version: 2 | 3;
   runs: Record<string, TaskRun>;
 }
 
 export interface StartTaskRunInput {
   task: Task;
   trigger: TaskRunTrigger;
+  agentId?: string;
+  provider?: ProviderId;
+  model?: string;
   retryOf?: string;
   distill: boolean;
   timeoutMs?: number;
@@ -100,6 +107,8 @@ function isTaskRun(value: unknown): value is TaskRun {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const run = value as Partial<TaskRun>;
   const optionalStrings = [
+    run.agentId,
+    run.model,
     run.retryOf,
     run.output,
     run.summary,
@@ -138,6 +147,7 @@ function isTaskRun(value: unknown): value is TaskRun {
     && isSpaceId(run.space)
     && typeof run.topic === "string"
     && ["manual", "scheduled", "chat", "retry"].includes(String(run.trigger))
+    && (run.provider === undefined || isCliProvider(run.provider))
     && typeof run.distill === "boolean"
     && (run.notify === undefined || typeof run.notify === "boolean")
     && ["running", "succeeded", "failed", "cancelled", "timed_out"].includes(String(run.status))
@@ -189,6 +199,7 @@ export class TaskRunStore {
     if (!existsSync(this.configPath)) return runs;
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<TaskRunsFile>;
+      if (parsed.version !== 2 && parsed.version !== 3) return runs;
       for (const [id, value] of Object.entries(parsed.runs ?? {})) {
         if (!isTaskRun(value) || value.id !== id) continue;
         runs.set(id, clone(value));
@@ -203,7 +214,7 @@ export class TaskRunStore {
     const configDir = dirname(this.configPath);
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const tempPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
-    const file: TaskRunsFile = { version: 2, runs: Object.fromEntries(runs) };
+    const file: TaskRunsFile = { version: 3, runs: Object.fromEntries(runs) };
     try {
       writeFileSync(tempPath, JSON.stringify(file, null, 2), { encoding: "utf8", mode: 0o600 });
       const fileDescriptor = openSync(tempPath, "r");
@@ -279,6 +290,9 @@ export class TaskRunStore {
         space: input.task.space,
         topic: input.task.topic,
         trigger: input.trigger,
+        agentId: input.agentId,
+        provider: input.provider,
+        model: input.model,
         retryOf: input.retryOf,
         distill: input.distill,
         notify: input.task.notify,
@@ -407,6 +421,15 @@ export class TaskRunStore {
     return [...this.runs.values()]
       .filter((run) => !taskId || run.taskId === taskId)
       .sort((a, b) => b.startedAt - a.startedAt)
+      .map(clone);
+  }
+
+  listByAgent(agentId: string, limit = 20): TaskRun[] {
+    const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 20));
+    return [...this.runs.values()]
+      .filter((run) => run.agentId === agentId)
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .slice(0, boundedLimit)
       .map(clone);
   }
 

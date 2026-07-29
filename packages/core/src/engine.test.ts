@@ -746,6 +746,75 @@ describe("Knowledge seam contract", () => {
     expect(engine.agentForSpace(personalSpace)).toBeUndefined();
   });
 
+  test("an Agent cannot change visibility while incompatible spaces are bound", () => {
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({ name: "群助手", visibility: "Team" });
+    engine.updateSpaceMeta(SPACE, { agentId: agent.id });
+
+    expect(() => engine.updateAgent(agent.id, { visibility: "Personal" }))
+      .toThrow("先解除");
+    expect(engine.agents.get(agent.id)?.visibility).toBe("Team");
+    expect(engine.registry.get(SPACE)?.agentId).toBe(agent.id);
+  });
+
+  test("deleting an Agent clears every binding before removing it", () => {
+    const personalSpace: SpaceId = "personal/ou_delete_agent";
+    engine.ensureSpace(SPACE);
+    engine.ensureSpace(personalSpace);
+    const agent = engine.agents.create({ name: "待删除助手", visibility: "Team" });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    engine.registry.updateMeta(personalSpace, { agentId: agent.id });
+
+    const result = engine.removeAgentAndUnbind(agent.id);
+
+    expect(result?.bindings.map((space) => space.id).sort()).toEqual([
+      personalSpace,
+      SPACE,
+    ]);
+    expect(engine.agents.has(agent.id)).toBe(false);
+    expect(engine.registry.get(SPACE)?.agentId).toBeUndefined();
+    expect(engine.registry.get(personalSpace)?.agentId).toBeUndefined();
+  });
+
+  test("an Agent is preserved when clearing its bindings fails", () => {
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({ name: "保留助手", visibility: "Team" });
+    engine.updateSpaceMeta(SPACE, { agentId: agent.id });
+    engine.registry.clearAgentBindings = () => {
+      throw new Error("registry unavailable");
+    };
+
+    expect(() => engine.removeAgentAndUnbind(agent.id)).toThrow("registry unavailable");
+    expect(engine.agents.has(agent.id)).toBe(true);
+    expect(engine.registry.get(SPACE)?.agentId).toBe(agent.id);
+  });
+
+  test("an Agent deletion can be retried after its bindings were already cleared", () => {
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({ name: "可重试删除", visibility: "Team" });
+    engine.updateSpaceMeta(SPACE, { agentId: agent.id });
+    const persist = (engine.agents as unknown as {
+      persist: (agents?: unknown) => void;
+    }).persist.bind(engine.agents);
+    Object.defineProperty(engine.agents, "persist", {
+      configurable: true,
+      value: () => {
+        throw new Error("agent store unavailable");
+      },
+    });
+
+    expect(() => engine.removeAgentAndUnbind(agent.id)).toThrow("agent store unavailable");
+    expect(engine.registry.get(SPACE)?.agentId).toBeUndefined();
+    expect(engine.agents.has(agent.id)).toBe(true);
+
+    Object.defineProperty(engine.agents, "persist", {
+      configurable: true,
+      value: persist,
+    });
+    expect(engine.removeAgentAndUnbind(agent.id)?.bindings).toEqual([]);
+    expect(engine.agents.has(agent.id)).toBe(false);
+  });
+
   test("runTask: research output is captured as a raw 'task' entry + lastRun recorded", async () => {
     // A dedicated engine whose CLI runner returns research text for the task.
     const taskEngine = new KnowledgeEngine({
@@ -803,6 +872,44 @@ describe("Knowledge seam contract", () => {
       workdir: realpathSync(workdir),
       skills: ["code-review", "github:yeet"],
     });
+    taskEngine.close();
+  });
+
+  test("runTask records the Agent provider and model used for execution", async () => {
+    let executedProvider: string | undefined;
+    let executedModel: string | undefined;
+    const taskEngine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async (provider, input) => {
+        executedProvider = provider;
+        executedModel = input.model;
+        return "已记录执行快照";
+      },
+    });
+    taskEngine.ensureSpace(SPACE);
+    const agent = taskEngine.agents.create({
+      name: "Codex 执行助手",
+      provider: "codex",
+      model: "gpt-5.6-luna",
+    });
+    taskEngine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const task = taskEngine.tasks.create({
+      name: "记录执行信息",
+      space: SPACE,
+      topic: "检查执行快照",
+      distillOnRun: false,
+    })!;
+
+    const report = await taskEngine.runTask(task.id);
+    const run = taskEngine.getTaskRun(report.runId);
+
+    expect(run).toEqual(expect.objectContaining({
+      agentId: agent.id,
+      provider: "codex",
+      model: "gpt-5.6-luna",
+    }));
+    expect(executedProvider).toBe(run?.provider);
+    expect(executedModel).toBe(run?.model);
     taskEngine.close();
   });
 

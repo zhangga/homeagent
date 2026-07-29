@@ -60,6 +60,7 @@ import {
   agentVisibleInSpace,
   resolveAgentExecution,
   type Agent,
+  type AgentInput,
 } from "./agents.ts";
 import {
   DEFAULT_TASK_TIMEOUT_MINUTES,
@@ -1291,6 +1292,42 @@ export class KnowledgeEngine implements Knowledge {
     return agent && agentVisibleInSpace(agent, space) ? agent : undefined;
   }
 
+  updateAgent(id: string, input: AgentInput): Agent | undefined {
+    const current = this.agents.get(id);
+    if (!current) return undefined;
+    if (
+      input.visibility
+      && input.visibility !== current.visibility
+      && (input.visibility === "Team" || input.visibility === "Personal")
+    ) {
+      const candidate: Agent = { ...current, visibility: input.visibility };
+      const incompatible = this.registry.listByAgent(id)
+        .filter((space) => !agentVisibleInSpace(candidate, space.id));
+      if (incompatible.length > 0) {
+        throw new Error(
+          `请先解除不兼容的空间绑定：${incompatible.map((space) => space.name || space.id).join("、")}`,
+        );
+      }
+    }
+    return this.agents.update(id, input);
+  }
+
+  agentBindings(id: string): SpaceMeta[] {
+    return this.registry.listByAgent(id);
+  }
+
+  listAgentRuns(id: string, limit = 20): TaskRun[] {
+    return this.taskRuns.listByAgent(id, limit);
+  }
+
+  removeAgentAndUnbind(id: string): { agent: Agent; bindings: SpaceMeta[] } | undefined {
+    const agent = this.agents.get(id);
+    if (!agent) return undefined;
+    const bindings = this.registry.clearAgentBindings(id);
+    this.agents.remove(id);
+    return { agent, bindings };
+  }
+
   /**
    * Resolve the space-scoped LLM client shared by classification, ask, dream,
    * and tasks. Tests may inject one client for every space; production resolves
@@ -1302,9 +1339,10 @@ export class KnowledgeEngine implements Knowledge {
     timeoutMs?: number,
     signal?: AbortSignal,
     taskExecution = false,
+    resolvedAgent?: Agent,
   ): LlmClient {
     if (this.llm) return this.llm;
-    const agent = this.agentForSpace(space);
+    const agent = resolvedAgent ?? this.agentForSpace(space);
     return this.makeSpaceCliClient(
       space,
       timeoutMs,
@@ -2359,9 +2397,34 @@ export class KnowledgeEngine implements Knowledge {
     if (activeRunId) {
       throw new TaskAlreadyRunningError(taskId, activeRunId);
     }
+    let executionAgent: Agent | undefined;
+    let provider: ProviderId | undefined;
+    let model: string | undefined;
+    let setupError: unknown;
+    try {
+      const configuredAgent = this.agentForSpace(task.space);
+      const cfg = config();
+      const selectedProvider = configuredAgent?.provider || cfg.defaultProvider;
+      const inheritedModel = !configuredAgent || configuredAgent.provider === cfg.defaultProvider
+        ? cfg.defaultModel
+        : "";
+      const selectedModel = configuredAgent?.model || inheritedModel || undefined;
+      model = selectedProvider === "codex" && selectedModel
+        ? canonicalModelId(selectedModel)
+        : selectedModel;
+      provider = isCliProvider(selectedProvider) ? selectedProvider : undefined;
+      executionAgent = configuredAgent
+        ? { ...configuredAgent, model: model ?? "" }
+        : undefined;
+    } catch (error) {
+      setupError = error;
+    }
     const run = this.taskRuns.start({
       task,
       trigger,
+      agentId: executionAgent?.id,
+      provider,
+      model,
       retryOf,
       distill,
       timeoutMs,
@@ -2374,7 +2437,14 @@ export class KnowledgeEngine implements Knowledge {
     this.taskRunControllers.set(run.id, controller);
     return {
       run,
-      completion: this.executeTaskRun(task, run, distill, controller)
+      completion: this.executeTaskRun(
+        task,
+        run,
+        distill,
+        controller,
+        executionAgent,
+        setupError,
+      )
         .finally(() => clearTimeout(timeout)),
     };
   }
@@ -2393,13 +2463,16 @@ export class KnowledgeEngine implements Knowledge {
     run: TaskRun,
     distill: boolean,
     controller: AbortController,
+    resolvedAgent?: Agent,
+    setupError?: unknown,
   ): Promise<TaskReport> {
     const startedAt = run.startedAt;
     let output: string | undefined;
     let rawId: string | undefined;
     try {
+      if (setupError) throw setupError;
       this.registry.ensure(task.space);
-      const agent = this.agentForSpace(task.space);
+      const agent = resolvedAgent;
       // The LLM call runs OUTSIDE the per-space serializer — research is
       // long-running and must not block captures/distillation. Only the write
       // (remember) is serialized, and it acquires the lock itself.
@@ -2408,6 +2481,7 @@ export class KnowledgeEngine implements Knowledge {
         run.timeoutMs ?? TASK_TIMEOUT_MS,
         controller.signal,
         true,
+        agent,
       );
       const res = await awaitTaskRunStep(
         client.complete({

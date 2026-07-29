@@ -62,9 +62,9 @@ export class SpaceRegistry {
     return map;
   }
 
-  private persist(): void {
+  private persist(meta = this.meta): void {
     mkdirSync(join(this.dataDir, "config"), { recursive: true });
-    const obj: RegistryFile = { spaces: Object.fromEntries(this.meta) };
+    const obj: RegistryFile = { spaces: Object.fromEntries(meta) };
     writeFileSync(this.configPath, JSON.stringify(obj, null, 2), "utf8");
   }
 
@@ -117,6 +117,26 @@ export class SpaceRegistry {
 
   list(): SpaceMeta[] {
     return [...this.meta.values()];
+  }
+
+  listByAgent(agentId: string): SpaceMeta[] {
+    return [...this.meta.values()]
+      .filter((meta) => meta.agentId === agentId)
+      .map((meta) => ({ ...meta }));
+  }
+
+  clearAgentBindings(agentId: string): SpaceMeta[] {
+    const affected = this.listByAgent(agentId);
+    if (affected.length === 0) return [];
+    const candidate = new Map(
+      [...this.meta].map(([id, meta]) => [id, { ...meta }]),
+    );
+    for (const meta of candidate.values()) {
+      if (meta.agentId === agentId) meta.agentId = undefined;
+    }
+    this.persist(candidate);
+    this.meta = candidate;
+    return affected;
   }
 
   setLastDream(space: SpaceId, at: number): void {

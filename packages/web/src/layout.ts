@@ -170,7 +170,7 @@ export function layout(
       <div class="foot">管理后台 · 内网自用</div>
     </nav>
     <div class="content">
-      <main>
+      <main class="${active === "agents" ? "agent-page" : ""}">
         <div class="crumbs">${trail}</div>
         <div id="runtime-health-alert" class="health-alert" hidden>
           运行状态异常，部分能力可能不可用。<a href="/health">查看详情</a>

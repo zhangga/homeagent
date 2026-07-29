@@ -41,10 +41,20 @@ import {
   TaskAlreadyRunningError,
   type FeishuResponseMode,
   type GroupParticipationLevel,
+  type Agent,
   type KnowledgeEngine,
   type TaskRun,
 } from "@homeagent/core";
 import { layout } from "./layout.ts";
+import { agentWorkbenchView } from "./agent-workbench-view.ts";
+import {
+  buildAgentWorkbench,
+  editorValuesFor,
+  validateAgentEditor,
+  type AgentEditorValues,
+  type AgentFieldErrors,
+  type AgentWorkbenchMode,
+} from "./agent-workbench.ts";
 import type { CodexSetupPort, FeishuRuntimeStatus, LarkSetupPort } from "./integrations.ts";
 import type { FeishuIntegrationService } from "./feishu-integration-service.ts";
 import { FeishuIntegrationError } from "./feishu-integration-service.ts";
@@ -55,7 +65,6 @@ import {
   type FeishuExternalSharingStatus,
 } from "./external-sharing.ts";
 import {
-  agentsView,
   askView,
   integrationsView,
   learningView,
@@ -126,6 +135,12 @@ function str(body: Record<string, unknown>, name: string): string {
 function parseGroupParticipationLevel(body: Record<string, unknown>): GroupParticipationLevel {
   const value = str(body, "participationLevel");
   return isGroupParticipationLevel(value) ? value : "balanced";
+}
+
+function agentRunLimit(raw: string | undefined): number {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return 20;
+  return Math.min(100, Math.max(20, Math.ceil(parsed / 20) * 20));
 }
 
 function parseFeishuResponseMode(
@@ -286,6 +301,62 @@ export function createWebApp(opts: WebOptions): Hono {
   const getModels = async (): Promise<Record<string, string[]>> => {
     if (!modelCache) modelCache = await listModels();
     return modelCache;
+  };
+  const agentValuesFromBody = (
+    body: Record<string, unknown>,
+    fallback: AgentEditorValues,
+  ): AgentEditorValues => {
+    const value = (name: keyof AgentEditorValues): string => (
+      typeof body[name] === "string" ? body[name] : fallback[name]
+    );
+    return {
+      name: value("name"),
+      instruction: value("instruction"),
+      provider: value("provider"),
+      model: value("model"),
+      // Non-Codex editors disable this select, so browsers intentionally omit it.
+      reasoningEffort: typeof body.reasoningEffort === "string"
+        ? body.reasoningEffort
+        : "",
+      visibility: value("visibility"),
+      permission: value("permission"),
+      workdir: value("workdir"),
+      skills: value("skills"),
+    };
+  };
+  const renderAgentWorkbench = async (input: {
+    mode: AgentWorkbenchMode;
+    selected?: Agent | null;
+    values?: AgentEditorValues;
+    errors?: AgentFieldErrors;
+    flash?: string;
+    formError?: string;
+    runLimit?: number;
+  }) => {
+    const agents = engine.agents.list();
+    const selected = input.selected ?? null;
+    const providers = await getProviders();
+    const models = await getModels();
+    const cfg = config();
+    const runLimit = input.runLimit ?? 20;
+    const allRuns = selected ? engine.listAgentRuns(selected.id, 100) : [];
+    return agentWorkbenchView(buildAgentWorkbench({
+      agents,
+      mode: input.mode,
+      selected,
+      providers,
+      models,
+      defaults: { provider: cfg.defaultProvider, model: cfg.defaultModel },
+      bindings: selected ? engine.agentBindings(selected.id) : [],
+      runs: allRuns.slice(0, runLimit),
+      runTotal: allRuns.length,
+      runLimit,
+      listRuns: engine.listTaskRuns(),
+      values: input.values,
+      errors: input.errors,
+      flash: input.flash,
+      formError: input.formError,
+    }));
   };
   const idleCodexLogin = (): CodexLoginSession => ({
     state: "idle",
@@ -1267,19 +1338,35 @@ export function createWebApp(opts: WebOptions): Hono {
   app.get("/agents", async (c) => {
     const agents = engine.agents.list();
     const ok = c.req.query("ok") ?? undefined;
-    const cfg = config();
+    if (agents[0] && c.req.query("view") !== "list") {
+      const query = ok ? `?ok=${encodeURIComponent(ok)}` : "";
+      return c.redirect(`/agents/${encodeURIComponent(agents[0].id)}${query}`);
+    }
     return c.html(
       await layout(
         "Agents",
         [{ label: "Agents" }],
-        await agentsView(
-          agents,
-          null,
-          await getProviders(),
-          await getModels(),
-          { provider: cfg.defaultProvider, model: cfg.defaultModel },
-          ok,
-        ),
+        await renderAgentWorkbench({ mode: "empty", flash: ok }),
+        "agents",
+      ),
+    );
+  });
+
+  app.get("/agents/new", async (c) => {
+    const providers = await getProviders();
+    const cfg = config();
+    return c.html(
+      await layout(
+        "新建 Agent",
+        [{ label: "Agents", href: "/agents" }, { label: "新建" }],
+        await renderAgentWorkbench({
+          mode: "create",
+          values: editorValuesFor(
+            null,
+            providers,
+            { provider: cfg.defaultProvider, model: cfg.defaultModel },
+          ),
+        }),
         "agents",
       ),
     );
@@ -1290,19 +1377,16 @@ export function createWebApp(opts: WebOptions): Hono {
     const agent = engine.agents.get(id);
     if (!agent) return c.notFound();
     const ok = c.req.query("ok") ?? undefined;
-    const cfg = config();
     return c.html(
       await layout(
         agent.name,
         [{ label: "Agents", href: "/agents" }, { label: agent.name }],
-        await agentsView(
-          engine.agents.list(),
-          agent,
-          await getProviders(),
-          await getModels(),
-          { provider: cfg.defaultProvider, model: cfg.defaultModel },
-          ok,
-        ),
+        await renderAgentWorkbench({
+          mode: "edit",
+          selected: agent,
+          flash: ok,
+          runLimit: agentRunLimit(c.req.query("runs")),
+        }),
         "agents",
       ),
     );
@@ -1310,42 +1394,133 @@ export function createWebApp(opts: WebOptions): Hono {
 
   app.post("/agents", async (c) => {
     const body = await c.req.parseBody();
-    const agent = engine.agents.create({
-      name: str(body, "name"),
-      instruction: str(body, "instruction"),
-      model: str(body, "model"),
-      reasoningEffort: str(body, "reasoningEffort"),
-      provider: str(body, "provider"),
-      visibility: str(body, "visibility"),
-      workdir: str(body, "workdir"),
-      permission: str(body, "permission"),
-      skills: str(body, "skills"),
+    const cfg = config();
+    const providers = await getProviders();
+    const values = agentValuesFromBody(
+      body,
+      editorValuesFor(
+        null,
+        providers,
+        { provider: cfg.defaultProvider, model: cfg.defaultModel },
+      ),
+    );
+    const validation = validateAgentEditor(values, {
+      providers,
+      models: await getModels(),
+      defaults: { provider: cfg.defaultProvider, model: cfg.defaultModel },
+      current: null,
     });
-    return c.redirect(`/agents/${encodeURIComponent(agent.id)}?ok=${encodeURIComponent("已创建")}`);
+    if (!validation.ok) {
+      return c.html(
+        await layout(
+          "新建 Agent",
+          [{ label: "Agents", href: "/agents" }, { label: "新建" }],
+          await renderAgentWorkbench({
+            mode: "create",
+            values,
+            errors: validation.errors,
+            formError: "请修正标记的字段后再创建。",
+          }),
+          "agents",
+        ),
+        422,
+      );
+    }
+    const agent = engine.agents.create(values);
+    return c.redirect(
+      `/agents/${encodeURIComponent(agent.id)}?ok=${encodeURIComponent("已创建")}`,
+    );
   });
 
   app.post("/agents/:id", async (c) => {
     const id = decodeURIComponent(c.req.param("id"));
-    if (!engine.agents.has(id)) return c.notFound();
+    const current = engine.agents.get(id);
+    if (!current) return c.notFound();
     const body = await c.req.parseBody();
-    engine.agents.update(id, {
-      name: str(body, "name"),
-      instruction: str(body, "instruction"),
-      model: str(body, "model"),
-      reasoningEffort: str(body, "reasoningEffort"),
-      provider: str(body, "provider"),
-      visibility: str(body, "visibility"),
-      workdir: str(body, "workdir"),
-      permission: str(body, "permission"),
-      skills: str(body, "skills"),
+    const cfg = config();
+    const providers = await getProviders();
+    const values = agentValuesFromBody(
+      body,
+      editorValuesFor(
+        current,
+        providers,
+        { provider: cfg.defaultProvider, model: cfg.defaultModel },
+      ),
+    );
+    const validation = validateAgentEditor(values, {
+      providers,
+      models: await getModels(),
+      defaults: { provider: cfg.defaultProvider, model: cfg.defaultModel },
+      current,
     });
-    return c.redirect(`/agents/${encodeURIComponent(id)}?ok=${encodeURIComponent("已保存")}`);
+    if (!validation.ok) {
+      return c.html(
+        await layout(
+          current.name,
+          [{ label: "Agents", href: "/agents" }, { label: current.name }],
+          await renderAgentWorkbench({
+            mode: "edit",
+            selected: current,
+            values,
+            errors: validation.errors,
+            formError: "请修正标记的字段后再保存。",
+          }),
+          "agents",
+        ),
+        422,
+      );
+    }
+    try {
+      engine.updateAgent(id, values);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "保存失败";
+      const visibilityConflict = message.includes("解除") || message.includes("绑定");
+      return c.html(
+        await layout(
+          current.name,
+          [{ label: "Agents", href: "/agents" }, { label: current.name }],
+          await renderAgentWorkbench({
+            mode: "edit",
+            selected: current,
+            values,
+            errors: visibilityConflict ? { visibility: message } : {},
+            formError: visibilityConflict ? "当前绑定与新的 Visibility 不兼容。" : message,
+          }),
+          "agents",
+        ),
+        409,
+      );
+    }
+    return c.redirect(
+      `/agents/${encodeURIComponent(id)}?ok=${encodeURIComponent("已保存")}`,
+    );
   });
 
   app.post("/agents/:id/delete", async (c) => {
     const id = decodeURIComponent(c.req.param("id"));
-    engine.agents.remove(id);
-    return c.redirect(`/agents?ok=${encodeURIComponent("已删除")}`);
+    const current = engine.agents.get(id);
+    if (!current) return c.notFound();
+    try {
+      const result = engine.removeAgentAndUnbind(id)!;
+      const suffix = result.bindings.length > 0
+        ? `，已解除 ${result.bindings.length} 个空间绑定`
+        : "";
+      return c.redirect(`/agents?ok=${encodeURIComponent(`已删除${suffix}`)}`);
+    } catch {
+      return c.html(
+        await layout(
+          current.name,
+          [{ label: "Agents", href: "/agents" }, { label: current.name }],
+          await renderAgentWorkbench({
+            mode: "edit",
+            selected: current,
+            formError: "删除失败：配置暂时无法保存，Agent 已保留，请重试。",
+          }),
+          "agents",
+        ),
+        500,
+      );
+    }
   });
 
   // ---- Tasks ---------------------------------------------------------------

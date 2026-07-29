@@ -1467,6 +1467,34 @@ describe("management backend (read-write)", () => {
     expect(view).toContain("仅 Codex");
   });
 
+  test("switching away from Codex clears the disabled reasoning field", async () => {
+    const created = engine.agents.create({
+      name: "切换 Provider",
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "high",
+    });
+
+    const response = await app.request(`/agents/${encodeURIComponent(created.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        name: created.name,
+        provider: "claude",
+        model: "sonnet",
+        visibility: "Team",
+        permission: "read-only",
+      }).toString(),
+    });
+
+    expect([302, 303]).toContain(response.status);
+    expect(engine.agents.get(created.id)).toEqual(expect.objectContaining({
+      provider: "claude",
+      model: "sonnet",
+      reasoningEffort: "",
+    }));
+  });
+
   test("rejects a reasoning effort unsupported by the selected Codex model", async () => {
     const form = new URLSearchParams({
       name: "旧模型助手",
@@ -1480,8 +1508,11 @@ describe("management backend (read-write)", () => {
       body: form.toString(),
     });
 
-    expect([302, 303]).toContain(response.status);
-    expect(engine.agents.list().find((item) => item.name === "旧模型助手")?.reasoningEffort).toBe("");
+    expect(response.status).toBe(422);
+    expect(engine.agents.list().find((item) => item.name === "旧模型助手")).toBeUndefined();
+    const body = await response.text();
+    expect(body).toContain("模型 gpt-5.5 不支持该推理强度");
+    expect(body).toContain("旧模型助手");
   });
 
   test("uses the inherited global Codex model to offer reasoning efforts", async () => {
@@ -1518,15 +1549,40 @@ describe("management backend (read-write)", () => {
       }).toString(),
     });
 
-    expect([302, 303]).toContain(response.status);
-    const agent = engine.agents.list().find((item) => item.name === "自定义模型");
-    expect(agent?.reasoningEffort).toBe("");
-    const view = await (await app.request(`/agents/${encodeURIComponent(agent!.id)}`)).text();
+    expect(response.status).toBe(422);
+    expect(engine.agents.list().find((item) => item.name === "自定义模型")).toBeUndefined();
+    const view = await response.text();
+    expect(view).toContain("模型 gpt-5.6-custom 不支持该推理强度");
     expect(view).toContain('"gpt-5.6-custom":[]');
   });
 
+  test("an existing custom model survives an unrelated edit", async () => {
+    const created = engine.agents.create({
+      name: "旧自定义模型",
+      provider: "codex",
+      model: "codex-custom",
+    });
+    const response = await app.request(`/agents/${encodeURIComponent(created.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        name: "旧自定义模型（已改名）",
+        provider: "codex",
+        model: "codex-custom",
+        visibility: "Team",
+        permission: "read-only",
+      }).toString(),
+    });
+
+    expect([302, 303]).toContain(response.status);
+    expect(engine.agents.get(created.id)).toEqual(expect.objectContaining({
+      name: "旧自定义模型（已改名）",
+      model: "codex-custom",
+    }));
+  });
+
   test("agents page shows detected providers; unavailable ones are disabled", async () => {
-    const body = await (await app.request("/agents")).text();
+    const body = await (await app.request("/agents/new")).text();
     expect(body).toContain("Claude Code");
     expect(body).toContain("TRAE CLI");
     // codex is unavailable in the stub -> rendered disabled with reason
@@ -1535,7 +1591,7 @@ describe("management backend (read-write)", () => {
   });
 
   test("agents page embeds a per-provider model catalog for the Model dropdown", async () => {
-    const body = await (await app.request("/agents")).text();
+    const body = await (await app.request("/agents/new")).text();
     // the client-side catalog carries each provider's models (mew: model list
     // changes with provider)
     expect(body).toContain("openrouter-3o"); // trae-cli
@@ -1546,14 +1602,63 @@ describe("management backend (read-write)", () => {
   });
 
   test("agent editor explains the active task-execution boundaries", async () => {
-    const body = await (await app.request("/agents")).text();
+    const body = await (await app.request("/agents/new")).text();
     expect(body).toContain("Workdir");
     expect(body).toContain("Permission");
     expect(body).toContain("Skills");
-    expect(body).toContain("任务执行");
-    expect(body).toContain("仅影响任务运行");
-    expect(body).toContain("完全访问会绕过 Provider 沙箱");
-    expect(body).not.toContain("暂未接入");
+    expect(body).toContain("仅影响研究任务");
+    expect(body).toContain("可写与完全访问权限必填");
+    expect(body).not.toContain("Device");
+    expect(body).not.toContain("Repositories");
+  });
+
+  test("agents index selects the first Agent and the editor shows its bindings", async () => {
+    const first = engine.agents.create({ name: "首选助手", provider: "claude" });
+    engine.updateSpaceMeta(SPACE, { agentId: first.id, name: "产品讨论群" });
+
+    const index = await app.request("/agents");
+    expect([302, 303]).toContain(index.status);
+    expect(index.headers.get("location")).toBe(`/agents/${encodeURIComponent(first.id)}`);
+
+    const body = await (await app.request(index.headers.get("location")!)).text();
+    expect(body).toContain('data-pane="agent-list"');
+    expect(body).toContain('data-pane="agent-editor"');
+    expect(body).toContain('data-pane="agent-inspector"');
+    expect(body).toContain("产品讨论群");
+    expect(body).toContain("CLI 就绪");
+
+    const mobileList = await app.request("/agents?view=list");
+    expect(mobileList.status).toBe(200);
+    const mobileListBody = await mobileList.text();
+    expect(mobileListBody).toContain("首选助手");
+    expect(mobileListBody).toContain("选择一个 Agent");
+  });
+
+  test("an incompatible visibility change is rejected with preserved field values", async () => {
+    const created = engine.agents.create({
+      name: "团队助手",
+      provider: "claude",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta(SPACE, { agentId: created.id });
+
+    const response = await app.request(`/agents/${encodeURIComponent(created.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        name: "团队助手（改名）",
+        provider: "claude",
+        visibility: "Personal",
+        permission: "read-only",
+      }).toString(),
+    });
+
+    expect(response.status).toBe(409);
+    expect(engine.agents.get(created.id)?.visibility).toBe("Team");
+    const body = await response.text();
+    expect(body).toContain("当前绑定与新的 Visibility 不兼容");
+    expect(body).toContain("团队助手（改名）");
+    expect(body).toContain('value="Personal" selected');
   });
 
   test("creating an agent persists task execution fields (workdir/permission/skills)", async () => {
@@ -1561,7 +1666,7 @@ describe("management backend (read-write)", () => {
       name: "任务助手",
       provider: "claude",
       permission: "write",
-      workdir: "~/work/proj",
+      workdir: dir,
       skills: "code-review, summarize",
     });
     const res = await app.request("/agents", {
@@ -1572,8 +1677,27 @@ describe("management backend (read-write)", () => {
     expect([302, 303]).toContain(res.status);
     const created = engine.agents.list().find((a) => a.name === "任务助手");
     expect(created?.permission).toBe("write");
-    expect(created?.workdir).toBe("~/work/proj");
+    expect(created?.workdir).toBe(dir);
     expect(created?.skills).toEqual(["code-review", "summarize"]);
+  });
+
+  test("agent validation rejects a missing Workdir before persistence", async () => {
+    const missing = join(dir, "missing-workdir");
+    const response = await app.request("/agents", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        name: "无效目录助手",
+        provider: "claude",
+        permission: "write",
+        workdir: missing,
+      }).toString(),
+    });
+
+    expect(response.status).toBe(422);
+    expect(engine.agents.list().find((item) => item.name === "无效目录助手"))
+      .toBeUndefined();
+    expect(await response.text()).toContain("Workdir 不存在");
   });
 
   test("creating an agent with a local CLI provider persists that provider", async () => {
@@ -1590,7 +1714,7 @@ describe("management backend (read-write)", () => {
 
   test("editing then deleting an agent works", async () => {
     const created = engine.agents.create({ name: "Temp", model: "" });
-    const edit = new URLSearchParams({ name: "Renamed", instruction: "x", model: "claude-sonnet-5", visibility: "Team" });
+    const edit = new URLSearchParams({ name: "Renamed", instruction: "x", model: "sonnet", visibility: "Team" });
     const r1 = await app.request(`/agents/${encodeURIComponent(created.id)}`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -1602,6 +1726,22 @@ describe("management backend (read-write)", () => {
     const r2 = await app.request(`/agents/${encodeURIComponent(created.id)}/delete`, { method: "POST" });
     expect([302, 303]).toContain(r2.status);
     expect(engine.agents.has(created.id)).toBe(false);
+  });
+
+  test("deleting an Agent clears its bindings before falling back to the default AI", async () => {
+    const created = engine.agents.create({ name: "待删除", provider: "claude" });
+    engine.updateSpaceMeta(SPACE, { agentId: created.id });
+
+    const response = await app.request(
+      `/agents/${encodeURIComponent(created.id)}/delete`,
+      { method: "POST" },
+    );
+
+    expect([302, 303]).toContain(response.status);
+    expect(engine.agents.has(created.id)).toBe(false);
+    expect(engine.registry.get(SPACE)?.agentId).toBeUndefined();
+    expect(decodeURIComponent(response.headers.get("location") ?? ""))
+      .toContain("已解除 1 个空间绑定");
   });
 
   test("integrations lists team groups and binds per-group settings", async () => {
