@@ -1,8 +1,95 @@
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
-import { validateBrandSvg, verifyBrandAssets } from "./verify-brand-assets.ts";
+import {
+  validateBrandPng,
+  validateBrandSvg,
+  verifyBrandAssets,
+} from "./verify-brand-assets.ts";
+
+function pngHeader(width: number, height: number): Uint8Array {
+  const bytes = new Uint8Array(33);
+  bytes.set([137, 80, 78, 71, 13, 10, 26, 10], 0);
+  bytes.set([0, 0, 0, 13, 73, 72, 68, 82], 8);
+  new DataView(bytes.buffer).setUint32(16, width);
+  new DataView(bytes.buffer).setUint32(20, height);
+  bytes.set([8, 6, 0, 0, 0], 24);
+  return bytes;
+}
 
 describe("brand asset verification", () => {
+  test("accepts a PNG whose IHDR dimensions match its public contract", () => {
+    const issues = validateBrandPng({
+      file: "avatar.png",
+      bytes: pngHeader(512, 512),
+      expectedWidth: 512,
+      expectedHeight: 512,
+    });
+
+    expect(issues).toEqual([]);
+  });
+
+  test("rejects bytes without the PNG signature and IHDR marker", () => {
+    const bytes = pngHeader(512, 512);
+    bytes[0] = 0;
+    bytes[12] = 0;
+
+    const issues = validateBrandPng({
+      file: "not-png.png",
+      bytes,
+      expectedWidth: 512,
+      expectedHeight: 512,
+    });
+
+    expect(issues).toEqual([
+      "not-png.png: invalid PNG signature",
+      "not-png.png: missing IHDR chunk",
+    ]);
+  });
+
+  test("rejects a PNG whose complete IHDR chunk is truncated", () => {
+    const issues = validateBrandPng({
+      file: "truncated.png",
+      bytes: pngHeader(512, 512).slice(0, 28),
+      expectedWidth: 512,
+      expectedHeight: 512,
+    });
+
+    expect(issues).toEqual(["truncated.png: truncated PNG header"]);
+  });
+
+  test("rejects unsupported PNG header metadata", () => {
+    const bytes = pngHeader(512, 512);
+    new DataView(bytes.buffer).setUint32(8, 12);
+    bytes[24] = 16;
+    bytes[25] = 3;
+
+    const issues = validateBrandPng({
+      file: "unsupported.png",
+      bytes,
+      expectedWidth: 512,
+      expectedHeight: 512,
+    });
+
+    expect(issues).toEqual([
+      "unsupported.png: IHDR chunk length must be 13",
+      "unsupported.png: unsupported bit depth 16",
+      "unsupported.png: unsupported color type 3",
+    ]);
+  });
+
+  test("rejects a valid PNG assigned to the wrong responsive slot", () => {
+    const issues = validateBrandPng({
+      file: "icon_512x512.png",
+      bytes: pngHeader(256, 256),
+      expectedWidth: 512,
+      expectedHeight: 512,
+    });
+
+    expect(issues).toEqual([
+      "icon_512x512.png: expected 512x512, received 256x256",
+    ]);
+  });
+
   test("accepts a static SVG that matches its public contract", () => {
     const issues = validateBrandSvg({
       file: "homeagent-mark.svg",
@@ -70,13 +157,38 @@ describe("brand asset verification", () => {
   test("verifies the repository's canonical brand sources together", () => {
     const report = verifyBrandAssets(resolve(import.meta.dir, ".."));
 
-    expect(report).toEqual({
-      files: [
-        "assets/brand/homeagent-mark.svg",
-        "assets/brand/homeagent-glyph.svg",
-      ],
-      issues: [],
-    });
+    expect(report.files.slice(0, 2)).toEqual([
+      "assets/brand/homeagent-mark.svg",
+      "assets/brand/homeagent-glyph.svg",
+    ]);
+    expect(report.issues).toEqual([]);
+  });
+
+  test("verifies the 512px Feishu avatar as a required repository asset", () => {
+    const report = verifyBrandAssets(resolve(import.meta.dir, ".."));
+
+    expect(report.files).toContain(
+      "assets/brand/homeagent-feishu-avatar-512.png",
+    );
+    expect(report.issues).toEqual([]);
+  });
+
+  test("verifies every required macOS iconset slot and pixel size", () => {
+    const report = verifyBrandAssets(resolve(import.meta.dir, ".."));
+
+    expect(report.files.filter((file) => file.includes("AppIcon.iconset"))).toEqual([
+      "assets/macos/AppIcon.iconset/icon_16x16.png",
+      "assets/macos/AppIcon.iconset/icon_16x16@2x.png",
+      "assets/macos/AppIcon.iconset/icon_32x32.png",
+      "assets/macos/AppIcon.iconset/icon_32x32@2x.png",
+      "assets/macos/AppIcon.iconset/icon_128x128.png",
+      "assets/macos/AppIcon.iconset/icon_128x128@2x.png",
+      "assets/macos/AppIcon.iconset/icon_256x256.png",
+      "assets/macos/AppIcon.iconset/icon_256x256@2x.png",
+      "assets/macos/AppIcon.iconset/icon_512x512.png",
+      "assets/macos/AppIcon.iconset/icon_512x512@2x.png",
+    ]);
+    expect(report.issues).toEqual([]);
   });
 
   test("rejects text that is not an SVG document", () => {
