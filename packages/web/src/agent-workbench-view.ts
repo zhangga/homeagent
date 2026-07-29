@@ -58,6 +58,20 @@ const AGENT_STYLE = `
     background:#f7f7f5;
     color:#20201d;
   }
+  .agent-workbench.is-create {
+    grid-template-columns:var(--agent-list-width) minmax(520px, 1fr);
+  }
+  .agent-visually-hidden {
+    position:absolute;
+    width:1px;
+    height:1px;
+    padding:0;
+    margin:-1px;
+    overflow:hidden;
+    clip:rect(0, 0, 0, 0);
+    white-space:nowrap;
+    border:0;
+  }
   .agent-pane { min-width:0; height:100%; overflow:auto; background:#fff; }
   .agent-list-pane, .agent-inspector-pane { background:#f5f5f2; }
   .agent-list-pane { position:relative; border-right:1px solid #deded9; }
@@ -176,6 +190,27 @@ const AGENT_STYLE = `
     text-overflow:ellipsis;
     white-space:nowrap;
   }
+  .agent-create-name-wrap { min-width:0; width:min(420px, 44vw); }
+  .agent-create-name {
+    width:100%;
+    min-height:34px;
+    border:1px solid transparent;
+    border-radius:7px;
+    padding:6px 9px;
+    background:transparent;
+    color:#242420;
+    font-size:14px;
+    font-weight:650;
+  }
+  .agent-create-name:hover { border-color:#e0e0da; background:#fafaf7; }
+  .agent-create-name:focus {
+    border-color:#777771;
+    outline:0;
+    background:#fff;
+    box-shadow:0 0 0 3px #efefeb;
+  }
+  .agent-create-name[aria-invalid="true"] { border-color:#c95c51; }
+  .agent-create-name-wrap .agent-field-error { margin:3px 9px 6px; }
   .agent-save-state {
     display:none;
     padding:2px 7px;
@@ -201,6 +236,95 @@ const AGENT_STYLE = `
   .agent-danger { border:1px solid #e1c6c2; background:#fff; color:#a7372c; }
   .agent-danger:hover { filter:none; background:#fff2f0; }
   .agent-editor-scroll { max-width:820px; margin:0 auto; padding:34px 46px 96px; }
+  .is-create .agent-editor-scroll { max-width:1080px; padding-top:28px; }
+  .agent-create-intro {
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:22px;
+  }
+  .agent-create-readiness {
+    display:inline-flex;
+    flex:0 0 auto;
+    align-items:center;
+    gap:7px;
+    margin-top:2px;
+    padding:5px 9px;
+    border:1px solid #c7dfd1;
+    border-radius:999px;
+    background:#f0faf4;
+    color:#216844;
+    font-size:11px;
+    font-weight:650;
+  }
+  .agent-create-readiness.unavailable {
+    border-color:#e3d2b5;
+    background:#fff8eb;
+    color:#85530c;
+  }
+  .agent-create-form { display:block; }
+  .agent-create-instruction { margin-bottom:22px; }
+  .agent-create-instruction .agent-field-control textarea { min-height:132px; }
+  .agent-create-core-grid {
+    display:grid;
+    grid-template-columns:minmax(0, 1fr) minmax(0, 1fr);
+    gap:18px 20px;
+  }
+  .agent-create-field {
+    display:block;
+    margin:0;
+  }
+  .agent-create-field .agent-field-label {
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    gap:12px;
+    margin:0 0 7px;
+    padding:0;
+  }
+  .agent-create-field .agent-field-label small {
+    display:inline;
+    margin:0;
+    text-align:right;
+  }
+  .agent-task-execution {
+    margin-top:26px;
+    overflow:hidden;
+    border:1px solid #dcdcd6;
+    border-radius:10px;
+    background:#f7f7f3;
+  }
+  .agent-task-execution summary {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:18px;
+    padding:14px 16px;
+    cursor:pointer;
+    color:#34342f;
+    font-size:13px;
+    font-weight:680;
+    list-style:none;
+  }
+  .agent-task-execution summary::-webkit-details-marker { display:none; }
+  .agent-task-execution summary::after {
+    content:"+";
+    color:#777771;
+    font-size:18px;
+    font-weight:400;
+  }
+  .agent-task-execution[open] summary::after { content:"−"; }
+  .agent-task-summary-copy { display:flex; align-items:baseline; gap:9px; }
+  .agent-task-summary-copy small { color:#85857f; font-size:11px; font-weight:400; }
+  .agent-task-fields {
+    display:grid;
+    grid-template-columns:minmax(0, 1fr) minmax(0, 1fr);
+    gap:18px 20px;
+    padding:18px 16px 20px;
+    border-top:1px solid #deded8;
+    background:#fff;
+  }
+  .agent-task-fields .agent-create-field:last-child { grid-column:1 / -1; }
   .agent-form-intro { margin-bottom:30px; }
   .agent-form-intro h1 {
     margin:0;
@@ -395,6 +519,11 @@ const AGENT_STYLE = `
     .agent-editor-actions { gap:5px; }
     .agent-editor-actions button { padding-right:9px; padding-left:9px; }
     .agent-editor-scroll { padding:26px 18px 90px; }
+    .agent-create-name-wrap { width:min(48vw, 320px); }
+    .agent-create-intro { display:block; }
+    .agent-create-readiness { margin-top:14px; }
+    .agent-create-core-grid, .agent-task-fields { grid-template-columns:1fr; }
+    .agent-task-fields .agent-create-field:last-child { grid-column:auto; }
     .agent-field { grid-template-columns:1fr; gap:7px; }
     .agent-field-label { padding-top:0; }
     .agent-field-control textarea { min-height:190px; }
@@ -507,7 +636,235 @@ export function agentWorkbenchView(
   const workdirAttrs = invalidAttrs(view.errors, "workdir");
   const skillsAttrs = invalidAttrs(view.errors, "skills");
 
-  const editor = hasEditor ? html`
+  const selectedProvider = providerOptions.find((provider) => provider.id === values.provider);
+  const taskExecutionOpen = Boolean(
+    view.errors.permission || view.errors.workdir || view.errors.skills,
+  );
+
+  const createEditor = html`
+    <div class="agent-pane-header agent-editor-header">
+      <div class="agent-editor-heading">
+        <a class="agent-mobile-back" href="/agents?view=list" aria-label="返回 Agent 列表">返回</a>
+        <div class="agent-create-name-wrap">
+          <label class="agent-visually-hidden" for="agent-name">Agent 名称</label>
+          <input
+            class="agent-create-name"
+            id="agent-name"
+            name="name"
+            form="agent-editor-form"
+            type="text"
+            value="${values.name}"
+            maxlength="100"
+            required
+            aria-invalid="${nameAttrs.invalid}"
+            aria-describedby="${nameAttrs.describedBy}"
+            aria-label="Agent 名称"
+            autocomplete="off"
+            data-name-mode="${view.automaticName ? "automatic" : "manual"}"
+          />
+          ${errorFor(view.errors, "name")}
+        </div>
+        <span class="agent-save-state" id="agent-save-state">未保存</span>
+      </div>
+      <div class="agent-editor-actions">
+        <a class="agent-secondary" href="${cancelHref}">取消</a>
+        <button class="agent-primary" type="submit" form="agent-editor-form">
+          创建 Agent
+        </button>
+      </div>
+    </div>
+    <div class="agent-editor-scroll">
+      <div class="agent-form-intro agent-create-intro">
+        <div>
+          <h1>创建 Agent</h1>
+          <p>配置回答人格，以及研究任务使用的本地 CLI。</p>
+        </div>
+        <div class="agent-create-readiness ${selectedProvider?.available ? "" : "unavailable"}">
+          <span class="agent-status-mark ${selectedProvider?.available ? "ready" : "unavailable"}" aria-hidden="true"></span>
+          <span data-provider-readiness>
+            ${selectedProvider?.name ?? values.provider} · ${selectedProvider?.available ? "CLI 就绪" : "CLI 不可用"}
+          </span>
+        </div>
+      </div>
+      ${view.flash ? html`<div class="agent-flash" role="status">${view.flash}</div>` : ""}
+      ${view.formError ? html`<div class="agent-form-alert" role="alert">${view.formError}</div>` : ""}
+      <form method="post" action="${formAction}" id="agent-editor-form" class="agent-create-form stack">
+        <div class="agent-field agent-create-field agent-create-instruction">
+          <label class="agent-field-label" for="agent-instruction">
+            Instruction
+            <small>可选 · 注入回答与研究任务</small>
+          </label>
+          <div class="agent-field-control">
+            <textarea
+              id="agent-instruction"
+              name="instruction"
+              maxlength="20000"
+              aria-invalid="${instructionAttrs.invalid}"
+              aria-describedby="${instructionAttrs.describedBy}"
+              placeholder="描述这个 Agent 的职责、判断原则和表达方式"
+            >${values.instruction}</textarea>
+            <p class="agent-field-hint"><span id="agent-instruction-count">${values.instruction.length}</span> / 20,000</p>
+            ${errorFor(view.errors, "instruction")}
+          </div>
+        </div>
+
+        <div class="agent-create-core-grid">
+          <div class="agent-field agent-create-field">
+            <label class="agent-field-label" for="agent-provider">
+              Provider
+              <small>本机可用 CLI</small>
+            </label>
+            <div class="agent-field-control">
+              <select
+                id="agent-provider"
+                name="provider"
+                aria-invalid="${providerAttrs.invalid}"
+                aria-describedby="${providerAttrs.describedBy}"
+              >
+                ${providerOptions.map((provider) => html`
+                  <option
+                    value="${provider.id}"
+                    ${provider.id === values.provider ? "selected" : ""}
+                    ${!provider.available && provider.id !== values.provider ? "disabled" : ""}
+                  >
+                    ${provider.name} · ${provider.available ? "CLI 就绪" : `不可用：${provider.detail}`}
+                  </option>
+                `)}
+              </select>
+              ${errorFor(view.errors, "provider")}
+            </div>
+          </div>
+          <div class="agent-field agent-create-field">
+            <label class="agent-field-label" for="agent-model">
+              Model
+              <small>可继承默认配置</small>
+            </label>
+            <div class="agent-field-control">
+              <select
+                id="agent-model"
+                name="model"
+                aria-invalid="${modelAttrs.invalid}"
+                aria-describedby="${modelAttrs.describedBy}"
+              >
+                <option value="" ${values.model === "" ? "selected" : ""}>使用默认模型</option>
+                ${modelOptions}
+              </select>
+              ${errorFor(view.errors, "model")}
+            </div>
+          </div>
+          <div class="agent-field agent-create-field">
+            <label class="agent-field-label" for="agent-visibility">
+              Visibility
+              <small>限制可绑定空间</small>
+            </label>
+            <div class="agent-field-control">
+              <select
+                id="agent-visibility"
+                name="visibility"
+                aria-invalid="${visibilityAttrs.invalid}"
+                aria-describedby="${visibilityAttrs.describedBy}"
+              >
+                <option value="Team" ${values.visibility === "Team" ? "selected" : ""}>Team</option>
+                <option value="Personal" ${values.visibility === "Personal" ? "selected" : ""}>Personal</option>
+              </select>
+              ${errorFor(view.errors, "visibility")}
+            </div>
+          </div>
+          <div class="agent-field agent-create-field">
+            <label class="agent-field-label" for="agent-reasoning-effort">
+              推理强度
+              <small>仅 Codex</small>
+            </label>
+            <div class="agent-field-control">
+              <select
+                id="agent-reasoning-effort"
+                name="reasoningEffort"
+                ${values.provider !== "codex" ? "disabled" : ""}
+                aria-invalid="${reasoningAttrs.invalid}"
+                aria-describedby="${reasoningAttrs.describedBy}"
+              >
+                <option value="" ${values.reasoningEffort === "" ? "selected" : ""}>继承 Codex 默认配置</option>
+                ${reasoningOptions}
+              </select>
+              ${errorFor(view.errors, "reasoningEffort")}
+            </div>
+          </div>
+        </div>
+
+        <details class="agent-task-execution" ${taskExecutionOpen ? "open" : ""}>
+          <summary>
+            <span class="agent-task-summary-copy">
+              任务执行
+              <small>仅影响研究任务</small>
+            </span>
+          </summary>
+          <div class="agent-task-fields">
+            <div class="agent-field agent-create-field">
+              <label class="agent-field-label" for="agent-permission">
+                Permission
+                <small>本地 CLI 沙箱</small>
+              </label>
+              <div class="agent-field-control">
+                <select
+                  id="agent-permission"
+                  name="permission"
+                  aria-invalid="${permissionAttrs.invalid}"
+                  aria-describedby="${permissionAttrs.describedBy}"
+                >
+                  ${Object.entries(PERMISSION_LABELS).map(([permission, label]) => html`
+                    <option value="${permission}" ${values.permission === permission ? "selected" : ""}>${label}</option>
+                  `)}
+                </select>
+                ${errorFor(view.errors, "permission")}
+              </div>
+            </div>
+            <div class="agent-field agent-create-field">
+              <label class="agent-field-label" for="agent-workdir">
+                Workdir
+                <small>可写与完全访问权限必填</small>
+              </label>
+              <div class="agent-field-control">
+                <input
+                  id="agent-workdir"
+                  name="workdir"
+                  type="text"
+                  value="${values.workdir}"
+                  maxlength="2048"
+                  placeholder="~/work/project"
+                  aria-invalid="${workdirAttrs.invalid}"
+                  aria-describedby="${workdirAttrs.describedBy}"
+                  autocomplete="off"
+                />
+                ${errorFor(view.errors, "workdir")}
+              </div>
+            </div>
+            <div class="agent-field agent-create-field">
+              <label class="agent-field-label" for="agent-skills">
+                Skills
+                <small>逗号或换行分隔</small>
+              </label>
+              <div class="agent-field-control">
+                <input
+                  id="agent-skills"
+                  name="skills"
+                  type="text"
+                  value="${values.skills}"
+                  maxlength="4000"
+                  placeholder="code-review, web-search"
+                  aria-invalid="${skillsAttrs.invalid}"
+                  aria-describedby="${skillsAttrs.describedBy}"
+                  autocomplete="off"
+                />
+                ${errorFor(view.errors, "skills")}
+              </div>
+            </div>
+          </div>
+        </details>
+      </form>
+    </div>
+  `;
+
+  const editOrEmptyEditor = hasEditor ? html`
     <div class="agent-pane-header agent-editor-header">
       <div class="agent-editor-heading">
         <a class="agent-mobile-back" href="/agents?view=list" aria-label="返回 Agent 列表">返回</a>
@@ -734,6 +1091,8 @@ export function agentWorkbenchView(
     </div>
   `;
 
+  const editor = view.mode === "create" ? createEditor : editOrEmptyEditor;
+
   const inspector = view.inspector ? html`
     <div class="agent-pane-header">
       <h2 class="agent-pane-title">运行与绑定</h2>
@@ -836,6 +1195,7 @@ export function agentWorkbenchView(
   `;
 
   const modelCatalog = scriptJson(view.models);
+  const generatedNames = scriptJson(view.generatedNames);
   const inheritedCodexModel = view.defaults.provider === "codex" ? view.defaults.model : "";
   const reasoningCatalog = scriptJson(Object.fromEntries(
     [...new Set(["", ...(view.models.codex ?? []), ...(values.model ? [values.model] : [])])]
@@ -845,6 +1205,11 @@ export function agentWorkbenchView(
       ]),
   ));
   const reasoningLabels = scriptJson(REASONING_LABELS);
+  const workbenchClasses = [
+    "agent-workbench",
+    hasEditor ? "has-editor" : "",
+    view.mode === "create" ? "is-create" : "",
+  ].filter(Boolean).join(" ");
 
   const script = raw(`<script>
 (function () {
@@ -854,9 +1219,12 @@ export function agentWorkbenchView(
   var saveState = document.getElementById('agent-save-state');
   var instruction = document.getElementById('agent-instruction');
   var instructionCount = document.getElementById('agent-instruction-count');
+  var nameInput = document.getElementById('agent-name');
   var provider = document.getElementById('agent-provider');
   var model = document.getElementById('agent-model');
   var reasoning = document.getElementById('agent-reasoning-effort');
+  var providerReadiness = document.querySelector('[data-provider-readiness]');
+  var nameIsAutomatic = !!nameInput && nameInput.dataset.nameMode === 'automatic';
   var initial = form ? new FormData(form) : null;
   var initialText = initial ? new URLSearchParams(Array.from(initial.entries()).map(function (entry) {
     return [entry[0], String(entry[1])];
@@ -876,6 +1244,13 @@ export function agentWorkbenchView(
     form.addEventListener('change', markDirty);
     form.addEventListener('submit', function () { dirty = false; });
   }
+  if (nameInput) {
+    nameInput.addEventListener('input', function () {
+      nameIsAutomatic = false;
+      nameInput.dataset.nameMode = 'manual';
+      markDirty();
+    });
+  }
   window.addEventListener('beforeunload', function (event) {
     if (!dirty) return;
     event.preventDefault();
@@ -888,6 +1263,7 @@ export function agentWorkbenchView(
   }
 
   var MODELS = ${modelCatalog};
+  var GENERATED_NAMES = ${generatedNames};
   var REASONING = ${reasoningCatalog};
   var REASONING_LABELS = ${reasoningLabels};
   function syncReasoning() {
@@ -910,6 +1286,24 @@ export function agentWorkbenchView(
   }
   if (provider && model) {
     provider.addEventListener('change', function () {
+      if (nameInput && nameIsAutomatic && GENERATED_NAMES[provider.value]) {
+        nameInput.value = GENERATED_NAMES[provider.value];
+      }
+      if (providerReadiness) {
+        var selectedOption = provider.options[provider.selectedIndex];
+        var readinessText = selectedOption ? selectedOption.textContent.trim() : provider.value;
+        var ready = readinessText.indexOf('CLI 就绪') !== -1;
+        providerReadiness.textContent = readinessText;
+        var readinessContainer = providerReadiness.closest('.agent-create-readiness');
+        if (readinessContainer) readinessContainer.classList.toggle('unavailable', !ready);
+        var readinessMark = readinessContainer
+          ? readinessContainer.querySelector('.agent-status-mark')
+          : null;
+        if (readinessMark) {
+          readinessMark.classList.toggle('ready', ready);
+          readinessMark.classList.toggle('unavailable', !ready);
+        }
+      }
       var previous = model.value;
       model.replaceChildren();
       var inherited = document.createElement('option');
@@ -929,6 +1323,9 @@ export function agentWorkbenchView(
     model.addEventListener('change', syncReasoning);
     syncReasoning();
   }
+
+  var firstInvalid = document.querySelector('[aria-invalid="true"]');
+  if (firstInvalid && typeof firstInvalid.focus === 'function') firstInvalid.focus();
 
   var inspector = document.getElementById('agent-inspector');
   var overlay = document.querySelector('.agent-inspector-overlay');
@@ -1049,7 +1446,7 @@ export function agentWorkbenchView(
 
   return html`
     <style>${raw(AGENT_STYLE)}</style>
-    <div class="agent-workbench ${hasEditor ? "has-editor" : ""}">
+    <div class="${workbenchClasses}">
       <aside class="agent-pane agent-list-pane" data-pane="agent-list" aria-label="Agent 列表">
         <div class="agent-pane-header">
           <div>
@@ -1076,10 +1473,12 @@ export function agentWorkbenchView(
         ></div>
       </aside>
       <section class="agent-pane agent-editor-pane" data-pane="agent-editor">${editor}</section>
-      <aside class="agent-pane agent-inspector-pane" id="agent-inspector" data-pane="agent-inspector" aria-label="Agent 运行与绑定">
-        ${inspector}
-      </aside>
-      <button class="agent-inspector-overlay" type="button" aria-label="关闭详情"></button>
+      ${view.mode === "create" ? "" : html`
+        <aside class="agent-pane agent-inspector-pane" id="agent-inspector" data-pane="agent-inspector" aria-label="Agent 运行与绑定">
+          ${inspector}
+        </aside>
+        <button class="agent-inspector-overlay" type="button" aria-label="关闭详情"></button>
+      `}
     </div>
     ${script}
   `;

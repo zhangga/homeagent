@@ -80,6 +80,8 @@ export interface AgentWorkbenchView {
   list: AgentWorkbenchListItem[];
   selected: Agent | null;
   editor: AgentEditorValues;
+  generatedNames: AgentNameCandidates;
+  automaticName: boolean;
   errors: AgentFieldErrors;
   providers: DetectedProvider[];
   models: Record<string, string[]>;
@@ -125,6 +127,43 @@ const MAX_INSTRUCTION_LENGTH = 20_000;
 const MAX_MODEL_LENGTH = 200;
 const MAX_WORKDIR_LENGTH = 2_048;
 const MAX_SKILLS_LENGTH = 4_000;
+
+const AGENT_BASE_NAMES = {
+  claude: "Claude Code Agent",
+  codex: "Codex Agent",
+  "trae-cli": "Trae CLI Agent",
+} as const;
+
+type GeneratedAgentProvider = keyof typeof AGENT_BASE_NAMES;
+
+export type AgentNameCandidates = Record<GeneratedAgentProvider, string>;
+
+export function generatedAgentName(
+  provider: GeneratedAgentProvider,
+  agents: Pick<Agent, "name">[],
+): string {
+  const base = AGENT_BASE_NAMES[provider];
+  const names = new Set(agents.map((agent) => agent.name));
+  if (!names.has(base)) return base;
+  for (let suffix = 2; ; suffix += 1) {
+    const candidate = `${base} (${suffix})`;
+    if (!names.has(candidate)) return candidate;
+  }
+}
+
+export function generatedAgentNames(
+  agents: Pick<Agent, "name">[],
+): AgentNameCandidates {
+  return {
+    claude: generatedAgentName("claude", agents),
+    codex: generatedAgentName("codex", agents),
+    "trae-cli": generatedAgentName("trae-cli", agents),
+  };
+}
+
+function isGeneratedAgentProvider(provider: string): provider is GeneratedAgentProvider {
+  return provider in AGENT_BASE_NAMES;
+}
 
 function detectedProvider(
   providers: DetectedProvider[],
@@ -264,6 +303,16 @@ export function validateAgentEditor(
 }
 
 export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkbenchView {
+  const generatedNames = generatedAgentNames(input.agents);
+  const automaticName = input.mode === "create" && input.values === undefined;
+  const editor = input.values
+    ?? editorValuesFor(input.selected, input.providers, input.defaults);
+  if (
+    automaticName
+    && isGeneratedAgentProvider(editor.provider)
+  ) {
+    editor.name = generatedNames[editor.provider];
+  }
   const runningAgentIds = new Set(
     (input.listRuns ?? input.runs)
       .filter((run) => run.status === "running" && run.agentId)
@@ -324,7 +373,9 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
     mode: input.mode,
     list,
     selected: input.selected,
-    editor: input.values ?? editorValuesFor(input.selected, input.providers, input.defaults),
+    editor,
+    generatedNames,
+    automaticName,
     errors: input.errors ?? {},
     providers: input.providers,
     models: input.models,

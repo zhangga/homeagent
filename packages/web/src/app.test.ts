@@ -1634,6 +1634,21 @@ describe("management backend (read-write)", () => {
     }));
   });
 
+  test("new Agent page suggests the next provider-specific name without persisting it", async () => {
+    engine.agents.create({ name: "Claude Code Agent", provider: "claude" });
+    engine.agents.create({ name: "Claude Code Agent (2)", provider: "claude" });
+
+    const response = await app.request("/agents/new");
+    expect(response.status).toBe(200);
+    const body = await response.text();
+
+    expect(body).toContain('class="agent-workbench has-editor is-create"');
+    expect(body).toContain('value="Claude Code Agent (3)"');
+    expect(body).toContain('data-name-mode="automatic"');
+    expect(body).not.toContain('data-pane="agent-inspector"');
+    expect(engine.agents.list()).toHaveLength(2);
+  });
+
   test("agents page shows detected providers; unavailable ones are disabled", async () => {
     const body = await (await app.request("/agents/new")).text();
     expect(body).toContain("Claude Code");
@@ -1750,7 +1765,12 @@ describe("management backend (read-write)", () => {
     expect(response.status).toBe(422);
     expect(engine.agents.list().find((item) => item.name === "无效目录助手"))
       .toBeUndefined();
-    expect(await response.text()).toContain("Workdir 不存在");
+    const body = await response.text();
+    expect(body).toContain("Workdir 不存在");
+    expect(body).toContain('value="无效目录助手"');
+    expect(body).toContain(`value="${missing}"`);
+    expect(body).toContain('data-name-mode="manual"');
+    expect(body).toContain('<details class="agent-task-execution" open>');
   });
 
   test("creating an agent with a local CLI provider persists that provider", async () => {

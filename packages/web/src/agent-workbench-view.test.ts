@@ -18,6 +18,40 @@ const selected: Agent = {
 };
 
 describe("Agent workbench view", () => {
+  test("renders a focused create workbench without an empty inspector", async () => {
+    const view = buildAgentWorkbench({
+      agents: [{ ...selected, name: "Codex Agent" }],
+      mode: "create",
+      selected: null,
+      providers: [{
+        id: "codex",
+        name: "Codex",
+        bin: "codex",
+        available: true,
+        detail: "0.42.0",
+      }],
+      models: { codex: ["gpt-5.6-sol"] },
+      defaults: { provider: "codex", model: "gpt-5.6-sol" },
+      bindings: [],
+      runs: [],
+    });
+
+    const body = String(await agentWorkbenchView(view));
+    expect(body).toContain('class="agent-workbench has-editor is-create"');
+    expect(body).toContain('id="agent-name"');
+    expect(body).toContain('form="agent-editor-form"');
+    expect(body).toContain('value="Codex Agent (2)"');
+    expect(body).toContain('data-name-mode="automatic"');
+    expect(body).toContain('class="agent-create-core-grid"');
+    expect(body).toContain('<details class="agent-task-execution"');
+    expect(body).toContain("Codex · CLI 就绪");
+    expect(body).not.toContain('data-pane="agent-inspector"');
+    expect(body).not.toContain('<button class="agent-inspector-overlay"');
+    expect(body).not.toContain("Device");
+    expect(body).not.toContain("Repositories");
+    expect(body).not.toContain("Environment");
+  });
+
   test("renders the approved three-pane workbench without Mew device fields", async () => {
     const view = buildAgentWorkbench({
       agents: [selected],
@@ -99,17 +133,23 @@ describe("Agent workbench view", () => {
         model: "",
         reasoningEffort: "",
         visibility: "Team",
-        permission: "read-only",
-        workdir: "",
+        permission: "write",
+        workdir: "C:\\missing\\project",
         skills: "",
       },
-      errors: { name: "请输入 Agent 名称" },
+      errors: {
+        name: "请输入 Agent 名称",
+        workdir: "Workdir 不存在",
+      },
     });
 
     const body = String(await agentWorkbenchView(view));
     expect(body).toContain("创建 Agent");
     expect(body).toContain("保留这段内容");
     expect(body).toContain("请输入 Agent 名称");
+    expect(body).toContain('value="C:\\missing\\project"');
+    expect(body).toContain("Workdir 不存在");
+    expect(body).toContain('<details class="agent-task-execution" open>');
     expect(body).toContain('aria-invalid="true"');
   });
 });

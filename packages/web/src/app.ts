@@ -1454,19 +1454,12 @@ export function createWebApp(opts: WebOptions): Hono {
   });
 
   app.get("/agents/new", async (c) => {
-    const providers = await getProviders();
-    const cfg = config();
     return c.html(
       await layout(
         "新建 Agent",
         [{ label: "Agents", href: "/agents" }, { label: "新建" }],
         await renderAgentWorkbench({
           mode: "create",
-          values: editorValuesFor(
-            null,
-            providers,
-            { provider: cfg.defaultProvider, model: cfg.defaultModel },
-          ),
         }),
         "agents",
       ),

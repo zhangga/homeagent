@@ -6,6 +6,7 @@ import type { Agent, SpaceMeta, TaskRun } from "@homeagent/core";
 import type { DetectedProvider } from "@homeagent/llm";
 import {
   buildAgentWorkbench,
+  generatedAgentName,
   validateAgentEditor,
   type AgentEditorValues,
 } from "./agent-workbench.ts";
@@ -67,6 +68,70 @@ const runs: TaskRun[] = [
     startedAt: 300,
   },
 ];
+
+describe("Agent create defaults", () => {
+  test("generates a provider-specific Agent name", () => {
+    expect(generatedAgentName("codex", [])).toBe("Codex Agent");
+  });
+
+  test("uses the lowest available suffix without matching similar names", () => {
+    expect(generatedAgentName("codex", [
+      { name: "Codex Agent" },
+      { name: "Codex Agent (2)" },
+      { name: "Codex Agent (4)" },
+      { name: "Codex Agent draft" },
+    ])).toBe("Codex Agent (3)");
+  });
+
+  test("builds a fresh create state with generated candidates", () => {
+    const view = buildAgentWorkbench({
+      agents: [{ ...agent, name: "Codex Agent" }],
+      mode: "create",
+      selected: null,
+      providers,
+      models: { codex: ["gpt-5.6-sol"] },
+      defaults: { provider: "codex", model: "gpt-5.6-sol" },
+      bindings: [],
+      runs: [],
+    });
+
+    expect(view.editor.name).toBe("Codex Agent (2)");
+    expect(view.generatedNames).toEqual({
+      claude: "Claude Code Agent",
+      codex: "Codex Agent (2)",
+      "trae-cli": "Trae CLI Agent",
+    });
+    expect(view.automaticName).toBe(true);
+  });
+
+  test("preserves a submitted create name as manual", () => {
+    const submitted: AgentEditorValues = {
+      name: "我的研究助手",
+      instruction: "",
+      provider: "codex",
+      model: "",
+      reasoningEffort: "",
+      visibility: "Team",
+      permission: "read-only",
+      workdir: "",
+      skills: "",
+    };
+    const view = buildAgentWorkbench({
+      agents: [],
+      mode: "create",
+      selected: null,
+      providers,
+      models: {},
+      defaults: { provider: "codex", model: "" },
+      bindings: [],
+      runs: [],
+      values: submitted,
+    });
+
+    expect(view.editor.name).toBe("我的研究助手");
+    expect(view.automaticName).toBe(false);
+  });
+});
 
 describe("Agent workbench presenter", () => {
   test("derives honest readiness, effective model, bindings, and run snapshots", () => {
