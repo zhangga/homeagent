@@ -1,0 +1,5 @@
+<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <path id="brand-roof" d="M10 32 32 14l22 18" fill="none" stroke="var(--homeagent-roof, currentColor)" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path id="brand-home" d="M16 30v17c0 5 4 8 9 8h14c5 0 9-3 9-8V30" fill="none" stroke="var(--homeagent-roof, currentColor)" stroke-width="5" stroke-linecap="round"/>
+  <path id="brand-spark" d="m32 24 3 9 9 3-9 3-3 9-3-9-9-3 9-3Z" fill="var(--homeagent-spark, currentColor)"/>
+</svg>

@@ -1,0 +1,23 @@
+<svg viewBox="0 0 180 180" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="brand-terracotta" x1="24" y1="20" x2="156" y2="160" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#DA7B51"/>
+      <stop offset="0.55" stop-color="#C45F43"/>
+      <stop offset="1" stop-color="#A94733"/>
+    </linearGradient>
+    <radialGradient id="brand-hearth" cx="0" cy="0" r="1" gradientTransform="translate(90 103) rotate(90) scale(19)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF3E5"/>
+      <stop offset="0.52" stop-color="#F4C965"/>
+      <stop offset="1" stop-color="#DA7B51"/>
+    </radialGradient>
+  </defs>
+  <rect id="brand-background" x="6" y="6" width="168" height="168" rx="42" fill="url(#brand-terracotta)"/>
+  <path id="brand-roof" d="M35 88 90 43l55 45" fill="none" stroke="#FFF3E5" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <path id="brand-home" d="M50 85v42c0 9 7 16 16 16h48c9 0 16-7 16-16V85" fill="none" stroke="#FFF3E5" stroke-width="10" stroke-linecap="round"/>
+  <circle id="brand-halo" cx="90" cy="103" r="29" fill="#F4C965" opacity="0.18"/>
+  <g id="brand-spark">
+    <circle cx="90" cy="103" r="18" fill="url(#brand-hearth)"/>
+    <path d="m90 80 5.5 17.5L113 103l-17.5 5.5L90 126l-5.5-17.5L67 103l17.5-5.5Z" fill="#FFF3E5"/>
+  </g>
+  <circle id="brand-detail-spark" cx="133" cy="49" r="6.5" fill="#F4C965"/>
+</svg>
