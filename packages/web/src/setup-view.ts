@@ -11,6 +11,7 @@ import {
   isFeishuProvisioningActive,
   isFeishuProvisioningFailure,
 } from "./feishu-provisioning-view.ts";
+import { brandMark } from "./brand-mark.ts";
 import { safeLarkVerificationUrl } from "./verification-url.ts";
 
 export interface SetupViewInput {
@@ -63,9 +64,9 @@ const SETUP_STYLE = `
   .shell { position:relative; width:min(1040px,calc(100% - 36px)); min-height:100vh; margin:auto;
     display:grid; grid-template-columns:260px minmax(0,680px); gap:74px; align-items:center; padding:54px 0; }
   .brand { position:absolute; top:28px; left:0; display:flex; align-items:center; gap:10px;
-    color:var(--ink); font-weight:700; letter-spacing:.02em; }
-  .brand-mark { width:29px; height:29px; display:grid; place-items:center; border:1px solid var(--line);
-    border-radius:50%; background:rgba(255,255,255,.5); }
+    color:var(--ink); font-weight:700; letter-spacing:.02em; text-decoration:none; }
+  .brand:hover { text-decoration:none; }
+  .brand .homeagent-brand-mark { flex:0 0 auto; }
   .progress { align-self:center; }
   .progress-kicker { color:var(--moss); font-size:12px; font-weight:700; letter-spacing:.16em;
     text-transform:uppercase; margin-bottom:26px; }
@@ -377,6 +378,14 @@ function doneStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscape
     <form method="post" action="/setup/finish" class="actions"><button class="primary-action">进入 HomeAgent</button></form>`;
 }
 
+function setupBrand(): HtmlEscapedString | Promise<HtmlEscapedString> {
+  return html`<a class="brand" href="/">${brandMark({
+    variant: "full",
+    size: 29,
+    decorative: true,
+  })}homeagent</a>`;
+}
+
 export function setupView(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
   const content = input.snapshot.current === "ai" ? aiStep(input)
     : input.snapshot.current === "feishu" ? feishuStep(input)
@@ -385,14 +394,14 @@ export function setupView(input: SetupViewInput): HtmlEscapedString | Promise<Ht
           : input.snapshot.current === "invite" ? inviteStep(input)
             : doneStep(input);
   return html`<div class="shell">
-    <a class="brand" href="/"><span class="brand-mark">⌁</span>homeagent</a>
+    ${setupBrand()}
     ${progress(input.snapshot)}
     <main class="stage">${input.flashMsg ? html`<div class="flash">${input.flashMsg}</div>` : ""}${content}</main>
   </div>`;
 }
 
 export function restartingView(instanceId: string): HtmlEscapedString | Promise<HtmlEscapedString> {
-  return setupLayout(html`<div class="shell"><a class="brand" href="/"><span class="brand-mark">⌁</span>homeagent</a>
+  return setupLayout(html`<div class="shell">${setupBrand()}
     <aside class="progress"><div class="progress-kicker">Applying connection</div></aside>
     <main class="stage"><div class="eyebrow">04 · Activate</div><h1 class="setup-title">正在唤醒机器人</h1>
       <p class="lede">服务会短暂离线，然后自动回到这里。请不要关闭这个页面。</p><div id="restart-status" data-instance="${instanceId}" class="waiting"><strong>重新连接中…</strong></div>

@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { html } from "hono/html";
 import { brandMark } from "./brand-mark.ts";
+import { layout } from "./layout.ts";
+import { restartingView } from "./setup-view.ts";
 
 async function render(
   options: Parameters<typeof brandMark>[0] = {},
@@ -108,5 +111,34 @@ describe("brandMark", () => {
     expect(() => brandMark({ size: Number.NaN })).toThrow(
       "HomeAgent brand size must be a positive finite number",
     );
+  });
+
+  test("uses the shared dark mark in admin branding", async () => {
+    const output = String(await layout(
+      "Settings",
+      [{ label: "Settings" }],
+      html`<p>Settings body</p>`,
+      "settings",
+    ));
+
+    expect((output.match(/data-homeagent-brand="dark"/gu) ?? []).length)
+      .toBeGreaterThanOrEqual(1);
+    expect((output.match(/>homeagent</gu) ?? []).length)
+      .toBeGreaterThanOrEqual(1);
+    expect(output).not.toContain("🧠");
+    expect(output).toContain("<title>Settings · homeagent</title>");
+    expect(output).toContain('href="/settings"');
+  });
+
+  test("uses the shared flat mark in setup chrome", async () => {
+    const restarting = String(await restartingView("brand-test-instance"));
+
+    expect(restarting).toContain('data-homeagent-brand="full"');
+    expect(restarting).toContain('data-responsive="compact"');
+    expect(restarting).toContain(">homeagent</a>");
+    expect(restarting).not.toContain("⌁");
+    expect(restarting).toContain(".brand:hover { text-decoration:none; }");
+    expect(restarting).toContain("<title>开始使用 · homeagent</title>");
+    expect(restarting).toContain("brand-test-instance");
   });
 });

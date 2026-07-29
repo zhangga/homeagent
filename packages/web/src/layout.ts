@@ -10,6 +10,7 @@
  */
 import { html, raw } from "hono/html";
 import type { HtmlEscapedString } from "hono/utils/html";
+import { brandMark } from "./brand-mark.ts";
 
 const STYLE = `
   :root {
@@ -28,7 +29,8 @@ const STYLE = `
   /* left nav rail */
   nav.rail { width:220px; min-width:220px; background:var(--nav-bg); color:var(--nav-fg);
              min-height:100vh; display:flex; flex-direction:column; padding:14px 10px; }
-  nav.rail .brand { color:#fff; font-weight:700; font-size:16px; padding:8px 12px 16px; }
+  nav.rail .brand { display:flex; align-items:center; gap:10px; color:#fff; font-weight:700;
+                    font-size:16px; padding:8px 12px 16px; }
   nav.rail a { display:flex; align-items:center; gap:10px; color:var(--nav-fg);
                padding:8px 12px; border-radius:8px; font-size:14px; margin-bottom:2px; }
   nav.rail a:hover { background:var(--nav-active); text-decoration:none; }
@@ -164,7 +166,11 @@ export function layout(
   </head>
   <body>
     <nav class="rail">
-      <div class="brand">🧠 homeagent</div>
+      <div class="brand">${brandMark({
+        variant: "dark",
+        size: 28,
+        decorative: true,
+      })}homeagent</div>
       ${navLinks}
       <div class="spacer"></div>
       <div class="foot">管理后台 · 内网自用</div>
