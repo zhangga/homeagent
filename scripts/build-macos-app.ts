@@ -27,6 +27,18 @@ export interface MacOSBuildPlan {
 
 const LARK_VERSION = "1.0.69";
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+const MACOS_ICON_FILES = [
+  "icon_16x16.png",
+  "icon_16x16@2x.png",
+  "icon_32x32.png",
+  "icon_32x32@2x.png",
+  "icon_128x128.png",
+  "icon_128x128@2x.png",
+  "icon_256x256.png",
+  "icon_256x256@2x.png",
+  "icon_512x512.png",
+  "icon_512x512@2x.png",
+] as const;
 
 export function createMacOSBuildPlan(input: {
   repoRoot?: string;
@@ -49,6 +61,8 @@ export function createMacOSBuildPlan(input: {
       "HomeAgent.app/Contents/Resources/bin/bun",
       "HomeAgent.app/Contents/Resources/bin/lark-cli",
       "HomeAgent.app/Contents/Resources/bin/attachment-extract",
+      "HomeAgent.app/Contents/Resources/HomeAgent.icns",
+      "HomeAgent.app/Contents/Resources/brand/homeagent-feishu-avatar-512.png",
       "HomeAgent.app/Contents/Resources/LICENSE",
       "HomeAgent.app/Contents/Resources/THIRD_PARTY_NOTICES.md",
     ],
@@ -130,8 +144,20 @@ function assertInside(child: string, parent: string): void {
 }
 
 async function assertReleaseInputs(plan: MacOSBuildPlan, allowDirty: boolean): Promise<void> {
-  for (const file of ["bun.lock", "LICENSE", "THIRD_PARTY_NOTICES.md", "package.json"]) {
-    if (!existsSync(join(plan.repoRoot, file))) throw new Error(`missing release input: ${file}`);
+  const required = [
+    "bun.lock",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "package.json",
+    "assets/macos/Info.plist.template",
+    "assets/brand/homeagent-feishu-avatar-512.png",
+    ...MACOS_ICON_FILES.map((file) => `assets/macos/AppIcon.iconset/${file}`),
+  ];
+  for (const file of required) {
+    const path = join(plan.repoRoot, file);
+    if (!existsSync(path) || !lstatSync(path).isFile()) {
+      throw new Error(`missing release input: ${file}`);
+    }
   }
   if (!allowDirty) {
     const status = await mustRun(["git", "status", "--porcelain", "--", "bun.lock"], plan.repoRoot);
@@ -278,6 +304,24 @@ export async function buildMacOSApp(input: {
       .replaceAll("{{VERSION}}", pkg.version)
       .replaceAll("{{BUILD_VERSION}}", bundleVersion(pkg.version)),
     { mode: 0o644 },
+  );
+  const iconPath = join(resources, "HomeAgent.icns");
+  await mustRun([
+    "/usr/bin/iconutil",
+    "-c",
+    "icns",
+    join(plan.repoRoot, "assets", "macos", "AppIcon.iconset"),
+    "-o",
+    iconPath,
+  ], plan.repoRoot);
+  if (!existsSync(iconPath) || !lstatSync(iconPath).isFile()) {
+    throw new Error("iconutil did not create HomeAgent.icns");
+  }
+  const brandResources = join(resources, "brand");
+  mkdirSync(brandResources, { recursive: true });
+  copyFileSync(
+    join(plan.repoRoot, "assets", "brand", "homeagent-feishu-avatar-512.png"),
+    join(brandResources, "homeagent-feishu-avatar-512.png"),
   );
   copyFileSync(join(plan.repoRoot, "LICENSE"), join(resources, "LICENSE"));
   copyFileSync(join(plan.repoRoot, "THIRD_PARTY_NOTICES.md"), join(resources, "THIRD_PARTY_NOTICES.md"));

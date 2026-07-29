@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import { KnowledgeEngine, type SpaceArchive } from "@homeagent/core";
 
 const REQUIRED = [
@@ -12,6 +12,8 @@ const REQUIRED = [
   "Contents/Resources/bin/bun",
   "Contents/Resources/bin/lark-cli",
   "Contents/Resources/bin/attachment-extract",
+  "Contents/Resources/HomeAgent.icns",
+  "Contents/Resources/brand/homeagent-feishu-avatar-512.png",
 ] as const;
 const RECOVERY_SPACE = "team/oc_packaged_recovery" as const;
 const RECOVERY_CONTENT = "打包应用崩溃恢复验收：四类持久化数据必须保留。";
@@ -32,7 +34,18 @@ export function inspectMacOSBundle(appPath: string): { appPath: string; files: s
   if (!resolved.endsWith(".app")) throw new Error("bundle path must end in .app");
   const files = REQUIRED.map((file) => join(resolved, file));
   for (const file of files) {
-    if (!existsSync(file) || !statSync(file).isFile()) throw new Error(`bundle is missing ${file.slice(resolved.length + 1)}`);
+    if (!existsSync(file) || !statSync(file).isFile()) {
+      const relativePath = file.slice(resolved.length + 1).split(sep).join("/");
+      throw new Error(`bundle is missing ${relativePath}`);
+    }
+  }
+  const plist = readFileSync(join(resolved, "Contents", "Info.plist"), "utf8");
+  if (
+    !/<key>\s*CFBundleIconFile\s*<\/key>\s*<string>\s*HomeAgent\s*<\/string>/.test(
+      plist,
+    )
+  ) {
+    throw new Error("Info.plist does not reference HomeAgent.icns");
   }
   return { appPath: resolved, files };
 }
