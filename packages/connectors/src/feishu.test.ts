@@ -270,6 +270,27 @@ describe("FeishuConnector daemon (fake spawn)", () => {
 });
 
 describe("FeishuConnector outbound", () => {
+  test("resolves Windows command shims before spawning with an environment overlay", async () => {
+    if (process.platform !== "win32") return;
+
+    const directory = mkdtempSync(join(tmpdir(), "homeagent-command-shim-"));
+    const executable = join(directory, "homeagent-command-probe.cmd");
+    writeFileSync(executable, "@echo off\r\necho %HOMEAGENT_COMMAND_PROBE%\r\n");
+
+    try {
+      await expect(
+        runFeishuCommand(["homeagent-command-probe"], {
+          env: {
+            PATH: `${directory};${process.env.PATH ?? ""}`,
+            HOMEAGENT_COMMAND_PROBE: "resolved",
+          },
+        }).then((output) => output.trim()),
+      ).resolves.toBe("resolved");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("passes sensitive command input over stdin instead of argv", async () => {
     const output = await runFeishuCommand(
       [process.execPath, "-e", "const input = await Bun.stdin.text(); process.stdout.write(input)"],

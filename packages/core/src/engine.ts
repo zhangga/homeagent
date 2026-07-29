@@ -54,6 +54,7 @@ import {
   removeQuarantineRecord,
 } from "./quarantine.ts";
 import { SpaceRegistry } from "./registry.ts";
+import { FeishuGroupBindingStore } from "./feishu-bindings.ts";
 import {
   AgentStore,
   agentVisibleInSpace,
@@ -851,6 +852,7 @@ interface DreamCycleHealth {
 
 export class KnowledgeEngine implements Knowledge {
   readonly registry: SpaceRegistry;
+  readonly feishuBindings: FeishuGroupBindingStore;
   readonly agents: AgentStore;
   readonly tasks: TaskStore;
   readonly taskRuns: TaskRunStore;
@@ -873,6 +875,7 @@ export class KnowledgeEngine implements Knowledge {
   constructor(opts: EngineOptions = {}) {
     this.dataDir = opts.dataDir ?? config().dataDir;
     this.registry = new SpaceRegistry(this.dataDir);
+    this.feishuBindings = new FeishuGroupBindingStore(this.dataDir);
     this.agents = new AgentStore(this.dataDir);
     this.tasks = new TaskStore(this.dataDir);
     this.taskRuns = new TaskRunStore(this.dataDir, {

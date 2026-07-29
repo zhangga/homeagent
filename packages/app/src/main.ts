@@ -7,7 +7,13 @@
  * and shuts everything down gracefully on SIGINT/SIGTERM (propagating SIGTERM to
  * the lark-cli consumers — never kill -9).
  */
-import { assertSafeWebBinding, config, logger } from "@homeagent/shared";
+import {
+  assertSafeWebBinding,
+  config,
+  logger,
+  saveSettings,
+  type LarkSetupStatus,
+} from "@homeagent/shared";
 import { accessSync, constants, statSync } from "node:fs";
 import { join } from "node:path";
 import { KnowledgeEngine } from "@homeagent/core";
@@ -18,7 +24,7 @@ import {
   createNativeExtractor,
   extractAttachmentText,
 } from "@homeagent/orchestrator";
-import { createWebApp } from "@homeagent/web";
+import { createWebApp, FeishuIntegrationService } from "@homeagent/web";
 import { Scheduler } from "./scheduler.ts";
 import { TaskScheduler } from "./task-scheduler.ts";
 import { LearningScheduler, learningNotification } from "./learning-scheduler.ts";
@@ -47,6 +53,55 @@ export function isUsableManagedExecutable(path: string): boolean {
   }
 }
 
+export interface FeishuStartupPreparation {
+  status: LarkSetupStatus;
+  migrated: number;
+  locallyDisabled: boolean;
+  consumersEnabled: boolean;
+}
+
+export async function prepareFeishuStartup(
+  engine: KnowledgeEngine,
+  setup: { status(): Promise<LarkSetupStatus> },
+  disabledAppId?: string,
+): Promise<FeishuStartupPreparation> {
+  const status = await setup.status();
+  const currentAppId =
+    status.state === "ready" && status.verified ? status.appId : undefined;
+  const migrated = engine.feishuBindings.migrateLegacy(
+    engine.registry.list(),
+    currentAppId,
+  );
+  if (currentAppId) {
+    engine.feishuBindings.markMismatchedAppNeedsReconnect(currentAppId);
+  }
+  const locallyDisabled = Boolean(
+    currentAppId && disabledAppId === currentAppId,
+  );
+  if (locallyDisabled && currentAppId) {
+    engine.feishuBindings.markAppNeedsReconnect(currentAppId);
+  }
+  return {
+    status,
+    migrated,
+    locallyDisabled,
+    consumersEnabled: Boolean(currentAppId) && !locallyDisabled,
+  };
+}
+
+function teamBindingIsInactive(
+  engine: KnowledgeEngine,
+  space: string,
+  chatId: string,
+  activeAppId?: string,
+): boolean {
+  const binding = engine.feishuBindings.getBySpace(space as `team/${string}`);
+  return !binding
+    || binding.state !== "active"
+    || binding.chatId !== chatId
+    || (activeAppId !== undefined && binding.boundAppId !== activeAppId);
+}
+
 async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Promise<void> {
   const runtimePaths = resolveRuntimePaths();
   const stopLogMaintenance = startServiceLogMaintenance(cfg.dataDir);
@@ -58,6 +113,12 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   });
 
   const engine = new KnowledgeEngine({ recoverInterruptedTaskRuns: true });
+  const larkSetup = new LarkCliSetup({ larkBin: runtimePaths.larkBin });
+  const feishuStartup = await prepareFeishuStartup(
+    engine,
+    larkSetup,
+    cfg.feishuConnectionDisabledAppId,
+  );
 
   // 1. feishu connector + orchestrator
   const connector = new FeishuConnector({ larkBin: runtimePaths.larkBin });
@@ -67,12 +128,53 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   const orchestrator = new Orchestrator({
     engine,
     connector,
+    activeFeishuAppId:
+      feishuStartup.status.state === "ready" && feishuStartup.status.verified
+        ? feishuStartup.status.appId
+        : undefined,
     docFetcher: (link) => connector.fetchDoc(link),
     attachmentExtractor: (attachment) =>
       extractAttachmentText(attachment, nativeAttachmentExtractor),
   });
-  await orchestrator.start();
-  log.info("orchestrator live; listening for feishu events");
+  let feishuOutboundEnabled = feishuStartup.consumersEnabled;
+  let feishuLocallyDisabled = feishuStartup.locallyDisabled;
+  if (feishuStartup.consumersEnabled) {
+    await orchestrator.start();
+    log.info("orchestrator live; listening for feishu events", {
+      migratedBindings: feishuStartup.migrated,
+    });
+  } else {
+    log.info("feishu event consumers not started", {
+      reason: feishuStartup.locallyDisabled
+        ? "locally_disabled"
+        : feishuStartup.status.state,
+      migratedBindings: feishuStartup.migrated,
+    });
+  }
+
+  const sendFeishuNotice = async (
+    space: string | undefined,
+    chatId: string,
+    text: string,
+  ): Promise<void> => {
+    if (!feishuOutboundEnabled) {
+      throw new Error("Feishu delivery is disabled until restart");
+    }
+    if (
+      space?.startsWith("team/")
+      && teamBindingIsInactive(
+        engine,
+        space,
+        chatId,
+        feishuStartup.status.state === "ready" && feishuStartup.status.verified
+          ? feishuStartup.status.appId
+          : undefined,
+      )
+    ) {
+      throw new Error(`Feishu group is not connected: ${space}`);
+    }
+    await connector.notice(chatId, text);
+  };
 
   // Push a task's summary to its space-bound feishu chat (shared by the task
   // scheduler and the backend's manual "run now").
@@ -80,7 +182,11 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
     const chatId = engine.registry.get(space as never)?.chatId;
     if (!chatId) throw new Error(`task space has no bound Feishu chat: ${space}`);
     if (!summary) throw new Error(`task run has no notification summary: ${name}`);
-    await connector.notice(chatId, `🔎 任务「${name}」已完成：\n\n${summary}`);
+    await sendFeishuNotice(
+      space,
+      chatId,
+      `🔎 任务「${name}」已完成：\n\n${summary}`,
+    );
   };
 
   let scheduler: Scheduler | undefined;
@@ -90,6 +196,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   const reportHealth = createSystemHealthReporter({
     engine,
     connectorHealth: () => connector.health(),
+    feishuLocallyDisabled: () => feishuLocallyDisabled,
     dreamSchedulerHealth: () => scheduler?.health(),
     taskSchedulerHealth: () => taskScheduler?.health(),
     reminderSchedulerHealth: () => reminderScheduler?.health(),
@@ -99,7 +206,6 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   });
 
   // 2. management web backend
-  const larkSetup = new LarkCliSetup({ larkBin: runtimePaths.larkBin });
   const managedCodexBin = join(runtimePaths.dataDir, "bin", "codex");
   const codexProviderSetup = runtimePaths.bundled
     ? new CodexProviderSetup({ codexBin: managedCodexBin })
@@ -107,6 +213,25 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   const codexInstaller = runtimePaths.bundled
     ? new CodexReleaseInstaller({ dataDir: runtimePaths.dataDir })
     : undefined;
+  const feishuIntegration = new FeishuIntegrationService({
+    engine,
+    larkSetup,
+    activeIdentity: () =>
+      feishuOutboundEnabled && cfg.feishuBotName && cfg.feishuBotOpenId
+        ? { botName: cfg.feishuBotName, botOpenId: cfg.feishuBotOpenId }
+        : undefined,
+    runtimeStatus: () => connector.health(),
+    sendTestMessage: (chatId, text) =>
+      sendFeishuNotice(`team/${chatId}`, chatId, text),
+    persistConnectionDisabledAppId: (appId) => {
+      saveSettings({ feishuConnectionDisabledAppId: appId }, cfg.dataDir);
+    },
+    disableRuntime: async () => {
+      feishuOutboundEnabled = false;
+      feishuLocallyDisabled = true;
+      await orchestrator.stop();
+    },
+  });
   const app = createWebApp({
     engine,
     adminToken: cfg.webAdminToken,
@@ -125,10 +250,12 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
         }
       : undefined,
     feishuRuntime: () => connector.health(),
-    activeFeishuIdentity: cfg.feishuBotName && cfg.feishuBotOpenId
+    activeFeishuIdentity: feishuOutboundEnabled && cfg.feishuBotName && cfg.feishuBotOpenId
       ? { botName: cfg.feishuBotName, botOpenId: cfg.feishuBotOpenId }
       : undefined,
-    onIntegrationTest: async (chatId, text) => connector.notice(chatId, text),
+    feishuIntegration,
+    onIntegrationTest: async (chatId, text) =>
+      sendFeishuNotice(`team/${chatId}`, chatId, text),
     onTaskRun: async (_taskId, run) => {
       await notifyTaskDone(run.space, run.taskName, run.summary);
     },
@@ -164,10 +291,14 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   // Feishu accepts it; an accepted lesson then waits for the learner's answer.
   learningScheduler = new LearningScheduler(engine, {
     notify: async (plan, _source, session) => {
-      await connector.notice(plan.chatId, learningNotification(plan, session));
+      await sendFeishuNotice(
+        plan.space,
+        plan.chatId,
+        learningNotification(plan, session),
+      );
     },
     followUp: async (plan, _session, message) => {
-      await connector.notice(plan.chatId, message);
+      await sendFeishuNotice(plan.space, plan.chatId, message);
     },
   });
   await learningScheduler.start();
@@ -177,7 +308,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   // accepts the outbound message, so transient failures remain retryable.
   reminderScheduler = new ReminderScheduler(engine, {
     notify: async (reminder, message) => {
-      await connector.notice(reminder.chatId, message);
+      await sendFeishuNotice(reminder.space, reminder.chatId, message);
     },
   });
   await reminderScheduler.start();

@@ -1,18 +1,9 @@
 /**
  * Canned copy for the orchestrator (kept out of runtime.ts so wording is easy to
- * tweak). Two pieces the plan calls out explicitly:
- *   - GROUP_ADDED_NOTICE (Q4/Q6): the one-time message sent when the bot joins a
- *     group, disclosing that it learns from the group and how to retract.
- *   - coldStartNote (Q3): the honest nudge appended when answering from general
+ * tweak). The plan calls out coldStartNote (Q3): the honest nudge appended when answering from general
  *     knowledge while the space's knowledge base is still empty.
  */
 import { isProviderTimeoutError } from "@homeagent/llm";
-
-export const GROUP_ADDED_NOTICE = [
-  "大家好，我是 homeagent 🧠。",
-  "我会学习本群里分享的知识，用于以后回答大家的问题（@我 即可提问）。",
-  "如果某条消息不希望我记录，回复时 @我 说「别记这条」即可撤回。",
-].join("\n");
 
 /**
  * Shown when a message can't be answered because no runnable LLM provider is

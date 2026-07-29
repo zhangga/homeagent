@@ -2,17 +2,16 @@
 import {
   closeSync,
   existsSync,
-  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
-  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { isSpaceId, type SpaceId } from "@homeagent/shared";
+import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 import {
   normalizeLearningResource,
   type LearningResource,
@@ -806,14 +805,14 @@ export class LearningPlanStore {
       writeFileSync(temporaryPath, JSON.stringify(file, null, 2), { encoding: "utf8", mode: 0o600 });
       const fileDescriptor = openSync(temporaryPath, "r");
       try {
-        fsyncSync(fileDescriptor);
+        durableFsyncSync(fileDescriptor);
       } finally {
         closeSync(fileDescriptor);
       }
-      renameSync(temporaryPath, this.configPath);
+      durableRenameSync(temporaryPath, this.configPath);
       const directoryDescriptor = openSync(configDir, "r");
       try {
-        fsyncSync(directoryDescriptor);
+        durableFsyncSync(directoryDescriptor);
       } finally {
         closeSync(directoryDescriptor);
       }

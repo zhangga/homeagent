@@ -17,6 +17,7 @@ import {
 } from "./soak-runtime.ts";
 
 export const AUTOMATED_FEISHU_SOAK_SCENARIOS = [
+  "group_binding_lifecycle",
   "message_capture",
   "mention_answer",
   "proactive_participation",
@@ -116,18 +117,38 @@ interface LarkProcessResult {
 
 type ProcessRunner = (args: string[], cwd: string) => Promise<LarkProcessResult>;
 
-interface DriverOptions {
+export interface FeishuSoakDriverOptions {
   chatId: string;
   botOpenId: string;
   dataDir: string;
   evidencePath: string;
   monitorPath: string;
+  adminUrl: string;
+  adminToken?: string;
   researchTaskName?: string;
   scenarios: AutomatedScenario[];
   responseTimeoutMs: number;
   longTimeoutMs: number;
   sender: "api" | "ui";
   dryRun: boolean;
+}
+
+interface StoredFeishuBinding {
+  chatId: string;
+  spaceId: string;
+  state: "active" | "disconnected" | "needs_reconnect";
+  boundAppId?: string;
+  responseMode: "mentions_only" | "smart" | "all_messages";
+  participationLevel?: "reserved" | "balanced" | "active";
+  replyInThread: boolean;
+}
+
+export interface FeishuSoakAdminFormRequest {
+  adminUrl: string;
+  adminToken?: string;
+  path: string;
+  form: Record<string, string>;
+  fetchImpl?: typeof fetch;
 }
 
 export interface UiUserAction {
@@ -534,11 +555,66 @@ function numberArg(args: string[], flag: string, fallback: number): number {
   return value;
 }
 
-function parseOptions(args: string[]): DriverOptions {
+function configuredWebPort(
+  dataDir: string,
+  env: Record<string, string | undefined>,
+): number {
+  const fromEnvironment = Number(env.HOMEAGENT_WEB_PORT);
+  if (
+    Number.isInteger(fromEnvironment)
+    && fromEnvironment > 0
+    && fromEnvironment <= 65_535
+  ) {
+    return fromEnvironment;
+  }
+  try {
+    const settings = object(JSON.parse(
+      readFileSync(join(dataDir, "config", "settings.json"), "utf8"),
+    ));
+    const fromSettings = settings.webPort;
+    if (
+      typeof fromSettings === "number"
+      && Number.isInteger(fromSettings)
+      && fromSettings > 0
+      && fromSettings <= 65_535
+    ) {
+      return fromSettings;
+    }
+  } catch {
+    // The default is also used before HomeAgent has written settings.json.
+  }
+  return 3_000;
+}
+
+function normalizeAdminUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("--admin-url must be a valid HTTP URL");
+  }
+  if (
+    !["http:", "https:"].includes(url.protocol)
+    || url.username
+    || url.password
+    || (url.pathname !== "/" && url.pathname !== "")
+    || url.search
+    || url.hash
+  ) {
+    throw new Error("--admin-url must contain only an HTTP(S) origin");
+  }
+  return url.origin;
+}
+
+export function parseFeishuSoakOptions(
+  args: string[],
+  env: Record<string, string | undefined> = process.env,
+): FeishuSoakDriverOptions {
   const valueFlags = new Set([
     "--chat-id",
     "--bot-open-id",
     "--data-dir",
+    "--admin-url",
     "--evidence",
     "--monitor",
     "--research-task",
@@ -557,6 +633,7 @@ function parseOptions(args: string[]): DriverOptions {
     if (valueFlags.has(arg)) index += 1;
   }
 
+  const dataDir = resolve(stringArg(args, "--data-dir", "./data")!);
   const evidencePath = resolve(stringArg(args, "--evidence", "./data/soak/soak-evidence.jsonl")!);
   const sender = stringArg(args, "--sender", "api");
   if (sender !== "api" && sender !== "ui") {
@@ -565,12 +642,20 @@ function parseOptions(args: string[]): DriverOptions {
   return {
     chatId: stringArg(args, "--chat-id") ?? "",
     botOpenId: stringArg(args, "--bot-open-id") ?? "",
-    dataDir: resolve(stringArg(args, "--data-dir", "./data")!),
+    dataDir,
     evidencePath,
     monitorPath: resolve(
       stringArg(args, "--monitor", join(dirname(evidencePath), "soak-24h.jsonl"))!,
     ),
     researchTaskName: stringArg(args, "--research-task"),
+    adminUrl: normalizeAdminUrl(
+      stringArg(
+        args,
+        "--admin-url",
+        `http://127.0.0.1:${configuredWebPort(dataDir, env)}`,
+      )!,
+    ),
+    adminToken: env.HOMEAGENT_SOAK_ADMIN_TOKEN?.trim() || undefined,
     scenarios: resolveRequestedScenarios(stringArg(args, "--scenarios")),
     responseTimeoutMs: numberArg(args, "--response-timeout-seconds", 180) * 1_000,
     longTimeoutMs: numberArg(args, "--long-timeout-minutes", 25) * 60_000,
@@ -579,20 +664,75 @@ function parseOptions(args: string[]): DriverOptions {
   };
 }
 
+function allowedAdminMutationPath(path: string): boolean {
+  if (path === "/integrations/groups/connect") return true;
+  return /^\/integrations\/groups\/[^/?#]+\/disconnect$/u.test(path);
+}
+
+export async function postFeishuSoakAdminForm(
+  request: FeishuSoakAdminFormRequest,
+): Promise<void> {
+  if (!allowedAdminMutationPath(request.path)) {
+    throw new Error("unsupported soak administration path");
+  }
+  const origin = normalizeAdminUrl(request.adminUrl);
+  const headers = new Headers({
+    "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+    origin,
+    "sec-fetch-site": "same-origin",
+  });
+  if (request.adminToken) {
+    headers.set("authorization", `Bearer ${request.adminToken}`);
+  }
+  const response = await (request.fetchImpl ?? fetch)(
+    `${origin}${request.path}`,
+    {
+      method: "POST",
+      headers,
+      body: new URLSearchParams(request.form),
+      redirect: "manual",
+      signal: AbortSignal.timeout(15_000),
+    },
+  );
+  const location = response.headers.get("location") ?? "";
+  const rejectedConnect = request.path === "/integrations/groups/connect"
+    && location.startsWith("/integrations/groups/connect?");
+  if (
+    response.status < 300
+    || response.status >= 400
+    || rejectedConnect
+  ) {
+    const responseText = await response.text();
+    const detail = (request.adminToken
+      ? responseText.replaceAll(request.adminToken, "[redacted]")
+      : responseText)
+      .replace(/\s+/gu, " ")
+      .slice(0, 300);
+    throw new Error(
+      `HomeAgent administration request failed (${response.status})${
+        detail ? `: ${detail}` : ""
+      }`,
+    );
+  }
+}
+
 function safeError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/\s+/gu, " ").slice(0, 500);
 }
 
 class FeishuSoakDriver {
-  private readonly options: DriverOptions;
+  private readonly options: FeishuSoakDriverOptions;
   private readonly runMarker: string;
   private readonly fixtureDir: string;
   private readonly processRunner: ProcessRunner;
   private attachmentMessageId?: string;
   private captured?: { messageId: string; rawId: string; token: string };
 
-  constructor(options: DriverOptions, processRunner: ProcessRunner = defaultProcessRunner) {
+  constructor(
+    options: FeishuSoakDriverOptions,
+    processRunner: ProcessRunner = defaultProcessRunner,
+  ) {
     this.options = options;
     this.processRunner = processRunner;
     this.runMarker = `F5-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${randomUUID().slice(0, 8)}`;
@@ -601,6 +741,160 @@ class FeishuSoakDriver {
 
   close(): void {
     rmSync(this.fixtureDir, { recursive: true, force: true });
+  }
+
+  private storedBinding(): StoredFeishuBinding | undefined {
+    return valuesFromFile<StoredFeishuBinding>(
+      join(this.options.dataDir, "config", "feishu-group-bindings.json"),
+      "bindings",
+    ).find((binding) => binding.chatId === this.options.chatId);
+  }
+
+  private async waitForBinding(
+    state: StoredFeishuBinding["state"],
+  ): Promise<StoredFeishuBinding> {
+    return this.poll(`group binding ${state}`, 15_000, async () => {
+      const binding = this.storedBinding();
+      return binding?.state === state ? binding : undefined;
+    }, 250);
+  }
+
+  private async adminConnect(
+    policy: Pick<
+      StoredFeishuBinding,
+      "responseMode" | "participationLevel" | "replyInThread"
+    >,
+  ): Promise<StoredFeishuBinding> {
+    await postFeishuSoakAdminForm({
+      adminUrl: this.options.adminUrl,
+      adminToken: this.options.adminToken,
+      path: "/integrations/groups/connect",
+      form: {
+        chatId: this.options.chatId,
+        responseMode: policy.responseMode,
+        ...(policy.participationLevel
+          ? { participationLevel: policy.participationLevel }
+          : {}),
+        ...(policy.replyInThread ? { replyInThread: "on" } : {}),
+      },
+    });
+    return this.waitForBinding("active");
+  }
+
+  private async adminDisconnect(spaceId: string): Promise<void> {
+    await postFeishuSoakAdminForm({
+      adminUrl: this.options.adminUrl,
+      adminToken: this.options.adminToken,
+      path: `/integrations/groups/${encodeURIComponent(spaceId)}/disconnect`,
+      form: {},
+    });
+    await this.waitForBinding("disconnected");
+  }
+
+  private async lifecycleMentionProbe(label: string): Promise<{
+    messageId: string;
+    replyId: string;
+    rawId: string;
+  }> {
+    const token = `${this.runMarker}-${label}`;
+    const messageId = await this.sendText(
+      this.mention(
+        `连接生命周期验收：9 + 6 等于多少？请用中文数字回答，并原样包含 ${token}`,
+      ),
+      `${this.runMarker}-${label.toLowerCase()}`,
+    );
+    const [reply, raw] = await Promise.all([
+      this.waitForBotReply(messageId, { includes: ["十五", token] }),
+      this.poll("connected group capture", this.options.responseTimeoutMs, async () =>
+        this.rawForMessage(messageId, token)
+      ),
+    ]);
+    return {
+      messageId,
+      replyId: reply.message_id,
+      rawId: raw.id,
+    };
+  }
+
+  private async assertDisconnectedPrivacy(): Promise<void> {
+    const token = `${this.runMarker}-DISCONNECTED`;
+    const messageId = await this.sendText(
+      this.mention(
+        `断开期间不应收录或回复这条消息。隐私验收标记：${token}`,
+      ),
+      `${this.runMarker}-disconnected`,
+    );
+    const deadline = Date.now() + 45_000;
+    while (Date.now() < deadline) {
+      if (this.rawForMessage(messageId, token)) {
+        throw new Error("disconnected group message was unexpectedly captured");
+      }
+      const root = flattenLarkMessages(await this.listMessages()).find(
+        (candidate) => candidate.message_id === messageId,
+      );
+      if (!root) throw new Error("disconnected probe is not visible to the Bot");
+      if (
+        flattenLarkMessages(root.thread_replies ?? []).some(
+          (candidate) => isBotMessage(candidate, this.options.botOpenId),
+        )
+      ) {
+        throw new Error("disconnected group message unexpectedly received a reply");
+      }
+      await Bun.sleep(Math.min(5_000, Math.max(1, deadline - Date.now())));
+    }
+  }
+
+  private async groupBindingLifecycle(): Promise<string> {
+    const original = this.storedBinding();
+    if (original?.state === "needs_reconnect") {
+      throw new Error(
+        "group_binding_lifecycle requires an active, disconnected, or new target group",
+      );
+    }
+    const lifecyclePolicy = original
+      ? {
+        responseMode: original.responseMode,
+        participationLevel: original.participationLevel,
+        replyInThread: original.replyInThread,
+      }
+      : {
+        responseMode: "mentions_only" as const,
+        participationLevel: undefined,
+        replyInThread: true,
+      };
+    let lifecycleSpaceId: string | undefined;
+    try {
+      const connected = await this.adminConnect(lifecyclePolicy);
+      lifecycleSpaceId = connected.spaceId;
+      await this.lifecycleMentionProbe("ACTIVE");
+
+      await this.adminDisconnect(connected.spaceId);
+      await this.assertDisconnectedPrivacy();
+
+      const reconnected = await this.adminConnect(lifecyclePolicy);
+      if (reconnected.spaceId !== lifecycleSpaceId) {
+        throw new Error("reconnect did not reuse the original group workspace");
+      }
+      const resumed = await this.lifecycleMentionProbe("RECONNECTED");
+      return resumed.replyId;
+    } finally {
+      const current = this.storedBinding();
+      if (original) {
+        const restored = await this.adminConnect({
+          responseMode: original.responseMode,
+          participationLevel: original.participationLevel,
+          replyInThread: original.replyInThread,
+        });
+        if (restored.spaceId !== original.spaceId) {
+          throw new Error("cleanup did not restore the original group workspace");
+        }
+        if (original.state === "disconnected") {
+          await this.adminDisconnect(original.spaceId);
+        }
+      } else if (current) {
+        await this.adminDisconnect(current.spaceId);
+      }
+    }
   }
 
   private mention(text: string): string {
@@ -612,6 +906,39 @@ class FeishuSoakDriver {
       attempts,
       processRunner: this.processRunner,
     });
+  }
+
+  private async requireFullGroupMessageCapability(): Promise<void> {
+    const result = await this.processRunner([
+      "auth",
+      "check",
+      "--scope",
+      "im:message.group_msg",
+      "--json",
+    ], process.cwd());
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = object(JSON.parse(result.stdout.trim()));
+    } catch {
+      throw new Error(
+        "proactive_participation requires a verified im:message.group_msg capability",
+      );
+    }
+    const missing = Array.isArray(parsed.missing) ? parsed.missing : [];
+    const granted = Array.isArray(parsed.granted)
+      ? parsed.granted
+      : Array.isArray(parsed.scopes)
+        ? parsed.scopes
+        : [];
+    if (
+      result.exitCode !== 0
+      || missing.includes("im:message.group_msg")
+      || !granted.includes("im:message.group_msg")
+    ) {
+      throw new Error(
+        "proactive_participation requires enterprise approval for im:message.group_msg",
+      );
+    }
   }
 
   private emitUiAction(action: UiUserAction): void {
@@ -851,6 +1178,7 @@ class FeishuSoakDriver {
   }
 
   private async proactiveParticipation(): Promise<string> {
+    await this.requireFullGroupMessageCapability();
     const token = `${this.runMarker}-PROACTIVE-OK`;
     const messageId = await this.sendText(
       `这是面向全群的明确问题：7 + 6 等于多少？请用中文数字回答，并原样包含 ${token}。`,
@@ -1066,6 +1394,7 @@ class FeishuSoakDriver {
 
   private verifier(scenario: AutomatedScenario): () => Promise<string> {
     const verifiers: Record<AutomatedScenario, () => Promise<string>> = {
+      group_binding_lifecycle: () => this.groupBindingLifecycle(),
       message_capture: () => this.messageCapture(),
       mention_answer: () => this.mentionAnswer(),
       proactive_participation: () => this.proactiveParticipation(),
@@ -1101,9 +1430,10 @@ class FeishuSoakDriver {
   }
 }
 
-function printPlan(options: DriverOptions): void {
+function printPlan(options: FeishuSoakDriverOptions): void {
   console.log(JSON.stringify({
     chatId: options.chatId,
+    adminUrl: options.adminUrl,
     evidencePath: options.evidencePath,
     monitorPath: options.monitorPath,
     scenarios: options.scenarios,
@@ -1118,7 +1448,7 @@ function printPlan(options: DriverOptions): void {
 
 if (import.meta.main) {
   try {
-    const options = parseOptions(process.argv.slice(2));
+    const options = parseFeishuSoakOptions(process.argv.slice(2));
     if (!options.chatId) throw new Error("--chat-id is required");
     if (!options.botOpenId) throw new Error("--bot-open-id is required");
     if (options.dryRun) {

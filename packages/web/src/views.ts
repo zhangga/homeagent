@@ -16,6 +16,8 @@ import type {
   SystemHealthSnapshot,
   LarkProvisioningSession,
   LarkSetupStatus,
+  LarkCapabilityState,
+  LarkChatSummary,
 } from "@homeagent/shared";
 import type {
   SpaceMeta,
@@ -43,6 +45,10 @@ import {
 } from "@homeagent/core";
 import { codexReasoningEffortsForModel, type DetectedProvider } from "@homeagent/llm";
 import type { FeishuRuntimeStatus } from "./integrations.ts";
+import type {
+  FeishuGroupIntegrationView,
+  FeishuIntegrationSnapshot,
+} from "./feishu-integration-service.ts";
 import type { FeishuExternalSharingStatus } from "./external-sharing.ts";
 import {
   feishuProvisioningPollScript,
@@ -1665,6 +1671,74 @@ function externalSharingControl(
   </div>`;
 }
 
+export function feishuGroupConnectView(input: {
+  candidates: LarkChatSummary[];
+  capability: LarkCapabilityState;
+  flashMsg?: string;
+}): HtmlEscapedString | Promise<HtmlEscapedString> {
+  const fullMessagesAvailable = input.capability === "available";
+  const defaultMode = fullMessagesAvailable ? "smart" : "mentions_only";
+  return html`<div class="integration-shell">
+    <div class="integration-page-head">
+      <div>
+        <div class="eyebrow">FEISHU GROUPS</div>
+        <h1>连接飞书群</h1>
+        <p class="subtitle">只会列出当前 Bot 已加入且能够读取的群。连接后才会收录消息或参与回复。</p>
+      </div>
+      <a class="btn secondary" href="/integrations">返回 Integrations</a>
+    </div>
+    ${flash(input.flashMsg)}
+    ${input.candidates.length > 0
+      ? html`<form method="post" action="/integrations/groups/connect" class="card stack integration-connect-card">
+          <div class="field">
+            <label>飞书群</label>
+            <select name="chatId" required>
+              ${input.candidates.map((chat) =>
+                html`<option value="${chat.chatId}">${chat.name || chat.chatId}${chat.external ? " · 外部群" : ""}</option>`
+              )}
+            </select>
+            <div class="hint">提交时会再次校验 Bot 是否仍在群内。</div>
+          </div>
+          <div class="field">
+            <label>响应方式</label>
+            <select name="responseMode">
+              <option value="mentions_only" ${defaultMode === "mentions_only" ? "selected" : ""}>仅在 @ Bot 时回复</option>
+              <option value="smart" ${defaultMode === "smart" ? "selected" : ""} ${fullMessagesAvailable ? "" : "disabled"}>智能参与群聊</option>
+              <option value="all_messages" ${fullMessagesAvailable ? "" : "disabled"}>响应所有消息</option>
+            </select>
+            ${fullMessagesAvailable
+              ? html`<div class="hint">推荐“智能参与”：消息会收录，未 @ 时由模型判断是否值得插话。</div>`
+              : html`<div class="callout warning">当前应用缺少完整群消息权限，暂时只能选择“仅在 @ Bot 时回复”。</div>`}
+          </div>
+          <details>
+            <summary>更多设置</summary>
+            <div class="grid2 details-grid">
+              <div class="field">
+                <label>智能活跃度</label>
+                <select name="participationLevel">
+                  <option value="reserved">稳重</option>
+                  <option value="balanced" selected>均衡</option>
+                  <option value="active">积极</option>
+                </select>
+              </div>
+              <label class="toggle-row compact-toggle">
+                <span><strong>Topic reply</strong><span class="hint">在飞书话题内回复</span></span>
+                <span class="switch"><input type="checkbox" name="replyInThread" checked /><span class="slider"></span></span>
+              </label>
+            </div>
+          </details>
+          <div class="actions">
+            <button type="submit">连接群聊</button>
+            <a class="btn secondary" href="/integrations">取消</a>
+          </div>
+        </form>`
+      : html`<div class="empty">
+          <strong>没有可连接的群</strong>
+          <p>请先把当前 Bot 加入飞书群，然后刷新此页面。已连接的群不会重复出现。</p>
+        </div>`}
+  </div>`;
+}
+
 export interface IntegrationsViewInput {
   botName: string;
   botOpenId: string;
@@ -1675,12 +1749,16 @@ export interface IntegrationsViewInput {
   externalSharing: FeishuExternalSharingStatus;
   groups: SpaceMeta[];
   agents: Agent[];
+  integration?: FeishuIntegrationSnapshot;
   flashMsg?: string;
 }
 
 export function integrationsView(
   input: IntegrationsViewInput,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
+  if (input.integration) {
+    return integrationsControlCenterView(input, input.integration);
+  }
   const {
     botName,
     botOpenId,
@@ -1835,6 +1913,195 @@ export function integrationsView(
         <div class="actions"><button type="submit" class="secondary">手动连接已有应用</button><button type="submit" class="secondary" formnovalidate formaction="/integrations/bot/verify">只验证现有配置</button></div>
       </form>
     </details>`;
+}
+
+function integrationsControlCenterView(
+  input: IntegrationsViewInput,
+  snapshot: FeishuIntegrationSnapshot,
+): HtmlEscapedString | Promise<HtmlEscapedString> {
+  const setup = snapshot.bot;
+  const runtimeFailed =
+    snapshot.runtime?.consumers.some((consumer) => consumer.state === "failed")
+    ?? false;
+  const runtimeBadge = snapshot.restartRequired
+    ? html`<span class="badge degraded">需要重启</span>`
+    : runtimeFailed
+      ? html`<span class="badge down">消息监听异常</span>`
+      : snapshot.runtime?.ready
+        ? html`<span class="badge ok">正在运行</span>`
+        : html`<span class="badge degraded">未启动</span>`;
+  const capabilityBadge = snapshot.capability === "available"
+    ? html`<span class="badge ok">完整群消息可用</span>`
+    : snapshot.capability === "unavailable"
+      ? html`<span class="badge degraded">仅 @ 消息可用</span>`
+      : html`<span class="badge degraded">权限状态未知</span>`;
+  const cards = snapshot.groups.length > 0
+    ? snapshot.groups.map((group) =>
+        integrationGroupCard(group, snapshot)
+      )
+    : [html`<div class="empty integration-empty">
+        <strong>还没有连接群聊</strong>
+        <p>先把 Bot 加入飞书群，再使用“连接群聊”明确启用。未连接的群不会被收录或回复。</p>
+      </div>`];
+
+  return html`<style>${raw(`
+    .integration-console { --paper:#fffdf8; --ink:#25231f; --line:#e7e0d4; color:var(--ink); }
+    .integration-console .console-head { display:flex; justify-content:space-between; gap:20px; align-items:flex-end; margin-bottom:18px; }
+    .integration-console .eyebrow { font:600 11px/1.2 ui-monospace,monospace; letter-spacing:.16em; color:#8a623a; margin-bottom:8px; }
+    .integration-console .bot-console { background:var(--paper); border-color:var(--line); box-shadow:0 10px 28px rgba(74,58,35,.05); }
+    .integration-console .bot-title { display:flex; align-items:center; gap:12px; }
+    .integration-console .bot-mark { width:38px; height:38px; display:grid; place-items:center; border-radius:10px; background:#2f5f52; color:#fff; font-weight:700; }
+    .integration-console .console-facts { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .integration-console .group-grid { display:grid; gap:12px; }
+    .integration-console .group-card { border-color:var(--line); background:#fff; }
+    .integration-console .group-head { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; }
+    .integration-console .group-summary { display:flex; flex-wrap:wrap; gap:7px; margin-top:7px; color:#756d61; font-size:12px; }
+    .integration-console .group-summary span { padding:2px 7px; border:1px solid var(--line); border-radius:999px; background:var(--paper); }
+    .integration-console details.policy-details { border-top:1px solid var(--line); margin-top:14px; padding-top:12px; }
+    .integration-console details.policy-details summary { cursor:pointer; color:#5f564a; font-weight:600; }
+    .integration-console .degraded-note { margin:12px 0 0; padding:9px 11px; background:#fff7df; border:1px solid #ecd9a4; border-radius:8px; color:#75551a; font-size:13px; }
+    .integration-console .integration-empty { border:1px dashed var(--line); border-radius:10px; background:var(--paper); }
+    @media (max-width:720px) { .integration-console .console-head,.integration-console .group-head { align-items:flex-start; flex-direction:column; } }
+  `)}</style>
+  <div class="integration-console">
+    <div class="console-head">
+      <div>
+        <div class="eyebrow">FEISHU CONTROL CENTER</div>
+        <h1>飞书连接</h1>
+        <p class="subtitle">一个当前 Bot，明确连接群聊，并为每个群选择参与方式。</p>
+      </div>
+      <a class="btn" href="/integrations/groups/connect">连接群聊</a>
+    </div>
+    ${flash(input.flashMsg)}
+
+    <section class="card bot-console">
+      <div class="integration-row">
+        <div>
+          <div class="bot-title">
+            <span class="bot-mark">飞</span>
+            <div>
+              <strong>${setup.botName || input.botName || "飞书 Bot"}</strong>
+              <div class="muted">${setup.appId ?? "尚未配置应用"}${setup.botOpenId ? ` · ${setup.botOpenId}` : ""}</div>
+            </div>
+          </div>
+          <div class="console-facts">${runtimeBadge}${capabilityBadge}</div>
+        </div>
+        <div class="integration-actions">
+          ${setup.state === "ready" && setup.verified
+            ? html`<form method="post" action="/integrations/bot/verify"><button class="secondary" type="submit">重新验证</button></form>
+              <form method="post" action="/integrations/bot/disconnect" onsubmit="return confirm('在 HomeAgent 中停用当前 Bot？凭据和知识不会删除。')">
+                <button class="danger" type="submit">停用 Bot</button>
+              </form>`
+            : feishuProvisioningControl(setup, input.provisioning)}
+        </div>
+      </div>
+      ${snapshot.restartRequired
+        ? html`<div class="degraded-note">Bot 配置已变化或刚恢复连接，需要重启服务后消息消费者才会使用当前身份。</div>`
+        : ""}
+      ${setup.state === "ready" && setup.verified && setup.brand !== "lark"
+        ? html`<div class="integration-row"><div><strong>对外共享</strong><div class="muted">允许加入外部群和接受外部用户私聊。</div></div>${externalSharingControl(input.externalSharing)}</div>`
+        : ""}
+    </section>
+
+    <div class="console-head">
+      <div><h2>群聊连接</h2><p class="subtitle">断开只停止收录和回复，不删除已有知识、任务、提醒或学习计划。</p></div>
+      <span class="muted">${snapshot.groups.filter((group) => group.state === "active").length} 个正在连接</span>
+    </div>
+    <div class="group-grid">${cards}</div>
+
+    <details class="card">
+      <summary style="cursor:pointer;font-weight:600">更多 Bot 设置</summary>
+      <div class="muted" style="margin:10px 0 14px">手动连接已有应用或创建并切换机器人。身份变更需要重启服务。</div>
+      ${feishuProvisioningControl(setup, input.provisioning)}
+      <form method="post" action="/integrations/bot/setup" class="stack" style="margin-top:14px">
+        <div class="grid2">
+          <div class="field"><label>App ID</label><input type="text" name="appId" placeholder="cli_..." required autocomplete="off" /></div>
+          <div class="field"><label>App Secret</label><input type="password" name="appSecret" required autocomplete="new-password" /></div>
+        </div>
+        <input type="hidden" name="brand" value="${setup.brand === "lark" ? "lark" : "feishu"}" />
+        <button type="submit" class="secondary">手动连接已有应用</button>
+      </form>
+    </details>
+  </div>`;
+}
+
+function integrationGroupCard(
+  group: FeishuGroupIntegrationView,
+  snapshot: FeishuIntegrationSnapshot,
+): HtmlEscapedString | Promise<HtmlEscapedString> {
+  const binding = group.binding;
+  const space = group.space;
+  const encodedSpace = encodeURIComponent(binding.spaceId);
+  const modeLabel = binding.responseMode === "mentions_only"
+    ? "仅 @ 回复"
+    : binding.responseMode === "all_messages"
+      ? "响应所有消息"
+      : `智能参与 · ${GROUP_PARTICIPATION_LABELS[binding.participationLevel ?? "balanced"]}`;
+  const stateBadge = group.state === "active"
+    ? html`<span class="badge ok">已连接</span>`
+    : group.state === "disconnected"
+      ? html`<span class="badge degraded">已断开</span>`
+      : html`<span class="badge degraded">需要重连</span>`;
+  const canUseFullMessages = snapshot.capability === "available";
+  const agentOptions = [
+    html`<option value="" ${!space?.agentId ? "selected" : ""}>默认（全局）</option>`,
+    ...snapshot.agents.map((agent) =>
+      html`<option value="${agent.id}" ${agent.id === space?.agentId ? "selected" : ""}>${agent.name}</option>`
+    ),
+  ];
+  if (group.state !== "active") {
+    return html`<article class="card group-card">
+      <div class="group-head">
+        <div><strong>${space?.name || binding.chatId}</strong><div class="muted">${binding.chatId}</div></div>
+        ${stateBadge}
+      </div>
+      <div class="group-summary"><span>${modeLabel}</span><span>知识空间保留</span></div>
+      <div class="actions" style="margin-top:14px"><a class="btn" href="/integrations/groups/connect">重新连接</a></div>
+    </article>`;
+  }
+  return html`<article class="card group-card">
+    <div class="group-head">
+      <div>
+        <strong>${space?.name || binding.chatId}</strong>
+        <div class="muted">${binding.chatId}</div>
+        <div class="group-summary"><span>${modeLabel}</span><span>${binding.replyInThread ? "Topic reply" : "普通回复"}</span><span>${space?.agentId ? "指定 Agent" : "默认 Agent"}</span></div>
+      </div>
+      ${stateBadge}
+    </div>
+    ${group.degraded
+      ? html`<div class="degraded-note">当前应用无法确认完整群消息权限；现有策略保留，但运行时可能只能收到 @ Bot 的消息。</div>`
+      : ""}
+    <form method="post" action="/integrations/groups/${encodedSpace}" class="stack">
+      <div class="field" style="margin-top:14px">
+        <label>响应方式</label>
+        <select name="responseMode">
+          <option value="mentions_only" ${binding.responseMode === "mentions_only" ? "selected" : ""}>仅在 @ Bot 时回复</option>
+          <option value="smart" ${binding.responseMode === "smart" ? "selected" : ""} ${canUseFullMessages || binding.responseMode === "smart" ? "" : "disabled"}>智能参与群聊</option>
+          <option value="all_messages" ${binding.responseMode === "all_messages" ? "selected" : ""} ${canUseFullMessages || binding.responseMode === "all_messages" ? "" : "disabled"}>响应所有消息</option>
+        </select>
+      </div>
+      <details class="policy-details">
+        <summary>更多设置</summary>
+        <div class="grid2" style="margin-top:14px">
+          <div class="field"><label>群名称</label><input type="text" name="name" value="${space?.name ?? ""}" /></div>
+          <div class="field"><label>指定 Agent</label><select name="agentId">${agentOptions}</select></div>
+          <div class="field"><label>智能活跃度</label>
+            <select name="participationLevel">
+              ${(["reserved", "balanced", "active"] as const).map((level) =>
+                html`<option value="${level}" ${level === (binding.participationLevel ?? "balanced") ? "selected" : ""}>${GROUP_PARTICIPATION_LABELS[level]}</option>`
+              )}
+            </select>
+          </div>
+          <label class="toggle-row compact-toggle"><span><strong>Topic reply</strong><span class="hint">在飞书话题内回复</span></span><span class="switch"><input type="checkbox" name="replyInThread" ${binding.replyInThread ? "checked" : ""} /><span class="slider"></span></span></label>
+        </div>
+      </details>
+      <div class="actions" style="margin-top:14px">
+        <button type="submit">保存</button>
+        <button type="submit" class="secondary" formaction="/integrations/groups/${encodedSpace}/test">测试连接</button>
+        <button type="submit" class="danger" formaction="/integrations/groups/${encodedSpace}/disconnect" onclick="return confirm('断开该群？已有知识和任务会保留。')">断开</button>
+      </div>
+    </form>
+  </article>`;
 }
 
 // ---- Settings --------------------------------------------------------------

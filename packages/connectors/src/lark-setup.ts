@@ -6,6 +6,8 @@
  * lark-cli owns its application profile and token storage.
  */
 import type {
+  LarkCapabilityState,
+  LarkChatSummary,
   LarkProvisioningSession,
   LarkSetupInput,
   LarkSetupStatus,
@@ -274,11 +276,72 @@ export class LarkCliSetup {
     return { ...this.provisioning };
   }
 
+  async listBotChats(): Promise<LarkChatSummary[]> {
+    const chats = new Map<string, LarkChatSummary>();
+    const seenTokens = new Set<string>();
+    let pageToken: string | undefined;
+    for (let page = 0; page < MAX_CHAT_LIST_PAGES; page += 1) {
+      const argv = [
+        this.larkBin,
+        "im",
+        "+chat-list",
+        "--as",
+        "bot",
+        "--page-size",
+        "100",
+        ...(pageToken ? ["--page-token", pageToken] : []),
+        "--json",
+      ];
+      let result: LarkSetupCommandResult;
+      try {
+        result = await this.runner.run({ argv, timeoutMs: 15_000 });
+      } catch {
+        throw new Error("Unable to list Feishu groups");
+      }
+      if (result.code !== 0) throw new Error("Unable to list Feishu groups");
+      const root = parseStructuredRoot(
+        result.stdout,
+        "Unable to list Feishu groups",
+      );
+      const rawChats = root.chats === null ? [] : root.chats;
+      if (!Array.isArray(rawChats)) {
+        throw new Error("Unable to list Feishu groups");
+      }
+      for (const rawChat of rawChats) {
+        const chat = parseChatSummary(rawChat);
+        const previous = chats.get(chat.chatId);
+        if (previous && JSON.stringify(previous) !== JSON.stringify(chat)) {
+          throw new Error("Unable to list Feishu groups");
+        }
+        chats.set(chat.chatId, chat);
+      }
+      if (root.has_more !== true) {
+        return [...chats.values()].sort(compareChats);
+      }
+      const nextToken = stringValue(root.page_token ?? root.pageToken);
+      if (!nextToken || seenTokens.has(nextToken)) {
+        throw new Error("Unable to list Feishu groups");
+      }
+      seenTokens.add(nextToken);
+      pageToken = nextToken;
+    }
+    throw new Error("Unable to list Feishu groups");
+  }
+
   async chatIsExternal(chatId: string): Promise<boolean> {
-    const normalizedChatId = chatId.trim();
-    if (!normalizedChatId) return false;
     try {
-      const result = await this.runner.run({
+      return (await this.getBotChat(chatId))?.external === true;
+    } catch {
+      return false;
+    }
+  }
+
+  async getBotChat(chatId: string): Promise<LarkChatSummary | undefined> {
+    const normalizedChatId = chatId.trim();
+    if (!normalizedChatId) return undefined;
+    let result: LarkSetupCommandResult;
+    try {
+      result = await this.runner.run({
         argv: [
           this.larkBin,
           "im",
@@ -292,14 +355,57 @@ export class LarkCliSetup {
         ],
         timeoutMs: 15_000,
       });
-      if (result.code !== 0) return false;
-      const parsed = JSON.parse(result.stdout) as unknown;
-      if (!isRecord(parsed)) return false;
-      const root = isRecord(parsed.data) ? parsed.data : parsed;
-      return root.external === true;
     } catch {
-      return false;
+      throw new Error("Unable to verify Feishu group");
     }
+    if (result.code !== 0) return undefined;
+    const root = parseStructuredRoot(
+      result.stdout,
+      "Unable to verify Feishu group",
+    );
+    return parseChatSummary(
+      root,
+      "Unable to verify Feishu group",
+      normalizedChatId,
+    );
+  }
+
+  async fullGroupMessageCapability(): Promise<LarkCapabilityState> {
+    let result: LarkSetupCommandResult;
+    try {
+      result = await this.runner.run({
+        argv: [
+          this.larkBin,
+          "auth",
+          "check",
+          "--scope",
+          FULL_GROUP_MESSAGE_SCOPE,
+          "--json",
+        ],
+        timeoutMs: 15_000,
+      });
+    } catch {
+      return "unknown";
+    }
+    let root: Record<string, unknown>;
+    try {
+      root = parseStructuredRoot(result.stdout, "Invalid capability output");
+    } catch {
+      return "unknown";
+    }
+    const missing = stringArray(root.missing);
+    const granted = stringArray(root.granted ?? root.scopes);
+    if (missing?.includes(FULL_GROUP_MESSAGE_SCOPE)) return "unavailable";
+    if (
+      result.code === 0
+      && (
+        granted?.includes(FULL_GROUP_MESSAGE_SCOPE)
+        || (root.ok === true && missing?.length === 0)
+      )
+    ) {
+      return "available";
+    }
+    return "unknown";
   }
 
   private async verifyRequiredEvents(): Promise<{
@@ -459,4 +565,55 @@ function exactVerificationUrl(value: string): string | undefined {
 
 function registrationErrorCode(error: unknown): string | undefined {
   return isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+}
+
+const MAX_CHAT_LIST_PAGES = 100;
+const FULL_GROUP_MESSAGE_SCOPE = "im:message.group_msg";
+
+function parseStructuredRoot(
+  stdout: string,
+  publicError: string,
+): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(stdout) as unknown;
+    const root = isRecord(parsed) && isRecord(parsed.data)
+      ? parsed.data
+      : parsed;
+    if (!isRecord(root)) throw new Error(publicError);
+    return root;
+  } catch {
+    throw new Error(publicError);
+  }
+}
+
+function parseChatSummary(
+  value: unknown,
+  publicError = "Unable to list Feishu groups",
+  fallbackChatId?: string,
+): LarkChatSummary {
+  if (!isRecord(value)) throw new Error(publicError);
+  const chatId = stringValue(value.chat_id ?? value.chatId) ?? fallbackChatId;
+  if (!chatId) throw new Error(publicError);
+  const description = stringValue(value.description);
+  const ownerId = stringValue(value.owner_id ?? value.ownerId);
+  return {
+    chatId,
+    name: stringValue(value.name) ?? "",
+    ...(description ? { description } : {}),
+    ...(typeof value.external === "boolean"
+      ? { external: value.external }
+      : {}),
+    ...(ownerId ? { ownerId } : {}),
+  };
+}
+
+function compareChats(left: LarkChatSummary, right: LarkChatSummary): number {
+  return left.name.localeCompare(right.name) || left.chatId.localeCompare(right.chatId);
+}
+
+function stringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    return undefined;
+  }
+  return value.map((item) => item.trim()).filter(Boolean);
 }

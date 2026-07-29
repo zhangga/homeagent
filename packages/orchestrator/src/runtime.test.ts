@@ -41,7 +41,7 @@ function makeFake(): FakeLlm {
         return {
           resolved: true,
           title: "购买8.5日北京去苏州的火车票",
-          triggerAt: "2026-07-22T07:30:00+08:00",
+          triggerAt: "2099-07-22T07:30:00+08:00",
           untilConfirmed: false,
         };
       }
@@ -91,6 +91,16 @@ function makeCliOnlyRuntime(
   agentInput?: AgentInput,
 ) {
   cliEngine.ensureSpace(space);
+  if (space.startsWith("team/")) {
+    const chatId = space.slice("team/".length);
+    cliEngine.feishuBindings.connect({
+      chatId,
+      spaceId: space,
+      responseMode: "smart",
+      participationLevel: "balanced",
+      replyInThread: true,
+    });
+  }
   if (agentInput) {
     const agent = cliEngine.agents.create({
       ...agentInput,
@@ -115,6 +125,13 @@ beforeEach(() => {
   resetConfig();
   fake = makeFake();
   engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+  engine.feishuBindings.connect({
+    chatId: "oc_team",
+    spaceId: "team/oc_team",
+    responseMode: "smart",
+    participationLevel: "balanced",
+    replyInThread: true,
+  });
   connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
   orch = new Orchestrator({ engine, connector, llm: fake });
 });
@@ -132,6 +149,62 @@ afterEach(async () => {
 });
 
 describe("orchestrator trunk (cli connector, no feishu)", () => {
+  test("an unbound group event has no capture, model, or reply side effects", async () => {
+    engine.feishuBindings.disconnect("team/oc_team");
+    let downloads = 0;
+    orch = new Orchestrator({
+      engine,
+      connector,
+      llm: fake,
+      attachmentDownloader: async () => {
+        downloads += 1;
+        return [];
+      },
+    });
+    await orch.start();
+
+    await connector.inject({
+      kind: "message",
+      eventId: "unbound-file",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_me",
+      text: "@agent remember this file",
+      messageId: "om_unbound",
+      messageType: "file",
+      mentionsBot: true,
+      createdAt: Date.now(),
+    });
+
+    expect(engine.registry.has("team/oc_team")).toBeFalse();
+    expect(connector.sent).toEqual([]);
+    expect(fake.calls).toEqual([]);
+    expect(downloads).toBe(0);
+  });
+
+  test("a binding for a replaced Bot cannot be consumed by the running Bot", async () => {
+    engine.feishuBindings.connect({
+      chatId: "oc_team",
+      spaceId: "team/oc_team",
+      boundAppId: "cli_new",
+      responseMode: "mentions_only",
+      replyInThread: true,
+    });
+    orch = new Orchestrator({
+      engine,
+      connector,
+      llm: fake,
+      activeFeishuAppId: "cli_old",
+    });
+    await orch.start();
+
+    await connector.sendGroup("@agent do not consume this", true);
+
+    expect(engine.registry.has("team/oc_team")).toBeFalse();
+    expect(connector.sent).toEqual([]);
+    expect(fake.calls).toEqual([]);
+  });
+
   test("health reports answer, proactive participation, and queue metrics without content", async () => {
     await engine.upsertPage(
       "team/oc_team",
@@ -215,12 +288,13 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     }));
   });
 
-  test("bot added creates team space and sends one-time notice", async () => {
+  test("bot-added events do not create a binding, space, or notice", async () => {
+    engine.feishuBindings.disconnect("team/oc_team");
     await orch.start();
     await connector.sendBotAdded();
-    expect(connector.notices.length).toBe(1);
-    expect(connector.notices[0]!.markdown).toContain("别记这条");
-    expect(engine.registry.has("team/oc_team")).toBe(true);
+    expect(connector.notices).toEqual([]);
+    expect(engine.registry.has("team/oc_team")).toBe(false);
+    expect(engine.feishuBindings.activeByChatId("oc_team")).toBeUndefined();
   });
 
   test("unaddressed group message is captured but gets no reply (Q2)", async () => {
@@ -234,6 +308,42 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       call.kind === "json"
       && String(call.opts.prompt).includes("群消息是否值得机器人主动回答")
     )).toBe(true);
+  });
+
+  test("mentions-only captures delivered group messages without classification", async () => {
+    engine.feishuBindings.updatePolicy("team/oc_team", {
+      responseMode: "mentions_only",
+      participationLevel: undefined,
+      replyInThread: true,
+    });
+    await orch.start();
+
+    await connector.sendGroup("ordinary unmentioned update", false);
+
+    expect(engine.registry.store("team/oc_team").index().countRaw(true)).toBe(1);
+    expect(connector.sent).toEqual([]);
+    expect(fake.calls.some((call) =>
+      call.kind === "json"
+      && String(call.opts.prompt).includes("群消息是否值得机器人主动回答")
+    )).toBeFalse();
+  });
+
+  test("all-messages replies to eligible unmentioned messages without classification", async () => {
+    engine.feishuBindings.updatePolicy("team/oc_team", {
+      responseMode: "all_messages",
+      participationLevel: undefined,
+      replyInThread: true,
+    });
+    await orch.start();
+
+    await connector.sendGroup("hello", false);
+
+    expect(connector.sent).toHaveLength(1);
+    expect(engine.registry.store("team/oc_team").index().countRaw(true)).toBe(1);
+    expect(fake.calls.some((call) =>
+      call.kind === "json"
+      && String(call.opts.prompt).includes("群消息是否值得机器人主动回答")
+    )).toBeFalse();
   });
 
   test("an unmentioned group message is captured before participation classification finishes", async () => {
@@ -350,15 +460,24 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     await connector.sendGroup("这个方案值得补充失败重试策略", false);
     expect(connector.sent).toHaveLength(1); // defaults to balanced
 
-    engine.registry.updateMeta("team/oc_team", { participationLevel: "reserved" });
+    engine.feishuBindings.updatePolicy("team/oc_team", {
+      responseMode: "smart",
+      participationLevel: "reserved",
+    });
     await connector.sendGroup("这个方案值得补充失败重试策略", false);
     expect(connector.sent).toHaveLength(1);
 
-    engine.registry.updateMeta("team/oc_team", { participationLevel: "balanced" });
+    engine.feishuBindings.updatePolicy("team/oc_team", {
+      responseMode: "smart",
+      participationLevel: "balanced",
+    });
     await connector.sendGroup("这个方案值得补充失败重试策略", false);
     expect(connector.sent).toHaveLength(2);
 
-    engine.registry.updateMeta("team/oc_team", { participationLevel: "active" });
+    engine.feishuBindings.updatePolicy("team/oc_team", {
+      responseMode: "smart",
+      participationLevel: "active",
+    });
     await connector.sendGroup("这个改动看起来还可以加一点监控", false);
     expect(connector.sent).toHaveLength(3);
   });
@@ -376,7 +495,10 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     }));
     orch = new Orchestrator({ engine, connector, llm: overEager });
     engine.ensureSpace("team/oc_team");
-    engine.registry.updateMeta("team/oc_team", { participationLevel: "active" });
+    engine.feishuBindings.updatePolicy("team/oc_team", {
+      responseMode: "smart",
+      participationLevel: "active",
+    });
 
     await orch.start();
     await connector.sendGroup("@Alice 谁负责后端服务？", false);
@@ -429,6 +551,50 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(connector.sent[0]!.markdown).toContain("Alice");
     expect(connector.sent[0]!.markdown).toContain("依据");
     expect(connector.sent[0]!.inThread).toBe(true);
+  });
+
+  test("group reply placement comes from the active binding", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    engine.updateSpaceMeta("team/oc_team", { replyInThread: true });
+    engine.feishuBindings.updatePolicy("team/oc_team", {
+      responseMode: "mentions_only",
+      replyInThread: false,
+    });
+    await orch.start();
+
+    await connector.sendGroup("hello", true);
+
+    expect(connector.sent).toHaveLength(1);
+    expect(connector.sent[0]!.inThread).toBe(false);
+  });
+
+  test("disconnecting during answer generation suppresses the outbound reply", async () => {
+    let markAsked!: () => void;
+    let releaseAnswer!: () => void;
+    const asked = new Promise<void>((resolve) => {
+      markAsked = resolve;
+    });
+    const answerGate = new Promise<void>((resolve) => {
+      releaseAnswer = resolve;
+    });
+    engine.ask = async () => {
+      markAsked();
+      await answerGate;
+      return {
+        answer: "This reply must be suppressed.",
+        source: "general",
+        citations: [],
+      };
+    };
+    await orch.start();
+
+    const handling = connector.sendGroup("answer this", true);
+    await asked;
+    engine.feishuBindings.disconnect("team/oc_team");
+    releaseAnswer();
+    await handling;
+
+    expect(connector.sent).toEqual([]);
   });
 
   test("a natural-language analysis request reaches conversation without intent classification", async () => {
@@ -880,7 +1046,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
 
     expect(engine.reminders.list()).toEqual([]);
     expect(connector.sent.at(-1)?.markdown).toContain("请确认");
-    expect(connector.sent.at(-1)?.markdown).toContain("2026");
+    expect(connector.sent.at(-1)?.markdown).toContain("2099");
     expect(connector.sent.at(-1)?.markdown).toContain("购买8.5日北京去苏州的火车票");
 
     await connector.inject({
@@ -901,7 +1067,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(engine.reminders.list()).toEqual([
       expect.objectContaining({
         title: "购买8.5日北京去苏州的火车票",
-        triggerAt: new Date("2026-07-22T07:30:00+08:00").getTime(),
+        triggerAt: new Date("2099-07-22T07:30:00+08:00").getTime(),
         sourceMessageId: "om_cli-1",
         status: "scheduled",
       }),
@@ -977,7 +1143,10 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       return { messageId: "om_target", senderId: "ou_me" };
     };
     engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
-    engine.registry.updateMeta("team/oc_team", { mentionsOnly: false });
+    engine.feishuBindings.updatePolicy("team/oc_team", {
+      responseMode: "all_messages",
+      participationLevel: undefined,
+    });
 
     await orch.start();
     await connector.sendGroup("别记这条", false);
@@ -1540,7 +1709,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     ]);
   });
 
-  test("group with mentionsOnly=false answers an unaddressed question", async () => {
+  test("all-messages mode answers an unaddressed question", async () => {
     // seed a page + the team space, then flip the group to respond-to-all
     await engine.upsertPage("team/oc_team", {
       slug: "entities/alice",
@@ -1555,7 +1724,10 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       updatedAt: Date.now(),
       contentHash: "h",
     });
-    engine.registry.updateMeta("team/oc_team", { mentionsOnly: false });
+    engine.feishuBindings.updatePolicy("team/oc_team", {
+      responseMode: "all_messages",
+      participationLevel: undefined,
+    });
     await orch.start();
     // NOT @-mentioned, but the group is set to respond to all messages
     await connector.sendGroup("谁负责后端服务？", false);

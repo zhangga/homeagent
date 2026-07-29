@@ -22,6 +22,17 @@ export interface LarkSetupInput {
   brand: "feishu" | "lark";
 }
 
+/** Safe, public metadata for a chat visible to the configured Bot. */
+export interface LarkChatSummary {
+  chatId: string;
+  name: string;
+  description?: string;
+  external?: boolean;
+  ownerId?: string;
+}
+
+export type LarkCapabilityState = "available" | "unavailable" | "unknown";
+
 export type LarkProvisioningState =
   | "idle"
   | "starting"

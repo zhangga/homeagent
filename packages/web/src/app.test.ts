@@ -13,6 +13,7 @@ import {
 } from "@homeagent/shared";
 import { KnowledgeEngine, FakeLlm } from "@homeagent/core";
 import { createWebApp } from "./app.ts";
+import { FeishuIntegrationService } from "./feishu-integration-service.ts";
 
 let dir: string;
 let engine: KnowledgeEngine;
@@ -44,6 +45,14 @@ beforeEach(async () => {
   engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
   await engine.upsertPage(SPACE, page("entities/alice", "Alice", "Alice 负责后端服务。"));
   await engine.remember({ space: SPACE, source: "message", content: "一条原始消息" });
+  engine.feishuBindings.connect({
+    chatId: "oc_web",
+    spaceId: SPACE,
+    boundAppId: "cli_current",
+    responseMode: "smart",
+    participationLevel: "balanced",
+    replyInThread: true,
+  });
   app = createWebApp({
     engine,
     // deterministic + fast: don't spawn real CLIs
@@ -583,7 +592,7 @@ describe("web backend (read-only)", () => {
     expect(readSettings(dir).onboardingCompletedAt).toEqual(expect.any(Number));
   });
 
-  test("finishes group verification only after a new real message", async () => {
+  test("finishes group setup only after an explicit active binding", async () => {
     const startedAt = Date.now() + 1_000;
     saveSettings({
       onboardingStartedAt: startedAt,
@@ -610,19 +619,28 @@ describe("web backend (read-only)", () => {
       feishuRuntime: () => ({ ready: true, consumers: [] }),
     });
 
-    expect(await (await setupApp.request("/setup")).text()).toContain("发送第一条共同记忆");
+    engine.feishuBindings.disconnect(SPACE);
+    expect(await (await setupApp.request("/setup")).text()).toContain("明确连接第一个群聊");
     await engine.remember({
       space: SPACE,
       source: "task",
       content: "不是飞书消息",
       createdAt: startedAt + 1,
     });
-    expect(await (await setupApp.request("/setup")).text()).toContain("发送第一条共同记忆");
+    expect(await (await setupApp.request("/setup")).text()).toContain("明确连接第一个群聊");
     await engine.remember({
       space: SPACE,
       source: "message",
       content: "来自本次设置的飞书消息",
       createdAt: startedAt + 2,
+    });
+    expect(await (await setupApp.request("/setup")).text()).toContain("明确连接第一个群聊");
+    engine.feishuBindings.connect({
+      chatId: "oc_web",
+      spaceId: SPACE,
+      boundAppId: "cli_current",
+      responseMode: "mentions_only",
+      replyInThread: true,
     });
     expect(await (await setupApp.request("/setup")).text()).toContain("一切就绪");
   });
@@ -1623,6 +1641,162 @@ describe("management backend (read-write)", () => {
     expect(meta?.replyInThread).toBe(true);
     expect(meta?.participationLevel).toBe("active");
     expect(meta?.mentionsOnly).toBe(true);
+  });
+
+  test("integration connection page discovers and explicitly connects a Bot-visible group", async () => {
+    const larkSetup = {
+      status: async () => ({
+        state: "ready" as const,
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu" as const,
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      listBotChats: async () => [
+        { chatId: "oc_web", name: "Already connected" },
+        { chatId: "oc_new", name: "New product group" },
+      ],
+      getBotChat: async (chatId: string) => ({
+        chatId,
+        name: "New product group",
+      }),
+      fullGroupMessageCapability: async () => "available" as const,
+    };
+    const service = new FeishuIntegrationService({
+      engine,
+      larkSetup,
+    });
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: service,
+      detectProviders: async () => [],
+      providerModels: async () => ({}),
+    });
+
+    const page = await (await integrationApp.request(
+      "/integrations/groups/connect",
+    )).text();
+    expect(page).toContain("连接飞书群");
+    expect(page).toContain("New product group");
+    expect(page).not.toContain("Already connected");
+
+    const response = await integrationApp.request(
+      "/integrations/groups/connect",
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          chatId: "oc_new",
+          responseMode: "smart",
+          participationLevel: "balanced",
+          replyInThread: "on",
+        }).toString(),
+      },
+    );
+
+    expect([302, 303]).toContain(response.status);
+    expect(engine.feishuBindings.activeByChatId("oc_new")).toMatchObject({
+      responseMode: "smart",
+      replyInThread: true,
+    });
+
+    const integrations = await (await integrationApp.request("/integrations")).text();
+    expect(integrations).toContain("FEISHU CONTROL CENTER");
+    expect(integrations).toContain("New product group");
+    expect(integrations).toContain('name="responseMode"');
+    expect(integrations).toContain(
+      'formaction="/integrations/groups/team%2Foc_new/disconnect"',
+    );
+
+    const update = await integrationApp.request(
+      `/integrations/groups/${encodeURIComponent("team/oc_new")}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          name: "Renamed group",
+          responseMode: "all_messages",
+          participationLevel: "balanced",
+        }).toString(),
+      },
+    );
+    expect([302, 303]).toContain(update.status);
+    expect(engine.feishuBindings.activeByChatId("oc_new")).toMatchObject({
+      responseMode: "all_messages",
+      replyInThread: false,
+    });
+    expect(engine.registry.get("team/oc_new")?.name).toBe("Renamed group");
+
+    const disconnect = await integrationApp.request(
+      `/integrations/groups/${encodeURIComponent("team/oc_new")}/disconnect`,
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(disconnect.status);
+    expect(engine.feishuBindings.getByChatId("oc_new")?.state)
+      .toBe("disconnected");
+    expect(engine.registry.has("team/oc_new")).toBeTrue();
+  });
+
+  test("Bot disconnect is local and verification clears the disable marker", async () => {
+    const larkSetup = {
+      status: async () => ({
+        state: "ready" as const,
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu" as const,
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "available" as const,
+    };
+    let disabled = 0;
+    const service = new FeishuIntegrationService({
+      engine,
+      larkSetup,
+      persistConnectionDisabledAppId: (appId) => {
+        saveSettings({ feishuConnectionDisabledAppId: appId }, dir);
+      },
+      disableRuntime: () => {
+        disabled += 1;
+      },
+    });
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: service,
+    });
+
+    const disconnect = await integrationApp.request(
+      "/integrations/bot/disconnect",
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(disconnect.status);
+    expect(disabled).toBe(1);
+    expect(readSettings(dir).feishuConnectionDisabledAppId)
+      .toBe("cli_current");
+    expect(engine.feishuBindings.getByChatId("oc_web")?.state)
+      .toBe("needs_reconnect");
+
+    const verify = await integrationApp.request(
+      "/integrations/bot/verify",
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(verify.status);
+    expect(readSettings(dir).feishuConnectionDisabledAppId).toBe("");
+    expect(readSettings(dir)).toMatchObject({
+      feishuBotName: "HomeAgent",
+      feishuBotOpenId: "ou_bot",
+    });
   });
 
   test("a Personal Agent cannot be bound to a team integration", async () => {

@@ -47,6 +47,8 @@ export interface Config {
   feishuBotName?: string;
   /** feishu bot open_id, for precise @-mention detection (optional) */
   feishuBotOpenId?: string;
+  /** configured app intentionally disabled inside HomeAgent */
+  feishuConnectionDisabledAppId?: string;
   /** app id whose external-sharing publishing flow is being tracked */
   feishuExternalSharingAppId?: string;
   /** timestamp after which an external-group message may verify sharing */
@@ -79,6 +81,7 @@ export interface PersistedSettings {
   defaultModel?: string;
   feishuBotName?: string;
   feishuBotOpenId?: string;
+  feishuConnectionDisabledAppId?: string;
   feishuExternalSharingAppId?: string;
   feishuExternalSharingStartedAt?: number;
   feishuExternalSharingVerifiedAt?: number;
@@ -100,6 +103,7 @@ export const EDITABLE_KEYS: (keyof PersistedSettings)[] = [
   "defaultModel",
   "feishuBotName",
   "feishuBotOpenId",
+  "feishuConnectionDisabledAppId",
   "feishuExternalSharingAppId",
   "feishuExternalSharingStartedAt",
   "feishuExternalSharingVerifiedAt",
@@ -181,6 +185,7 @@ export function loadConfig(env = process.env): Config {
     defaultModel: brandedEnv(env, "DEFAULT_MODEL") || "",
     feishuBotName: brandedEnv(env, "FEISHU_BOT_NAME") || undefined,
     feishuBotOpenId: brandedEnv(env, "FEISHU_BOT_OPEN_ID") || undefined,
+    feishuConnectionDisabledAppId: undefined,
     feishuExternalSharingAppId: undefined,
     feishuExternalSharingStartedAt: undefined,
     feishuExternalSharingVerifiedAt: undefined,
@@ -204,6 +209,10 @@ export function loadConfig(env = process.env): Config {
   if (persisted.defaultModel !== undefined) base.defaultModel = persisted.defaultModel;
   if (persisted.feishuBotName !== undefined) base.feishuBotName = persisted.feishuBotName || undefined;
   if (persisted.feishuBotOpenId !== undefined) base.feishuBotOpenId = persisted.feishuBotOpenId || undefined;
+  if (persisted.feishuConnectionDisabledAppId !== undefined) {
+    base.feishuConnectionDisabledAppId =
+      persisted.feishuConnectionDisabledAppId || undefined;
+  }
   if (persisted.feishuExternalSharingAppId !== undefined) {
     base.feishuExternalSharingAppId = persisted.feishuExternalSharingAppId || undefined;
   }

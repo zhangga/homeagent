@@ -3,6 +3,7 @@ export * from "./group-participation.ts";
 export * from "./knowledge.ts";
 export * from "./engine.ts";
 export * from "./registry.ts";
+export * from "./feishu-bindings.ts";
 export * from "./agents.ts";
 export * from "./tasks.ts";
 export * from "./task-runs.ts";

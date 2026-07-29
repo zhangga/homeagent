@@ -656,12 +656,14 @@ export async function runFeishuCommand(
   cmd: string[],
   opts: CommandOptions = {},
 ): Promise<string> {
-  const proc = Bun.spawn(cmd, {
+  const env = opts.env ? { ...process.env, ...opts.env } : undefined;
+  const spawnCommand = resolveWindowsCommandShim(cmd, env, opts.cwd);
+  const proc = Bun.spawn(spawnCommand, {
     cwd: opts?.cwd,
     stdout: "pipe",
     stderr: "pipe",
     stdin: opts.stdin === undefined ? "ignore" : "pipe",
-    env: opts.env ? { ...process.env, ...opts.env } : undefined,
+    env,
   });
   if (opts.stdin !== undefined && proc.stdin && typeof proc.stdin !== "number") {
     proc.stdin.write(opts.stdin);
@@ -712,6 +714,21 @@ export async function runFeishuCommand(
   const [stdoutText, stderrText, code] = outcome.value;
   if (code !== 0) throw new Error(`command failed (${code}): ${stderrText.slice(0, 500)}`);
   return stdoutText;
+}
+
+function resolveWindowsCommandShim(
+  cmd: string[],
+  env: Record<string, string | undefined> | undefined,
+  cwd: string | undefined,
+): string[] {
+  if (process.platform !== "win32" || cmd.length === 0) return cmd;
+  const executable = cmd[0]!;
+  if (/[\\/]/.test(executable)) return cmd;
+  const resolved = Bun.which(executable, {
+    PATH: env?.PATH ?? env?.Path ?? process.env.PATH,
+    cwd: cwd ?? process.cwd(),
+  });
+  return resolved ? [resolved, ...cmd.slice(1)] : cmd;
 }
 
 function collectStream(stream: ReadableStream<Uint8Array>): {

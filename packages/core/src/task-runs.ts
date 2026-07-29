@@ -1,11 +1,9 @@
 import {
   closeSync,
   existsSync,
-  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
-  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -13,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { isSpaceId, type SpaceId } from "@homeagent/shared";
 import type { Task } from "./tasks.ts";
+import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 
 export type TaskRunStatus = "running" | "succeeded" | "failed" | "cancelled" | "timed_out";
 export type TaskRunTrigger = "manual" | "scheduled" | "chat" | "retry";
@@ -209,14 +208,14 @@ export class TaskRunStore {
       writeFileSync(tempPath, JSON.stringify(file, null, 2), { encoding: "utf8", mode: 0o600 });
       const fileDescriptor = openSync(tempPath, "r");
       try {
-        fsyncSync(fileDescriptor);
+        durableFsyncSync(fileDescriptor);
       } finally {
         closeSync(fileDescriptor);
       }
-      renameSync(tempPath, this.configPath);
+      durableRenameSync(tempPath, this.configPath);
       const directoryDescriptor = openSync(configDir, "r");
       try {
-        fsyncSync(directoryDescriptor);
+        durableFsyncSync(directoryDescriptor);
       } finally {
         closeSync(directoryDescriptor);
       }

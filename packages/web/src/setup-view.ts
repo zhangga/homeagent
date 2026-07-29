@@ -40,7 +40,7 @@ const STEP_LABELS: Record<SetupStep, string> = {
   feishu: "创建机器人",
   external_share: "发布对外共享",
   activate: "激活监听",
-  invite: "发送测试消息",
+  invite: "连接群聊",
   done: "开始使用",
 };
 
@@ -362,17 +362,18 @@ function activateStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEs
 }
 
 function inviteStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
-  return html`<div class="eyebrow">05 · Invite</div><h1 class="setup-title">发送第一条共同记忆</h1>
-    <p class="lede">在飞书里搜索机器人，把它加入一个群聊，然后发送“@机器人 记住：这是第一条测试消息”。@ 能确保最小权限的新应用也收到这条验证消息；HomeAgent 收到后会自动建立知识空间。</p>
+  return html`<div class="eyebrow">05 · Connect group</div><h1 class="setup-title">明确连接第一个群聊</h1>
+    <p class="lede">先在飞书里把机器人加入目标群，再到 HomeAgent 选择“连接群聊”。只有明确连接后，HomeAgent 才会收录群消息或参与回复。</p>
     <div class="bot-token"><span>●</span><strong>${input.lark.botName ?? "HomeAgent 机器人"}</strong></div>
-    ${input.groups.length ? html`<p class="muted">已发现群聊，正在等待第一条消息。</p>` : ""}
-    <form method="get" action="/setup" class="actions"><button class="primary-action">我已发送，重新检查</button></form>
+    ${input.groups.length ? html`<p class="muted">已连接群聊，可以继续。</p>` : ""}
+    <div class="actions"><a class="primary-action" href="/integrations/groups/connect">选择要连接的群</a></div>
+    <form method="get" action="/setup" class="actions"><button class="secondary-action">我已连接，重新检查</button></form>
     <form method="post" action="/setup/finish" class="actions"><button class="secondary-action">暂时只在私聊中使用</button></form>`;
 }
 
 function doneStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
   return html`<div class="eyebrow">06 · Ready</div><h1 class="setup-title">一切就绪，记忆开始生长</h1>
-    <p class="lede">${input.groups.length ? `已发现 ${input.groups.length} 个群聊空间。` : "机器人已连接。"} 接下来只要在飞书里分享、提问或发送资料，HomeAgent 会在后台持续整理。</p>
+    <p class="lede">${input.groups.length ? `已连接 ${input.groups.length} 个群聊空间。` : "机器人已连接。"} 接下来只要在已连接群里分享、提问或发送资料，HomeAgent 会在后台持续整理。</p>
     <form method="post" action="/setup/finish" class="actions"><button class="primary-action">进入 HomeAgent</button></form>`;
 }
 

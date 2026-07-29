@@ -6,6 +6,7 @@ import {
 import { dirname, resolve } from "node:path";
 
 export const FEISHU_SOAK_SCENARIOS = [
+  "group_binding_lifecycle",
   "message_capture",
   "mention_answer",
   "proactive_participation",

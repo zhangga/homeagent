@@ -1,5 +1,7 @@
 /** Public setup boundary used by the management backend. */
 import type {
+  LarkCapabilityState,
+  LarkChatSummary,
   LarkProvisioningSession,
   LarkSetupInput,
   LarkSetupStatus,
@@ -13,6 +15,9 @@ export interface LarkSetupPort {
   provisioningStatus?(): LarkProvisioningSession;
   /** Read-only verification that a chat belongs to an external group. */
   chatIsExternal?(chatId: string): Promise<boolean>;
+  listBotChats?(): Promise<LarkChatSummary[]>;
+  getBotChat?(chatId: string): Promise<LarkChatSummary | undefined>;
+  fullGroupMessageCapability?(): Promise<LarkCapabilityState>;
 }
 
 export interface FeishuRuntimeStatus {

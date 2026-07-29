@@ -12,11 +12,9 @@
 import {
   closeSync,
   existsSync,
-  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
-  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -24,6 +22,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { SpaceId } from "@homeagent/shared";
 import { isSpaceId } from "@homeagent/shared";
+import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 
 /** How often a task runs. */
 export type TaskCadence = "hourly" | "daily";
@@ -152,14 +151,14 @@ export class TaskStore {
       });
       const fileDescriptor = openSync(temporaryPath, "r");
       try {
-        fsyncSync(fileDescriptor);
+        durableFsyncSync(fileDescriptor);
       } finally {
         closeSync(fileDescriptor);
       }
-      renameSync(temporaryPath, this.configPath);
+      durableRenameSync(temporaryPath, this.configPath);
       const directoryDescriptor = openSync(configDir, "r");
       try {
-        fsyncSync(directoryDescriptor);
+        durableFsyncSync(directoryDescriptor);
       } finally {
         closeSync(directoryDescriptor);
       }

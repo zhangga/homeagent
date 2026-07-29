@@ -6,17 +6,16 @@
 import {
   closeSync,
   existsSync,
-  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
-  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { isSpaceId, type Citation, type SpaceId } from "@homeagent/shared";
+import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 
 export type AnswerOutcome = "succeeded" | "failed" | "timed_out";
 export const ANSWER_FEEDBACK_KINDS = [
@@ -292,14 +291,14 @@ export class QualityStore {
       );
       const fileDescriptor = openSync(temporaryPath, "r");
       try {
-        fsyncSync(fileDescriptor);
+        durableFsyncSync(fileDescriptor);
       } finally {
         closeSync(fileDescriptor);
       }
-      renameSync(temporaryPath, this.configPath);
+      durableRenameSync(temporaryPath, this.configPath);
       const directoryDescriptor = openSync(directory, "r");
       try {
-        fsyncSync(directoryDescriptor);
+        durableFsyncSync(directoryDescriptor);
       } finally {
         closeSync(directoryDescriptor);
       }

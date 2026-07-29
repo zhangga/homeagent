@@ -154,6 +154,22 @@ describe("editable settings overlay", () => {
     expect(cfg.feishuBotOpenId).toBe("ou_x");
   });
 
+  test("persists the locally disabled Feishu app without clearing its identity", () => {
+    saveSettings({
+      feishuBotName: "homeagent",
+      feishuBotOpenId: "ou_x",
+      feishuConnectionDisabledAppId: "cli_disabled",
+    }, dir);
+
+    const cfg = loadConfig();
+    expect(cfg.feishuConnectionDisabledAppId).toBe("cli_disabled");
+    expect(cfg.feishuBotName).toBe("homeagent");
+    expect(cfg.feishuBotOpenId).toBe("ou_x");
+
+    saveSettings({ feishuConnectionDisabledAppId: "" }, dir);
+    expect(loadConfig().feishuConnectionDisabledAppId).toBeUndefined();
+  });
+
   test("persists external sharing progress for the current Feishu app", () => {
     saveSettings({
       feishuExternalSharingAppId: "cli_external",

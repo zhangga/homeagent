@@ -131,6 +131,36 @@ describe("system health reporter", () => {
     engine.close();
   });
 
+  test("reports an intentional HomeAgent-local Feishu disable distinctly", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-feishu-disabled-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: false,
+        consumers: [],
+      }),
+      feishuLocallyDisabled: () => true,
+      dreamSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" },
+      ],
+      requiredProviderIds: () => ["codex"],
+    });
+
+    const snapshot = await reportHealth();
+
+    expect(snapshot.components.feishu).toMatchObject({
+      status: "degraded",
+      summary: "飞书连接已在 HomeAgent 中停用",
+      details: { locallyDisabled: true },
+    });
+    engine.close();
+  });
+
   test("AI runtime health distinguishes normal, backlog, and recent answer failures", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hb-health-ai-runtime-"));
     dirs.push(dir);

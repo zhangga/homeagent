@@ -68,7 +68,8 @@ Homebrew 或 lark-cli。
 4. 确认应用自动安装并启动 LaunchAgent，然后自动打开 `/setup`。
 5. 完成 Codex 安装和 ChatGPT 登录。
 6. 创建或连接飞书机器人，确认两个事件消费者就绪。
-7. 加入测试群，发送真实消息，完成首次知识收录，并记下原始记录 ID。
+7. 加入测试群，在 “Integrations” 中显式连接该群并选择响应方式，再发送真实消息完成首次知识收录，
+   记下原始记录 ID。
 8. 在同一空间创建一个禁用的研究任务、一个未来提醒和一个学习计划，记下各自名称或 ID。
 9. 在后台确认知识、任务、提醒和学习计划均可查看。
 10. 运行 `"/Applications/HomeAgent.app/Contents/MacOS/homeagent" doctor --json`，保存脱敏结果到发布记录。
@@ -150,12 +151,19 @@ bun run soak -- --record-evidence reminder_delivery \
 bun run soak:feishu -- \
   --chat-id oc_xxx \
   --bot-open-id ou_xxx \
+  --admin-url http://127.0.0.1:3000 \
   --sender ui \
   --data-dir ./data \
   --evidence ./artifacts/soak-evidence.jsonl \
   --monitor ./artifacts/soak-24h.jsonl \
   --research-task "发布浸泡研究"
 ```
+
+`--admin-url` 指向本次受测 HomeAgent 的管理后台。若后台启用了
+`HOMEAGENT_WEB_ADMIN_TOKEN`，在启动驱动的终端通过
+`HOMEAGENT_SOAK_ADMIN_TOKEN='<管理令牌>'` 提供同一个值；不要把令牌写进命令参数、发布记录或
+evidence JSONL。本机回环且未启用后台认证时无需设置该环境变量。驱动只对固定的群连接/断开路径发起
+Bearer、同源、禁止自动重定向的管理请求。
 
 `--sender ui` 是外部群和真实用户验收的默认选择。驱动会逐步输出以
 `[F5_USER_ACTION]` 开头的结构化动作（发送文本、回复、上传图片或文件），由已登录的飞书
@@ -171,12 +179,33 @@ lark-cli auth login --scope "im:message.send_as_user im:message im:resource:uplo
 
 飞书对外部群的用户身份消息接口可能返回 `230027`；这时不要重复授权，改用 `--sender ui`。
 
-可先加 `--dry-run` 检查场景和路径而不发送消息。默认自动执行前九项；`network_recovery` 不接受
+群绑定生命周期应先单独在获准的测试群执行；目标群可以原本已连接或已断开，推荐预先配置为
+“仅在 @ Bot 时回复”。驱动会保存原状态，通过公开管理路由执行连接、@ 回复、断开后的零收录/零回复、
+原空间重连与恢复收录，并在 `finally` 中恢复原来的已连接/已断开状态：
+
+```bash
+HOMEAGENT_SOAK_ADMIN_TOKEN='<仅在后台启用认证时设置>' \
+bun run soak:feishu -- \
+  --chat-id oc_xxx \
+  --bot-open-id ou_xxx \
+  --admin-url http://127.0.0.1:3000 \
+  --sender ui \
+  --data-dir ./data \
+  --evidence ./artifacts/soak-evidence.jsonl \
+  --scenarios group_binding_lifecycle,mention_answer
+```
+
+缺少 `im:message.group_msg` 时，生命周期仍以“仅在 @ Bot 时回复”完成；`proactive_participation`
+会给出明确的权限前置条件并失败，不得用 @ 消息伪装通过。只有确认企业已批准该敏感权限后，才能运行
+智能参与、普通群消息收录以及“响应所有消息”的验收。
+
+可先加 `--dry-run` 检查场景和路径而不发送消息。默认自动执行前十项；`network_recovery` 不接受
 自动伪造的接口失败，必须在明确获准中断测试机网络后受控执行，并继续使用 `--record-evidence`
 记录恢复后的真实消息或发布记录编号。
 
 必须覆盖以下场景；失败的尝试使用 `--failed` 记录，修复后再记录新的成功证据：
 
+- `group_binding_lifecycle`：显式连接、断开隐私、原空间重连和状态恢复；
 - `message_capture`：群消息静默收录；
 - `mention_answer`：@ 问答；
 - `proactive_participation`：一次主动参与；
@@ -189,7 +218,7 @@ lark-cli auth login --scope "im:message.send_as_user im:message im:resource:uplo
 - `network_recovery`：网络短暂中断后恢复。
 
 Soak 默认要求 `/healthz` 和 `/readyz` 同时成功，并记录延迟、失败、连续失败和进程替换次数。
-发布门禁只有在 runtime 指标和上述十项最新证据都成功时才通过。两个 JSONL 文件不得包含消息
+发布门禁只有在 runtime 指标和上述十一项最新证据都成功时才通过。两个 JSONL 文件不得包含消息
 正文或凭据。
 
 ## 6. 发布决定

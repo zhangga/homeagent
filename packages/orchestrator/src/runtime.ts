@@ -12,7 +12,8 @@
  *      reaches engine.ask so fuzzy language can be answered or clarified by the
  *      model instead of being trapped behind a grammatical intent label.
  *
- * bot_added events (Q4/Q6) create the team space and send a one-time notice.
+ * bot_added events are intentionally informational only. Administrators bind
+ * groups explicitly through the Integrations page.
  *
  * Events are processed one-at-a-time via a Serializer keyed globally, so the
  * runtime behaves as a single consumer queue (plan §III) while the engine's own
@@ -23,8 +24,8 @@ import { Serializer, logger, type SerializerSnapshot } from "@homeagent/shared";
 import { isProviderTimeoutError } from "@homeagent/llm";
 import {
   resolveGroupParticipationLevel,
-  usesLegacyRespondAll,
   type AnswerOutcome,
+  type FeishuGroupBinding,
   type KnowledgeEngine,
   type LlmClient,
 } from "@homeagent/core";
@@ -45,7 +46,7 @@ import {
   type KnowledgeControl,
 } from "./conversation-interpreter.ts";
 import { formatAnswer } from "./format.ts";
-import { GROUP_ADDED_NOTICE, coldStartNote, providerNotice } from "./messages.ts";
+import { coldStartNote, providerNotice } from "./messages.ts";
 import { parseTaskCommand, handleTaskCommand } from "./task-commands.ts";
 import {
   handleLearningAnswer,
@@ -170,6 +171,11 @@ function discloseUnavailableVision(text: string): string {
 export interface RuntimeOptions {
   engine: KnowledgeEngine;
   connector: Connector;
+  /**
+   * Bot app identity captured at process startup. Group bindings for a
+   * different (or unknown) app stay inert until the process restarts.
+   */
+  activeFeishuAppId?: string;
   llm?: LlmClient;
   /** max eventIds remembered for dedup */
   dedupSize?: number;
@@ -188,6 +194,7 @@ export interface RuntimeOptions {
 export class Orchestrator {
   private engine: KnowledgeEngine;
   private connector: Connector;
+  private activeFeishuAppId?: string;
   private llm?: LlmClient;
   private serializer = new Serializer();
   private seen = new Set<string>();
@@ -224,6 +231,7 @@ export class Orchestrator {
   constructor(opts: RuntimeOptions) {
     this.engine = opts.engine;
     this.connector = opts.connector;
+    this.activeFeishuAppId = opts.activeFeishuAppId;
     this.llm = opts.llm;
     this.dedupSize = opts.dedupSize ?? 5000;
     this.docFetcher = opts.docFetcher;
@@ -388,21 +396,22 @@ export class Orchestrator {
       log.debug("dropping duplicate event", { eventId: event.eventId });
       return;
     }
-    if (event.kind === "bot_added") return this.handleBotAdded(event.chatId);
+    if (event.kind === "bot_added") return;
     return this.handleMessage(event);
-  }
-
-  private async handleBotAdded(chatId: string): Promise<void> {
-    const space: SpaceId = `team/${chatId}`;
-    this.engine.ensureSpace(space, { chatId });
-    log.info("bot added to group; created team space", { space });
-    await this.connector.notice(chatId, GROUP_ADDED_NOTICE);
   }
 
   private async handleMessage(msg: InboundMessage): Promise<void> {
     const { writeSpace, readSpaces } = attribute(msg);
-    const meta = this.engine.registry.get(writeSpace);
-
+    const groupBinding: FeishuGroupBinding | undefined =
+      msg.chatType === "group"
+        ? this.activeGroupBinding(msg.chatId)
+        : undefined;
+    if (msg.chatType === "group" && !groupBinding) {
+      log.debug("dropping event from an unbound Feishu group", {
+        chatId: msg.chatId,
+      });
+      return;
+    }
     // Task control commands (/task ...) are handled BEFORE capture/gate: they're
     // instructions, not knowledge, so they're never stored, and they always get
     // a reply (even in a group without an @-mention).
@@ -454,9 +463,11 @@ export class Orchestrator {
       return this.withThinking(msg, () => this.send(msg, pendingReminderReply));
     }
 
-    const participationLevel = resolveGroupParticipationLevel(meta);
+    const participationLevel = resolveGroupParticipationLevel(groupBinding);
     let decision = gate(msg, {
-      mentionsOnly: usesLegacyRespondAll(meta) ? false : true,
+      mentionsOnly: groupBinding?.responseMode === "all_messages"
+        ? false
+        : true,
     });
     let proactiveParticipation = false;
 
@@ -509,7 +520,12 @@ export class Orchestrator {
       }
     };
 
-    if (!decision.respond && msg.chatType === "group" && !msg.mentionsBot) {
+    if (
+      !decision.respond
+      && msg.chatType === "group"
+      && !msg.mentionsBot
+      && groupBinding?.responseMode === "smart"
+    ) {
       // Persist first: a slow classifier must not put the message's durable
       // capture behind an external model call.
       await captureInputs();
@@ -1008,15 +1024,32 @@ export class Orchestrator {
   }
 
   private async send(msg: InboundMessage, markdown: string): Promise<void> {
-    // "Topic reply" (mew): per-space replyInThread override; defaults to
-    // threading in groups and not in p2p.
-    const meta = this.engine.registry.get(attribute(msg).writeSpace);
-    const inThread = meta?.replyInThread ?? msg.chatType === "group";
+    // Recheck immediately before outbound delivery so an administrator can
+    // disconnect a group while a slow answer is being generated.
+    const groupBinding = msg.chatType === "group"
+      ? this.activeGroupBinding(msg.chatId)
+      : undefined;
+    if (msg.chatType === "group" && !groupBinding) return;
+    const inThread = groupBinding?.replyInThread ?? false;
     await this.connector.reply({
       chatId: msg.chatId,
       replyToMessageId: msg.messageId,
       markdown,
       inThread,
     });
+  }
+
+  private activeGroupBinding(chatId: string): FeishuGroupBinding | undefined {
+    const binding = this.engine.feishuBindings.activeByChatId(chatId);
+    if (
+      !binding
+      || (
+        this.activeFeishuAppId !== undefined
+        && binding.boundAppId !== this.activeFeishuAppId
+      )
+    ) {
+      return undefined;
+    }
+    return binding;
   }
 }

@@ -11,8 +11,10 @@ import {
   isTransientLarkFailure,
   invokeLarkCliWithRetry,
   latestDeliveredLearningSession,
+  postFeishuSoakAdminForm,
   parseLarkCliResult,
   parseLarkCreateTime,
+  parseFeishuSoakOptions,
   resolveRequestedScenarios,
   selectInFlightResearchRun,
   selectReusableResearchRun,
@@ -48,6 +50,7 @@ function message(
 describe("Feishu soak acceptance primitives", () => {
   test("automates every business scenario except the destructive network recovery check", () => {
     expect(AUTOMATED_FEISHU_SOAK_SCENARIOS).toEqual([
+      "group_binding_lifecycle",
       "message_capture",
       "mention_answer",
       "proactive_participation",
@@ -61,6 +64,9 @@ describe("Feishu soak acceptance primitives", () => {
   });
 
   test("adds and orders dependencies when rerunning an individual failed scenario", () => {
+    expect(resolveRequestedScenarios("group_binding_lifecycle")).toEqual([
+      "group_binding_lifecycle",
+    ]);
     expect(resolveRequestedScenarios("learning_interaction")).toEqual([
       "attachment_extraction",
       "learning_interaction",
@@ -70,6 +76,73 @@ describe("Feishu soak acceptance primitives", () => {
       "mention_answer",
       "distill_citation",
     ]);
+  });
+
+  test("accepts an admin URL and reads its secret only from the soak environment", () => {
+    const options = parseFeishuSoakOptions([
+      "--chat-id", "oc_test",
+      "--bot-open-id", "ou_bot",
+      "--admin-url", "http://127.0.0.1:3210/",
+      "--scenarios", "group_binding_lifecycle",
+    ], {
+      HOMEAGENT_SOAK_ADMIN_TOKEN: "soak-secret",
+    });
+
+    expect(options.adminUrl).toBe("http://127.0.0.1:3210");
+    expect(options.adminToken).toBe("soak-secret");
+    expect(options.scenarios).toEqual(["group_binding_lifecycle"]);
+    expect(() => parseFeishuSoakOptions([
+      "--chat-id", "oc_test",
+      "--bot-open-id", "ou_bot",
+      "--admin-token", "must-not-be-an-argument",
+    ])).toThrow("unknown argument");
+  });
+
+  test("admin mutations use bearer auth, same-origin headers, and disabled redirects", async () => {
+    let requestedUrl = "";
+    let requestedInit: RequestInit | undefined;
+    await postFeishuSoakAdminForm({
+      adminUrl: "http://127.0.0.1:3210",
+      adminToken: "soak-secret",
+      path: "/integrations/groups/connect",
+      form: {
+        chatId: "oc_test",
+        responseMode: "mentions_only",
+        replyInThread: "on",
+      },
+      fetchImpl: async (input, init) => {
+        requestedUrl = String(input);
+        requestedInit = init;
+        return new Response(null, {
+          status: 302,
+          headers: { location: "/integrations?ok=connected" },
+        });
+      },
+    });
+
+    expect(requestedUrl).toBe("http://127.0.0.1:3210/integrations/groups/connect");
+    expect(requestedInit?.method).toBe("POST");
+    expect(requestedInit?.redirect).toBe("manual");
+    const headers = new Headers(requestedInit?.headers);
+    expect(headers.get("authorization")).toBe("Bearer soak-secret");
+    expect(headers.get("origin")).toBe("http://127.0.0.1:3210");
+    expect(headers.get("sec-fetch-site")).toBe("same-origin");
+    expect(String(requestedInit?.body)).toContain("responseMode=mentions_only");
+
+    let surfacedError: unknown;
+    try {
+      await postFeishuSoakAdminForm({
+        adminUrl: "http://127.0.0.1:3210",
+        adminToken: "soak-secret",
+        path: "/integrations/groups/connect",
+        form: { chatId: "oc_test", responseMode: "mentions_only" },
+        fetchImpl: async () =>
+          new Response("debug echo: Bearer soak-secret", { status: 500 }),
+      });
+    } catch (error) {
+      surfacedError = error;
+    }
+    expect(String(surfacedError)).not.toContain("soak-secret");
   });
 
   test("parses successful CLI envelopes and rejects logical failures even with JSON output", () => {

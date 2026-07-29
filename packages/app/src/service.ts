@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { dlopen, FFIType } from "bun:ffi";
+import { dlopen, FFIType, ptr } from "bun:ffi";
 import { brandedEnv } from "@homeagent/shared";
 
 export const SERVICE_LABEL = "com.homeagent.agent";
@@ -209,6 +209,13 @@ function defaultIsProcessAlive(pid: number): boolean {
 const LOCK_EX = 2;
 const LOCK_NB = 4;
 const LOCK_UN = 8;
+const WINDOWS_LOCKFILE_FAIL_IMMEDIATELY = 1;
+const WINDOWS_LOCKFILE_EXCLUSIVE_LOCK = 2;
+const WINDOWS_GENERIC_READ_WRITE = 0xc0000000;
+const WINDOWS_SHARE_READ_WRITE_DELETE = 7;
+const WINDOWS_OPEN_ALWAYS = 4;
+const WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x80;
+const WINDOWS_LOCK_VIOLATION = 33;
 const flockLibrary = process.platform === "darwin"
   ? dlopen("/usr/lib/libSystem.B.dylib", {
       flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
@@ -218,10 +225,167 @@ const flockLibrary = process.platform === "darwin"
         flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
       })
     : undefined;
+const windowsLockLibrary = process.platform === "win32"
+  ? dlopen("kernel32.dll", {
+      CreateFileW: {
+        args: [
+          FFIType.ptr,
+          FFIType.u32,
+          FFIType.u32,
+          FFIType.ptr,
+          FFIType.u32,
+          FFIType.u32,
+          FFIType.ptr,
+        ],
+        returns: FFIType.ptr,
+      },
+      LockFileEx: {
+        args: [
+          FFIType.ptr,
+          FFIType.u32,
+          FFIType.u32,
+          FFIType.u32,
+          FFIType.u32,
+          FFIType.ptr,
+        ],
+        returns: FFIType.i32,
+      },
+      UnlockFileEx: {
+        args: [
+          FFIType.ptr,
+          FFIType.u32,
+          FFIType.u32,
+          FFIType.u32,
+          FFIType.ptr,
+        ],
+        returns: FFIType.i32,
+      },
+      CloseHandle: {
+        args: [FFIType.ptr],
+        returns: FFIType.i32,
+      },
+      GetLastError: {
+        args: [],
+        returns: FFIType.u32,
+      },
+    })
+  : undefined;
 
 function systemFlock(fd: number, operation: number): number {
   if (!flockLibrary) throw new Error(`single-process locking is unsupported on ${process.platform}`);
   return Number(flockLibrary.symbols.flock(fd, operation));
+}
+
+interface NativeProcessLock {
+  release(): void;
+}
+
+function invalidWindowsHandle(handle: number | bigint | null): boolean {
+  if (handle === null) return true;
+  if (typeof handle === "bigint") {
+    return handle === -1n || handle === 0xffffffffffffffffn;
+  }
+  return handle === -1 || !Number.isSafeInteger(handle);
+}
+
+function tryAcquireNativeProcessLock(
+  fd: number,
+  path: string,
+): NativeProcessLock | undefined {
+  if (windowsLockLibrary) {
+    // Keep metadata readable while the lock is held. Windows byte-range locks
+    // can block truncate/write even through another handle in this process, so
+    // the kernel lock lives in a stable sidecar and the existing JSON remains
+    // the human-readable owner record.
+    const widePath = Buffer.from(`${path}.native\0`, "utf16le");
+    const handle = windowsLockLibrary.symbols.CreateFileW(
+      ptr(widePath),
+      WINDOWS_GENERIC_READ_WRITE,
+      WINDOWS_SHARE_READ_WRITE_DELETE,
+      0,
+      WINDOWS_OPEN_ALWAYS,
+      WINDOWS_FILE_ATTRIBUTE_NORMAL,
+      0,
+    );
+    if (invalidWindowsHandle(handle)) {
+      const code = Number(windowsLockLibrary.symbols.GetLastError());
+      throw new Error(`unable to open the single-process lock (${code})`);
+    }
+    const overlapped = new Uint8Array(32);
+    const locked = Number(windowsLockLibrary.symbols.LockFileEx(
+      handle,
+      WINDOWS_LOCKFILE_FAIL_IMMEDIATELY | WINDOWS_LOCKFILE_EXCLUSIVE_LOCK,
+      0,
+      0xffffffff,
+      0xffffffff,
+      ptr(overlapped),
+    ));
+    if (locked === 0) {
+      const code = Number(windowsLockLibrary.symbols.GetLastError());
+      windowsLockLibrary.symbols.CloseHandle(handle);
+      if (code === WINDOWS_LOCK_VIOLATION) return undefined;
+      throw new Error(`unable to acquire the single-process lock (${code})`);
+    }
+    let released = false;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        try {
+          windowsLockLibrary.symbols.UnlockFileEx(
+            handle,
+            0,
+            0xffffffff,
+            0xffffffff,
+            ptr(overlapped),
+          );
+        } finally {
+          windowsLockLibrary.symbols.CloseHandle(handle);
+        }
+      },
+    };
+  }
+  if (!flockLibrary) {
+    throw new Error(`single-process locking is unsupported on ${process.platform}`);
+  }
+  if (systemFlock(fd, LOCK_EX | LOCK_NB) !== 0) return undefined;
+  let released = false;
+  return {
+    release: () => {
+      if (released) return;
+      released = true;
+      systemFlock(fd, LOCK_UN);
+    },
+  };
+}
+
+function syncLockMetadata(fd: number): void {
+  try {
+    fsyncSync(fd);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (
+      process.platform === "win32"
+      && (code === "EPERM" || code === "EINVAL")
+    ) {
+      return;
+    }
+    throw error;
+  }
+}
+
+function openLockMetadata(path: string): number {
+  try {
+    return openSync(path, "r+");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  try {
+    return openSync(path, "wx+", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    return openSync(path, "r+");
+  }
 }
 
 /** Acquire the single-process guard, replacing only a provably stale owner. */
@@ -235,10 +399,11 @@ export function acquireProcessLock(options: ProcessLockOptions): ProcessLock {
   const path = join(runDir, "homebrain.lock");
   const cleanupPath = `${path}.cleanup`;
   mkdirSync(runDir, { recursive: true });
-  const fd = openSync(path, "a+", 0o600);
-  let locked = false;
+  const fd = openLockMetadata(path);
+  let nativeLock: NativeProcessLock | undefined;
   try {
-    if (systemFlock(fd, LOCK_EX | LOCK_NB) !== 0) {
+    nativeLock = tryAcquireNativeProcessLock(fd, path);
+    if (!nativeLock) {
       let ownerPid: number | undefined;
       try {
         const owner = JSON.parse(readFileSync(path, "utf8")) as { pid?: unknown };
@@ -250,7 +415,6 @@ export function acquireProcessLock(options: ProcessLockOptions): ProcessLock {
         ownerPid ? `homeagent is already running (PID ${ownerPid})` : "homeagent is already running",
       );
     }
-    locked = true;
 
     // Before P3.2, the service used a PID-only lock. Refuse an actually live
     // legacy owner during an in-place upgrade; version 2 locks are governed by
@@ -273,7 +437,7 @@ export function acquireProcessLock(options: ProcessLockOptions): ProcessLock {
     rmSync(cleanupPath, { recursive: true, force: true });
     ftruncateSync(fd, 0);
     writeFileSync(fd, JSON.stringify({ version: 2, pid, startedAt }), "utf8");
-    fsyncSync(fd);
+    syncLockMetadata(fd);
     chmodSync(path, 0o600);
     let released = false;
     return {
@@ -284,14 +448,14 @@ export function acquireProcessLock(options: ProcessLockOptions): ProcessLock {
         if (released) return;
         released = true;
         try {
-          systemFlock(fd, LOCK_UN);
+          nativeLock?.release();
         } finally {
           closeSync(fd);
         }
       },
     };
   } catch (err) {
-    if (locked) systemFlock(fd, LOCK_UN);
+    nativeLock?.release();
     closeSync(fd);
     throw err;
   }

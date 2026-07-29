@@ -18,6 +18,7 @@ import type { RuntimeServiceStatus } from "./service.ts";
 export interface SystemHealthSources {
   engine: KnowledgeEngine;
   connectorHealth: () => ConnectorHealth;
+  feishuLocallyDisabled?: () => boolean;
   dreamSchedulerHealth: () => RuntimeLoopHealth | undefined;
   taskSchedulerHealth: () => RuntimeLoopHealth | undefined;
   reminderSchedulerHealth?: () => RuntimeLoopHealth | undefined;
@@ -186,14 +187,28 @@ export function createSystemHealthReporter(
     let connector: ConnectorHealth;
     try {
       connector = sources.connectorHealth();
+      let locallyDisabled = false;
+      try {
+        locallyDisabled = sources.feishuLocallyDisabled?.() === true;
+      } catch {
+        // Connector health remains authoritative if the optional flag fails.
+      }
       const failedConsumers = connector.consumers.filter((consumer) => consumer.state === "failed");
       const pendingConsumers = connector.consumers.filter((consumer) => consumer.state !== "ready");
       components.feishu = {
-        status: connector.ready ? "ok" : failedConsumers.length > 0 ? "down" : "degraded",
-        summary: connector.ready
-          ? "飞书事件消费者已就绪"
-          : `未就绪：${pendingConsumers.map((consumer) => consumer.key).join("、") || "尚未启动"}`,
-        details: { ...connector },
+        status: locallyDisabled
+          ? "degraded"
+          : connector.ready
+            ? "ok"
+            : failedConsumers.length > 0
+              ? "down"
+              : "degraded",
+        summary: locallyDisabled
+          ? "飞书连接已在 HomeAgent 中停用"
+          : connector.ready
+            ? "飞书事件消费者已就绪"
+            : `未就绪：${pendingConsumers.map((consumer) => consumer.key).join("、") || "尚未启动"}`,
+        details: { ...connector, ...(locallyDisabled ? { locallyDisabled: true } : {}) },
       };
     } catch (err) {
       connector = { name: "feishu", ready: false, consumers: [] };

@@ -34,6 +34,270 @@ async function waitForProvisioningUrl(
 }
 
 describe("LarkCliSetup", () => {
+  test("lists Bot-visible chats with only safe public fields", async () => {
+    const calls: LarkSetupCommand[] = [];
+    const setup = new LarkCliSetup({
+      runner: {
+        async run(command) {
+          calls.push(command);
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              data: {
+                chats: [{
+                  chat_id: "oc_product",
+                  name: "Product",
+                  description: "Planning",
+                  external: false,
+                  owner_id: "ou_owner",
+                  tenant_key: "private",
+                }],
+                has_more: false,
+                _notice: { update_available: true },
+              },
+            }),
+            stderr: "",
+          };
+        },
+      },
+    });
+
+    expect(await setup.listBotChats()).toEqual([{
+      chatId: "oc_product",
+      name: "Product",
+      description: "Planning",
+      external: false,
+      ownerId: "ou_owner",
+    }]);
+    expect(calls).toEqual([{
+      argv: [
+        "lark-cli",
+        "im",
+        "+chat-list",
+        "--as",
+        "bot",
+        "--page-size",
+        "100",
+        "--json",
+      ],
+      timeoutMs: 15_000,
+    }]);
+  });
+
+  test("paginates Bot chats and normalizes null chats to an empty page", async () => {
+    const calls: LarkSetupCommand[] = [];
+    const responses = [
+      {
+        code: 0,
+        stdout: JSON.stringify({
+          data: {
+            chats: [{ chat_id: "oc_z", name: "Zulu" }],
+            has_more: true,
+            page_token: "next-page",
+          },
+        }),
+        stderr: "",
+      },
+      {
+        code: 0,
+        stdout: JSON.stringify({
+          data: { chats: null, has_more: false },
+        }),
+        stderr: "",
+      },
+    ];
+    const setup = new LarkCliSetup({
+      runner: {
+        async run(command) {
+          calls.push(command);
+          return responses.shift()!;
+        },
+      },
+    });
+
+    expect(await setup.listBotChats()).toEqual([
+      { chatId: "oc_z", name: "Zulu" },
+    ]);
+    expect(calls[1]?.argv).toEqual([
+      "lark-cli",
+      "im",
+      "+chat-list",
+      "--as",
+      "bot",
+      "--page-size",
+      "100",
+      "--page-token",
+      "next-page",
+      "--json",
+    ]);
+  });
+
+  test("gets one Bot chat for membership verification", async () => {
+    const calls: LarkSetupCommand[] = [];
+    const setup = new LarkCliSetup({
+      runner: {
+        async run(command) {
+          calls.push(command);
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              data: {
+                chat_id: "oc_product",
+                name: "Product",
+                external: true,
+                tenant_key: "private",
+              },
+            }),
+            stderr: "",
+          };
+        },
+      },
+    });
+
+    expect(await setup.getBotChat(" oc_product ")).toEqual({
+      chatId: "oc_product",
+      name: "Product",
+      external: true,
+    });
+    expect(calls).toEqual([{
+      argv: [
+        "lark-cli",
+        "im",
+        "chats",
+        "get",
+        "--chat-id",
+        "oc_product",
+        "--as",
+        "bot",
+        "--json",
+      ],
+      timeoutMs: 15_000,
+    }]);
+  });
+
+  test("checks full group-message capability through structured auth output", async () => {
+    const calls: LarkSetupCommand[] = [];
+    const setup = new LarkCliSetup({
+      runner: {
+        async run(command) {
+          calls.push(command);
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              ok: true,
+              granted: ["im:message.group_msg"],
+              missing: [],
+              _notice: { latest_version: "private" },
+            }),
+            stderr: "",
+          };
+        },
+      },
+    });
+
+    expect(await setup.fullGroupMessageCapability()).toBe("available");
+    expect(calls).toEqual([{
+      argv: [
+        "lark-cli",
+        "auth",
+        "check",
+        "--scope",
+        "im:message.group_msg",
+        "--json",
+      ],
+      timeoutMs: 15_000,
+    }]);
+  });
+
+  test("maps missing capability conservatively and treats ambiguity as unknown", async () => {
+    const unavailable = new LarkCliSetup({
+      runner: {
+        async run() {
+          return {
+            code: 1,
+            stdout: JSON.stringify({
+              missing: ["im:message.group_msg"],
+              suggestion: "private repair diagnostic",
+            }),
+            stderr: "private",
+          };
+        },
+      },
+    });
+    const malformed = new LarkCliSetup({
+      runner: {
+        async run() {
+          return { code: 124, stdout: "not-json", stderr: "private timeout" };
+        },
+      },
+    });
+    const ambiguous = new LarkCliSetup({
+      runner: {
+        async run() {
+          return { code: 0, stdout: JSON.stringify({ ok: true }), stderr: "" };
+        },
+      },
+    });
+
+    expect(await unavailable.fullGroupMessageCapability()).toBe("unavailable");
+    expect(await malformed.fullGroupMessageCapability()).toBe("unknown");
+    expect(await ambiguous.fullGroupMessageCapability()).toBe("unknown");
+  });
+
+  test("rejects repeated pagination tokens and conflicting duplicate chats safely", async () => {
+    let page = 0;
+    const repeated = new LarkCliSetup({
+      runner: {
+        async run() {
+          page += 1;
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              chats: [],
+              has_more: true,
+              page_token: "repeated",
+            }),
+            stderr: "",
+          };
+        },
+      },
+    });
+    const duplicate = new LarkCliSetup({
+      runner: {
+        async run() {
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              chats: [
+                { chat_id: "oc_same", name: "First" },
+                {
+                  chat_id: "oc_same",
+                  name: "Second",
+                  secret: "private-diagnostic",
+                },
+              ],
+              has_more: false,
+            }),
+            stderr: "",
+          };
+        },
+      },
+    });
+
+    await expect(repeated.listBotChats()).rejects.toThrow(
+      "Unable to list Feishu groups",
+    );
+    expect(page).toBe(2);
+    let duplicateError = "";
+    try {
+      await duplicate.listBotChats();
+    } catch (error) {
+      duplicateError = String(error);
+    }
+    expect(duplicateError).toContain("Unable to list Feishu groups");
+    expect(duplicateError).not.toContain("private-diagnostic");
+  });
+
   test("detects external chats through the read-only bot API", async () => {
     const calls: LarkSetupCommand[] = [];
     const setup = new LarkCliSetup({

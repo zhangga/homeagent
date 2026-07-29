@@ -244,8 +244,9 @@ describe("guided setup view", () => {
       lark: { state: "ready", verified: true, botName: "小脑", botOpenId: "ou_bot", message: "ready" },
     });
     expect(invite).toContain("小脑");
-    expect(invite).toContain("@机器人 记住：这是第一条测试消息");
-    expect(invite).toContain("我已发送，重新检查");
+    expect(invite).toContain("只有明确连接后");
+    expect(invite).toContain('href="/integrations/groups/connect"');
+    expect(invite).toContain("我已连接，重新检查");
   });
 
   test("failed provisioning explains the failure without exposing CLI output", () => {

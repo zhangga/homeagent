@@ -22,6 +22,10 @@ function response(status: number, body: unknown = {}): Response {
 }
 
 describe("runtime soak monitor", () => {
+  test("requires group binding lifecycle evidence for release", () => {
+    expect(FEISHU_SOAK_SCENARIOS).toContain("group_binding_lifecycle");
+  });
+
   test("passes a stable ready runtime over repeated samples", async () => {
     let now = 0;
     const report = await runSoak({
