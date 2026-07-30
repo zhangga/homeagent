@@ -176,7 +176,7 @@ describe("LarkCliSetup", () => {
     }]);
   });
 
-  test("checks full group-message capability through structured auth output", async () => {
+  test("checks full group-message capability from the Bot tenant scope inventory", async () => {
     const calls: LarkSetupCommand[] = [];
     const setup = new LarkCliSetup({
       runner: {
@@ -186,8 +186,14 @@ describe("LarkCliSetup", () => {
             code: 0,
             stdout: JSON.stringify({
               ok: true,
-              granted: ["im:message.group_msg"],
-              missing: [],
+              identity: "bot",
+              data: {
+                scopes: [{
+                  scope_name: "im:message.group_msg",
+                  grant_status: 1,
+                  scope_type: "tenant",
+                }],
+              },
               _notice: { latest_version: "private" },
             }),
             stderr: "",
@@ -200,11 +206,13 @@ describe("LarkCliSetup", () => {
     expect(calls).toEqual([{
       argv: [
         "lark-cli",
-        "auth",
-        "check",
-        "--scope",
-        "im:message.group_msg",
-        "--json",
+        "api",
+        "GET",
+        "/open-apis/application/v6/scopes",
+        "--as",
+        "bot",
+        "--format",
+        "json",
       ],
       timeoutMs: 15_000,
     }]);
@@ -247,17 +255,82 @@ describe("LarkCliSetup", () => {
     );
   });
 
-  test("maps missing capability conservatively and treats ambiguity as unknown", async () => {
-    const unavailable = new LarkCliSetup({
+  test("reports unavailable only from an explicit Bot tenant denial or omission", async () => {
+    const denied = new LarkCliSetup({
+      runner: {
+        async run() {
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              data: {
+                scopes: [{
+                  scope_name: "im:message.group_msg",
+                  grant_status: 2,
+                  scope_type: "tenant",
+                }],
+              },
+            }),
+            stderr: "",
+          };
+        },
+      },
+    });
+    const omitted = new LarkCliSetup({
+      runner: {
+        async run() {
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              data: {
+                scopes: [{
+                  scope_name: "im:message:readonly",
+                  grant_status: 1,
+                  scope_type: "tenant",
+                }],
+              },
+            }),
+            stderr: "",
+          };
+        },
+      },
+    });
+    const userOnly = new LarkCliSetup({
+      runner: {
+        async run() {
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              data: {
+                scopes: [{
+                  scope_name: "im:message.group_msg",
+                  grant_status: 1,
+                  scope_type: "user",
+                }],
+              },
+            }),
+            stderr: "",
+          };
+        },
+      },
+    });
+
+    expect(await denied.fullGroupMessageCapability()).toBe("unavailable");
+    expect(await omitted.fullGroupMessageCapability()).toBe("unavailable");
+    expect(await userOnly.fullGroupMessageCapability()).toBe("unavailable");
+  });
+
+  test("does not mistake missing user login or malformed output for a Bot denial", async () => {
+    const userNotLoggedIn = new LarkCliSetup({
       runner: {
         async run() {
           return {
             code: 1,
             stdout: JSON.stringify({
+              ok: false,
+              error: "not_logged_in",
               missing: ["im:message.group_msg"],
-              suggestion: "private repair diagnostic",
             }),
-            stderr: "private",
+            stderr: "",
           };
         },
       },
@@ -277,7 +350,7 @@ describe("LarkCliSetup", () => {
       },
     });
 
-    expect(await unavailable.fullGroupMessageCapability()).toBe("unavailable");
+    expect(await userNotLoggedIn.fullGroupMessageCapability()).toBe("unknown");
     expect(await malformed.fullGroupMessageCapability()).toBe("unknown");
     expect(await ambiguous.fullGroupMessageCapability()).toBe("unknown");
   });

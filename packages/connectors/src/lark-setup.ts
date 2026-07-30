@@ -374,14 +374,18 @@ export class LarkCliSetup {
   async fullGroupMessageCapability(): Promise<LarkCapabilityState> {
     let result: LarkSetupCommandResult;
     try {
+      // `auth check` inspects user OAuth state. Query the tenant scope inventory
+      // as the Bot so bot-only installations cannot be mistaken for a denial.
       result = await this.runner.run({
         argv: [
           this.larkBin,
-          "auth",
-          "check",
-          "--scope",
-          FULL_GROUP_MESSAGE_SCOPE,
-          "--json",
+          "api",
+          "GET",
+          "/open-apis/application/v6/scopes",
+          "--as",
+          "bot",
+          "--format",
+          "json",
         ],
         timeoutMs: 15_000,
       });
@@ -394,18 +398,18 @@ export class LarkCliSetup {
     } catch {
       return "unknown";
     }
-    const missing = stringArray(root.missing);
-    const granted = stringArray(root.granted ?? root.scopes);
-    if (missing?.includes(FULL_GROUP_MESSAGE_SCOPE)) return "unavailable";
-    if (
-      result.code === 0
+    if (result.code !== 0 || !Array.isArray(root.scopes)) return "unknown";
+    const scope = root.scopes.find((candidate) =>
+      isRecord(candidate)
+      && candidate.scope_name === FULL_GROUP_MESSAGE_SCOPE
       && (
-        granted?.includes(FULL_GROUP_MESSAGE_SCOPE)
-        || (root.ok === true && missing?.length === 0)
+        candidate.scope_type === undefined
+        || candidate.scope_type === "tenant"
       )
-    ) {
-      return "available";
-    }
+    );
+    if (!isRecord(scope)) return "unavailable";
+    if (scope.grant_status === 1) return "available";
+    if (scope.grant_status === 2) return "unavailable";
     return "unknown";
   }
 
