@@ -12,7 +12,7 @@ import type {
   LarkSetupInput,
   LarkSetupStatus,
 } from "@homeagent/shared";
-import { runFeishuCommand } from "./feishu.ts";
+import { runFeishuCommandResult } from "./feishu.ts";
 import {
   sdkLarkAppRegistrar,
   type LarkAppRegistrar,
@@ -47,6 +47,7 @@ const NO_NOTIFIER_ENV = {
   LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
   LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1",
 };
+const MAX_SETUP_DIAGNOSTIC_BYTES = 64 * 1_024;
 
 const VERIFICATION_URL =
   /https:\/\/(?:open\.feishu\.cn|open\.larksuite\.com)\/page\/(?:cli|launcher)\?[^\s<>'"]+/;
@@ -63,13 +64,13 @@ const REQUIRED_EVENT_KEYS = [
 export const bunLarkSetupRunner: LarkSetupCommandRunner = {
   async run(command): Promise<LarkSetupCommandResult> {
     try {
-      const stdout = await runFeishuCommand(command.argv, {
+      return await runFeishuCommandResult(command.argv, {
         stdin: command.stdin,
         env: NO_NOTIFIER_ENV,
         timeoutMs: command.timeoutMs,
         terminationGraceMs: 250,
+        maxCapturedBytes: MAX_SETUP_DIAGNOSTIC_BYTES,
       });
-      return { code: 0, stdout, stderr: "" };
     } catch (error) {
       const stderr = String(error);
       return {

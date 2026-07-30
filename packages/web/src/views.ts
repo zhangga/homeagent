@@ -1925,6 +1925,36 @@ function integrationsControlCenterView(
     : snapshot.capability === "unavailable"
       ? html`<span class="badge degraded">仅 @ 消息可用</span>`
       : html`<span class="badge degraded">权限状态未知</span>`;
+  const runtimeRecovery = snapshot.restartRequired
+    ? html`<div class="degraded-note">Bot 配置已变化或刚恢复连接，需要重启服务后消息消费者才会使用当前身份。
+        <a class="btn secondary" href="/health">前往运行状态重启</a>
+      </div>`
+    : runtimeFailed
+      ? html`<div class="degraded-note">飞书消息监听异常，请到运行状态查看并恢复消费者。
+          <a class="btn secondary" href="/health">前往运行状态恢复</a>
+        </div>`
+      : "";
+  const capabilityRecovery = snapshot.capability === "unavailable"
+    ? html`<div class="degraded-note">
+        <strong>缺少完整群消息权限</strong>
+        <div>当前只能可靠处理 @ Bot 的群消息。请在飞书应用中确认群消息权限和版本发布状态，再重新检查。</div>
+        <div class="actions" style="margin-top:10px">
+          ${setup.brand !== "lark" && input.externalSharing.consoleUrl
+            ? html`<a class="btn secondary" href="${input.externalSharing.consoleUrl}" target="_blank" rel="noreferrer">打开飞书应用并检查权限</a>`
+            : ""}
+          <form method="post" action="/integrations/bot/verify"><button class="secondary" type="submit">重新检查权限</button></form>
+        </div>
+      </div>`
+    : snapshot.capability === "unknown"
+      ? html`<div class="degraded-note">
+          <strong>权限检测失败</strong>
+          <div>HomeAgent 暂时无法确认完整群消息权限；不会据此开放未 @ 消息的响应方式。</div>
+          <div class="actions" style="margin-top:10px">
+            <form method="post" action="/integrations/bot/verify"><button class="secondary" type="submit">重新检查权限</button></form>
+            <a class="btn secondary" href="/health">前往运行状态</a>
+          </div>
+        </div>`
+      : "";
   const cards = snapshot.groups.length > 0
     ? snapshot.groups.map((group) =>
         integrationGroupCard(group, snapshot)
@@ -1985,9 +2015,8 @@ function integrationsControlCenterView(
             : feishuProvisioningControl(setup, input.provisioning)}
         </div>
       </div>
-      ${snapshot.restartRequired
-        ? html`<div class="degraded-note">Bot 配置已变化或刚恢复连接，需要重启服务后消息消费者才会使用当前身份。</div>`
-        : ""}
+      ${runtimeRecovery}
+      ${capabilityRecovery}
       ${feishuAvatarControl(input.brandAvatarAvailable)}
       ${setup.state === "ready" && setup.verified && setup.brand !== "lark"
         ? html`<div class="integration-row"><div><strong>对外共享</strong><div class="muted">允许加入外部群和接受外部用户私聊。</div></div>${externalSharingControl(input.externalSharing)}</div>`
@@ -2005,11 +2034,17 @@ function integrationsControlCenterView(
       <div class="muted" style="margin:10px 0 14px">手动连接已有应用或创建并切换机器人。身份变更需要重启服务。</div>
       ${feishuProvisioningControl(setup, input.provisioning)}
       <form method="post" action="/integrations/bot/setup" class="stack" style="margin-top:14px">
+        <div class="field">
+          <label>应用平台</label>
+          <select name="brand">
+            <option value="feishu"${setup.brand === "lark" ? "" : " selected"}>飞书</option>
+            <option value="lark"${setup.brand === "lark" ? " selected" : ""}>Lark</option>
+          </select>
+        </div>
         <div class="grid2">
           <div class="field"><label>App ID</label><input type="text" name="appId" placeholder="cli_..." required autocomplete="off" /></div>
           <div class="field"><label>App Secret</label><input type="password" name="appSecret" required autocomplete="new-password" /></div>
         </div>
-        <input type="hidden" name="brand" value="${setup.brand === "lark" ? "lark" : "feishu"}" />
         <button type="submit" class="secondary">手动连接已有应用</button>
       </form>
     </details>

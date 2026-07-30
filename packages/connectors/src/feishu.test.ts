@@ -303,7 +303,7 @@ describe("FeishuConnector outbound", () => {
   test("cancels the command deadline after a fast successful command", async () => {
     let cancellations = 0;
     await expect(
-      runFeishuCommand(["/usr/bin/true"], {
+      runFeishuCommand([process.execPath, "-e", "process.exit(0)"], {
         timeoutMs: 30_000,
         deadlineFactory: () => ({
           elapsed: new Promise<void>(() => {}),
@@ -318,6 +318,8 @@ describe("FeishuConnector outbound", () => {
   });
 
   test("terminates a command that ignores SIGTERM and returns within a fixed bound", async () => {
+    if (process.platform === "win32") return;
+
     const directory = mkdtempSync(join(tmpdir(), "hb-command-timeout-"));
     const executable = join(directory, "hang.sh");
     const pidFile = join(directory, "pid");
@@ -342,6 +344,8 @@ describe("FeishuConnector outbound", () => {
   });
 
   test("terminates a download while its output file grows beyond the byte limit", async () => {
+    if (process.platform === "win32") return;
+
     const directory = mkdtempSync(join(tmpdir(), "hb-command-size-"));
     const executable = join(directory, "grow.sh");
     const outputPath = join(directory, "resource.bin");

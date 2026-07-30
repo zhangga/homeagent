@@ -55,11 +55,19 @@ export interface CommandOptions {
   stdin?: string;
   /** per-command environment overlay */
   env?: Record<string, string>;
+  /** maximum stdout/stderr bytes retained in memory; streams are still drained */
+  maxCapturedBytes?: number;
   /** injectable clock seam; defaults to a cancellable setTimeout */
   deadlineFactory?: DeadlineFactory;
   /** absolute path to a command-created file that must stay within the byte limit */
   outputPath?: string;
   maxOutputBytes?: number;
+}
+
+export interface FeishuCommandResult {
+  code: number;
+  stdout: string;
+  stderr: string;
 }
 
 type RunCommand = (cmd: string[], opts?: CommandOptions) => Promise<string>;
@@ -682,6 +690,20 @@ export async function runFeishuCommand(
   cmd: string[],
   opts: CommandOptions = {},
 ): Promise<string> {
+  const result = await runFeishuCommandResult(cmd, opts);
+  if (result.code !== 0) {
+    throw new Error(
+      `command failed (${result.code}): ${result.stderr.slice(0, 500)}`,
+    );
+  }
+  return result.stdout;
+}
+
+/** Run a command to completion while preserving a completed non-zero result. */
+export async function runFeishuCommandResult(
+  cmd: string[],
+  opts: CommandOptions = {},
+): Promise<FeishuCommandResult> {
   const env = opts.env ? { ...process.env, ...opts.env } : undefined;
   const spawnCommand = resolveWindowsCommandShim(cmd, env, opts.cwd);
   const proc = Bun.spawn(spawnCommand, {
@@ -695,8 +717,8 @@ export async function runFeishuCommand(
     proc.stdin.write(opts.stdin);
     proc.stdin.end();
   }
-  const stdout = collectStream(proc.stdout);
-  const stderr = collectStream(proc.stderr);
+  const stdout = collectStream(proc.stdout, opts.maxCapturedBytes);
+  const stderr = collectStream(proc.stderr, opts.maxCapturedBytes);
   const completion = Promise.all([stdout.result, stderr.result, proc.exited]);
   const timeoutMs = opts.timeoutMs;
   const deadline = timeoutMs === undefined
@@ -738,8 +760,11 @@ export async function runFeishuCommand(
   }
 
   const [stdoutText, stderrText, code] = outcome.value;
-  if (code !== 0) throw new Error(`command failed (${code}): ${stderrText.slice(0, 500)}`);
-  return stdoutText;
+  return {
+    code,
+    stdout: stdoutText,
+    stderr: stderrText,
+  };
 }
 
 function resolveWindowsCommandShim(
@@ -757,7 +782,10 @@ function resolveWindowsCommandShim(
   return resolved ? [resolved, ...cmd.slice(1)] : cmd;
 }
 
-function collectStream(stream: ReadableStream<Uint8Array>): {
+function collectStream(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes = Number.POSITIVE_INFINITY,
+): {
   result: Promise<string>;
   cancel: () => void;
 } {
@@ -766,11 +794,19 @@ function collectStream(stream: ReadableStream<Uint8Array>): {
   let cancelled = false;
   const result = (async () => {
     let text = "";
+    let capturedBytes = 0;
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        text += decoder.decode(value, { stream: true });
+        const remaining = Math.max(0, maxBytes - capturedBytes);
+        if (remaining > 0) {
+          const captured = value.byteLength <= remaining
+            ? value
+            : value.subarray(0, remaining);
+          text += decoder.decode(captured, { stream: true });
+          capturedBytes += captured.byteLength;
+        }
       }
       return text + decoder.decode();
     } catch (err) {

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  bunLarkSetupRunner,
   LarkCliSetup,
   type LarkSetupCommand,
   type LarkSetupCommandRunner,
@@ -207,6 +208,43 @@ describe("LarkCliSetup", () => {
       ],
       timeoutMs: 15_000,
     }]);
+  });
+
+  test("production runner preserves structured stdout from a completed non-zero check", async () => {
+    const stdout = JSON.stringify({
+      missing: ["im:message.group_msg"],
+      ok: false,
+    });
+
+    const result = await bunLarkSetupRunner.run({
+      argv: [
+        process.execPath,
+        "-e",
+        `process.stdout.write(${JSON.stringify(stdout)}); process.exit(1);`,
+      ],
+      timeoutMs: 5_000,
+    });
+
+    expect(result).toEqual({
+      code: 1,
+      stdout,
+      stderr: "",
+    });
+  });
+
+  test("production runner bounds completed diagnostic output", async () => {
+    const result = await bunLarkSetupRunner.run({
+      argv: [
+        process.execPath,
+        "-e",
+        'process.stdout.write("x".repeat(100_000)); process.exit(1);',
+      ],
+      timeoutMs: 5_000,
+    });
+
+    expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(
+      64 * 1_024,
+    );
   });
 
   test("maps missing capability conservatively and treats ambiguity as unknown", async () => {

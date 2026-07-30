@@ -14,6 +14,7 @@ import {
 import { KnowledgeEngine, FakeLlm } from "@homeagent/core";
 import { createWebApp } from "./app.ts";
 import { FeishuIntegrationService } from "./feishu-integration-service.ts";
+import type { LarkSetupPort } from "./integrations.ts";
 
 let dir: string;
 let engine: KnowledgeEngine;
@@ -2062,6 +2063,186 @@ describe("management backend (read-write)", () => {
       },
     });
     expect(engine.registry.has("team/oc_prompt_failed")).toBeFalse();
+  });
+
+  test("integration control center explains missing group permission and offers safe recovery", async () => {
+    const larkSetup = {
+      status: async () => ({
+        state: "ready" as const,
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu" as const,
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "unavailable" as const,
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+        runtimeStatus: () => ({ ready: true, consumers: [] }),
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+
+    expect(page).toContain("缺少完整群消息权限");
+    expect(page).toContain("打开飞书应用并检查权限");
+    expect(page).toContain('href="https://open.feishu.cn/app/cli_current"');
+    expect(page).toContain("重新检查权限");
+  });
+
+  test("integration control center manual setup can switch between Feishu and Lark", async () => {
+    const configured: Array<{
+      appId: string;
+      appSecret: string;
+      brand: "feishu" | "lark";
+    }> = [];
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "ready",
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu",
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+      configure: async (input) => {
+        configured.push(input);
+        return {
+          state: "ready",
+          verified: true,
+          appId: input.appId,
+          brand: input.brand,
+          botName: "Lark Agent",
+          botOpenId: "ou_lark",
+          message: "ready",
+        };
+      },
+      fullGroupMessageCapability: async () => "available",
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+    expect(page).toContain('<select name="brand">');
+    expect(page).toContain('<option value="feishu" selected>飞书</option>');
+    expect(page).toContain('<option value="lark">Lark</option>');
+
+    const response = await integrationApp.request("/integrations/bot/setup", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        appId: "cli_lark",
+        appSecret: "lark-secret",
+        brand: "lark",
+      }).toString(),
+    });
+
+    expect([302, 303]).toContain(response.status);
+    expect(configured).toEqual([{
+      appId: "cli_lark",
+      appSecret: "lark-secret",
+      brand: "lark",
+    }]);
+  });
+
+  test("integration control center explains unknown permission and failed consumers without leaking errors", async () => {
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "ready",
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu",
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "private status detail",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "unknown",
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+        activeIdentity: () => ({
+          botName: "HomeAgent",
+          botOpenId: "ou_bot",
+        }),
+        runtimeStatus: () => ({
+          ready: false,
+          consumers: [{
+            key: "im.message.receive_v1",
+            state: "failed",
+            lastError: "private consumer error",
+          }],
+        }),
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+
+    expect(page).toContain("权限检测失败");
+    expect(page).toContain("重新检查权限");
+    expect(page).toContain("消息监听异常");
+    expect(page).toContain("前往运行状态恢复");
+    expect(page).not.toContain("private status detail");
+    expect(page).not.toContain("private consumer error");
+  });
+
+  test("integration control center links a changed Bot identity to runtime restart", async () => {
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "ready",
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu",
+        botName: "New Bot",
+        botOpenId: "ou_new",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "available",
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+        activeIdentity: () => ({
+          botName: "Old Bot",
+          botOpenId: "ou_old",
+        }),
+        runtimeStatus: () => ({ ready: true, consumers: [] }),
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+
+    expect(page).toContain("需要重启");
+    expect(page).toContain("前往运行状态重启");
+    expect(page).toContain('href="/health"');
   });
 
   test("Bot disconnect is local and verification clears the disable marker", async () => {
