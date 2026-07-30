@@ -174,12 +174,66 @@ describe("Agent workbench presenter", () => {
       expect.objectContaining({
         name: "review",
         sourceKey: "shared-agents:review",
-        sourceLabel: "shared-agents · review",
+        sourceLabel: "共享 · review",
         providerIds: ["claude", "codex", "trae-cli"],
         status: "available",
       }),
     ]);
     expect(JSON.stringify(view.skillCatalog)).not.toContain("C:\\\\Users");
+  });
+
+  test("hides Provider-native Skills while preserving an existing exact binding", () => {
+    const source = {
+      sourceKey: "codex-user:review",
+      rootKind: "codex-user" as const,
+      relativeDir: "review",
+      name: "review",
+      description: "Codex-native review.",
+      providerIds: ["codex"] as const,
+      skillFile: "C:\\Users\\alice\\.codex\\skills\\review\\SKILL.md",
+      skillFileHash: "b".repeat(64),
+      status: "available" as const,
+      diagnostics: [],
+    };
+    const selected = {
+      ...agent,
+      skills: [{
+        kind: "source" as const,
+        sourceKey: source.sourceKey,
+        name: source.name,
+      }],
+    };
+    const view = buildAgentWorkbench({
+      agents: [selected],
+      mode: "edit",
+      selected,
+      providers,
+      models: {},
+      defaults: { provider: "codex", model: "" },
+      bindings: [],
+      runs: [],
+      catalog: {
+        sources: [{ ...source, providerIds: [...source.providerIds] }],
+        entries: [{
+          key: `review:${source.skillFileHash}`,
+          name: source.name,
+          description: source.description,
+          skillFileHash: source.skillFileHash,
+          sources: [{ ...source, providerIds: [...source.providerIds] }],
+        }],
+        diagnostics: [],
+        refreshedAt: 123,
+      },
+    });
+
+    expect(view.skillCatalog.rows).toEqual([]);
+    expect(view.skillCatalog.selected).toEqual([
+      expect.objectContaining({
+        sourceKey: "codex-user:review",
+        status: "provider-native",
+        statusLabel: "Provider 自带 · 保留绑定",
+      }),
+    ]);
   });
 
   test("exposes a durable run error without deriving one from task content", () => {

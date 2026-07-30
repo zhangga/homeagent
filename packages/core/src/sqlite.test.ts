@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -130,6 +131,67 @@ describe("SpaceIndex raw capture", () => {
 
     expect(idx.findRecentRawsByChat("oc_1", 400, 2).map((record) => record.content))
       .toEqual(["new", "old"]);
+  });
+
+  test("legacy message rows remain visible only through explicit Agent-history fallback", () => {
+    const path = join(dir, "legacy.db");
+    const database = new Database(path, { create: true });
+    database.run(`
+      CREATE TABLE raw (
+        id TEXT PRIMARY KEY,
+        space TEXT NOT NULL,
+        source TEXT NOT NULL,
+        author TEXT,
+        chat_id TEXT,
+        message_id TEXT,
+        content TEXT NOT NULL,
+        attachments_json TEXT NOT NULL DEFAULT '[]',
+        created INTEGER NOT NULL,
+        ingested INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    database.query(`
+      INSERT INTO raw
+        (id, space, source, author, chat_id, message_id, content, created)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "legacy-message",
+      "team/oc_1",
+      "message",
+      "ou_a",
+      "oc_1",
+      "om_legacy",
+      "@HomeAgent legacy chat",
+      100,
+    );
+    database.close();
+
+    const migrated = new SpaceIndex(path);
+    expect(migrated.listAgentChatRaws("agent_current", {
+      includeLegacy: false,
+      limit: 10,
+    })).toEqual([]);
+    expect(migrated.listAgentChatRaws("agent_current", {
+      includeLegacy: true,
+      limit: 10,
+    })).toEqual([
+      expect.objectContaining({
+        id: "legacy-message",
+        content: "@HomeAgent legacy chat",
+      }),
+    ]);
+    expect(migrated.getRaw("legacy-message")?.agentResponse).toBeUndefined();
+    expect(migrated.recordAgentResponse(
+      "oc_1",
+      "om_legacy",
+      "这是升级后保存的回复。",
+      200,
+    )).toBeTrue();
+    expect(migrated.getRaw("legacy-message")).toEqual(expect.objectContaining({
+      agentResponse: "这是升级后保存的回复。",
+      agentRespondedAt: 200,
+    }));
+    migrated.close();
   });
 });
 

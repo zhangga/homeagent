@@ -1,0 +1,64 @@
+<h2>设计第 1 部分：绑定关系与组件边界</h2>
+<p class="subtitle">Skill 属于 Agent；飞书群不直接绑定 Skill，而是通过空间选择 Agent。</p>
+
+<div class="mockup">
+  <div class="mockup-header">请求解析与执行路径</div>
+  <div class="mockup-body">
+    <div style="display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap">
+      <div style="padding:14px 18px;border:1px solid #c8d5e3;border-radius:10px;background:#f7fbff;text-align:center">
+        <strong>飞书群 A</strong><br><span style="font-size:12px;color:#63788c">chat_id</span>
+      </div>
+      <div style="font-size:22px;color:#71869a">→</div>
+      <div style="padding:14px 18px;border:1px solid #c8d5e3;border-radius:10px;background:#f7fbff;text-align:center">
+        <strong>团队空间 A</strong><br><span style="font-size:12px;color:#63788c">team/&lt;chat_id&gt;</span>
+      </div>
+      <div style="font-size:22px;color:#71869a">→</div>
+      <div style="padding:14px 18px;border:2px solid #5292d0;border-radius:10px;background:#eaf4ff;text-align:center">
+        <strong>Agent A</strong><br><span style="font-size:12px;color:#3974aa">Provider · Model · Permission</span>
+      </div>
+      <div style="font-size:22px;color:#71869a">→</div>
+      <div style="padding:14px 18px;border:2px solid #53a273;border-radius:10px;background:#edf9f1;text-align:center">
+        <strong>Skill 绑定集合</strong><br><span style="font-size:12px;color:#35704d">稳定来源标识</span>
+      </div>
+    </div>
+
+    <div style="display:flex;justify-content:center;margin:20px 0 8px">
+      <div style="width:2px;height:30px;background:#9eafbf"></div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px">
+      <div style="padding:13px;border:1px solid #d9e0e7;border-radius:9px;background:#fff">
+        <strong>SkillCatalog</strong>
+        <p style="font-size:13px;margin:6px 0 0">扫描本机目录、解析 SKILL.md、合并相同内容、标记冲突与 Provider 可用性。</p>
+      </div>
+      <div style="padding:13px;border:1px solid #d9e0e7;border-radius:9px;background:#fff">
+        <strong>Execution Resolver</strong>
+        <p style="font-size:13px;margin:6px 0 0">每次调用按 Agent 绑定解析实际可加载 Skills，并遵守对话或任务权限。</p>
+      </div>
+      <div style="padding:13px;border:1px solid #d9e0e7;border-radius:9px;background:#fff">
+        <strong>Run Evidence</strong>
+        <p style="font-size:13px;margin:6px 0 0">记录 loaded / skipped / warning；任务写入运行历史，对话把警告附在回复末尾。</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>边界约定</h3>
+  <ul>
+    <li>AgentStore 只保存绑定关系，不保存或复制 SKILL.md 内容。</li>
+    <li>SkillCatalog 是只读目录投影，首版不引入 skills.json、文件监听或远程同步。</li>
+    <li>空间换绑 Agent 后，新请求立即使用新 Agent；历史任务继续保留启动时快照。</li>
+    <li>个人空间沿用同一模型：个人空间 → Personal Agent → 该 Agent 的 Skills。</li>
+  </ul>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="approve-architecture" onclick="toggleSelect(this)">
+    <div class="letter">✓</div>
+    <div class="content">
+      <h3>确认这部分架构</h3>
+      <p>继续设计数据模型、目录扫描与冲突处理。</p>
+    </div>
+  </div>
+</div>

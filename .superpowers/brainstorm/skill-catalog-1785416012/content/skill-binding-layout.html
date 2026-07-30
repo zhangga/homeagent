@@ -1,0 +1,90 @@
+<h2>Agent 的 Skills 应该怎么选？</h2>
+<p class="subtitle">两种方案都遵循“飞书群 → 空间 → Agent → Skills”，区别在于日常配置效率与目录信息密度。</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">方案 A · Agent 表单内联选择（推荐）</div>
+        <div class="mockup-body">
+          <div class="label">TASK EXECUTION</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:10px">
+            <div>
+              <div style="font-size:12px;color:#666;margin-bottom:5px">Permission</div>
+              <div class="mock-input">Read only</div>
+            </div>
+            <div>
+              <div style="font-size:12px;color:#666;margin-bottom:5px">Workdir</div>
+              <div class="mock-input">~/work/project</div>
+            </div>
+          </div>
+          <div style="font-size:12px;color:#666;margin:14px 0 6px">Skills</div>
+          <div class="mock-input">🔎 搜索已安装的 Skill…</div>
+          <div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:10px">
+            <span style="padding:5px 9px;border-radius:14px;background:#e8f2ff;color:#145aa3">codex-review ✓</span>
+            <span style="padding:5px 9px;border-radius:14px;background:#e8f7ef;color:#17683a">lark-doc ✓</span>
+          </div>
+          <div style="font-size:12px;color:#587085;margin-top:10px">Codex 2 · Claude 1 · TRAE 1　↻ 刷新目录</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A. 内联目录选择器</h3>
+      <p>在现有 Agent 配置中直接搜索、勾选和查看 Provider 可用性。改动集中，群管理员配置路径最短。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">方案 B · 独立 Skill 管理抽屉</div>
+        <div class="mockup-body">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <div class="label">AGENT SKILLS</div>
+              <strong>2 个已绑定</strong>
+            </div>
+            <button class="mock-button">管理 Skills</button>
+          </div>
+          <div style="display:grid;grid-template-columns:145px 1fr;gap:12px;margin-top:14px">
+            <div class="mock-sidebar" style="min-height:150px">
+              <div>全部　12</div>
+              <div style="margin-top:10px">Codex　8</div>
+              <div style="margin-top:10px">Claude　6</div>
+              <div style="margin-top:10px">TRAE　4</div>
+            </div>
+            <div class="mock-content" style="min-height:150px">
+              <div class="mock-input">🔎 搜索目录…</div>
+              <div style="margin-top:10px;padding:8px;border-bottom:1px solid #ddd">☑ codex-review　Codex</div>
+              <div style="padding:8px;border-bottom:1px solid #ddd">☑ lark-doc　Codex · Claude</div>
+              <div style="padding:8px">☐ browser　Codex</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B. 独立管理抽屉</h3>
+      <p>目录信息更完整，也更容易扩展来源和更新管理；但第一版操作更重，并提前引入接近独立 Skills 页的结构。</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>本阶段建议</h4>
+    <ul>
+      <li>优先选择 A，保持最小闭环。</li>
+      <li>选择器仍展示 Skill 来源路径和 Provider 可用性。</li>
+      <li>未来增加 Git/URL 导入时，再自然升级为独立管理页。</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>共同约束</h4>
+    <ul>
+      <li>Agent 只保存稳定 Skill 标识，不复制 SKILL.md 内容。</li>
+      <li>运行前重新解析可用性。</li>
+      <li>不可用 Skill 按你选择的策略跳过并警告。</li>
+    </ul>
+  </div>
+</div>

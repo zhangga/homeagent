@@ -502,15 +502,19 @@ export class Orchestrator {
     }
 
     let inputsCaptured = false;
+    let capturedMessageRawId: string | undefined;
     const captureInputs = async (): Promise<void> => {
       if (inputsCaptured) return;
       inputsCaptured = true;
 
       // Always capture (收录 != 应答).
       if (decision.capture && msg.text.trim() !== "") {
-        await this.engine.remember({
+        capturedMessageRawId = await this.engine.remember({
           space: writeSpace,
           source: "message",
+          agentId: decision.respond
+            ? this.engine.agentForSpace(writeSpace)?.id
+            : undefined,
           author: msg.senderId,
           chatId: msg.chatId,
           messageId: msg.messageId,
@@ -566,6 +570,10 @@ export class Orchestrator {
             participation.reason,
           ].join(": "),
         };
+        const agentId = this.engine.agentForSpace(writeSpace)?.id;
+        if (agentId && capturedMessageRawId) {
+          await this.engine.attributeRawToAgent(writeSpace, capturedMessageRawId, agentId);
+        }
       }
     }
 
@@ -1050,6 +1058,23 @@ export class Orchestrator {
       markdown,
       inThread,
     });
+    const { writeSpace } = attribute(msg);
+    try {
+      await this.engine.recordAgentResponse(writeSpace, {
+        chatId: msg.chatId,
+        messageId: msg.messageId,
+        response: markdown,
+      });
+    } catch (err) {
+      // Delivery already succeeded. A local persistence failure must not cause
+      // the connector to retry and send the same reply twice.
+      log.warn("agent response persistence failed", {
+        space: writeSpace,
+        chatId: msg.chatId,
+        messageId: msg.messageId,
+        err: String(err),
+      });
+    }
   }
 
   private activeGroupBinding(chatId: string): FeishuGroupBinding | undefined {

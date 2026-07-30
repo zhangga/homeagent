@@ -840,6 +840,18 @@ export interface EngineOptions {
   skillCatalog?: SkillCatalog;
 }
 
+/** Durable inbound Chat message shown in an Agent's activity timeline. */
+export interface AgentChatRecord {
+  id: string;
+  agentId?: string;
+  space: SpaceId;
+  author?: string;
+  chatId?: string;
+  messageId?: string;
+  content: string;
+  createdAt: number;
+}
+
 export interface SpaceAgentCallContext {
   agent?: Agent;
   client: LlmClient;
@@ -1349,6 +1361,31 @@ export class KnowledgeEngine implements Knowledge {
     return this.taskRuns.listByAgent(id, limit);
   }
 
+  listAgentChatRecords(id: string, limit = 20): AgentChatRecord[] {
+    const safeLimit = Math.max(0, Math.floor(limit));
+    if (safeLimit === 0) return [];
+    return this.registry.list()
+      .flatMap((meta) => {
+        const includesLegacyRecords = meta.agentId === id;
+        return this.registry.store(meta.id).index().listAgentChatRaws(id, {
+          includeLegacy: includesLegacyRecords,
+          limit: safeLimit,
+        })
+          .map((record) => ({
+            id: record.id,
+            agentId: record.agentId,
+            space: record.space,
+            author: record.author,
+            chatId: record.chatId,
+            messageId: record.messageId,
+            content: record.content,
+            createdAt: record.createdAt,
+          }));
+      })
+      .sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id))
+      .slice(0, safeLimit);
+  }
+
   removeAgentAndUnbind(id: string): { agent: Agent; bindings: SpaceMeta[] } | undefined {
     const agent = this.agents.get(id);
     if (!agent) return undefined;
@@ -1492,6 +1529,40 @@ export class KnowledgeEngine implements Knowledge {
       const id = index.insertRaw(entry);
       log.debug("remembered raw entry", { space: entry.space, source: entry.source, id });
       return id;
+    });
+  }
+
+  async attributeRawToAgent(
+    space: SpaceId,
+    rawId: string,
+    agentId: string,
+  ): Promise<boolean> {
+    return this.serializer.run(space, async () => {
+      const agent = this.agents.get(agentId);
+      if (!agent || !agentVisibleInSpace(agent, space) || !this.registry.has(space)) {
+        return false;
+      }
+      return this.registry.store(space).index().attributeRawToAgent(rawId, agentId);
+    });
+  }
+
+  async recordAgentResponse(
+    space: SpaceId,
+    input: {
+      chatId: string;
+      messageId: string;
+      response: string;
+      respondedAt?: number;
+    },
+  ): Promise<boolean> {
+    return this.serializer.run(space, async () => {
+      if (!this.registry.has(space)) return false;
+      return this.registry.store(space).index().recordAgentResponse(
+        input.chatId,
+        input.messageId,
+        input.response,
+        input.respondedAt,
+      );
     });
   }
 

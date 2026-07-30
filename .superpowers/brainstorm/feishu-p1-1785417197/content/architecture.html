@@ -1,0 +1,66 @@
+<h2>P1 · 飞书连接闭环架构</h2>
+<p class="subtitle">不新增持久化工作流；由现有可信状态实时派生 Bot 与每个群的进度。</p>
+
+<div class="mockup">
+  <div class="mockup-header">服务端只读进度模型</div>
+  <div class="mockup-body">
+    <div style="display:grid;grid-template-columns:1fr auto 1.25fr auto 1fr;gap:14px;align-items:center">
+      <div style="display:grid;gap:8px">
+        <div style="padding:10px;border:1px solid #ddd4c7;border-radius:8px;background:#fff">Bot 验证状态</div>
+        <div style="padding:10px;border:1px solid #ddd4c7;border-radius:8px;background:#fff">权限检测结果</div>
+        <div style="padding:10px;border:1px solid #ddd4c7;border-radius:8px;background:#fff">Runtime / Consumer</div>
+        <div style="padding:10px;border:1px solid #ddd4c7;border-radius:8px;background:#fff">群绑定与管理员确认</div>
+        <div style="padding:10px;border:1px solid #ddd4c7;border-radius:8px;background:#fff">最近一次测试记录</div>
+      </div>
+      <div style="font-size:28px;color:#8a623a">→</div>
+      <div style="padding:18px;border:2px solid #b87840;border-radius:12px;background:#fff8ed">
+        <div class="label">Feishu Connection Progress</div>
+        <h3 style="margin:8px 0">派生进度模型</h3>
+        <p style="margin:0 0 10px">输出 Bot 阶段、每个群的阶段、当前健康和唯一下一步。</p>
+        <code>not_configured → permission → restart → confirm → test → complete</code>
+      </div>
+      <div style="font-size:28px;color:#8a623a">→</div>
+      <div style="display:grid;gap:8px">
+        <div style="padding:12px;border:1px solid #bdd2c9;border-radius:8px;background:#f3faf6">
+          <strong>GET /integrations/status</strong>
+          <div style="font-size:12px;color:#647067;margin-top:4px">只读、无凭据、固定公开字段</div>
+        </div>
+        <div style="padding:12px;border:1px solid #bdd2c9;border-radius:8px;background:#f3faf6">
+          <strong>未完成时轮询</strong>
+          <div style="font-size:12px;color:#647067;margin-top:4px">页面隐藏后暂停，全部完成后停止</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:20px">
+  <div class="label">每个群独立闭环</div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px">
+    <span style="padding:8px 12px;border-radius:999px;background:#f1eee8">等待管理员确认</span>
+    <span>→</span>
+    <span style="padding:8px 12px;border-radius:999px;background:#fff2d5">等待用户测试</span>
+    <span>→</span>
+    <span style="padding:8px 12px;border-radius:999px;background:#e7f4eb;color:#315c3e">连接完成</span>
+    <span style="margin-left:10px;color:#706a61">＋ 当前运行异常时叠加健康警告，不抹掉已验证记录</span>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>保持简单</h4>
+    <ul>
+      <li>重启后从持久化绑定和测试记录自然恢复</li>
+      <li>不引入第二套流程状态和迁移</li>
+      <li>所有写操作继续走现有 POST 路由</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>明确约束</h4>
+    <ul>
+      <li>轮询接口绝不执行修复或外部写入</li>
+      <li>不能返回 raw CLI/consumer 错误</li>
+      <li>表单编辑期间不刷新整页</li>
+    </ul>
+  </div>
+</div>

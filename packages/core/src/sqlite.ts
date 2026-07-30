@@ -58,6 +58,10 @@ export class SpaceIndex {
         id TEXT PRIMARY KEY,
         space TEXT NOT NULL,
         source TEXT NOT NULL,
+        agent_id TEXT,
+        agent_handled INTEGER,
+        agent_response TEXT,
+        agent_responded_at INTEGER,
         author TEXT,
         chat_id TEXT,
         message_id TEXT,
@@ -67,6 +71,21 @@ export class SpaceIndex {
         ingested INTEGER NOT NULL DEFAULT 0
       )
     `);
+    const rawColumns = this.db.query(`PRAGMA table_info(raw)`).all() as {
+      name: string;
+    }[];
+    if (!rawColumns.some((column) => column.name === "agent_id")) {
+      this.db.run(`ALTER TABLE raw ADD COLUMN agent_id TEXT`);
+    }
+    if (!rawColumns.some((column) => column.name === "agent_handled")) {
+      this.db.run(`ALTER TABLE raw ADD COLUMN agent_handled INTEGER`);
+    }
+    if (!rawColumns.some((column) => column.name === "agent_response")) {
+      this.db.run(`ALTER TABLE raw ADD COLUMN agent_response TEXT`);
+    }
+    if (!rawColumns.some((column) => column.name === "agent_responded_at")) {
+      this.db.run(`ALTER TABLE raw ADD COLUMN agent_responded_at INTEGER`);
+    }
     this.db.run(`
       CREATE TABLE IF NOT EXISTS message_retractions (
         chat_id TEXT NOT NULL,
@@ -80,6 +99,10 @@ export class SpaceIndex {
     this.db.run(`CREATE INDEX IF NOT EXISTS raw_ingested ON raw(ingested, created)`);
     this.db.run(`CREATE INDEX IF NOT EXISTS raw_message ON raw(chat_id, message_id)`);
     this.db.run(`CREATE INDEX IF NOT EXISTS raw_chat_created ON raw(chat_id, created DESC)`);
+    this.db.run(
+      `CREATE INDEX IF NOT EXISTS raw_agent_created
+       ON raw(agent_id, agent_handled, created DESC)`,
+    );
     this.db.run(`CREATE INDEX IF NOT EXISTS pages_type ON pages(type)`);
   }
 
@@ -194,13 +217,19 @@ export class SpaceIndex {
     const id = randomUUID();
     this.db
       .query(
-        `INSERT INTO raw (id, space, source, author, chat_id, message_id, content, attachments_json, created, ingested)
-         VALUES ($id, $space, $source, $author, $chat, $msg, $content, $att, $created, 0)`,
+        `INSERT INTO raw (id, space, source, agent_id, agent_handled, agent_response, agent_responded_at, author, chat_id, message_id, content, attachments_json, created, ingested)
+         VALUES ($id, $space, $source, $agent, $handled, $response, $respondedAt, $author, $chat, $msg, $content, $att, $created, 0)`,
       )
       .run({
         $id: id,
         $space: entry.space,
         $source: entry.source,
+        $agent: entry.agentId ?? null,
+        $handled: entry.source === "message"
+          ? (entry.agentHandled ?? Boolean(entry.agentId) ? 1 : 0)
+          : null,
+        $response: entry.agentResponse ?? null,
+        $respondedAt: entry.agentRespondedAt ?? null,
         $author: entry.author ?? null,
         $chat: entry.chatId ?? null,
         $msg: entry.messageId ?? null,
@@ -215,13 +244,17 @@ export class SpaceIndex {
   restoreRaw(record: RawRecord): void {
     this.db
       .query(
-        `INSERT INTO raw (id, space, source, author, chat_id, message_id, content, attachments_json, created, ingested)
-         VALUES ($id, $space, $source, $author, $chat, $msg, $content, $att, $created, $ingested)`,
+        `INSERT INTO raw (id, space, source, agent_id, agent_handled, agent_response, agent_responded_at, author, chat_id, message_id, content, attachments_json, created, ingested)
+         VALUES ($id, $space, $source, $agent, $handled, $response, $respondedAt, $author, $chat, $msg, $content, $att, $created, $ingested)`,
       )
       .run({
         $id: record.id,
         $space: record.space,
         $source: record.source,
+        $agent: record.agentId ?? null,
+        $handled: record.agentHandled === undefined ? null : record.agentHandled ? 1 : 0,
+        $response: record.agentResponse ?? null,
+        $respondedAt: record.agentRespondedAt ?? null,
         $author: record.author ?? null,
         $chat: record.chatId ?? null,
         $msg: record.messageId ?? null,
@@ -248,6 +281,34 @@ export class SpaceIndex {
     return row ? rowToRaw(row) : null;
   }
 
+  attributeRawToAgent(id: string, agentId: string): boolean {
+    if (!agentId.trim()) return false;
+    const result = this.db
+      .query(
+        `UPDATE raw
+         SET agent_id = ?, agent_handled = 1
+         WHERE id = ? AND source = 'message'`,
+      )
+      .run(agentId, id);
+    return result.changes > 0;
+  }
+
+  recordAgentResponse(
+    chatId: string,
+    messageId: string,
+    response: string,
+    respondedAt = Date.now(),
+  ): boolean {
+    const result = this.db
+      .query(
+        `UPDATE raw
+         SET agent_response = ?, agent_responded_at = ?
+         WHERE chat_id = ? AND message_id = ? AND source = 'message'`,
+      )
+      .run(response, respondedAt, chatId, messageId);
+    return result.changes > 0;
+  }
+
   findRawsByMessageId(messageId: string, chatId: string): RawRecord[] {
     const rows = this.db
       .query(
@@ -256,6 +317,27 @@ export class SpaceIndex {
          ORDER BY created ASC`,
       )
       .all(messageId, chatId) as Record<string, unknown>[];
+    return rows.map(rowToRaw);
+  }
+
+  listAgentChatRaws(
+    agentId: string,
+    opts: { includeLegacy?: boolean; limit?: number } = {},
+  ): RawRecord[] {
+    const safeLimit = Math.max(0, Math.floor(opts.limit ?? 20));
+    if (!agentId.trim() || safeLimit === 0) return [];
+    const legacy = opts.includeLegacy
+      ? `OR (agent_id IS NULL AND agent_handled IS NULL)`
+      : ``;
+    const rows = this.db
+      .query(
+        `SELECT * FROM raw
+         WHERE source = 'message'
+           AND (agent_id = ? ${legacy})
+         ORDER BY created DESC
+         LIMIT ${safeLimit}`,
+      )
+      .all(agentId) as Record<string, unknown>[];
     return rows.map(rowToRaw);
   }
 
@@ -473,6 +555,14 @@ function rowToRaw(row: Record<string, unknown>): RawRecord {
     id: String(row.id),
     space: String(row.space) as RawRecord["space"],
     source: String(row.source) as RawRecord["source"],
+    ...(row.agent_id == null ? {} : { agentId: String(row.agent_id) }),
+    ...(row.agent_handled == null
+      ? {}
+      : { agentHandled: Number(row.agent_handled) === 1 }),
+    ...(row.agent_response == null ? {} : { agentResponse: String(row.agent_response) }),
+    ...(row.agent_responded_at == null
+      ? {}
+      : { agentRespondedAt: Number(row.agent_responded_at) }),
     author: row.author == null ? undefined : String(row.author),
     chatId: row.chat_id == null ? undefined : String(row.chat_id),
     messageId: row.message_id == null ? undefined : String(row.message_id),

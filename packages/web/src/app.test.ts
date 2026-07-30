@@ -253,6 +253,51 @@ describe("web backend (read-only)", () => {
     expect(detailBody).toContain("重新提炼这条记录");
   });
 
+  test("shows the Agent response associated with a raw Chat message", async () => {
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "message",
+      agentId: "agent_chat",
+      chatId: "oc_product",
+      messageId: "om_agent_response",
+      content: "请总结一下发布状态",
+    });
+    await engine.recordAgentResponse(SPACE, {
+      chatId: "oc_product",
+      messageId: "om_agent_response",
+      response: "发布已完成，当前没有阻塞项。",
+      respondedAt: 1_785_414_242_024,
+    });
+
+    const detail = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/raw/${encodeURIComponent(rawId)}`,
+    );
+    const detailBody = await detail.text();
+
+    expect(detailBody).toContain("Agent 回复");
+    expect(detailBody).toContain("发布已完成，当前没有阻塞项。");
+    expect(detailBody).toContain("回复时间");
+  });
+
+  test("explains why a legacy raw Chat message has no Agent response", async () => {
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "message",
+      agentHandled: true,
+      chatId: "oc_product",
+      messageId: "om_legacy_chat",
+      content: "hi",
+    });
+
+    const detail = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/raw/${encodeURIComponent(rawId)}`,
+    );
+    const detailBody = await detail.text();
+
+    expect(detailBody).toContain("Agent 回复");
+    expect(detailBody).toContain("旧记录的历史回复无法从本地补回");
+  });
+
   test("redistills one raw record from its detail page", async () => {
     const rawId = await engine.remember({
       space: SPACE,
@@ -1525,11 +1570,10 @@ describe("management backend (read-write)", () => {
     const response = await app.request("/skills");
     expect(response.status).toBe(200);
     const body = await response.text();
-    expect(body).toContain("本机 Skills");
-    expect(body).toContain("全局继承");
-    expect(body).toContain("Pinned");
+    expect(body).toContain("共享 Skills");
+    expect(body).toContain("Provider 自带能力不重复展示");
     expect(body).toContain("review");
-    expect(body).toContain("shared-agents · review");
+    expect(body).toContain("共享 · review");
     expect(body).toContain("Review Agent");
     expect(body).toContain(`/agents/${encodeURIComponent(agent.id)}`);
     expect(body).not.toContain(skillRoot);
@@ -1796,6 +1840,62 @@ describe("management backend (read-write)", () => {
     const mobileListBody = await mobileList.text();
     expect(mobileListBody).toContain("首选助手");
     expect(mobileListBody).toContain("选择一个 Agent");
+  });
+
+  test("agent Recent runs includes durable Chat records attributed to that Agent", async () => {
+    const selected = engine.agents.create({ name: "Chat Agent", provider: "claude" });
+    engine.updateSpaceMeta(SPACE, { agentId: selected.id, name: "Product chat" });
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "message",
+      author: "ou_product",
+      chatId: "oc_web",
+      messageId: "om_agent_chat",
+      content: "@HomeAgent summarize the release status",
+      agentId: selected.id,
+      createdAt: 1_785_414_241_024,
+    });
+
+    const body = await (
+      await app.request(`/agents/${encodeURIComponent(selected.id)}`)
+    ).text();
+    const editorBody = body.slice(
+      body.indexOf('data-pane="agent-editor"'),
+      body.indexOf('data-pane="agent-inspector"'),
+    );
+
+    expect(editorBody).toContain("Recent runs");
+    expect(editorBody).toContain("Chat");
+    expect(editorBody).toContain("summarize the release status");
+    expect(editorBody).toContain(
+      `/spaces/${encodeURIComponent(SPACE)}/raw/${encodeURIComponent(rawId)}`,
+    );
+  });
+
+  test("Chat history remains with the Agent that handled it after a space is rebound", async () => {
+    const original = engine.agents.create({ name: "Original Agent", provider: "claude" });
+    const replacement = engine.agents.create({ name: "Replacement Agent", provider: "claude" });
+    engine.updateSpaceMeta(SPACE, { agentId: original.id, name: "Product chat" });
+    await engine.remember({
+      space: SPACE,
+      source: "message",
+      chatId: "oc_web",
+      messageId: "om_before_rebind",
+      content: "@HomeAgent keep this with the original Agent",
+      agentId: original.id,
+      createdAt: 1_785_414_241_024,
+    });
+    engine.updateSpaceMeta(SPACE, { agentId: replacement.id });
+
+    const originalBody = await (
+      await app.request(`/agents/${encodeURIComponent(original.id)}`)
+    ).text();
+    const replacementBody = await (
+      await app.request(`/agents/${encodeURIComponent(replacement.id)}`)
+    ).text();
+
+    expect(originalBody).toContain("keep this with the original Agent");
+    expect(replacementBody).not.toContain("keep this with the original Agent");
   });
 
   test("an incompatible visibility change is rejected with preserved field values", async () => {

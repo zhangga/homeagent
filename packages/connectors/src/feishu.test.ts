@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { InboundEvent } from "./connector.ts";
@@ -291,6 +300,44 @@ describe("FeishuConnector outbound", () => {
     }
   });
 
+  test("bypasses the npm lark-cli shim so multiline arguments keep following flags", async () => {
+    if (process.platform !== "win32") return;
+
+    const directory = mkdtempSync(join(tmpdir(), "homeagent-lark-cli-shim-"));
+    const nativeDirectory = join(
+      directory,
+      "node_modules",
+      "@larksuite",
+      "cli",
+      "bin",
+    );
+    const nativeExecutable = join(nativeDirectory, "lark-cli.exe");
+    mkdirSync(nativeDirectory, { recursive: true });
+    writeFileSync(join(directory, "lark-cli.cmd"), "@echo off\r\nexit /b 99\r\n");
+    linkSync(process.execPath, nativeExecutable);
+
+    try {
+      const output = await runFeishuCommand(
+        [
+          "lark-cli",
+          "-e",
+          "process.stdout.write(JSON.stringify(Bun.argv))",
+          "first line\nsecond line",
+          "--message-id",
+          "om_multiline",
+        ],
+        { env: { PATH: `${directory};${process.env.PATH ?? ""}` } },
+      );
+      const argv = JSON.parse(output) as string[];
+
+      expect(argv).toContain("first line\nsecond line");
+      expect(argv).toContain("--message-id");
+      expect(argv).toContain("om_multiline");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("passes sensitive command input over stdin instead of argv", async () => {
     const output = await runFeishuCommand(
       [process.execPath, "-e", "const input = await Bun.stdin.text(); process.stdout.write(input)"],
@@ -534,6 +581,32 @@ describe("FeishuConnector outbound", () => {
     expect(cmd).toContain("--reply-in-thread");
     expect(cmd).toContain("--as");
     expect(cmd).toContain("bot");
+  });
+
+  test("reply retries idempotently and propagates a final delivery failure", async () => {
+    const commands: string[][] = [];
+    connector = new FeishuConnector({
+      spawner: new FakeSpawner(),
+      replyRetryDelayMs: 0,
+      runCommand: async (cmd) => {
+        commands.push(cmd);
+        throw new Error("temporary Feishu delivery failure");
+      },
+    });
+
+    await expect(connector.reply({
+      chatId: "oc_1",
+      replyToMessageId: "om_retry",
+      markdown: "hello",
+    })).rejects.toThrow("temporary Feishu delivery failure");
+
+    expect(commands).toHaveLength(2);
+    const idempotencyKeys = commands.map((cmd) => {
+      const keyIndex = cmd.indexOf("--idempotency-key");
+      return keyIndex < 0 ? undefined : cmd[keyIndex + 1];
+    });
+    expect(idempotencyKeys[0]).toBeDefined();
+    expect(idempotencyKeys[1]).toBe(idempotencyKeys[0]);
   });
 
   test("notice uses +messages-send with chat-id", async () => {

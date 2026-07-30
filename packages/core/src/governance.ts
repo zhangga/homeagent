@@ -201,6 +201,14 @@ function optionalText(value: unknown, label: string): string | undefined {
   return value === undefined ? undefined : text(value, label);
 }
 
+function optionalBoolean(value: unknown, label: string): boolean | undefined {
+  return value === undefined ? undefined : boolean(value, label);
+}
+
+function optionalFiniteNumber(value: unknown, label: string): number | undefined {
+  return value === undefined ? undefined : finiteNumber(value, label);
+}
+
 function reasoningEffort(value: unknown, model: string): Agent["reasoningEffort"] {
   if (value === undefined || value === "") return "";
   const effort = text(value, "agent.reasoningEffort") as Agent["reasoningEffort"];
@@ -268,6 +276,13 @@ function parseRaw(value: unknown, index: number, space: SpaceId): RawRecord {
     id: nonemptyText(item.id, `raw[${index}].id`),
     space,
     source,
+    agentId: optionalText(item.agentId, `raw[${index}].agentId`),
+    agentHandled: optionalBoolean(item.agentHandled, `raw[${index}].agentHandled`),
+    agentResponse: optionalText(item.agentResponse, `raw[${index}].agentResponse`),
+    agentRespondedAt: optionalFiniteNumber(
+      item.agentRespondedAt,
+      `raw[${index}].agentRespondedAt`,
+    ),
     author: optionalText(item.author, `raw[${index}].author`),
     chatId: optionalText(item.chatId, `raw[${index}].chatId`),
     messageId: optionalText(item.messageId, `raw[${index}].messageId`),

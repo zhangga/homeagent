@@ -407,6 +407,77 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     )).toBeFalse();
   });
 
+  test("an addressed Chat is durably attributed to the Agent that handled it", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Group Chat Agent",
+      provider: "claude",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    await orch.start();
+
+    await connector.sendGroup("@agent hello", true);
+
+    const chats = engine.listAgentChatRecords(agent.id, 10);
+    expect(chats).toEqual([
+      expect.objectContaining({
+        agentId: agent.id,
+        space: "team/oc_team",
+        content: "@agent hello",
+      }),
+    ]);
+    const detail = await engine.getRawGovernanceDetail("team/oc_team", chats[0]!.id);
+    expect(detail?.raw).toMatchObject({
+      agentResponse: connector.sent[0]!.markdown,
+      agentRespondedAt: expect.any(Number),
+    });
+  });
+
+  test("a failed outbound delivery is not recorded as an Agent response", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Delivery-aware Agent",
+      provider: "claude",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    connector.reply = async () => {
+      throw new Error("Feishu delivery failed");
+    };
+    await orch.start();
+
+    await expect(connector.sendGroup("@agent hello", true))
+      .rejects.toThrow("Feishu delivery failed");
+
+    const chats = engine.listAgentChatRecords(agent.id, 10);
+    expect(chats).toHaveLength(1);
+    const detail = await engine.getRawGovernanceDetail("team/oc_team", chats[0]!.id);
+    expect(detail?.raw.agentResponse).toBeUndefined();
+    expect(detail?.raw.agentRespondedAt).toBeUndefined();
+  });
+
+  test("a capture-only group message is not shown as an Agent Chat run", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Mentions-only Agent",
+      provider: "claude",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    engine.feishuBindings.updatePolicy("team/oc_team", {
+      responseMode: "mentions_only",
+      participationLevel: undefined,
+      replyInThread: true,
+    });
+    await orch.start();
+
+    await connector.sendGroup("ordinary unmentioned update", false);
+
+    expect(connector.sent).toEqual([]);
+    expect(engine.listAgentChatRecords(agent.id, 10)).toEqual([]);
+  });
+
   test("an unmentioned group message is captured before participation classification finishes", async () => {
     let markClassificationStarted!: () => void;
     let releaseClassification!: () => void;
@@ -464,6 +535,11 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("an unmentioned group question is proactively answered and still captured", async () => {
+    const agent = engine.agents.create({
+      name: "Proactive Chat Agent",
+      provider: "claude",
+      visibility: "Team",
+    });
     await engine.upsertPage("team/oc_team", {
       slug: "entities/alice",
       type: "entity",
@@ -477,6 +553,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       updatedAt: Date.now(),
       contentHash: "h",
     });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
 
     await orch.start();
     await connector.sendGroup("谁负责后端服务", false);
@@ -484,6 +561,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(connector.sent).toHaveLength(1);
     expect(connector.sent[0]!.markdown).toContain("Alice");
     expect(engine.registry.store("team/oc_team").index().countRaw(true)).toBe(1);
+    expect(engine.listAgentChatRecords(agent.id, 10)[0]?.agentId).toBe(agent.id);
   });
 
   test("group participation level progressively answers more optional discussion", async () => {

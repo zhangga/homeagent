@@ -33,6 +33,17 @@ export interface Attachment {
 export interface RawEntry {
   space: SpaceId;
   source: RawSource;
+  /** Agent that handled this inbound message, when it triggered an Agent response. */
+  agentId?: string;
+  /**
+   * Whether this message entered a response path. Undefined denotes a legacy
+   * record created before Agent Chat attribution was available.
+   */
+  agentHandled?: boolean;
+  /** Markdown sent by the Agent in response to this inbound message. */
+  agentResponse?: string;
+  /** Epoch ms when the Agent response was delivered. */
+  agentRespondedAt?: number;
   /** open_id of the author when known */
   author?: string;
   chatId?: string;

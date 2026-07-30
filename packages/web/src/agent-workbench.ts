@@ -1,5 +1,6 @@
 import type {
   Agent,
+  AgentChatRecord,
   AgentInput,
   AgentSkillBinding,
   SkillCatalogSnapshot,
@@ -62,10 +63,12 @@ export interface AgentBindingView {
 
 export interface AgentRunView {
   id: string;
-  taskId: string;
+  kind: "task" | "chat";
+  href: string;
+  taskId?: string;
   taskName: string;
   topic: string;
-  status: TaskRun["status"];
+  status: TaskRun["status"] | "recorded";
   error?: string;
   startedAt: number;
   finishedAt?: number;
@@ -132,7 +135,7 @@ export interface AgentSkillSelectionView {
   name: string;
   sourceKey?: string;
   sourceLabel: string;
-  status: "selected" | "missing" | "legacy";
+  status: "selected" | "provider-native" | "missing" | "legacy";
   statusLabel: string;
 }
 
@@ -152,6 +155,7 @@ export interface BuildAgentWorkbenchInput {
   defaults: { provider: string; model: string };
   bindings: SpaceMeta[];
   runs: TaskRun[];
+  chatRecords?: AgentChatRecord[];
   /** Runs for all Agents, used only for the left-list running indicator. */
   listRuns?: TaskRun[];
   runTotal?: number;
@@ -321,8 +325,12 @@ function buildSkillCatalogView(
       });
     }
   }
-  const rows = snapshot.entries.map((entry): AgentSkillCatalogRow => {
-    const ordered = [...entry.sources].sort((a, b) =>
+  const rows = snapshot.entries.flatMap((entry): AgentSkillCatalogRow[] => {
+    const sharedSources = entry.sources.filter(
+      (candidate) => candidate.rootKind === "shared-agents",
+    );
+    if (sharedSources.length === 0) return [];
+    const ordered = [...sharedSources].sort((a, b) =>
       rootRank(provider, a.rootKind) - rootRank(provider, b.rootKind)
       || a.sourceKey.localeCompare(b.sourceKey)
     );
@@ -346,21 +354,21 @@ function buildSkillCatalogView(
         status = "shadowed";
       }
     }
-    return {
+    return [{
       key: entry.key,
       name: entry.name,
       description: entry.description,
       sourceKey: source.sourceKey,
-      sourceLabel: `${source.rootKind} · ${source.relativeDir}`,
-      providerIds: [...new Set(entry.sources.flatMap((candidate) => candidate.providerIds))],
+      sourceLabel: `共享 · ${source.relativeDir}`,
+      providerIds: [...new Set(sharedSources.flatMap((candidate) => candidate.providerIds))],
       status,
       statusLabel: SKILL_STATUS_LABELS[status],
-      selected: entry.sources.some((candidate) => selectedKeys.has(candidate.sourceKey)),
-      sourceCount: entry.sources.length,
-      diagnostics: entry.sources.flatMap((candidate) =>
+      selected: sharedSources.some((candidate) => selectedKeys.has(candidate.sourceKey)),
+      sourceCount: sharedSources.length,
+      diagnostics: sharedSources.flatMap((candidate) =>
         candidate.diagnostics.map((diagnostic) => diagnostic.message)
       ),
-    };
+    }];
   });
   const knownByKey = new Map(snapshot.sources.map((source) => [source.sourceKey, source]));
   const selectedViews: AgentSkillSelectionView[] = [];
@@ -372,8 +380,10 @@ function buildSkillCatalogView(
           name: source.name,
           sourceKey,
           sourceLabel: `${source.rootKind} · ${source.relativeDir}`,
-          status: "selected",
-          statusLabel: "已固定",
+          status: source.rootKind === "shared-agents" ? "selected" : "provider-native",
+          statusLabel: source.rootKind === "shared-agents"
+            ? "已固定"
+            : "Provider 自带 · 保留绑定",
         }
       : {
           kind: "source",
@@ -398,9 +408,9 @@ function buildSkillCatalogView(
   return {
     rows,
     selected: selectedViews,
-    diagnostics: snapshot.diagnostics.map((diagnostic) =>
-      `${diagnostic.rootKind}: ${diagnostic.message}`
-    ),
+    diagnostics: snapshot.diagnostics
+      .filter((diagnostic) => diagnostic.rootKind === "shared-agents")
+      .map((diagnostic) => `共享: ${diagnostic.message}`),
     refreshedAt: snapshot.refreshedAt,
   };
 }
@@ -624,8 +634,11 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
         detail: binding.id,
         typeLabel: binding.id.startsWith("team/") ? "团队空间" : "个人空间",
       })),
-      runs: input.runs.map((run) => ({
+      runs: [
+        ...input.runs.map((run): AgentRunView => ({
         id: run.id,
+        kind: "task",
+        href: `/tasks/runs/${encodeURIComponent(run.id)}`,
         taskId: run.taskId,
         taskName: run.taskName,
         topic: run.topic,
@@ -637,10 +650,29 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
         model: run.model || "CLI 默认模型",
         space: run.space,
         retryable: ["failed", "cancelled", "timed_out"].includes(run.status),
-      })),
-      runTotal: input.runTotal ?? input.runs.length,
+        })),
+        ...(input.chatRecords ?? []).map((record): AgentRunView => ({
+          id: record.id,
+          kind: "chat",
+          href:
+            `/spaces/${encodeURIComponent(record.space)}/raw/${encodeURIComponent(record.id)}`,
+          taskName: "Chat",
+          topic: record.content,
+          status: "recorded",
+          startedAt: record.createdAt,
+          provider: input.selected!.provider,
+          model: effectiveModel(input.selected!, input.defaults),
+          space: record.space,
+          retryable: false,
+        })),
+      ]
+        .sort((a, b) => b.startedAt - a.startedAt || a.id.localeCompare(b.id))
+        .slice(0, input.runLimit ?? 20),
+      runTotal: input.runTotal ?? input.runs.length + (input.chatRecords?.length ?? 0),
       runLimit: input.runLimit ?? 20,
-      hasMoreRuns: (input.runTotal ?? input.runs.length) > input.runs.length,
+      hasMoreRuns:
+        (input.runTotal ?? input.runs.length + (input.chatRecords?.length ?? 0))
+          > (input.runLimit ?? 20),
     };
   }
 

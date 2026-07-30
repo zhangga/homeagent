@@ -14,9 +14,9 @@
  *   - fetches docx links via `docs +fetch --as user` for doc sync (Q8).
  */
 import { config, logger } from "@homeagent/shared";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type {
   Connector,
   ConnectorHealth,
@@ -89,6 +89,8 @@ export interface FeishuConnectorOptions {
   maxNeverReady?: number;
   /** maximum accepted downloaded attachment size; defaults to 20 MiB */
   maxAttachmentBytes?: number;
+  /** delay before the single idempotent reply retry; defaults to 250 ms */
+  replyRetryDelayMs?: number;
   /** run a command and return its stdout (injected for tests) */
   runCommand?: RunCommand;
 }
@@ -199,6 +201,7 @@ export class FeishuConnector implements Connector {
   private backoffMaxMs: number;
   private maxNeverReady: number;
   private maxAttachmentBytes: number;
+  private replyRetryDelayMs: number;
   private runCommand: RunCommand;
   private handler?: (event: InboundEvent) => void | Promise<void>;
   private consumers: Consumer[] = [];
@@ -217,6 +220,7 @@ export class FeishuConnector implements Connector {
     this.backoffMaxMs = opts.backoffMaxMs ?? 60_000;
     this.maxNeverReady = opts.maxNeverReady ?? 5;
     this.maxAttachmentBytes = opts.maxAttachmentBytes ?? 20 * 1024 * 1024;
+    this.replyRetryDelayMs = Math.max(0, Math.floor(opts.replyRetryDelayMs ?? 250));
     this.runCommand = opts.runCommand ?? runFeishuCommand;
   }
 
@@ -416,10 +420,33 @@ export class FeishuConnector implements Connector {
     ];
     if (out.replyToMessageId) cmd.push("--message-id", out.replyToMessageId);
     if (out.inThread) cmd.push("--reply-in-thread");
-    try {
-      await this.runCommand(cmd);
-    } catch (err) {
-      log.error("reply failed", { err: String(err) });
+    if (out.replyToMessageId) {
+      cmd.push(
+        "--idempotency-key",
+        `homeagent-${out.replyToMessageId}`.slice(0, 50),
+      );
+    }
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await this.runCommand(cmd);
+        return;
+      } catch (err) {
+        if (attempt === 1) {
+          log.warn("reply attempt failed; retrying", {
+            chatId: out.chatId,
+            messageId: out.replyToMessageId,
+            err: String(err),
+          });
+          if (this.replyRetryDelayMs > 0) await Bun.sleep(this.replyRetryDelayMs);
+          continue;
+        }
+        log.error("reply failed", {
+          chatId: out.chatId,
+          messageId: out.replyToMessageId,
+          err: String(err),
+        });
+        throw err;
+      }
     }
   }
 
@@ -774,12 +801,34 @@ function resolveWindowsCommandShim(
 ): string[] {
   if (process.platform !== "win32" || cmd.length === 0) return cmd;
   const executable = cmd[0]!;
-  if (/[\\/]/.test(executable)) return cmd;
-  const resolved = Bun.which(executable, {
-    PATH: env?.PATH ?? env?.Path ?? process.env.PATH,
-    cwd: cwd ?? process.cwd(),
-  });
-  return resolved ? [resolved, ...cmd.slice(1)] : cmd;
+  const resolved = /[\\/]/.test(executable)
+    ? executable
+    : Bun.which(executable, {
+        PATH: env?.PATH ?? env?.Path ?? process.env.PATH,
+        cwd: cwd ?? process.cwd(),
+      });
+  if (!resolved) return cmd;
+
+  // npm exposes lark-cli through a .cmd shim on Windows. Passing a multiline
+  // Markdown argument through that batch file causes cmd.exe to split the
+  // command, silently dropping flags that follow the body (notably
+  // --message-id). The package also ships a native executable, so bypass the
+  // lossy batch layer when it is available.
+  if (basename(resolved).toLowerCase() === "lark-cli.cmd") {
+    const nativeLarkCli = join(
+      dirname(resolved),
+      "node_modules",
+      "@larksuite",
+      "cli",
+      "bin",
+      "lark-cli.exe",
+    );
+    if (existsSync(nativeLarkCli)) {
+      return [nativeLarkCli, ...cmd.slice(1)];
+    }
+  }
+
+  return [resolved, ...cmd.slice(1)];
 }
 
 function collectStream(

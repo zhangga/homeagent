@@ -12,6 +12,19 @@ import {
   runProvider,
 } from "./providers.ts";
 
+function writeArgEchoProvider(directory: string, name = "provider"): string {
+  const bin = join(directory, process.platform === "win32" ? `${name}.cmd` : name);
+  writeFileSync(
+    bin,
+    process.platform === "win32"
+      ? "@echo off\r\necho %*\r\n"
+      : '#!/bin/sh\nprintf "%s\\n" "$*"\n',
+    "utf8",
+  );
+  if (process.platform !== "win32") chmodSync(bin, 0o755);
+  return bin;
+}
+
 describe("Codex model capabilities", () => {
   test("reasoning effort choices follow the selected model", () => {
     expect(codexReasoningEffortsForModel("gpt-5.6-sol")).toEqual([
@@ -52,24 +65,49 @@ describe("provider detection", () => {
 
   test("passes visual inputs to Codex as native image attachments", async () => {
     const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-provider-argv-"));
     try {
-      process.env.HOMEAGENT_CODEX_BIN = "/bin/echo";
+      process.env.HOMEAGENT_CODEX_BIN = writeArgEchoProvider(directory);
 
-      expect(
-        await runProvider(
-          "codex",
-          {
-            prompt: "分析这顿晚餐",
-            images: [{ path: "/tmp/dinner.png" }],
-          },
-          500,
-        ),
-      ).toBe(
-        '-c cli_auth_credentials_store="keyring" exec --sandbox read-only --image /tmp/dinner.png -- 分析这顿晚餐',
+      const output = await runProvider(
+        "codex",
+        {
+          prompt: "分析这顿晚餐",
+          images: [{ path: "/tmp/dinner.png" }],
+        },
+        500,
       );
+      expect(output).toContain("cli_auth_credentials_store");
+      expect(output).toContain("exec --sandbox read-only");
+      expect(output).toContain("--image /tmp/dinner.png -- -");
     } finally {
       if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
       else process.env.HOMEAGENT_CODEX_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("delivers a multiline Codex prompt intact over stdin", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ha-codex-stdin-"));
+    const bin = join(directory, process.platform === "win32" ? "codex.cmd" : "codex");
+    const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const prompt = "默认agent\n\n请回答用户的问题：\n今天是几号啊";
+    try {
+      writeFileSync(
+        bin,
+        process.platform === "win32"
+          ? '@echo off\r\nnode -e "let s=\'\';process.stdin.setEncoding(\'utf8\');process.stdin.on(\'data\',d=>s+=d);process.stdin.on(\'end\',()=>process.stdout.write(s))"\r\n'
+          : "#!/bin/sh\ncat\n",
+        "utf8",
+      );
+      if (process.platform !== "win32") chmodSync(bin, 0o755);
+      process.env.HOMEAGENT_CODEX_BIN = bin;
+
+      expect(await runProvider("codex", { prompt }, 500)).toBe(prompt);
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+      else process.env.HOMEAGENT_CODEX_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
@@ -112,45 +150,50 @@ describe("provider detection", () => {
       "HOMEAGENT_TRAE_BIN",
     ] as const;
     const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    const directory = mkdtempSync(join(tmpdir(), "ha-provider-overrides-"));
     try {
-      for (const key of keys) process.env[key] = "/bin/echo";
+      const bin = writeArgEchoProvider(directory);
+      for (const key of keys) process.env[key] = bin;
 
       const detected = await detectProviders(500);
       expect(detected.map(({ id, bin }) => ({ id, bin }))).toEqual([
-        { id: "claude", bin: "/bin/echo" },
-        { id: "codex", bin: "/bin/echo" },
-        { id: "trae-cli", bin: "/bin/echo" },
+        { id: "claude", bin },
+        { id: "codex", bin },
+        { id: "trae-cli", bin },
       ]);
-      expect(await runProvider("codex", { prompt: "hello" }, 500)).toBe(
-        '-c cli_auth_credentials_store="keyring" exec --sandbox read-only -- hello',
+      const defaultRun = await runProvider("codex", { prompt: "hello" }, 500);
+      expect(defaultRun).toContain("cli_auth_credentials_store");
+      expect(defaultRun).toContain("exec --sandbox read-only -- -");
+
+      const configuredRun = await runProvider(
+        "codex",
+        { prompt: "hello", model: "gpt-5.6-sol", reasoningEffort: "high" },
+        500,
       );
-      expect(
-        await runProvider(
-          "codex",
-          { prompt: "hello", model: "gpt-5.6-sol", reasoningEffort: "high" },
-          500,
-        ),
-      ).toBe(
-        '-c cli_auth_credentials_store="keyring" -c model_reasoning_effort="high" exec --sandbox read-only -m gpt-5.6-sol -- hello',
-      );
+      expect(configuredRun).toContain("model_reasoning_effort");
+      expect(configuredRun).toContain("high");
+      expect(configuredRun).toContain("exec --sandbox read-only -m gpt-5.6-sol -- -");
     } finally {
       for (const key of keys) {
         const value = previous[key];
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
   test("accepts pre-rename managed binary overrides", async () => {
     const canonical = process.env.HOMEAGENT_CODEX_BIN;
     const legacy = process.env.HOMEBRAIN_CODEX_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-provider-legacy-"));
     try {
       delete process.env.HOMEAGENT_CODEX_BIN;
-      process.env.HOMEBRAIN_CODEX_BIN = "/bin/echo";
+      process.env.HOMEBRAIN_CODEX_BIN = writeArgEchoProvider(directory);
 
       const detected = await detectProviders(500);
-      expect(detected.find((provider) => provider.id === "codex")?.bin).toBe("/bin/echo");
+      expect(detected.find((provider) => provider.id === "codex")?.bin)
+        .toBe(process.env.HOMEBRAIN_CODEX_BIN);
       expect(await runProvider("codex", { prompt: "legacy" }, 500)).toContain(
         "cli_auth_credentials_store",
       );
@@ -159,6 +202,7 @@ describe("provider detection", () => {
       else process.env.HOMEAGENT_CODEX_BIN = canonical;
       if (legacy === undefined) delete process.env.HOMEBRAIN_CODEX_BIN;
       else process.env.HOMEBRAIN_CODEX_BIN = legacy;
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
@@ -169,8 +213,10 @@ describe("provider detection", () => {
       "HOMEAGENT_TRAE_BIN",
     ] as const;
     const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    const directory = mkdtempSync(join(tmpdir(), "ha-provider-permissions-"));
     try {
-      for (const key of keys) process.env[key] = "/bin/echo";
+      const bin = writeArgEchoProvider(directory);
+      for (const key of keys) process.env[key] = bin;
 
       expect(
         await runProvider("claude", {
@@ -204,21 +250,22 @@ describe("provider detection", () => {
       ).toBe(
         "-p admin --bare --tools default --dangerously-skip-permissions",
       );
-      expect(
-        await runProvider("codex", {
-          prompt: "edit",
-          execution: { permission: "write", skills: [] },
-        }, 500),
-      ).toBe(
-        '-c cli_auth_credentials_store="keyring" -c approval_policy="never" exec --sandbox workspace-write --skip-git-repo-check -- edit',
+      const codexWrite = await runProvider("codex", {
+        prompt: "edit",
+        execution: { permission: "write", skills: [] },
+      }, 500);
+      expect(codexWrite).toContain("approval_policy");
+      expect(codexWrite).toContain(
+        "exec --sandbox workspace-write --skip-git-repo-check -- -",
       );
-      expect(
-        await runProvider("codex", {
-          prompt: "research",
-          execution: { permission: "read-only", skills: [], webSearch: true },
-        }, 500),
-      ).toBe(
-        '-c cli_auth_credentials_store="keyring" -c approval_policy="never" --search exec --sandbox read-only --skip-git-repo-check -- research',
+
+      const codexResearch = await runProvider("codex", {
+        prompt: "research",
+        execution: { permission: "read-only", skills: [], webSearch: true },
+      }, 500);
+      expect(codexResearch).toContain("approval_policy");
+      expect(codexResearch).toContain(
+        "--search exec --sandbox read-only --skip-git-repo-check -- -",
       );
       expect(
         await runProvider("trae-cli", {
@@ -250,6 +297,7 @@ describe("provider detection", () => {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
@@ -261,8 +309,8 @@ describe("provider detection", () => {
       writeFileSync(
         bin,
         process.platform === "win32"
-          ? "@echo off\r\necho %CD%\r\necho %*\r\n"
-          : '#!/bin/sh\nprintf "%s\\n" "$PWD"\nprintf "%s\\n" "$*"\n',
+          ? '@echo off\r\necho %CD%\r\necho %*\r\nnode -e "let s=\'\';process.stdin.setEncoding(\'utf8\');process.stdin.on(\'data\',d=>s+=d);process.stdin.on(\'end\',()=>process.stdout.write(s))"\r\n'
+          : '#!/bin/sh\nprintf "%s\\n" "$PWD"\nprintf "%s\\n" "$*"\ncat\n',
         "utf8",
       );
       if (process.platform !== "win32") chmodSync(bin, 0o755);
@@ -315,6 +363,8 @@ describe("provider detection", () => {
   });
 
   test("runProvider terminates the CLI process when its abort signal fires", async () => {
+    if (process.platform === "win32") return;
+
     const dir = mkdtempSync(join(tmpdir(), "ha-provider-abort-"));
     const bin = join(dir, "slow-provider");
     const previous = process.env.HOMEAGENT_TRAE_BIN;

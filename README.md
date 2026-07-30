@@ -177,19 +177,19 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 左侧导航包含：
 
 - **空间 / 知识**：空间列表、知识页、原始条目、问答测试、手动触发提炼，以及提炼失败记录的单条/批量恢复。支持编辑 `purpose.md` / `schema.md`、查看完整原始记录及其关联知识页、单条重新提炼、固定目标重新生成、删除知识页和提交可追溯的人工纠错；所有人工治理操作都会写入审计记录。
-- **Agents**（三栏工作台）：左侧选择 Agent，中间编辑配置，右侧查看真实的 CLI 状态、当前空间/飞书群绑定和该 Agent 最近的研究任务运行。支持新建 / 编辑 / 删除，配置 **名称、Provider、Instruction（人格，会注入到回答）、Model、推理强度、Visibility、Permission、Workdir、Pinned Skills**；所有更改都要显式保存，不会自动写入。
-  - 桌面端保持三栏并可拖拽或用方向键调整栏宽；窄屏把右侧信息收进详情抽屉，手机端在 Agent 列表和详情之间切换。页面不显示 HomeAgent 没有实现的 Mew Device、Repository、Environment、Concurrency 或 Chats 信息。
+- **Agents**（三栏工作台）：左侧选择 Agent，中间编辑配置，右侧查看真实的 CLI 状态、当前空间/飞书群绑定和该 Agent 最近处理的 Chat / 研究任务运行。Chat 记录会固定归属到实际处理它的 Agent，并可从 Recent runs 进入对应的原始消息详情。支持新建 / 编辑 / 删除，配置 **名称、Provider、Instruction（人格，会注入到回答）、Model、推理强度、Visibility、Permission、Workdir、Pinned Skills**；所有更改都要显式保存，不会自动写入。
+  - 桌面端保持三栏并可拖拽或用方向键调整栏宽；窄屏把右侧信息收进详情抽屉，手机端在 Agent 列表和详情之间切换。页面不显示 HomeAgent 没有实现的 Mew Device、Repository、Environment、Concurrency 或独立 Chats 模块。
   - **Provider = 本机已安装的 agent CLI**（`claude` / `codex` / `trae-cli`）。**所有 LLM 工作（自然对话/问答 ask + 提炼 dream + 任务）都通过当前空间配置的本机 CLI 子进程执行，homeagent 不直连任何网络 API**。普通消息不再先调用一次通用意图分类：明确的副作用操作由窄规则处理，其他表达默认交给 Agent 自然回应，指代不清时只追问一个关键问题。后台**探测本机** CLI，只让可用的可选（装了但跑不了的灰显并标注原因，如 WSL 下无 Linux node 的 codex）。
-  - **Pinned Skill 绑定属于 Agent，不属于群聊**：飞书群绑定团队空间，空间再绑定 Team Agent；个人空间绑定 Personal Agent。因此不同群可以使用不同 Agent，并自然获得各自的 Instruction、Provider、Model 与显式固定能力。Agent 编辑器直接扫描并选择本机 Skill，不接受 Git URL 或任意路径输入。
+  - **Pinned Skill 绑定属于 Agent，不属于群聊**：飞书群绑定团队空间，空间再绑定 Team Agent；个人空间绑定 Personal Agent。因此不同群可以使用不同 Agent，并自然获得各自的 Instruction、Provider、Model 与显式固定能力。Agent 编辑器只扫描并选择 `~/.agents/skills` 中的共享 Skill，不接受 Git URL 或任意路径输入。
   - **全局继承是默认行为**：Agent 没有固定任何 Skill 时，Codex、Claude 或 TRAE 仍可按各自的默认规则使用电脑上安装的全局 Skills；固定后的 Pinned Skills 才由 HomeAgent 在每次调用时显式解析与加载。空列表不表示“禁用全部 Skills”。
-  - **本机 Skill 目录**：共享 Skill 来自 `~/.agents/skills`；同时识别 Codex 的 `~/.codex/skills`、插件缓存与 vendor imports，Claude 的 `~/.claude/skills`、插件缓存与 marketplaces，以及 TRAE 的 `~/.trae/skills`。选择器按来源保存精确绑定；同名同内容合并展示，同名不同内容按 Provider 优先级解析并标出遮蔽或冲突。页面只显示来源类型与相对目录，不暴露绝对路径或 `SKILL.md` 正文。
+  - **本机 Skill 目录**：共享 Skill 来自 `~/.agents/skills`，选择器按来源保存精确绑定；同名同内容合并展示，同名不同内容标出冲突。后端仍识别 Codex、Claude 和 TRAE 的原生 Skill 目录，用于运行时解析、优先级和遮蔽判断，但 Provider 专属 Skill 不在普通清单或选择器中重复展示。页面不暴露绝对路径或 `SKILL.md` 正文。
   - **Pinned Skill 执行边界**：普通问答、提炼和学习都会显式加载空间 Agent 的 Pinned Skills，但始终使用 `read-only` 且不传 Workdir；研究任务加载同一组 Pinned Skills，并使用 Agent 的 Permission / Workdir。每次调用前都会重新核对文件、名称与内容哈希；缺失、损坏、不兼容或被遮蔽的 Skill 会被跳过，基础 Agent 继续运行，并在问答或任务通知中给出安全警告。
   - **图片分析使用 Codex 的原生视觉输入**：在飞书中回复图片或含图片的富文本消息，再说“分析一下”“看看这张图”等即可。每次最多传入 4 张、总计 20 MiB，回答完成后立即清理临时文件；下载失败或当前 Agent 不是 Codex 时会明确提示，不会假装已经看过图片。
   - **Model 随 Provider 变化**：切 Provider 时 Model 下拉自动换成该 provider 的维护清单（CLI 无“列模型”接口）；Codex 当前提供 `gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna / gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex-spark`。其中 `gpt-5.6-sol` 是 GPT-5.6 Sol 的完整模型 ID；HomeAgent 日常问答优先选择较快、成本更低的 `gpt-5.6-luna`，复杂研究可选择 `gpt-5.6-terra` 或 `gpt-5.6-sol`。
   - **推理强度按 Agent 配置**：Codex Agent 可选择继承默认值，或从当前模型支持的档位中选择；GPT-5.6 系列支持 `none / low / medium / high / xhigh / max`，旧模型不会显示不支持的档位。普通问答建议从 `medium` 开始，级别越高通常耗时和 token 越多。其他 Provider 暂不传递此配置。
   - **Visibility 会限制空间绑定**：Team Agent 只能绑定群空间；Personal Agent 只能绑定个人空间。群设置只展示 Team Agent，个人空间详情页只展示 Personal Agent，后端也会拒绝类型不匹配的绑定。已有不兼容绑定时不能直接切换 Visibility，必须先解除绑定；显式删除 Agent 则会先一次性清除所有绑定，让这些空间回退到默认 AI。
   - **任务权限会真实映射到 CLI 沙箱**：`read-only` 开启只读工具并禁止写入，`write` 以 Workdir 为工作根目录并启用 Provider 的工作区写入模式，`full` 会绕过 Provider 沙箱。`write/full` 必须配置存在的 Workdir。Permission 与 Workdir 只影响研究任务；Skills 则属于 Agent 的统一能力，并遵守上一条的普通调用只读边界。
-- **Skills**（本机能力清单）：只读展示各 Provider 可发现的 Skills、来源类型与相对目录、同名冲突/无效配置，以及反向的 **Used by Agents**。支持本地搜索、状态筛选和手动刷新；不在 HomeAgent 内复制 Mew 的远程导入、文件删除、自动同步或多设备同步，安装与更新仍由本机 CLI/Skill 管理工具负责。
+- **Skills**（共享能力清单）：只读展示 `~/.agents/skills` 中可跨 Provider 分配的共享 Skills、同名冲突/无效配置，以及反向的 **Used by Agents**。Codex、Claude 和 TRAE 的 Provider 专属 Skills 仍由各自 CLI 自动发现，HomeAgent 后端保留扫描用于运行时解析和冲突诊断，但不在普通清单和 Agent 选择器中重复展示。支持本地搜索、状态筛选和手动刷新；安装与更新仍由本机 CLI/Skill 管理工具负责。
 - **任务**（研究任务执行）：新建定期任务，让某空间的 Agent CLI 定期研究一个主题；产出**存为该空间的原始材料**（`source=task`），**运行结束立即触发一次本空间提炼**（当场变成 wiki 知识页，而非等夜间），并可**推送摘要到该空间绑定的飞书群/私聊**。
   - 字段：名称、目标空间、研究主题、周期（每天几点 / 每小时）、最长运行时间、启用开关、推送开关、完成后立即提炼开关。
   - **定时**（TaskScheduler，每任务独立周期，启动即 catch-up）+ **后台「立即运行」**。每次启动会立即生成持久化运行编号，并保存启动时实际采用的 Agent、Provider、Model 与 Skill 解析证据；之后即使空间重新绑定、Agent 改配置或本机 Skill 文件变化，历史归属和当次实际加载/跳过情况也不会被改写。任务详情页可查看状态、触发来源、耗时、完整输出或错误，并可重试失败、取消或超时的运行；Agent 工作台按准确归属展示最近记录。

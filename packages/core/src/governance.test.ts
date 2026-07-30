@@ -106,11 +106,18 @@ describe("space data governance", () => {
     const rawId = await source.remember({
       space: SPACE,
       source: "message",
+      agentId: agent.id,
       author: "ou_owner",
       chatId: "oc_governance",
       messageId: "om_keep",
       content: "项目代号是北极星",
       createdAt: 1_700_000_000_000,
+    });
+    await source.recordAgentResponse(SPACE, {
+      chatId: "oc_governance",
+      messageId: "om_keep",
+      response: "已记录：项目代号是北极星。",
+      respondedAt: 1_700_000_000_500,
     });
     const page: Page = {
       slug: "concepts/project-code",
@@ -189,7 +196,13 @@ describe("space data governance", () => {
         agent: expect.objectContaining({ id: agent.id, name: "治理助手" }),
         pages: [expect.objectContaining({ slug: page.slug, title: page.title })],
         raw: expect.arrayContaining([
-          expect.objectContaining({ id: rawId, messageId: "om_keep" }),
+          expect.objectContaining({
+            id: rawId,
+            messageId: "om_keep",
+            agentId: agent.id,
+            agentResponse: "已记录：项目代号是北极星。",
+            agentRespondedAt: 1_700_000_000_500,
+          }),
           expect.objectContaining({ source: "task", content: expect.stringContaining("项目运行记录") }),
         ]),
         retractions: [

@@ -469,6 +469,9 @@ export function createWebApp(opts: WebOptions): Hono {
     const cfg = config();
     const runLimit = input.runLimit ?? 20;
     const allRuns = selected ? engine.listAgentRuns(selected.id, 100) : [];
+    const allChatRecords = selected
+      ? engine.listAgentChatRecords(selected.id, 100)
+      : [];
     return agentWorkbenchView(buildAgentWorkbench({
       agents,
       mode: input.mode,
@@ -477,8 +480,9 @@ export function createWebApp(opts: WebOptions): Hono {
       models,
       defaults: { provider: cfg.defaultProvider, model: cfg.defaultModel },
       bindings: selected ? engine.agentBindings(selected.id) : [],
-      runs: allRuns.slice(0, runLimit),
-      runTotal: allRuns.length,
+      runs: allRuns,
+      chatRecords: allChatRecords,
+      runTotal: allRuns.length + allChatRecords.length,
       runLimit,
       listRuns: engine.listTaskRuns(),
       values: input.values,

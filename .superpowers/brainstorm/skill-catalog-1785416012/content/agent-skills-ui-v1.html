@@ -1,0 +1,95 @@
+<h2>设计第 4 部分：Agent Skills 内联界面</h2>
+<p class="subtitle">Skills 从“任务执行”中独立出来，成为 Agent 能力；Permission 与 Workdir 仍只控制研究任务。</p>
+
+<div class="mockup">
+  <div class="mockup-header">Agents / 群知识助手</div>
+  <div class="mockup-body">
+    <div style="display:grid;grid-template-columns:minmax(0,1.5fr) minmax(250px,0.8fr);gap:18px">
+      <div>
+        <div class="label">AGENT CAPABILITIES</div>
+        <h3 style="margin:7px 0 5px">Skills</h3>
+        <p style="font-size:13px;color:#607487;margin:0 0 10px">该 Agent 在绑定空间的群聊、问答、学习、提炼和任务中使用这些 Skills。</p>
+
+        <div style="display:flex;gap:8px">
+          <div class="mock-input" style="flex:1">🔎 搜索本机已安装的 Skills…</div>
+          <button class="mock-button">↻ 刷新</button>
+        </div>
+
+        <div style="border:1px solid #d8e1e9;border-radius:9px;margin-top:8px;overflow:hidden;background:#fff">
+          <div style="display:grid;grid-template-columns:24px 1fr auto;gap:8px;padding:10px 12px;border-bottom:1px solid #e8edf1">
+            <span>☑</span>
+            <span><strong>codex-review</strong><br><small style="color:#718396">~/.agents/skills · 代码审查</small></span>
+            <span style="font-size:12px;color:#28764a">Codex · Claude · TRAE</span>
+          </div>
+          <div style="display:grid;grid-template-columns:24px 1fr auto;gap:8px;padding:10px 12px;border-bottom:1px solid #e8edf1;background:#f8fbff">
+            <span>☑</span>
+            <span><strong>lark-doc</strong><br><small style="color:#718396">~/.agents/skills · 飞书文档操作</small></span>
+            <span style="font-size:12px;color:#28764a">Codex · Claude · TRAE</span>
+          </div>
+          <div style="display:grid;grid-template-columns:24px 1fr auto;gap:8px;padding:10px 12px">
+            <span>☐</span>
+            <span><strong>browser</strong><br><small style="color:#718396">Codex plugin · 浏览器控制</small></span>
+            <span style="font-size:12px;color:#a56a19">仅 Codex</span>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:10px">
+          <span style="padding:5px 9px;border-radius:14px;background:#e8f2ff;color:#145aa3">codex-review　×</span>
+          <span style="padding:5px 9px;border-radius:14px;background:#e8f7ef;color:#17683a">lark-doc　×</span>
+        </div>
+        <div style="font-size:12px;color:#607487;margin-top:8px">已选择 2 个 · 目录更新于刚刚 · 查看来源与诊断</div>
+
+        <details open style="margin-top:20px;border-top:1px solid #dfe6ec;padding-top:12px">
+          <summary><strong>Task execution</strong></summary>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+            <div><small>Permission</small><div class="mock-input">Read only</div></div>
+            <div><small>Workdir</small><div class="mock-input">未配置</div></div>
+          </div>
+          <p style="font-size:12px;color:#607487">仅研究任务使用；不会放大普通群聊的权限。</p>
+        </details>
+      </div>
+
+      <div style="border-left:1px solid #dfe6ec;padding-left:18px">
+        <div class="label">OPERATING CONTEXT</div>
+        <h3 style="margin:7px 0">当前绑定</h3>
+        <div style="padding:10px;border:1px solid #dce4eb;border-radius:8px;background:#fff">
+          <strong>研发知识群</strong><br>
+          <small style="color:#6b7e90">team/oc_research</small>
+        </div>
+        <div style="padding:10px;border:1px solid #dce4eb;border-radius:8px;background:#fff;margin-top:8px">
+          <strong>产品讨论群</strong><br>
+          <small style="color:#6b7e90">team/oc_product</small>
+        </div>
+        <h3 style="margin:18px 0 8px">Provider 可用性</h3>
+        <div style="font-size:13px;line-height:1.9">
+          <div>● Codex　2/2 可用</div>
+          <div style="color:#a56a19">● Claude　1/2 可用</div>
+          <div>● TRAE　2/2 可用</div>
+        </div>
+        <div style="margin-top:16px;padding:10px;border-radius:8px;background:#fff7e8;color:#7d5416;font-size:12px">
+          切换 Provider 时保留绑定，但不可用项会在保存前提示，并在运行时跳过。
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>主要状态</h3>
+  <ul>
+    <li>空目录：说明扫描过哪些路径，并提供刷新，不退回自由文本输入。</li>
+    <li>同名冲突：每个版本单独展示来源；相同内容折叠为一项。</li>
+    <li>旧配置未解析：保留警告标签，管理员可重新选择或移除。</li>
+    <li>Provider 不兼容：允许保存，但显示黄色状态；运行时遵循“跳过并警告”。</li>
+  </ul>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="approve-ui" onclick="toggleSelect(this)">
+    <div class="letter">✓</div>
+    <div class="content">
+      <h3>确认界面层级</h3>
+      <p>Skills 独立为 Agent capabilities；首版不增加单独 Skills 页面。</p>
+    </div>
+  </div>
+</div>

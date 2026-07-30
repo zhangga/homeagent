@@ -20,7 +20,6 @@ export interface SkillInventoryRow {
   name: string;
   description: string;
   sourceLabels: string[];
-  providerIds: string[];
   status: InventoryStatus;
   statusLabel: string;
   usedBy: SkillInventoryAgentView[];
@@ -44,7 +43,9 @@ const STATUS_LABELS: Record<InventoryStatus, string> = {
 };
 
 function sourceLabel(rootKind: SkillRootKind, relativeDir: string): string {
-  return `${rootKind} · ${relativeDir}`;
+  return rootKind === "shared-agents"
+    ? `共享 · ${relativeDir}`
+    : `${rootKind} · ${relativeDir}`;
 }
 
 function agentsUsingEntry(
@@ -73,17 +74,21 @@ export function buildSkillInventory(
       sourceCount: 0,
       agentCount: 0,
       issueCount: 0,
-      diagnostics: ["暂时无法读取本机 Skill 目录；Agent 仍可按 Provider 默认规则运行。"],
+      diagnostics: ["暂时无法读取共享 Skill 目录；Agent 仍可按 Provider 默认规则运行。"],
     };
   }
+  const sharedEntries = snapshot.entries.flatMap((entry): SkillCatalogEntry[] => {
+    const sources = entry.sources.filter((source) => source.rootKind === "shared-agents");
+    return sources.length > 0 ? [{ ...entry, sources }] : [];
+  });
   const hashesByName = new Map<string, Set<string>>();
-  for (const entry of snapshot.entries) {
+  for (const entry of sharedEntries) {
     const key = entry.name.toLowerCase();
     const hashes = hashesByName.get(key) ?? new Set<string>();
     hashes.add(entry.skillFileHash);
     hashesByName.set(key, hashes);
   }
-  const rows = snapshot.entries.map((entry): SkillInventoryRow => {
+  const rows = sharedEntries.map((entry): SkillInventoryRow => {
     const conflict = (hashesByName.get(entry.name.toLowerCase())?.size ?? 0) > 1;
     const allInvalid = entry.sources.every((source) => source.status !== "available");
     const status: InventoryStatus = allInvalid
@@ -100,7 +105,6 @@ export function buildSkillInventory(
       sourceLabels: entry.sources.map((source) =>
         sourceLabel(source.rootKind, source.relativeDir)
       ),
-      providerIds: [...new Set(entry.sources.flatMap((source) => source.providerIds))].sort(),
       status,
       statusLabel: STATUS_LABELS[status],
       usedBy: agentsUsingEntry(entry, agents),
@@ -114,12 +118,12 @@ export function buildSkillInventory(
   const usedAgentIds = new Set(rows.flatMap((row) => row.usedBy.map((agent) => agent.id)));
   return {
     rows,
-    sourceCount: snapshot.sources.length,
+    sourceCount: snapshot.sources.filter((source) => source.rootKind === "shared-agents").length,
     agentCount: usedAgentIds.size,
     issueCount: rows.filter((row) => row.status === "conflict" || row.status === "invalid").length,
-    diagnostics: snapshot.diagnostics.map((diagnostic) =>
-      `${diagnostic.rootKind}：${diagnostic.message}`
-    ),
+    diagnostics: snapshot.diagnostics
+      .filter((diagnostic) => diagnostic.rootKind === "shared-agents")
+      .map((diagnostic) => `共享：${diagnostic.message}`),
     refreshedAt: snapshot.refreshedAt,
   };
 }
@@ -157,12 +161,12 @@ const STYLE = `
   .skill-controls input, .skill-controls select { min-height:40px; }
   .skill-ledger { overflow:hidden; border:1px solid var(--skill-line); border-radius:11px;
     background:#fff; }
-  .skill-ledger-head { display:grid; grid-template-columns:minmax(180px,1.3fr) minmax(180px,1fr)
-    145px 120px; gap:14px; padding:9px 15px; border-bottom:1px solid var(--skill-line);
+  .skill-ledger-head { display:grid; grid-template-columns:minmax(220px,1.5fr) minmax(180px,1fr)
+    120px; gap:14px; padding:9px 15px; border-bottom:1px solid var(--skill-line);
     background:#f5f7f5; color:#68736e; font-size:10px; font-weight:800;
     letter-spacing:.09em; text-transform:uppercase; }
-  .skill-row { display:grid; grid-template-columns:minmax(180px,1.3fr) minmax(180px,1fr)
-    145px 120px; gap:14px; align-items:start; padding:14px 15px;
+  .skill-row { display:grid; grid-template-columns:minmax(220px,1.5fr) minmax(180px,1fr)
+    120px; gap:14px; align-items:start; padding:14px 15px;
     border-bottom:1px solid #edf1ee; }
   .skill-row:last-child { border-bottom:0; }
   .skill-row:hover { background:#fafcfb; }
@@ -173,9 +177,6 @@ const STYLE = `
   .skill-source-list { display:grid; gap:4px; min-width:0; }
   .skill-source-list code { overflow-wrap:anywhere; color:#52645b; background:#f1f5f2;
     border-radius:4px; padding:2px 5px; font-size:10px; }
-  .skill-providers { display:flex; flex-wrap:wrap; gap:4px; }
-  .skill-provider { padding:2px 6px; border-radius:999px; background:#eaf0ed; color:#446052;
-    font-size:9px; font-weight:800; text-transform:uppercase; }
   .skill-status { display:inline-flex; width:max-content; padding:3px 7px; border-radius:999px;
     background:var(--skill-mint); color:var(--skill-mint-strong); font-size:10px; font-weight:800; }
   .skill-status.conflict, .skill-status.invalid { background:var(--skill-amber); color:#91620a; }
@@ -219,9 +220,9 @@ export function skillInventoryView(
       ${flash ? html`<div class="flash" role="status">${flash}</div>` : ""}
       <header class="skill-inventory-head">
         <div>
-          <p class="skill-inventory-kicker">Local capability ledger</p>
-          <h1>本机 Skills</h1>
-          <p class="subtitle">审计本机 Provider 可发现的能力、来源冲突，以及哪些 Agent 已固定使用。</p>
+          <p class="skill-inventory-kicker">Shared capability ledger</p>
+          <h1>共享 Skills</h1>
+          <p class="subtitle">只展示可跨 Provider 分配的共享能力，以及哪些 Agent 已显式固定使用。</p>
         </div>
         <form class="skill-refresh" method="post" action="/agent-skills/refresh">
           <input type="hidden" name="returnTo" value="/skills" />
@@ -232,14 +233,14 @@ export function skillInventoryView(
       <div class="skill-policy">
         <div class="skill-policy-mark" aria-hidden="true">↳</div>
         <div>
-          <strong>全局继承是默认行为，Pinned 是显式保证</strong>
-          <p>Agent 未固定 Skill 时，仍可由 Codex、Claude 或 TRAE 按自身规则使用本机全局 Skills；Pinned Skills 会由 HomeAgent 在调用时显式加载。</p>
+          <strong>Provider 自带能力不重复展示</strong>
+          <p>Codex、Claude 或 TRAE 会按自身规则发现各自的专属 Skills；这里仅管理 <code>~/.agents/skills</code> 中可供 Agent 显式固定的共享能力。</p>
         </div>
       </div>
 
       <div class="skill-metrics" aria-label="Skill 目录摘要">
-        <div class="skill-metric"><span>能力版本</span><strong>${view.rows.length}</strong></div>
-        <div class="skill-metric"><span>本机来源</span><strong>${view.sourceCount}</strong></div>
+        <div class="skill-metric"><span>共享能力</span><strong>${view.rows.length}</strong></div>
+        <div class="skill-metric"><span>共享来源</span><strong>${view.sourceCount}</strong></div>
         <div class="skill-metric"><span>关联 Agents</span><strong>${view.agentCount}</strong></div>
         <div class="skill-metric"><span>待处理问题</span><strong>${view.issueCount}</strong></div>
       </div>
@@ -247,7 +248,7 @@ export function skillInventoryView(
       <div class="skill-controls">
         <label class="skill-visually-hidden" for="skill-inventory-search">搜索 Skills</label>
         <input id="skill-inventory-search" type="search"
-          placeholder="搜索名称、说明、来源或 Agent" autocomplete="off" />
+          placeholder="搜索共享 Skill、说明或 Agent" autocomplete="off" />
         <label class="skill-visually-hidden" for="skill-inventory-status">筛选状态</label>
         <select id="skill-inventory-status">
           <option value="">全部状态</option>
@@ -260,7 +261,7 @@ export function skillInventoryView(
 
       <div class="skill-ledger">
         <div class="skill-ledger-head" aria-hidden="true">
-          <span>Skill</span><span>来源</span><span>Provider</span><span>状态</span>
+          <span>Skill</span><span>共享来源</span><span>状态</span>
         </div>
         ${view.rows.length > 0 ? view.rows.map((row) => html`
           <article class="skill-row"
@@ -270,7 +271,6 @@ export function skillInventoryView(
               row.name,
               row.description,
               ...row.sourceLabels,
-              ...row.providerIds,
               ...row.usedBy.map((agent) => agent.name),
             ].join(" ").toLowerCase()}">
             <div class="skill-name">
@@ -279,9 +279,6 @@ export function skillInventoryView(
             </div>
             <div class="skill-source-list">
               ${row.sourceLabels.map((label) => html`<code>${label}</code>`)}
-            </div>
-            <div class="skill-providers">
-              ${row.providerIds.map((provider) => html`<span class="skill-provider">${provider}</span>`)}
             </div>
             <span class="skill-status ${row.status}">${row.statusLabel}</span>
             <div class="skill-used">
@@ -303,8 +300,8 @@ export function skillInventoryView(
           </article>
         `) : html`
           <div class="skill-empty">
-            <strong>尚未发现本机 Skill</strong>
-            <p>确认本机 CLI 的 Skill 目录存在，然后刷新目录。</p>
+            <strong>尚未发现共享 Skill</strong>
+            <p>把需要跨 Provider 分配的能力安装到 <code>~/.agents/skills</code>，然后刷新目录。</p>
           </div>
         `}
       </div>

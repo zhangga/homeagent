@@ -20,13 +20,13 @@ const selected: Agent = {
 describe("Agent workbench view", () => {
   test("renders an inline searchable Skill selector outside Task execution", async () => {
     const source = {
-      sourceKey: "codex-user:review",
-      rootKind: "codex-user" as const,
+      sourceKey: "shared-agents:review",
+      rootKind: "shared-agents" as const,
       relativeDir: "review",
       name: "review",
       description: "Review observable behavior.",
-      providerIds: ["codex"] as const,
-      skillFile: "C:\\Users\\alice\\.codex\\skills\\review\\SKILL.md",
+      providerIds: ["claude", "codex", "trae-cli"] as const,
+      skillFile: "C:\\Users\\alice\\.agents\\skills\\review\\SKILL.md",
       skillFileHash: "a".repeat(64),
       status: "available" as const,
       diagnostics: [],
@@ -61,7 +61,7 @@ describe("Agent workbench view", () => {
     });
 
     const body = String(await agentWorkbenchView(view));
-    const capabilitiesAt = body.indexOf("Pinned Skills");
+    const capabilitiesAt = body.indexOf("共享 Skills");
     const taskAt = body.indexOf('data-pane="agent-inspector"');
 
     expect(capabilitiesAt).toBeGreaterThan(-1);
@@ -70,10 +70,10 @@ describe("Agent workbench view", () => {
     expect(body).not.toContain('<details class="agent-skill-selector" open');
     expect(body).toContain('<summary class="agent-skill-summary"');
     expect(body).toContain("0 个已固定");
-    expect(body).toContain("仍可按当前 Provider 的默认规则使用本机全局 Skills");
+    expect(body).toContain("当前 Provider 自带的 Skills 无需再次固定");
     expect(body).toContain('id="agent-skill-search"');
     expect(body).toContain('name="skillSourceKeys"');
-    expect(body).toContain('value="codex-user:review"');
+    expect(body).toContain('value="shared-agents:review"');
     expect(body).toContain('data-skill-name="review"');
     expect(body).toContain('id="agent-skill-chips"');
     expect(body).toContain("syncSelectedSkillChips");

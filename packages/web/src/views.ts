@@ -364,6 +364,20 @@ export function rawGovernanceDetailView(
     ${attachment.name ?? attachment.ref}
     <span class="muted">${attachment.kind} · ${attachment.ref}</span>
   </li>`);
+  const agentResponse = detail.raw.source !== "message"
+    ? ""
+    : detail.raw.agentResponse !== undefined
+    ? html`<h2>Agent 回复</h2>
+      <div class="contentbox">${detail.raw.agentResponse}</div>
+      ${detail.raw.agentRespondedAt === undefined
+        ? ""
+        : html`<div class="muted" style="margin-top:8px">
+          回复时间：${fmtTime(detail.raw.agentRespondedAt)}
+        </div>`}`
+    : html`<h2>Agent 回复</h2>
+      <div class="empty">${detail.raw.agentHandled === false
+        ? "这条消息未触发 Agent 回复。"
+        : "这条记录没有保存 Agent 回复；旧记录的历史回复无法从本地补回。"}</div>`;
   return html`<h1>原始记录详情</h1>
     <p class="subtitle">${detail.raw.id}</p>
     ${flash(flashMsg)}
@@ -379,6 +393,7 @@ export function rawGovernanceDetailView(
     </div>
     <h2>完整内容</h2>
     <div class="contentbox">${detail.raw.content}</div>
+    ${agentResponse}
     <h2>附件（${attachments.length}）</h2>
     ${attachmentRows.length > 0
       ? html`<ul>${attachmentRows}</ul>`

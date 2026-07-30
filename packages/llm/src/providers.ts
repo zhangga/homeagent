@@ -84,8 +84,9 @@ interface CliSpec {
   /** curated model ids this provider commonly offers (mew shows these per-provider) */
   models: string[];
   /**
-   * Build the argv to run a one-shot, non-interactive completion. The prompt is
-   * passed on argv; system/model are folded in per-CLI. stdin is not used.
+   * Build the argv to run a one-shot, non-interactive completion. System/model
+   * are folded in per CLI; Codex reads its prompt from stdin so Windows npm
+   * command shims cannot truncate multiline input.
    */
   buildRun: (input: RunInput) => string[];
 }
@@ -233,7 +234,7 @@ const KNOWN: CliSpec[] = [
       "gpt-5.4-mini",
       "gpt-5.3-codex-spark",
     ],
-    buildRun: ({ prompt, model, reasoningEffort, images, execution }) => {
+    buildRun: ({ model, reasoningEffort, images, execution }) => {
       // Ordinary LLM work stays read-only; task execution maps the Agent's
       // permission tier to Codex's sandbox without interactive approvals.
       const args: string[] = [];
@@ -246,9 +247,9 @@ const KNOWN: CliSpec[] = [
       if (model) args.push("-m", model);
       for (const image of images ?? []) args.push("--image", image.path);
       // Codex's --image accepts multiple values. Terminate option parsing
-      // explicitly so the user prompt cannot be consumed as another image path
-      // (or interpreted as the reserved `review` / `resume` subcommand).
-      args.push("--", prompt);
+      // explicitly, then use `-` so multiline prompts travel over stdin rather
+      // than through Windows' lossy npm .cmd argument forwarding.
+      args.push("--", "-");
       return args;
     },
   },
@@ -282,6 +283,7 @@ async function runCmd(
   timeoutMs: number,
   signal?: AbortSignal,
   cwd?: string,
+  stdin?: string,
 ): Promise<{
   code: number | null;
   stdout: string;
@@ -294,8 +296,12 @@ async function runCmd(
     cwd,
     stdout: "pipe",
     stderr: "pipe",
-    stdin: "ignore",
+    stdin: stdin === undefined ? "ignore" : "pipe",
   });
+  if (stdin !== undefined && proc.stdin && typeof proc.stdin !== "number") {
+    proc.stdin.write(stdin);
+    proc.stdin.end();
+  }
   let timedOut = false;
   let aborted = false;
   let terminating = false;
@@ -468,6 +474,7 @@ export async function runProvider(
     timeoutMs,
     signal,
     prepared.execution?.workdir,
+    id === "codex" ? prepared.prompt : undefined,
   );
   if (aborted) throw signal?.reason ?? new Error(`provider ${id} cancelled`);
   if (timedOut) throw new Error(`provider ${id} timed out after ${timeoutMs}ms`);

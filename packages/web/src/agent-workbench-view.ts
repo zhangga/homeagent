@@ -13,6 +13,7 @@ const STATUS_LABELS = {
   failed: "失败",
   cancelled: "已取消",
   timed_out: "已超时",
+  recorded: "已记录",
 } as const;
 
 const PERMISSION_LABELS: Record<string, string> = {
@@ -526,6 +527,11 @@ const AGENT_STYLE = `
     background:#eff9f3;
     color:#21845a;
   }
+  .agent-run-item.recorded .agent-run-icon {
+    border-color:#9eb7d1;
+    background:#f1f6fb;
+    color:#426b94;
+  }
   .agent-run-item.running .agent-run-icon {
     border-color:#d6a85f;
     background:#fff8eb;
@@ -763,6 +769,11 @@ const AGENT_STYLE = `
     background:#fff7e7;
     color:#76500d;
   }
+  .agent-skill-chip.provider-native {
+    border-color:#cfd9e2;
+    background:#f3f6f8;
+    color:#536675;
+  }
   .agent-skill-chip input { width:13px; height:13px; margin:0; }
   .agent-skill-chip span {
     overflow:hidden;
@@ -830,8 +841,7 @@ const AGENT_STYLE = `
     white-space:nowrap;
   }
   .agent-skill-meta { display:flex; flex-wrap:wrap; gap:5px; margin-top:7px; align-items:center; }
-  .agent-skill-meta code,
-  .agent-skill-provider {
+  .agent-skill-meta code {
     max-width:100%;
     overflow:hidden;
     padding:2px 5px;
@@ -842,7 +852,6 @@ const AGENT_STYLE = `
     text-overflow:ellipsis;
     white-space:nowrap;
   }
-  .agent-skill-provider { background:#e8f0ec; color:#3d6853; text-transform:uppercase; }
   .agent-skill-row details, .agent-skill-scan-diagnostics { margin-top:8px; color:#74736d; font-size:10px; }
   .agent-skill-row details p, .agent-skill-scan-diagnostics p { margin:5px 0; overflow-wrap:anywhere; }
   .agent-skill-empty, .agent-skill-empty-selection {
@@ -980,8 +989,8 @@ export function agentWorkbenchView(
     <details class="agent-skill-selector" ${view.errors.skills ? "open" : ""}>
       <summary class="agent-skill-summary">
         <div class="agent-skill-summary-copy">
-          <h3 id="agent-skills-heading">Pinned Skills</h3>
-          <p>固定后由 HomeAgent 显式加载；未固定时，仍可按当前 Provider 的默认规则使用本机全局 Skills。</p>
+          <h3 id="agent-skills-heading">共享 Skills</h3>
+          <p>只列出可跨 Provider 分配的共享能力；当前 Provider 自带的 Skills 无需再次固定。</p>
         </div>
         <span class="agent-skill-pinned-count" id="agent-skill-pinned-count">
           ${view.skillCatalog.selected.length} 个已固定
@@ -994,10 +1003,10 @@ export function agentWorkbenchView(
           <input
             id="agent-skill-search"
             type="search"
-            placeholder="搜索名称、说明或来源"
+            placeholder="搜索共享 Skill"
             autocomplete="off"
           />
-          <span>${view.skillCatalog.rows.length} 个版本</span>
+          <span>${view.skillCatalog.rows.length} 个共享能力</span>
           <button
             class="agent-skill-refresh"
             type="submit"
@@ -1012,7 +1021,7 @@ export function agentWorkbenchView(
       >
           ${view.skillCatalog.selected.map((selection) => html`
             <label class="agent-skill-chip ${selection.status}">
-              ${selection.status === "missing" ? html`
+              ${selection.status === "missing" || selection.status === "provider-native" ? html`
                 <input
                   type="checkbox"
                   name="skillSourceKeys"
@@ -1045,7 +1054,7 @@ export function agentWorkbenchView(
         class="agent-skill-empty-selection"
         id="agent-skill-empty-selection"
         ${view.skillCatalog.selected.length > 0 ? "hidden" : ""}
-      >未固定 Skill；Agent 仍可按当前 Provider 的默认规则使用本机全局 Skills。</p>
+      >未固定共享 Skill；当前 Provider 自带的能力仍可按其默认规则使用。</p>
       <div
         class="agent-skill-list"
         id="agent-skills"
@@ -1078,9 +1087,6 @@ export function agentWorkbenchView(
                   <span class="agent-skill-description">${row.description || "未提供说明"}</span>
                   <span class="agent-skill-meta">
                     <code>${row.sourceLabel}</code>
-                    ${row.providerIds.map((providerId) =>
-                      html`<span class="agent-skill-provider">${providerId}</span>`
-                    )}
                     ${row.sourceCount > 1 ? html`<span>${row.sourceCount} 个同内容来源</span>` : ""}
                   </span>
                   ${row.diagnostics.length > 0 ? html`
@@ -1094,8 +1100,8 @@ export function agentWorkbenchView(
             `)
           : html`
               <div class="agent-skill-empty">
-                <strong>尚未发现本地 Skill</strong>
-                <span>请确认本机 Skill 目录存在，然后刷新目录。</span>
+                <strong>尚未发现共享 Skill</strong>
+                <span>请将共享能力安装到 ~/.agents/skills，然后刷新目录。</span>
               </div>
             `}
       </div>
@@ -1387,11 +1393,13 @@ export function agentWorkbenchView(
                 <div class="agent-run-item ${run.status}">
                   <a
                     class="agent-run-link"
-                    href="/tasks/runs/${encodeURIComponent(run.id)}"
+                    href="${run.href}"
                     aria-label="${STATUS_LABELS[run.status]}：${run.taskName}，${run.space}，${run.provider} / ${run.model}"
                   >
                     <span class="agent-run-icon" aria-hidden="true">
-                      ${run.status === "succeeded"
+                      ${run.status === "recorded"
+                        ? "◆"
+                        : run.status === "succeeded"
                         ? "✓"
                         : run.status === "running"
                           ? "…"
@@ -1403,7 +1411,11 @@ export function agentWorkbenchView(
                     </span>
                     <span class="agent-run-copy">
                       <span class="agent-run-primary">
-                        ${run.retryable && run.error ? run.error : run.taskName}
+                        ${run.kind === "chat"
+                          ? html`Chat · ${run.topic}`
+                          : run.retryable && run.error
+                            ? run.error
+                            : run.taskName}
                       </span>
                       <span class="agent-run-secondary">
                         <span class="agent-run-status-text">${STATUS_LABELS[run.status]}</span>
@@ -1429,7 +1441,7 @@ export function agentWorkbenchView(
               `)}
             </div>
           `
-          : html`<div class="agent-runs-empty">还没有由此 Agent 执行的研究任务</div>`}
+          : html`<div class="agent-runs-empty">还没有由此 Agent 处理的 Chat 或研究任务</div>`}
         ${view.inspector!.hasMoreRuns ? html`
           <a
             class="agent-load-more"
@@ -1791,7 +1803,9 @@ export function agentWorkbenchView(
       chip.remove();
     });
     var activeCount = 0;
-    skillChips.querySelectorAll('.agent-skill-chip.missing, .agent-skill-chip.legacy')
+    skillChips.querySelectorAll(
+      '.agent-skill-chip.missing, .agent-skill-chip.legacy, .agent-skill-chip.provider-native',
+    )
       .forEach(function (chip) {
         var checkbox = chip.querySelector('input[type="checkbox"]');
         chip.hidden = !checkbox || !checkbox.checked;

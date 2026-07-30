@@ -20,7 +20,11 @@ function source(
     relativeDir,
     name,
     description: `${name} description`,
-    providerIds: rootKind === "claude-user" ? ["claude"] : ["codex"],
+    providerIds: rootKind === "shared-agents"
+      ? ["claude", "codex", "trae-cli"]
+      : rootKind === "claude-user"
+        ? ["claude"]
+        : ["codex"],
     skillFile: `C:\\private\\${relativeDir}\\SKILL.md`,
     skillFileHash: hash,
     status,
@@ -73,8 +77,8 @@ function agent(sourceKey: string): Agent {
 
 describe("Skills inventory presenter", () => {
   test("marks same-name different-content entries as conflicts", () => {
-    const first = source("codex-user", "review", "review", "a".repeat(64));
-    const second = source("claude-user", "review", "review", "b".repeat(64));
+    const first = source("shared-agents", "review-a", "review", "a".repeat(64));
+    const second = source("shared-agents", "review-b", "review", "b".repeat(64));
 
     const view = buildSkillInventory(snapshot([first, second]), []);
 
@@ -85,8 +89,8 @@ describe("Skills inventory presenter", () => {
 
   test("groups same-content sources and resolves exact reverse Agent usage", () => {
     const hash = "a".repeat(64);
-    const first = source("codex-user", "review", "review", hash);
-    const second = source("claude-user", "review", "review", hash);
+    const first = source("shared-agents", "review-a", "review", hash);
+    const second = source("shared-agents", "review-b", "review", hash);
 
     const view = buildSkillInventory(snapshot([first, second]), [
       agent(second.sourceKey),
@@ -95,7 +99,7 @@ describe("Skills inventory presenter", () => {
     expect(view.rows).toHaveLength(1);
     expect(view.rows[0]).toEqual(expect.objectContaining({
       status: "duplicate",
-      sourceLabels: ["codex-user · review", "claude-user · review"],
+      sourceLabels: ["共享 · review-a", "共享 · review-b"],
       usedBy: [expect.objectContaining({ name: "Review Agent" })],
     }));
     expect(view.agentCount).toBe(1);
@@ -103,7 +107,7 @@ describe("Skills inventory presenter", () => {
 
   test("surfaces invalid entries and degrades safely without a snapshot", () => {
     const invalid = source(
-      "codex-user",
+      "shared-agents",
       "broken",
       "broken",
       "b".repeat(64),
@@ -118,5 +122,17 @@ describe("Skills inventory presenter", () => {
     const missingView = buildSkillInventory(undefined, []);
     expect(missingView.rows).toEqual([]);
     expect(missingView.diagnostics[0]).toContain("Provider 默认规则");
+  });
+
+  test("omits Provider-native sources from the shared inventory", () => {
+    const shared = source("shared-agents", "review", "review", "a".repeat(64));
+    const native = source("codex-user", "browser", "browser", "b".repeat(64));
+
+    const view = buildSkillInventory(snapshot([shared, native]), [agent(native.sourceKey)]);
+
+    expect(view.rows.map((row) => row.name)).toEqual(["review"]);
+    expect(view.sourceCount).toBe(1);
+    expect(view.agentCount).toBe(0);
+    expect(JSON.stringify(view)).not.toContain("codex-user");
   });
 });
