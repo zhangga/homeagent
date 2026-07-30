@@ -942,8 +942,8 @@ export function agentWorkbenchView(
       <input type="hidden" name="skillSelectorPresent" value="1" form="agent-editor-form" />
       <div class="agent-skill-heading-row">
         <div>
-          <h3 id="agent-skills-heading">Agent capabilities / Skills</h3>
-          <p>为这个 Agent 绑定本机已发现的 Skill。普通对话只读，研究任务沿用任务权限。</p>
+          <h3 id="agent-skills-heading">Pinned Skills</h3>
+          <p>固定后由 HomeAgent 显式加载；未固定时，仍可按当前 Provider 的默认规则使用本机全局 Skills。</p>
         </div>
         <button
           class="agent-skill-refresh"
@@ -964,7 +964,7 @@ export function agentWorkbenchView(
       <div
         class="agent-skill-chips"
         id="agent-skill-chips"
-        aria-label="已选择的 Skills"
+        aria-label="已固定的 Skills"
         ${view.skillCatalog.selected.length === 0 ? "hidden" : ""}
       >
           ${view.skillCatalog.selected.map((selection) => html`
@@ -1002,7 +1002,7 @@ export function agentWorkbenchView(
         class="agent-skill-empty-selection"
         id="agent-skill-empty-selection"
         ${view.skillCatalog.selected.length > 0 ? "hidden" : ""}
-      >尚未选择 Skill；Agent 会按基础指令运行。</p>
+      >未固定 Skill；Agent 仍可按当前 Provider 的默认规则使用本机全局 Skills。</p>
       <div
         class="agent-skill-list"
         id="agent-skills"
@@ -1761,7 +1761,7 @@ export function agentWorkbenchView(
       var name = document.createElement('span');
       name.textContent = row.dataset.skillName || checkbox.value;
       var status = document.createElement('small');
-      status.textContent = '已选择';
+      status.textContent = '已固定';
       var remove = document.createElement('button');
       remove.type = 'button';
       remove.setAttribute('aria-label', '移除 ' + name.textContent);

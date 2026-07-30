@@ -373,7 +373,7 @@ function buildSkillCatalogView(
           sourceKey,
           sourceLabel: `${source.rootKind} · ${source.relativeDir}`,
           status: "selected",
-          statusLabel: "已选择",
+          statusLabel: "已固定",
         }
       : {
           kind: "source",

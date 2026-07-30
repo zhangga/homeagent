@@ -54,6 +54,7 @@ import {
 } from "@homeagent/core";
 import { layout } from "./layout.ts";
 import { agentWorkbenchView } from "./agent-workbench-view.ts";
+import { buildSkillInventory, skillInventoryView } from "./skill-inventory-view.ts";
 import {
   agentInputForEditor,
   buildAgentWorkbench,
@@ -1457,12 +1458,34 @@ export function createWebApp(opts: WebOptions): Hono {
     return c.redirect(`/spaces/${encodeURIComponent(space)}`);
   });
 
+  // ---- Skills --------------------------------------------------------------
+
+  app.get("/skills", async (c) => {
+    let catalog;
+    try {
+      catalog = engine.skillCatalog.current();
+    } catch {
+      catalog = undefined;
+    }
+    return c.html(
+      await layout(
+        "Skills",
+        [{ label: "Skills" }],
+        skillInventoryView(
+          buildSkillInventory(catalog, engine.agents.list()),
+          c.req.query("ok") ?? undefined,
+        ),
+        "skills",
+      ),
+    );
+  });
+
   // ---- Agents --------------------------------------------------------------
 
   app.post("/agent-skills/refresh", async (c) => {
     const body = await c.req.parseBody();
     const requested = typeof body.returnTo === "string" ? body.returnTo : "/agents";
-    const returnTo = requested.startsWith("/agents")
+    const returnTo = (requested.startsWith("/agents") || requested === "/skills")
       && !requested.startsWith("//")
       && !/[\r\n]/u.test(requested)
       ? requested

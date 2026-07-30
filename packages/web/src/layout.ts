@@ -3,8 +3,8 @@
  * tagged-template helper rather than JSX: it needs no transform config,
  * auto-escapes interpolations (XSS-safe by default), and keeps views as plain
  * functions. Layout mirrors mew's structure: a dark left nav rail with the main
- * sections (Spaces/Knowledge, Agents, Tasks, Integrations, Governance, AI Quality, Health,
- * Logs, Settings), and a
+ * sections (Spaces/Knowledge, Agents, Skills, Tasks, Learning, Reminders, Integrations,
+ * Governance, AI Quality, Health, Logs, Settings), and a
  * content area. Unlike the previous read-only viewer, forms here mutate — every
  * mutating form POSTs and re-renders.
  */
@@ -177,6 +177,7 @@ export interface Crumb {
 const NAV: { key: string; label: string; href: string; ico: string }[] = [
   { key: "spaces", label: "空间 / 知识", href: "/", ico: "🗂" },
   { key: "agents", label: "Agents", href: "/agents", ico: "🤖" },
+  { key: "skills", label: "Skills", href: "/skills", ico: "🧩" },
   { key: "tasks", label: "任务", href: "/tasks", ico: "⏰" },
   { key: "learning", label: "学习", href: "/learning", ico: "📖" },
   { key: "reminders", label: "提醒", href: "/reminders", ico: "🔔" },

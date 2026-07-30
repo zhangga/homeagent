@@ -1492,8 +1492,48 @@ describe("management backend (read-write)", () => {
   test("nav rail exposes the mew-style sections", async () => {
     const body = await (await app.request("/")).text();
     expect(body).toContain("Agents");
+    expect(body).toContain('href="/skills"');
     expect(body).toContain("飞书连接");
     expect(body).toContain("设置");
+  });
+
+  test("Skills inventory shows local metadata and reverse Agent usage without leaking files", async () => {
+    mkdirSync(join(skillRoot, "review"), { recursive: true });
+    writeFileSync(
+      join(skillRoot, "review", "SKILL.md"),
+      [
+        "---",
+        "name: review",
+        "description: Review important changes.",
+        "---",
+        "PRIVATE_SKILL_BODY",
+      ].join("\n"),
+      "utf8",
+    );
+    engine.skillCatalog.refresh();
+    const agent = engine.agents.create({
+      name: "Review Agent",
+      provider: "claude",
+      visibility: "Team",
+      skills: [{
+        kind: "source",
+        sourceKey: "shared-agents:review",
+        name: "review",
+      }],
+    });
+
+    const response = await app.request("/skills");
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body).toContain("本机 Skills");
+    expect(body).toContain("全局继承");
+    expect(body).toContain("Pinned");
+    expect(body).toContain("review");
+    expect(body).toContain("shared-agents · review");
+    expect(body).toContain("Review Agent");
+    expect(body).toContain(`/agents/${encodeURIComponent(agent.id)}`);
+    expect(body).not.toContain(skillRoot);
+    expect(body).not.toContain("PRIVATE_SKILL_BODY");
   });
 
   test("creating an agent via POST persists and redirects to its editor", async () => {
@@ -1701,6 +1741,19 @@ describe("management backend (read-write)", () => {
       "Skill 目录刷新失败",
     );
     expect(response.headers.get("location")).not.toContain("private");
+  });
+
+  test("Skill catalog refresh returns to the standalone inventory", async () => {
+    const response = await app.request("/agent-skills/refresh", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ returnTo: "/skills" }).toString(),
+    });
+
+    expect([302, 303]).toContain(response.status);
+    expect(response.headers.get("location")).toStartWith("/skills?ok=");
+    const page = await app.request(response.headers.get("location")!);
+    expect(await page.text()).toContain("Skill 目录已刷新");
   });
 
   test("agent editor explains the active task-execution boundaries", async () => {

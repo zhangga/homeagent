@@ -61,11 +61,12 @@ describe("Agent workbench view", () => {
     });
 
     const body = String(await agentWorkbenchView(view));
-    const capabilitiesAt = body.indexOf("Agent capabilities / Skills");
+    const capabilitiesAt = body.indexOf("Pinned Skills");
     const taskAt = body.indexOf('data-pane="agent-inspector"');
 
     expect(capabilitiesAt).toBeGreaterThan(-1);
     expect(capabilitiesAt).toBeLessThan(taskAt);
+    expect(body).toContain("仍可按当前 Provider 的默认规则使用本机全局 Skills");
     expect(body).toContain('id="agent-skill-search"');
     expect(body).toContain('name="skillSourceKeys"');
     expect(body).toContain('value="codex-user:review"');
