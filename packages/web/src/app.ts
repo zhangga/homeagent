@@ -2022,6 +2022,24 @@ export function createWebApp(opts: WebOptions): Hono {
     );
   });
 
+  app.get("/integrations/progress", async (c) => {
+    c.header("cache-control", "no-store");
+    if (!opts.feishuIntegration) {
+      return c.json(
+        { error: "temporarily_unavailable", retryAfterMs: 10_000 },
+        503,
+      );
+    }
+    try {
+      return c.json(await opts.feishuIntegration.progress());
+    } catch {
+      return c.json(
+        { error: "temporarily_unavailable", retryAfterMs: 10_000 },
+        503,
+      );
+    }
+  });
+
   app.post("/integrations/bot/setup", async (c) => {
     const body = await c.req.parseBody();
     const returnTo = str(body, "returnTo") === "/setup" ? "/setup" : "/integrations";
@@ -2049,6 +2067,7 @@ export function createWebApp(opts: WebOptions): Hono {
 
   app.post("/integrations/bot/verify", async (c) => {
     const status = await getLarkStatus();
+    opts.feishuIntegration?.invalidateProgressProbes();
     if (!persistVerifiedBot(status)) {
       return c.redirect(`/integrations?ok=${encodeURIComponent("验证失败：lark-cli Bot 身份尚未就绪")}`);
     }

@@ -49,6 +49,11 @@ import type {
   FeishuGroupIntegrationView,
   FeishuIntegrationSnapshot,
 } from "./feishu-integration-service.ts";
+import {
+  deriveFeishuConnectionProgress,
+  type FeishuConnectionProgress,
+} from "./feishu-connection-progress.ts";
+import { feishuProgressBrowserScript } from "./feishu-progress-client.ts";
 import type { FeishuExternalSharingStatus } from "./external-sharing.ts";
 import {
   feishuProvisioningPollScript,
@@ -1933,17 +1938,111 @@ function integrationsControlCenterView(
   input: IntegrationsViewInput,
   snapshot: FeishuIntegrationSnapshot,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
+  const progress = deriveFeishuConnectionProgress({
+    bot: snapshot.bot,
+    activeIdentity: snapshot.activeIdentity,
+    runtime: snapshot.runtime,
+    capability: snapshot.capability,
+    groups: snapshot.groups.map((group) => ({
+      ...group.binding,
+      state: group.state,
+    })),
+  });
+  const nextSpace = progress.nextAction.spaceId;
+  const nextGroup = nextSpace
+    ? snapshot.groups.find((group) => group.binding.spaceId === nextSpace)
+    : undefined;
+  const nextGroupLabel = nextGroup?.space?.name
+    || nextGroup?.chat?.name
+    || nextGroup?.binding.chatId
+    || nextSpace;
+  const nextTitle = progress.nextAction.kind === "test_group"
+    ? `测试「${nextGroupLabel}」`
+    : progress.nextAction.kind === "connect_bot"
+      ? "连接飞书 Bot"
+      : progress.nextAction.kind === "verify_bot"
+        ? "验证飞书 Bot"
+        : progress.nextAction.kind === "recover_runtime"
+          ? "恢复飞书消息监听"
+          : progress.nextAction.kind === "restart_runtime"
+            ? "重启并加载新 Bot"
+            : progress.nextAction.kind === "wait_for_confirmation"
+              ? `等待「${nextGroupLabel}」管理员确认`
+              : progress.nextAction.kind === "reconnect_group"
+                ? `重新连接「${nextGroupLabel}」`
+                : progress.nextAction.kind === "connect_group"
+                  ? "连接一个群聊"
+                  : progress.nextAction.kind === "none"
+                    ? "飞书连接已完成"
+                    : "检查飞书连接";
+  const nextDescription = progress.nextAction.kind === "test_group"
+    ? "管理员已确认启用。发送一条测试消息，成功后该群即完成连接。"
+    : progress.nextAction.kind === "connect_bot"
+      ? "先创建或连接 Bot，群聊闭环才可以开始。"
+      : progress.nextAction.kind === "verify_bot"
+        ? "重新验证当前应用身份和权限后再继续群聊连接。"
+        : progress.nextAction.kind === "recover_runtime"
+          ? "历史连接结果仍然保留；先恢复当前消息消费者。"
+          : progress.nextAction.kind === "restart_runtime"
+            ? "当前运行中的消费者仍在使用旧身份，重启后再继续。"
+            : progress.nextAction.kind === "wait_for_confirmation"
+              ? "确认完成后会进入待测试状态，不会自动发送测试消息。"
+              : progress.nextAction.kind === "reconnect_group"
+                ? "Bot 身份已变化，需要由群管理员重新确认后再测试。"
+                : progress.nextAction.kind === "connect_group"
+                  ? "选择 Bot 已加入的群，由群管理员确认后再完成测试。"
+                  : "当前群聊已经过成功测试；后续运行异常不会抹除这份完成记录。";
+  const actionVisible = (
+    kind: FeishuConnectionProgress["nextAction"]["kind"],
+  ) => progress.nextAction.kind === kind;
+  const progressCard = html`<section
+    class="card integration-progress"
+    data-feishu-progress-root
+    data-feishu-next-action="${progress.nextAction.kind}"
+    data-next-space="${nextSpace ?? ""}"
+    data-feishu-revision="${progress.revision}"
+    data-poll-after="${progress.pollAfterMs ?? ""}"
+  >
+    <div>
+      <div class="eyebrow">当前下一步</div>
+      <strong data-feishu-title>${nextTitle}</strong>
+      <div class="muted" data-feishu-description>${nextDescription}</div>
+    </div>
+    <div class="integration-actions" data-feishu-actions>
+      ${actionVisible("connect_bot")
+        ? html`<a class="btn" href="#feishu-bot" data-feishu-action="connect_bot">连接 Bot</a>`
+        : html`<a class="btn" href="#feishu-bot" data-feishu-action="connect_bot" hidden>连接 Bot</a>`}
+      ${actionVisible("verify_bot")
+        ? html`<form method="post" action="/integrations/bot/verify" data-feishu-action="verify_bot"><button type="submit">重新验证</button></form>`
+        : html`<form method="post" action="/integrations/bot/verify" data-feishu-action="verify_bot" hidden><button type="submit">重新验证</button></form>`}
+      ${actionVisible("restart_runtime")
+        ? html`<a class="btn" href="/health" data-feishu-action="restart_runtime">前往重启</a>`
+        : html`<a class="btn" href="/health" data-feishu-action="restart_runtime" hidden>前往重启</a>`}
+      ${actionVisible("recover_runtime")
+        ? html`<a class="btn" href="/health" data-feishu-action="recover_runtime">前往恢复</a>`
+        : html`<a class="btn" href="/health" data-feishu-action="recover_runtime" hidden>前往恢复</a>`}
+      ${actionVisible("connect_group")
+        ? html`<a class="btn" href="/integrations/groups/connect" data-feishu-action="connect_group">选择群聊</a>`
+        : html`<a class="btn" href="/integrations/groups/connect" data-feishu-action="connect_group" hidden>选择群聊</a>`}
+      <button type="button" data-feishu-action="reconnect_group" data-feishu-scroll-group ${actionVisible("reconnect_group") ? "" : "hidden"}>重新连接</button>
+      <button type="button" data-feishu-action="test_group" data-feishu-scroll-group ${actionVisible("test_group") ? "" : "hidden"}>发送测试消息</button>
+      <button type="button" class="secondary" data-feishu-action="wait_for_confirmation" data-feishu-scroll-group ${actionVisible("wait_for_confirmation") ? "" : "hidden"}>查看确认状态</button>
+      ${actionVisible("none")
+        ? html`<span class="badge ok" data-feishu-action="none">已完成</span>`
+        : html`<span class="badge ok" data-feishu-action="none" hidden>已完成</span>`}
+    </div>
+  </section>`;
   const setup = snapshot.bot;
   const runtimeFailed =
     snapshot.runtime?.consumers.some((consumer) => consumer.state === "failed")
     ?? false;
   const runtimeBadge = snapshot.restartRequired
-    ? html`<span class="badge degraded">需要重启</span>`
+    ? html`<span class="badge degraded" data-feishu-bot-stage>需要重启</span>`
     : runtimeFailed
-      ? html`<span class="badge down">消息监听异常</span>`
+      ? html`<span class="badge down" data-feishu-bot-stage>消息监听异常</span>`
       : snapshot.runtime?.ready
-        ? html`<span class="badge ok">正在运行</span>`
-        : html`<span class="badge degraded">未启动</span>`;
+        ? html`<span class="badge ok" data-feishu-bot-stage>正在运行</span>`
+        : html`<span class="badge degraded" data-feishu-bot-stage>未启动</span>`;
   const capabilityBadge = snapshot.capability === "available"
     ? html`<span class="badge ok">完整群消息可用</span>`
     : snapshot.capability === "unavailable"
@@ -1981,7 +2080,13 @@ function integrationsControlCenterView(
       : "";
   const cards = snapshot.groups.length > 0
     ? snapshot.groups.map((group) =>
-        integrationGroupCard(group, snapshot)
+        integrationGroupCard(
+          group,
+          snapshot,
+          progress.groups.find((item) =>
+            item.spaceId === group.binding.spaceId
+          )!,
+        )
       )
     : [html`<div class="empty integration-empty">
         <strong>还没有发现群聊</strong>
@@ -1993,6 +2098,7 @@ function integrationsControlCenterView(
     .integration-console .console-head { display:flex; justify-content:space-between; gap:20px; align-items:flex-end; margin-bottom:18px; }
     .integration-console .eyebrow { font:600 11px/1.2 ui-monospace,monospace; letter-spacing:.16em; color:#8a623a; margin-bottom:8px; }
     .integration-console .bot-console { background:var(--paper); border-color:var(--line); box-shadow:0 10px 28px rgba(74,58,35,.05); }
+    .integration-console .integration-progress { display:flex; justify-content:space-between; align-items:center; gap:18px; border:2px solid #d5a15f; background:#fff8ed; }
     .integration-console .bot-title { display:flex; align-items:center; gap:12px; }
     .integration-console .bot-mark { width:38px; height:38px; display:grid; place-items:center; border-radius:10px; background:#2f5f52; color:#fff; font-weight:700; }
     .integration-console .console-facts { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
@@ -2017,8 +2123,19 @@ function integrationsControlCenterView(
       <a class="btn" href="/integrations/groups/connect">请求群确认</a>
     </div>
     ${flash(input.flashMsg)}
+    ${progressCard}
+    <div class="degraded-note" data-feishu-refresh-warning hidden>
+      连接状态暂时无法更新，请手动刷新页面。
+    </div>
 
-    <section class="card bot-console">
+    <section
+      class="card bot-console"
+      id="feishu-bot"
+      data-feishu-bot
+      data-feishu-stage="${progress.bot.stage}"
+      data-feishu-health="${progress.bot.health}"
+      data-feishu-capability="${progress.bot.capability}"
+    >
       <div class="integration-row">
         <div>
           <div class="bot-title">
@@ -2072,12 +2189,14 @@ function integrationsControlCenterView(
         <button type="submit" class="secondary">手动连接已有应用</button>
       </form>
     </details>
+    <script>${raw(feishuProgressBrowserScript(progress))}</script>
   </div>`;
 }
 
 function integrationGroupCard(
   group: FeishuGroupIntegrationView,
   snapshot: FeishuIntegrationSnapshot,
+  progress: FeishuConnectionProgress["groups"][number],
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const binding = group.binding;
   const space = group.space;
@@ -2113,32 +2232,70 @@ function integrationGroupCard(
             ? "提示发送中"
             : "尚未发送提示";
       const botName = snapshot.bot.botName || "HomeAgent";
-      return html`<article class="card group-card">
+      return html`<article
+        class="card group-card"
+        id="feishu-group-${encodedSpace}"
+        data-space-id="${binding.spaceId}"
+        data-feishu-stage="${progress.stage}"
+        data-completed-at="${progress.completedAt ?? ""}"
+      >
         <div class="group-head">
           <div><strong>${displayName}</strong><div class="muted">${binding.chatId}</div></div>
           ${stateBadge}
         </div>
         <div class="group-summary"><span>发现于 ${new Date(binding.createdAt).toISOString()}</span><span>${promptLabel}</span></div>
+        <div class="group-summary" data-feishu-closure>
+          <span data-feishu-group-stage>等待群管理员确认</span>
+          <span data-feishu-group-completed hidden></span>
+          ${progress.health === "degraded"
+            ? html`<span data-feishu-group-health>当前运行异常</span>`
+            : progress.health === "limited"
+              ? html`<span data-feishu-group-health>当前能力受限</span>`
+              : html`<span data-feishu-group-health hidden></span>`}
+        </div>
         <div class="degraded-note">请群主或管理员在群内发送“@${botName} 启用群聊”。确认前不会读取、记录或回复普通群消息。</div>
         <div class="actions" style="margin-top:14px">
           <form method="post" action="/integrations/groups/${encodedSpace}/confirmation"><button type="submit">重新发送提示</button></form>
           <form method="post" action="/integrations/groups/${encodedSpace}/ignore" onsubmit="return confirm('忽略该群？之后重新入群也不会自动启用。')"><button type="submit" class="danger">忽略此群</button></form>
+          <form method="post" action="/integrations/groups/${encodedSpace}/test" data-feishu-group-test data-feishu-poll-test hidden><button type="submit">测试连接</button></form>
         </div>
       </article>`;
     }
-    return html`<article class="card group-card">
+    return html`<article
+      class="card group-card"
+      id="feishu-group-${encodedSpace}"
+      data-space-id="${binding.spaceId}"
+      data-feishu-stage="${progress.stage}"
+      data-completed-at="${progress.completedAt ?? ""}"
+    >
       <div class="group-head">
         <div><strong>${displayName}</strong><div class="muted">${binding.chatId}</div></div>
         ${stateBadge}
       </div>
       <div class="group-summary"><span>${modeLabel}</span>${space ? html`<span>知识空间保留</span>` : ""}</div>
+      <div class="group-summary" data-feishu-closure>
+        <span data-feishu-group-stage>${progress.stage === "needs_reconnect" ? "需要重新确认" : "已断开"}</span>
+        <span data-feishu-group-completed hidden></span>
+        ${progress.health === "degraded"
+          ? html`<span data-feishu-group-health>当前运行异常</span>`
+          : progress.health === "limited"
+            ? html`<span data-feishu-group-health>当前能力受限</span>`
+            : html`<span data-feishu-group-health hidden></span>`}
+      </div>
       <form method="post" action="/integrations/groups/connect" class="actions" style="margin-top:14px">
         <input type="hidden" name="chatId" value="${binding.chatId}" />
         <button type="submit">请求群管理员确认</button>
       </form>
+      <form method="post" action="/integrations/groups/${encodedSpace}/test" data-feishu-group-test data-feishu-poll-test hidden><button type="submit">测试连接</button></form>
     </article>`;
   }
-  return html`<article class="card group-card">
+  return html`<article
+    class="card group-card"
+    id="feishu-group-${encodedSpace}"
+    data-space-id="${binding.spaceId}"
+    data-feishu-stage="${progress.stage}"
+    data-completed-at="${progress.completedAt ?? ""}"
+  >
     <div class="group-head">
       <div>
         <strong>${space?.name || binding.chatId}</strong>
@@ -2146,6 +2303,17 @@ function integrationGroupCard(
         <div class="group-summary"><span>${modeLabel}</span><span>${binding.replyInThread ? "Topic reply" : "普通回复"}</span><span>${space?.agentId ? "指定 Agent" : "默认 Agent"}</span></div>
       </div>
       ${stateBadge}
+    </div>
+    <div class="group-summary" data-feishu-closure>
+      <span data-feishu-group-stage>${progress.stage === "complete" ? "连接已验证" : "等待测试"}</span>
+      ${progress.completedAt
+        ? html`<span data-feishu-group-completed>验证于 ${new Date(progress.completedAt).toISOString()}</span>`
+        : html`<span data-feishu-group-completed hidden></span>`}
+      ${progress.health === "degraded"
+        ? html`<span data-feishu-group-health>当前运行异常</span>`
+        : progress.health === "limited"
+          ? html`<span data-feishu-group-health>当前能力受限</span>`
+          : html`<span data-feishu-group-health hidden></span>`}
     </div>
     ${group.degraded
       ? html`<div class="degraded-note">当前应用无法确认完整群消息权限；现有策略保留，但运行时可能只能收到 @ Bot 的消息。</div>`
@@ -2176,7 +2344,7 @@ function integrationGroupCard(
       </details>
       <div class="actions" style="margin-top:14px">
         <button type="submit">保存</button>
-        <button type="submit" class="secondary" formaction="/integrations/groups/${encodedSpace}/test">测试连接</button>
+        <button type="submit" class="secondary" formaction="/integrations/groups/${encodedSpace}/test" data-feishu-group-test>测试连接</button>
         <button type="submit" class="danger" formaction="/integrations/groups/${encodedSpace}/disconnect" onclick="return confirm('断开该群？已有知识和任务会保留。')">断开</button>
       </div>
     </form>

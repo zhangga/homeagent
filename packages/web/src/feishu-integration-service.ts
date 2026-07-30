@@ -17,6 +17,10 @@ import {
   type SpaceId,
 } from "@homeagent/shared";
 import type { FeishuRuntimeStatus, LarkSetupPort } from "./integrations.ts";
+import {
+  deriveFeishuConnectionProgress,
+  type FeishuConnectionProgress,
+} from "./feishu-connection-progress.ts";
 
 export type FeishuIntegrationErrorCode =
   | "bot_not_ready"
@@ -61,6 +65,7 @@ export interface FeishuIntegrationServiceOptions {
   runtimeStatus?: () => FeishuRuntimeStatus | undefined;
   persistConnectionDisabledAppId?: (appId: string) => Promise<void> | void;
   disableRuntime?: () => Promise<void> | void;
+  now?: () => number;
 }
 
 export interface FeishuGroupIntegrationView {
@@ -92,6 +97,15 @@ export class FeishuIntegrationService {
     appId: string,
   ) => Promise<void> | void;
   private readonly disableRuntime?: () => Promise<void> | void;
+  private readonly now: () => number;
+  private progressBotProbe?: {
+    expiresAt: number;
+    promise: Promise<LarkSetupStatus>;
+  };
+  private progressCapabilityProbe?: {
+    expiresAt: number;
+    promise: Promise<LarkCapabilityState>;
+  };
 
   constructor(opts: FeishuIntegrationServiceOptions) {
     this.engine = opts.engine;
@@ -103,6 +117,7 @@ export class FeishuIntegrationService {
     this.persistConnectionDisabledAppId =
       opts.persistConnectionDisabledAppId;
     this.disableRuntime = opts.disableRuntime;
+    this.now = opts.now ?? Date.now;
   }
 
   async snapshot(): Promise<FeishuIntegrationSnapshot> {
@@ -145,6 +160,80 @@ export class FeishuIntegrationService {
         (agent) => agent.visibility === "Team",
       ),
     };
+  }
+
+  async progress(): Promise<FeishuConnectionProgress> {
+    try {
+      const [bot, capability] = await Promise.all([
+        this.progressBot(),
+        this.progressCapability(),
+      ]);
+      return deriveFeishuConnectionProgress({
+        bot,
+        activeIdentity: this.activeIdentity(),
+        runtime: this.runtimeStatus(),
+        capability,
+        groups: this.engine.feishuBindings.list(),
+      });
+    } catch {
+      throw new FeishuIntegrationError(
+        "operation_unavailable",
+        "Feishu progress is temporarily unavailable",
+      );
+    }
+  }
+
+  invalidateProgressProbes(): void {
+    this.progressBotProbe = undefined;
+    this.progressCapabilityProbe = undefined;
+  }
+
+  private progressBot(): Promise<LarkSetupStatus> {
+    if (
+      !this.progressBotProbe
+      || this.progressBotProbe.expiresAt <= this.now()
+    ) {
+      const probe: {
+        expiresAt: number;
+        promise: Promise<LarkSetupStatus>;
+      } = {
+        expiresAt: this.now() + 5_000,
+        promise: this.larkSetup.status(),
+      };
+      probe.promise = probe.promise.catch((error) => {
+        if (this.progressBotProbe === probe) {
+          this.progressBotProbe = undefined;
+        }
+        throw error;
+      });
+      this.progressBotProbe = probe;
+    }
+    return this.progressBotProbe.promise;
+  }
+
+  private progressCapability(): Promise<LarkCapabilityState> {
+    if (
+      !this.progressCapabilityProbe
+      || this.progressCapabilityProbe.expiresAt <= this.now()
+    ) {
+      const capability = this.larkSetup.fullGroupMessageCapability?.()
+        ?? Promise.resolve("unknown" as const);
+      const probe: {
+        expiresAt: number;
+        promise: Promise<LarkCapabilityState>;
+      } = {
+        expiresAt: this.now() + 30_000,
+        promise: capability,
+      };
+      probe.promise = probe.promise.catch((error) => {
+        if (this.progressCapabilityProbe === probe) {
+          this.progressCapabilityProbe = undefined;
+        }
+        throw error;
+      });
+      this.progressCapabilityProbe = probe;
+    }
+    return this.progressCapabilityProbe.promise;
   }
 
   async listConnectionCandidates(): Promise<LarkChatSummary[]> {

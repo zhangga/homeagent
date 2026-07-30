@@ -2011,6 +2011,9 @@ describe("management backend (read-write)", () => {
     expect(pending).toContain(
       'action="/integrations/groups/team%2Foc_new/ignore"',
     );
+    expect(pending).toContain('data-space-id="team/oc_new"');
+    expect(pending).toContain('data-feishu-stage="waiting_confirmation"');
+    expect(pending).toContain("data-feishu-closure");
 
     const resend = await integrationApp.request(
       `/integrations/groups/${encodeURIComponent("team/oc_new")}/confirmation`,
@@ -2307,6 +2310,558 @@ describe("management backend (read-write)", () => {
     expect(page).toContain("需要重启");
     expect(page).toContain("前往运行状态重启");
     expect(page).toContain('href="/health"');
+  });
+
+  test("integration progress endpoint returns bounded uncached closure state", async () => {
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "ready",
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu",
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "available",
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+        activeIdentity: () => ({
+          botName: "HomeAgent",
+          botOpenId: "ou_bot",
+        }),
+        runtimeStatus: () => ({ ready: true, consumers: [] }),
+      }),
+    });
+
+    const response = await integrationApp.request("/integrations/progress");
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toMatchObject({
+      version: 1,
+      bot: { stage: "ready" },
+      groups: [{
+        spaceId: SPACE,
+        stage: "ready_to_test",
+      }],
+      nextAction: {
+        kind: "test_group",
+        spaceId: SPACE,
+      },
+    });
+  });
+
+  test("explicit Bot verification invalidates cached integration progress probes", async () => {
+    let botOpenId = "ou_old";
+    let statusReads = 0;
+    const larkSetup: LarkSetupPort = {
+      status: async () => {
+        statusReads += 1;
+        return {
+          state: "ready",
+          verified: true,
+          appId: "cli_current",
+          brand: "feishu",
+          botName: "HomeAgent",
+          botOpenId,
+          message: "ready",
+        };
+      },
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "available",
+    };
+    const service = new FeishuIntegrationService({
+      engine,
+      larkSetup,
+      activeIdentity: () => ({
+        botName: "HomeAgent",
+        botOpenId,
+      }),
+      runtimeStatus: () => ({ ready: true, consumers: [] }),
+    });
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: service,
+    });
+
+    expect(
+      ((await (await integrationApp.request("/integrations/progress")).json()) as {
+        bot: { stage: string };
+      }).bot.stage,
+    ).toBe("ready");
+    botOpenId = "ou_new";
+
+    const verification = await integrationApp.request(
+      "/integrations/bot/verify",
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(verification.status);
+
+    const refreshed = (await (
+      await integrationApp.request("/integrations/progress")
+    ).json()) as { bot: { stage: string } };
+    expect(refreshed.bot.stage).toBe("ready");
+    expect(statusReads).toBe(3);
+  });
+
+  test("integration progress is protected and returns a fixed unavailable response", async () => {
+    const larkSetup: LarkSetupPort = {
+      status: async () => {
+        throw new Error("private CLI output TOKEN");
+      },
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "unknown",
+    };
+    const secureApp = createWebApp({
+      engine,
+      adminToken: "admin-secret",
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+      }),
+    });
+
+    expect(
+      (await secureApp.request("/integrations/progress")).status,
+    ).toBe(401);
+    const response = await secureApp.request("/integrations/progress", {
+      headers: { authorization: "Bearer admin-secret" },
+    });
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const text = await response.text();
+    expect(JSON.parse(text)).toEqual({
+      error: "temporarily_unavailable",
+      retryAfterMs: 10_000,
+    });
+    expect(text).not.toContain("private");
+    expect(text).not.toContain("TOKEN");
+  });
+
+  test("connection closure prioritizes an unconfigured Bot before group work", async () => {
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "unconfigured",
+        verified: false,
+        brand: "feishu",
+        message: "not configured",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "unknown",
+      listBotChats: async () => [],
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+
+    expect(page).toContain('data-feishu-next-action="connect_bot"');
+    expect(page).toContain("连接飞书 Bot");
+    expect(page).toContain('href="#feishu-bot"');
+    expect(page).toContain('id="feishu-bot"');
+  });
+
+  test("connection closure offers explicit verification for an invalid Bot", async () => {
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "invalid",
+        verified: false,
+        appId: "cli_current",
+        brand: "feishu",
+        message: "invalid",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "unknown",
+      listBotChats: async () => [],
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+
+    expect(page).toContain('data-feishu-next-action="verify_bot"');
+    expect(page).toContain("验证飞书 Bot");
+    expect(page).toContain(
+      '<form method="post" action="/integrations/bot/verify"',
+    );
+  });
+
+  test("connection closure routes a changed Bot identity through restart", async () => {
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "ready",
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu",
+        botName: "HomeAgent",
+        botOpenId: "ou_new",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "available",
+      listBotChats: async () => [],
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+        activeIdentity: () => ({
+          botName: "HomeAgent",
+          botOpenId: "ou_old",
+        }),
+        runtimeStatus: () => ({ ready: true, consumers: [] }),
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+
+    expect(page).toContain('data-feishu-next-action="restart_runtime"');
+    expect(page).toContain("重启并加载新 Bot");
+    expect(page).toContain('data-feishu-action="restart_runtime"');
+    expect(page).toContain('href="/health"');
+  });
+
+  test("connection closure points an active untested group to its explicit test action", async () => {
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "ready",
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu",
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "available",
+      listBotChats: async () => [],
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+        activeIdentity: () => ({
+          botName: "HomeAgent",
+          botOpenId: "ou_bot",
+        }),
+        runtimeStatus: () => ({ ready: true, consumers: [] }),
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+
+    expect(page.match(/data-feishu-progress-root\r?\n/g)?.length).toBe(1);
+    expect(page).toContain('data-feishu-next-action="test_group"');
+    expect(page).toContain(`data-next-space="${SPACE}"`);
+    expect(page).toContain(`data-space-id="${SPACE}"`);
+    expect(page).toContain("data-feishu-revision=");
+    expect(page).toContain('data-poll-after="5000"');
+    expect(page).toContain("data-feishu-title");
+    expect(page).toContain("data-feishu-description");
+    expect(page).toContain("data-feishu-refresh-warning");
+    expect(page).toContain("发送测试消息");
+    expect(page).toContain('data-feishu-action="test_group"');
+    expect(page).toContain(
+      'data-feishu-action="test_group" data-feishu-scroll-group',
+    );
+    expect(page).not.toContain('href="#feishu-group-');
+    for (const action of [
+      "connect_bot",
+      "verify_bot",
+      "restart_runtime",
+      "recover_runtime",
+      "connect_group",
+      "reconnect_group",
+      "wait_for_confirmation",
+      "none",
+    ]) {
+      expect(page).toContain(`data-feishu-action="${action}"`);
+    }
+    expect(page).toContain('fetch("/integrations/progress"');
+    expect(page).toContain(
+      `formaction="/integrations/groups/${encodeURIComponent(SPACE)}/test"`,
+    );
+  });
+
+  test("connection closure waits for administrator confirmation without auto-testing", async () => {
+    engine.feishuBindings.disconnect(SPACE);
+    engine.feishuBindings.requestConfirmation({
+      chatId: "oc_web",
+      spaceId: SPACE,
+      boundAppId: "cli_current",
+    });
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "ready",
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu",
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "available",
+      listBotChats: async () => [],
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+        activeIdentity: () => ({
+          botName: "HomeAgent",
+          botOpenId: "ou_bot",
+        }),
+        runtimeStatus: () => ({ ready: true, consumers: [] }),
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+
+    expect(page).toContain(
+      'data-feishu-next-action="wait_for_confirmation"',
+    );
+    expect(page).toContain("等待群管理员确认");
+    expect(page).toContain(
+      'data-feishu-action="wait_for_confirmation"',
+    );
+    expect(page).toContain('data-feishu-stage="waiting_confirmation"');
+    expect(page).toContain("data-feishu-group-stage");
+    expect(page).toContain("data-feishu-group-completed");
+    expect(page).toContain("data-feishu-group-health");
+    expect(page).toContain("data-feishu-group-test");
+    expect(page).not.toContain("发送一条测试消息，成功后该群即完成连接");
+  });
+
+  test("connection closure points a stale group binding to reconnection", async () => {
+    engine.feishuBindings.markAppNeedsReconnect("cli_current");
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "ready",
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu",
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "available",
+      listBotChats: async () => [],
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+        activeIdentity: () => ({
+          botName: "HomeAgent",
+          botOpenId: "ou_bot",
+        }),
+        runtimeStatus: () => ({ ready: true, consumers: [] }),
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+
+    expect(page).toContain('data-feishu-next-action="reconnect_group"');
+    expect(page).toContain("重新连接");
+    expect(page).toContain('data-feishu-action="reconnect_group"');
+    expect(page).toContain('data-feishu-stage="needs_reconnect"');
+  });
+
+  test("connection closure asks for a group after the Bot is ready", async () => {
+    engine.feishuBindings.disconnect(SPACE);
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "ready",
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu",
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "available",
+      listBotChats: async () => [],
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+        activeIdentity: () => ({
+          botName: "HomeAgent",
+          botOpenId: "ou_bot",
+        }),
+        runtimeStatus: () => ({ ready: true, consumers: [] }),
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+
+    expect(page).toContain('data-feishu-next-action="connect_group"');
+    expect(page).toContain("连接一个群聊");
+    expect(page).toContain('data-feishu-action="connect_group"');
+    expect(page).toContain('href="/integrations/groups/connect"');
+  });
+
+  test("connection closure preserves group completion while runtime is currently unhealthy", async () => {
+    engine.feishuBindings.recordTest(SPACE, {
+      status: "succeeded",
+      at: 1_785_420_000_000,
+    });
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "ready",
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu",
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "available",
+      listBotChats: async () => [],
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+        activeIdentity: () => ({
+          botName: "HomeAgent",
+          botOpenId: "ou_bot",
+        }),
+        runtimeStatus: () => ({
+          ready: false,
+          consumers: [{
+            key: "im.message.receive_v1",
+            state: "failed",
+            lastError: "private runtime detail",
+          }],
+        }),
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+
+    expect(page).toContain('data-feishu-next-action="recover_runtime"');
+    expect(page).toContain("恢复飞书消息监听");
+    expect(page).toContain('data-feishu-action="recover_runtime"');
+    expect(page).toContain('href="/health"');
+    expect(page).toContain('data-feishu-stage="complete"');
+    expect(page).toContain('data-completed-at="1785420000000"');
+    expect(page).toContain("连接已验证");
+    expect(page).toContain("当前运行异常");
+    expect(page).not.toContain("private runtime detail");
+  });
+
+  test("connection closure completes a mention-only group without full-message permission", async () => {
+    engine.feishuBindings.updatePolicy(SPACE, {
+      responseMode: "mentions_only",
+    });
+    engine.feishuBindings.recordTest(SPACE, {
+      status: "succeeded",
+      at: 1_785_420_100_000,
+    });
+    const larkSetup: LarkSetupPort = {
+      status: async () => ({
+        state: "ready",
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu",
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      fullGroupMessageCapability: async () => "unavailable",
+      listBotChats: async () => [],
+    };
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: new FeishuIntegrationService({
+        engine,
+        larkSetup,
+        activeIdentity: () => ({
+          botName: "HomeAgent",
+          botOpenId: "ou_bot",
+        }),
+        runtimeStatus: () => ({ ready: true, consumers: [] }),
+      }),
+    });
+
+    const page = await (await integrationApp.request("/integrations")).text();
+    const groupStart = page.indexOf(`data-space-id="${SPACE}"`);
+    const groupCard = page.slice(
+      groupStart,
+      page.indexOf("</article>", groupStart),
+    );
+
+    expect(page).toContain('data-feishu-next-action="none"');
+    expect(page).toContain("飞书连接已完成");
+    expect(page).toContain('data-feishu-stage="complete"');
+    expect(page).toContain("仅 @ 消息可用");
+    expect(groupCard).not.toContain("当前能力受限");
   });
 
   test("Bot disconnect is local and verification clears the disable marker", async () => {

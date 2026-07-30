@@ -274,6 +274,206 @@ describe("FeishuIntegrationService", () => {
     expect(engine.feishuBindings.getBySpace(spaceId)?.state).toBe("active");
   });
 
+  test("progress derives closure without listing Bot-visible chats", async () => {
+    engine.feishuBindings.connect({
+      chatId: "oc_product",
+      spaceId: "team/oc_product",
+      boundAppId: "cli_current",
+      responseMode: "mentions_only",
+      replyInThread: true,
+    });
+    let chatLists = 0;
+    const service = new FeishuIntegrationService({
+      engine,
+      larkSetup: setupPort({
+        listBotChats: async () => {
+          chatLists += 1;
+          return [];
+        },
+      }),
+      activeIdentity: () => ({
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+      }),
+      runtimeStatus: () => ({ ready: true, consumers: [] }),
+    });
+
+    const progress = await service.progress();
+
+    expect(progress).toMatchObject({
+      version: 1,
+      groups: [{
+        spaceId: "team/oc_product",
+        stage: "ready_to_test",
+      }],
+      nextAction: {
+        kind: "test_group",
+        spaceId: "team/oc_product",
+      },
+    });
+    expect(chatLists).toBe(0);
+  });
+
+  test("concurrent progress reads share Bot and capability probes", async () => {
+    let statusReads = 0;
+    let capabilityReads = 0;
+    const port = setupPort({
+      status: async () => {
+        statusReads += 1;
+        await Promise.resolve();
+        return {
+          state: "ready",
+          verified: true,
+          appId: "cli_current",
+          brand: "feishu",
+          botName: "HomeAgent",
+          botOpenId: "ou_bot",
+          message: "ready",
+        };
+      },
+      fullGroupMessageCapability: async () => {
+        capabilityReads += 1;
+        await Promise.resolve();
+        return "available";
+      },
+    });
+    const service = new FeishuIntegrationService({
+      engine,
+      larkSetup: port,
+      activeIdentity: () => ({
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+      }),
+      runtimeStatus: () => ({ ready: true, consumers: [] }),
+    });
+
+    await Promise.all([service.progress(), service.progress()]);
+
+    expect(statusReads).toBe(1);
+    expect(capabilityReads).toBe(1);
+  });
+
+  test("progress refreshes Bot status after five seconds while retaining capability", async () => {
+    let now = 0;
+    let statusReads = 0;
+    let capabilityReads = 0;
+    const service = new FeishuIntegrationService({
+      engine,
+      larkSetup: setupPort({
+        status: async () => {
+          statusReads += 1;
+          return {
+            state: "ready",
+            verified: true,
+            appId: "cli_current",
+            brand: "feishu",
+            botName: "HomeAgent",
+            botOpenId: "ou_bot",
+            message: "ready",
+          };
+        },
+        fullGroupMessageCapability: async () => {
+          capabilityReads += 1;
+          return "available";
+        },
+      }),
+      now: () => now,
+    });
+
+    await service.progress();
+    now = 4_999;
+    await service.progress();
+    now = 5_000;
+    await service.progress();
+
+    expect(statusReads).toBe(2);
+    expect(capabilityReads).toBe(1);
+  });
+
+  test("progress refreshes capability after thirty seconds", async () => {
+    let now = 0;
+    let capabilityReads = 0;
+    const service = new FeishuIntegrationService({
+      engine,
+      larkSetup: setupPort({
+        fullGroupMessageCapability: async () => {
+          capabilityReads += 1;
+          return "available";
+        },
+      }),
+      now: () => now,
+    });
+
+    await service.progress();
+    now = 29_999;
+    await service.progress();
+    now = 30_000;
+    await service.progress();
+
+    expect(capabilityReads).toBe(2);
+  });
+
+  test("explicit invalidation refreshes both progress probes immediately", async () => {
+    let statusReads = 0;
+    let capabilityReads = 0;
+    const service = new FeishuIntegrationService({
+      engine,
+      larkSetup: setupPort({
+        status: async () => {
+          statusReads += 1;
+          return {
+            state: "ready",
+            verified: true,
+            appId: "cli_current",
+            brand: "feishu",
+            botName: "HomeAgent",
+            botOpenId: "ou_bot",
+            message: "ready",
+          };
+        },
+        fullGroupMessageCapability: async () => {
+          capabilityReads += 1;
+          return "available";
+        },
+      }),
+    });
+
+    await service.progress();
+    service.invalidateProgressProbes();
+    await service.progress();
+
+    expect(statusReads).toBe(2);
+    expect(capabilityReads).toBe(2);
+  });
+
+  test("failed progress probes expose only a fixed retryable service error", async () => {
+    let statusReads = 0;
+    const service = new FeishuIntegrationService({
+      engine,
+      larkSetup: setupPort({
+        status: async () => {
+          statusReads += 1;
+          throw new Error("private lark-cli output TOKEN");
+        },
+      }),
+    });
+
+    const first = service.progress().catch((error: unknown) => error);
+    const second = service.progress().catch((error: unknown) => error);
+    const [firstError, secondError] = await Promise.all([first, second]);
+
+    for (const error of [firstError, secondError]) {
+      expect(error).toBeInstanceOf(FeishuIntegrationError);
+      expect(error).toMatchObject({ code: "operation_unavailable" });
+      expect(String(error)).not.toContain("private");
+      expect(String(error)).not.toContain("TOKEN");
+    }
+    expect(statusReads).toBe(1);
+
+    await service.progress().catch(() => undefined);
+    expect(statusReads).toBe(2);
+  });
+
   test("disconnecting the Bot records a local disable and marks its bindings", async () => {
     engine.feishuBindings.connect({
       chatId: "oc_product",
