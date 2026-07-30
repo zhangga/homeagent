@@ -66,6 +66,10 @@ describe("Agent workbench view", () => {
 
     expect(capabilitiesAt).toBeGreaterThan(-1);
     expect(capabilitiesAt).toBeLessThan(taskAt);
+    expect(body).toContain('<details class="agent-skill-selector"');
+    expect(body).not.toContain('<details class="agent-skill-selector" open');
+    expect(body).toContain('<summary class="agent-skill-summary"');
+    expect(body).toContain("0 个已固定");
     expect(body).toContain("仍可按当前 Provider 的默认规则使用本机全局 Skills");
     expect(body).toContain('id="agent-skill-search"');
     expect(body).toContain('name="skillSourceKeys"');
@@ -223,6 +227,7 @@ describe("Agent workbench view", () => {
       errors: {
         name: "请输入 Agent 名称",
         workdir: "Workdir 不存在",
+        skills: "Pinned Skill 已不可用",
       },
     });
 
@@ -233,6 +238,8 @@ describe("Agent workbench view", () => {
     expect(body).toContain('value="C:\\missing\\project"');
     expect(body).toContain("Workdir 不存在");
     expect(body).toContain('<details class="agent-task-execution" open>');
+    expect(body).toContain('<details class="agent-skill-selector" open');
+    expect(body).toContain("Pinned Skill 已不可用");
     expect(body).toContain('aria-invalid="true"');
   });
 });

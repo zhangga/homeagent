@@ -659,7 +659,7 @@ const AGENT_STYLE = `
   }
   .agent-skill-selector {
     margin:20px 0;
-    padding:18px;
+    overflow:hidden;
     border:1px solid #dddcd4;
     border-radius:12px;
     background:
@@ -667,19 +667,54 @@ const AGENT_STYLE = `
       #fbfbf8;
   }
   .agent-create-form > .agent-skill-selector { margin:8px 0 22px; }
-  .agent-skill-heading-row {
+  .agent-skill-summary {
     display:flex;
-    align-items:flex-start;
-    justify-content:space-between;
-    gap:16px;
+    align-items:center;
+    gap:14px;
+    padding:16px 18px;
+    cursor:pointer;
+    list-style:none;
   }
-  .agent-skill-heading-row h3 { margin:0; font-size:14px; letter-spacing:-.01em; }
-  .agent-skill-heading-row p {
+  .agent-skill-summary::-webkit-details-marker { display:none; }
+  .agent-skill-summary:hover { background:rgba(255,255,255,.52); }
+  .agent-skill-summary:focus-visible { outline:2px solid #287956; outline-offset:-2px; }
+  .agent-skill-summary::after {
+    width:7px;
+    height:7px;
+    flex:0 0 auto;
+    border-right:1.5px solid #77776f;
+    border-bottom:1.5px solid #77776f;
+    content:"";
+    transform:rotate(45deg) translate(-2px, 2px);
+    transition:transform .16s ease;
+  }
+  .agent-skill-selector[open] > .agent-skill-summary::after {
+    transform:rotate(225deg) translate(-1px, 1px);
+  }
+  .agent-skill-summary-copy { min-width:0; flex:1; }
+  .agent-skill-summary h3 { margin:0; font-size:14px; letter-spacing:-.01em; }
+  .agent-skill-summary p {
     max-width:620px;
     margin:5px 0 0;
     color:#71716b;
     font-size:12px;
     line-height:1.55;
+  }
+  .agent-skill-pinned-count {
+    flex:0 0 auto;
+    padding:3px 8px;
+    border:1px solid #c8d9cf;
+    border-radius:999px;
+    background:#f1f8f4;
+    color:#2d684c;
+    font-size:10px;
+    font-weight:700;
+    white-space:nowrap;
+  }
+  .agent-skill-panel {
+    padding:0 18px 18px;
+    border-top:1px solid rgba(214,216,208,.72);
+    background:rgba(255,255,255,.38);
   }
   .agent-skill-refresh {
     flex:0 0 auto;
@@ -694,7 +729,7 @@ const AGENT_STYLE = `
     display:flex;
     align-items:center;
     gap:10px;
-    margin-top:14px;
+    margin-top:16px;
   }
   .agent-skill-toolbar input {
     min-width:0;
@@ -827,13 +862,17 @@ const AGENT_STYLE = `
     .agent-run-secondary { display:none; }
     .agent-run-link { grid-template-columns:18px minmax(0, 1fr) auto 12px; gap:8px; }
     .agent-run-time { font-size:10px; }
-    .agent-skill-heading-row { align-items:stretch; flex-direction:column; }
-    .agent-skill-refresh { align-self:flex-start; }
+    .agent-skill-summary { align-items:flex-start; }
+    .agent-skill-pinned-count { margin-left:auto; }
+    .agent-skill-toolbar { align-items:stretch; flex-wrap:wrap; }
+    .agent-skill-toolbar input { flex-basis:100%; }
     .agent-skill-status { display:block; margin-left:0; }
     .agent-skill-title-line { align-items:flex-start; flex-direction:column; gap:3px; }
   }
   @media (prefers-reduced-motion:reduce) {
-    .agent-inspector-pane, .agent-inspector-overlay { transition:none; }
+    .agent-inspector-pane, .agent-inspector-overlay, .agent-skill-summary::after {
+      transition:none;
+    }
   }
 `;
 
@@ -938,29 +977,33 @@ export function agentWorkbenchView(
   const selectedProvider = providerOptions.find((provider) => provider.id === values.provider);
   const taskExecutionOpen = Boolean(view.errors.permission || view.errors.workdir);
   const skillSelector = html`
-    <section class="agent-skill-selector" aria-labelledby="agent-skills-heading">
-      <input type="hidden" name="skillSelectorPresent" value="1" form="agent-editor-form" />
-      <div class="agent-skill-heading-row">
-        <div>
+    <details class="agent-skill-selector" ${view.errors.skills ? "open" : ""}>
+      <summary class="agent-skill-summary">
+        <div class="agent-skill-summary-copy">
           <h3 id="agent-skills-heading">Pinned Skills</h3>
           <p>固定后由 HomeAgent 显式加载；未固定时，仍可按当前 Provider 的默认规则使用本机全局 Skills。</p>
         </div>
-        <button
-          class="agent-skill-refresh"
-          type="submit"
-          form="agent-skill-refresh-form"
-        >刷新目录</button>
-      </div>
-      <div class="agent-skill-toolbar">
-        <label class="agent-visually-hidden" for="agent-skill-search">搜索 Skills</label>
-        <input
-          id="agent-skill-search"
-          type="search"
-          placeholder="搜索名称、说明或来源"
-          autocomplete="off"
-        />
-        <span>${view.skillCatalog.rows.length} 个版本</span>
-      </div>
+        <span class="agent-skill-pinned-count" id="agent-skill-pinned-count">
+          ${view.skillCatalog.selected.length} 个已固定
+        </span>
+      </summary>
+      <div class="agent-skill-panel">
+        <input type="hidden" name="skillSelectorPresent" value="1" form="agent-editor-form" />
+        <div class="agent-skill-toolbar">
+          <label class="agent-visually-hidden" for="agent-skill-search">搜索 Skills</label>
+          <input
+            id="agent-skill-search"
+            type="search"
+            placeholder="搜索名称、说明或来源"
+            autocomplete="off"
+          />
+          <span>${view.skillCatalog.rows.length} 个版本</span>
+          <button
+            class="agent-skill-refresh"
+            type="submit"
+            form="agent-skill-refresh-form"
+          >刷新目录</button>
+        </div>
       <div
         class="agent-skill-chips"
         id="agent-skill-chips"
@@ -1063,7 +1106,8 @@ export function agentWorkbenchView(
           ${view.skillCatalog.diagnostics.map((diagnostic) => html`<p>${diagnostic}</p>`)}
         </details>
       ` : ""}
-    </section>
+      </div>
+    </details>
   `;
 
   const createEditor = html`
@@ -1740,6 +1784,7 @@ export function agentWorkbenchView(
   }
   var skillChips = document.getElementById('agent-skill-chips');
   var emptySkillSelection = document.getElementById('agent-skill-empty-selection');
+  var skillPinnedCount = document.getElementById('agent-skill-pinned-count');
   function syncSelectedSkillChips() {
     if (!skillChips || !emptySkillSelection) return;
     skillChips.querySelectorAll('.agent-skill-chip.selected').forEach(function (chip) {
@@ -1772,6 +1817,7 @@ export function agentWorkbenchView(
     });
     skillChips.hidden = activeCount === 0;
     emptySkillSelection.hidden = activeCount > 0;
+    if (skillPinnedCount) skillPinnedCount.textContent = activeCount + ' 个已固定';
   }
   if (skillChips) {
     skillChips.addEventListener('click', function (event) {
