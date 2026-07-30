@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Hono } from "hono";
@@ -11,7 +11,7 @@ import {
   type SpaceId,
   type SystemHealthSnapshot,
 } from "@homeagent/shared";
-import { KnowledgeEngine, FakeLlm } from "@homeagent/core";
+import { KnowledgeEngine, FakeLlm, SkillCatalog } from "@homeagent/core";
 import { createWebApp } from "./app.ts";
 import { FeishuIntegrationService } from "./feishu-integration-service.ts";
 import type { LarkSetupPort } from "./integrations.ts";
@@ -20,6 +20,7 @@ let dir: string;
 let engine: KnowledgeEngine;
 let app: Hono;
 let fake: FakeLlm;
+let skillRoot: string;
 const SPACE: SpaceId = "team/oc_web";
 
 function page(slug: string, title: string, content: string): Page {
@@ -43,7 +44,19 @@ beforeEach(async () => {
   process.env.HOMEAGENT_DATA_DIR = dir;
   resetConfig();
   fake = new FakeLlm();
-  engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+  skillRoot = join(dir, "skills");
+  mkdirSync(skillRoot, { recursive: true });
+  engine = new KnowledgeEngine({
+    dataDir: dir,
+    llm: fake,
+    skillCatalog: new SkillCatalog({
+      roots: [{
+        kind: "shared-agents",
+        path: skillRoot,
+        providerIds: ["claude", "codex", "trae-cli"],
+      }],
+    }),
+  });
   await engine.upsertPage(SPACE, page("entities/alice", "Alice", "Alice 负责后端服务。"));
   await engine.remember({ space: SPACE, source: "message", content: "一条原始消息" });
   engine.feishuBindings.connect({
@@ -1422,7 +1435,7 @@ describe("management backend (read-write)", () => {
     expect(JSON.parse(archiveText)).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 6,
+        version: 7,
         learning: { plans: [], sources: [], sessions: [] },
         governanceAudit: [],
         taskRuns: [],
@@ -1672,6 +1685,24 @@ describe("management backend (read-write)", () => {
     expect(body).toContain("agent-model");
   });
 
+  test("Skill catalog refresh degrades to a safe Agent-page warning", async () => {
+    engine.skillCatalog.refresh = () => {
+      throw new Error("C:\\private\\skill-root failed");
+    };
+
+    const response = await app.request("/agent-skills/refresh", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ returnTo: "/agents/new" }).toString(),
+    });
+
+    expect([302, 303]).toContain(response.status);
+    expect(decodeURIComponent(response.headers.get("location") ?? "")).toContain(
+      "Skill 目录刷新失败",
+    );
+    expect(response.headers.get("location")).not.toContain("private");
+  });
+
   test("agent editor explains the active task-execution boundaries", async () => {
     const body = await (await app.request("/agents/new")).text();
     expect(body).toContain("Workdir");
@@ -1758,7 +1789,40 @@ describe("management backend (read-write)", () => {
     const created = engine.agents.list().find((a) => a.name === "任务助手");
     expect(created?.permission).toBe("write");
     expect(created?.workdir).toBe(dir);
-    expect(created?.skills).toEqual(["code-review", "summarize"]);
+    expect(created?.skills).toEqual([
+      { kind: "legacy-name", name: "code-review" },
+      { kind: "legacy-name", name: "summarize" },
+    ]);
+  });
+
+  test("creating an Agent persists the exact Skill source selected by the catalog form", async () => {
+    mkdirSync(join(skillRoot, "review"), { recursive: true });
+    writeFileSync(
+      join(skillRoot, "review", "SKILL.md"),
+      ["---", "name: review", "description: Review.", "---"].join("\n"),
+      "utf8",
+    );
+    engine.skillCatalog.refresh();
+    const form = new URLSearchParams({
+      name: "Skill Agent",
+      provider: "claude",
+      permission: "read-only",
+      skillSelectorPresent: "1",
+      skillSourceKeys: "shared-agents:review",
+    });
+
+    const response = await app.request("/agents", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: form.toString(),
+    });
+
+    expect([302, 303]).toContain(response.status);
+    expect(engine.agents.list().find((item) => item.name === "Skill Agent")?.skills).toEqual([{
+      kind: "source",
+      sourceKey: "shared-agents:review",
+      name: "review",
+    }]);
   });
 
   test("agent validation rejects a missing Workdir before persistence", async () => {
@@ -2861,6 +2925,24 @@ describe("management backend (read-write)", () => {
   test("tasks: manual run redirects to a durable run detail and fires onTaskRun", async () => {
     // make the fake client return research text
     fake.onText(() => "研究结果：要点若干");
+    mkdirSync(join(skillRoot, "review"), { recursive: true });
+    writeFileSync(
+      join(skillRoot, "review", "SKILL.md"),
+      ["---", "name: review", "description: Review.", "---"].join("\n"),
+      "utf8",
+    );
+    engine.skillCatalog.refresh();
+    const agent = engine.agents.create({
+      name: "Task Agent",
+      provider: "claude",
+      visibility: "Team",
+      skills: [{
+        kind: "source",
+        sourceKey: "shared-agents:review",
+        name: "review",
+      }],
+    });
+    engine.updateSpaceMeta(SPACE, { agentId: agent.id });
     let ranId: string | undefined;
     const app2 = createWebApp({
       engine,
@@ -2881,6 +2963,9 @@ describe("management backend (read-write)", () => {
     const detail = await (await app2.request(location)).text();
     expect(detail).toContain("运行详情");
     expect(detail).toContain("研究结果：要点若干");
+    expect(detail).toContain("Skill 解析");
+    expect(detail).toContain("review");
+    expect(detail).toContain("shared-agents:review");
     // captured into the space as a task raw entry
     expect(engine.registry.store(SPACE).index().listRaw({}).some((r) => r.source === "task")).toBe(true);
   });

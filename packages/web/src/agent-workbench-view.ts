@@ -657,12 +657,180 @@ const AGENT_STYLE = `
     .agent-run-retry { min-height:40px; }
     .agent-resizer { display:none; }
   }
+  .agent-skill-selector {
+    margin:20px 0;
+    padding:18px;
+    border:1px solid #dddcd4;
+    border-radius:12px;
+    background:
+      linear-gradient(135deg, rgba(228,242,235,.62), transparent 42%),
+      #fbfbf8;
+  }
+  .agent-create-form > .agent-skill-selector { margin:8px 0 22px; }
+  .agent-skill-heading-row {
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:16px;
+  }
+  .agent-skill-heading-row h3 { margin:0; font-size:14px; letter-spacing:-.01em; }
+  .agent-skill-heading-row p {
+    max-width:620px;
+    margin:5px 0 0;
+    color:#71716b;
+    font-size:12px;
+    line-height:1.55;
+  }
+  .agent-skill-refresh {
+    flex:0 0 auto;
+    padding:7px 10px;
+    border:1px solid #cbc9be;
+    border-radius:7px;
+    background:#fff;
+    color:#383832;
+    font-size:12px;
+  }
+  .agent-skill-toolbar {
+    display:flex;
+    align-items:center;
+    gap:10px;
+    margin-top:14px;
+  }
+  .agent-skill-toolbar input {
+    min-width:0;
+    flex:1;
+    height:36px;
+    border:1px solid #d7d5ca;
+    border-radius:8px;
+    background:#fff;
+  }
+  .agent-skill-toolbar > span { color:#85847d; font-size:11px; white-space:nowrap; }
+  .agent-skill-chips {
+    display:flex;
+    flex-wrap:wrap;
+    gap:7px;
+    margin:12px 0;
+  }
+  .agent-skill-chip {
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    max-width:100%;
+    padding:5px 7px 5px 9px;
+    border:1px solid #bcd5c7;
+    border-radius:999px;
+    background:#edf7f1;
+    color:#24573e;
+    font-size:11px;
+  }
+  .agent-skill-chip.missing, .agent-skill-chip.legacy {
+    border-color:#e0c38f;
+    background:#fff7e7;
+    color:#76500d;
+  }
+  .agent-skill-chip input { width:13px; height:13px; margin:0; }
+  .agent-skill-chip span {
+    overflow:hidden;
+    font-weight:670;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .agent-skill-chip small { color:inherit; opacity:.72; }
+  .agent-skill-chip button {
+    width:20px;
+    height:20px;
+    padding:0;
+    border:0;
+    border-radius:50%;
+    background:transparent;
+    color:inherit;
+    font-size:16px;
+    line-height:20px;
+  }
+  .agent-skill-list {
+    max-height:310px;
+    overflow:auto;
+    border:1px solid #dfded6;
+    border-radius:9px;
+    background:#fff;
+  }
+  .agent-skill-row {
+    display:grid;
+    grid-template-columns:18px minmax(0,1fr);
+    gap:10px;
+    padding:12px;
+    border-bottom:1px solid #ecebe5;
+    cursor:pointer;
+  }
+  .agent-skill-row:last-child { border-bottom:0; }
+  .agent-skill-row:hover { background:#f7faf7; }
+  .agent-skill-row:has(input:focus-visible) { outline:2px solid #287956; outline-offset:-2px; }
+  .agent-skill-row input { width:16px; height:16px; margin:2px 0 0; accent-color:#287956; }
+  .agent-skill-row-copy { min-width:0; }
+  .agent-skill-title-line { display:flex; align-items:center; gap:9px; min-width:0; }
+  .agent-skill-title-line strong {
+    overflow:hidden;
+    color:#292923;
+    font-size:13px;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .agent-skill-status {
+    margin-left:auto;
+    color:#27704f;
+    font-size:10px;
+    white-space:nowrap;
+  }
+  .status-invalid .agent-skill-status,
+  .status-incompatible .agent-skill-status,
+  .status-shadowed .agent-skill-status { color:#9a6205; }
+  .agent-skill-description {
+    display:block;
+    margin-top:3px;
+    overflow:hidden;
+    color:#6f6e67;
+    font-size:11px;
+    line-height:1.45;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .agent-skill-meta { display:flex; flex-wrap:wrap; gap:5px; margin-top:7px; align-items:center; }
+  .agent-skill-meta code,
+  .agent-skill-provider {
+    max-width:100%;
+    overflow:hidden;
+    padding:2px 5px;
+    border-radius:4px;
+    background:#f0f0eb;
+    color:#66665f;
+    font-size:9px;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .agent-skill-provider { background:#e8f0ec; color:#3d6853; text-transform:uppercase; }
+  .agent-skill-row details, .agent-skill-scan-diagnostics { margin-top:8px; color:#74736d; font-size:10px; }
+  .agent-skill-row details p, .agent-skill-scan-diagnostics p { margin:5px 0; overflow-wrap:anywhere; }
+  .agent-skill-empty, .agent-skill-empty-selection {
+    display:flex;
+    flex-direction:column;
+    gap:4px;
+    margin:0;
+    padding:20px;
+    color:#77766f;
+    font-size:11px;
+    text-align:center;
+  }
+  .agent-skill-empty-selection { padding:11px 0; text-align:left; }
   @media (max-width:540px) {
     body:has(main.agent-page) nav.rail { display:none; }
     .agent-title-text { max-width:28vw; }
     .agent-run-secondary { display:none; }
     .agent-run-link { grid-template-columns:18px minmax(0, 1fr) auto 12px; gap:8px; }
     .agent-run-time { font-size:10px; }
+    .agent-skill-heading-row { align-items:stretch; flex-direction:column; }
+    .agent-skill-refresh { align-self:flex-start; }
+    .agent-skill-status { display:block; margin-left:0; }
+    .agent-skill-title-line { align-items:flex-start; flex-direction:column; gap:3px; }
   }
   @media (prefers-reduced-motion:reduce) {
     .agent-inspector-pane, .agent-inspector-overlay { transition:none; }
@@ -768,9 +936,135 @@ export function agentWorkbenchView(
   const skillsAttrs = invalidAttrs(view.errors, "skills");
 
   const selectedProvider = providerOptions.find((provider) => provider.id === values.provider);
-  const taskExecutionOpen = Boolean(
-    view.errors.permission || view.errors.workdir || view.errors.skills,
-  );
+  const taskExecutionOpen = Boolean(view.errors.permission || view.errors.workdir);
+  const skillSelector = html`
+    <section class="agent-skill-selector" aria-labelledby="agent-skills-heading">
+      <input type="hidden" name="skillSelectorPresent" value="1" form="agent-editor-form" />
+      <div class="agent-skill-heading-row">
+        <div>
+          <h3 id="agent-skills-heading">Agent capabilities / Skills</h3>
+          <p>为这个 Agent 绑定本机已发现的 Skill。普通对话只读，研究任务沿用任务权限。</p>
+        </div>
+        <button
+          class="agent-skill-refresh"
+          type="submit"
+          form="agent-skill-refresh-form"
+        >刷新目录</button>
+      </div>
+      <div class="agent-skill-toolbar">
+        <label class="agent-visually-hidden" for="agent-skill-search">搜索 Skills</label>
+        <input
+          id="agent-skill-search"
+          type="search"
+          placeholder="搜索名称、说明或来源"
+          autocomplete="off"
+        />
+        <span>${view.skillCatalog.rows.length} 个版本</span>
+      </div>
+      <div
+        class="agent-skill-chips"
+        id="agent-skill-chips"
+        aria-label="已选择的 Skills"
+        ${view.skillCatalog.selected.length === 0 ? "hidden" : ""}
+      >
+          ${view.skillCatalog.selected.map((selection) => html`
+            <label class="agent-skill-chip ${selection.status}">
+              ${selection.status === "missing" ? html`
+                <input
+                  type="checkbox"
+                  name="skillSourceKeys"
+                  value="${selection.sourceKey ?? ""}"
+                  form="agent-editor-form"
+                  checked
+                />
+              ` : selection.status === "legacy" ? html`
+                <input
+                  type="checkbox"
+                  name="legacySkillNames"
+                  value="${selection.name}"
+                  form="agent-editor-form"
+                  checked
+                />
+              ` : ""}
+              <span>${selection.name}</span>
+              <small>${selection.statusLabel}</small>
+              ${selection.status === "selected" ? html`
+                <button
+                  type="button"
+                  aria-label="移除 ${selection.name}"
+                  data-remove-skill="${selection.sourceKey ?? ""}"
+                >×</button>
+              ` : ""}
+            </label>
+          `)}
+      </div>
+      <p
+        class="agent-skill-empty-selection"
+        id="agent-skill-empty-selection"
+        ${view.skillCatalog.selected.length > 0 ? "hidden" : ""}
+      >尚未选择 Skill；Agent 会按基础指令运行。</p>
+      <div
+        class="agent-skill-list"
+        id="agent-skills"
+        aria-invalid="${skillsAttrs.invalid}"
+        aria-describedby="${skillsAttrs.describedBy}"
+      >
+        ${view.skillCatalog.rows.length > 0
+          ? view.skillCatalog.rows.map((row) => html`
+              <label
+                class="agent-skill-row status-${row.status}"
+                data-skill-row
+                data-skill-search="${`${row.name} ${row.description} ${row.sourceLabel}`.toLowerCase()}"
+                data-skill-name="${row.name}"
+                data-skill-providers="${row.providerIds.join(",")}"
+                data-skill-base-status="${row.status}"
+              >
+                <input
+                  type="checkbox"
+                  name="skillSourceKeys"
+                  value="${row.sourceKey}"
+                  form="agent-editor-form"
+                  ${row.selected ? "checked" : ""}
+                  ${row.status === "invalid" ? "disabled" : ""}
+                />
+                <span class="agent-skill-row-copy">
+                  <span class="agent-skill-title-line">
+                    <strong>${row.name}</strong>
+                    <span class="agent-skill-status">${row.statusLabel}</span>
+                  </span>
+                  <span class="agent-skill-description">${row.description || "未提供说明"}</span>
+                  <span class="agent-skill-meta">
+                    <code>${row.sourceLabel}</code>
+                    ${row.providerIds.map((providerId) =>
+                      html`<span class="agent-skill-provider">${providerId}</span>`
+                    )}
+                    ${row.sourceCount > 1 ? html`<span>${row.sourceCount} 个同内容来源</span>` : ""}
+                  </span>
+                  ${row.diagnostics.length > 0 ? html`
+                    <details>
+                      <summary>查看诊断</summary>
+                      ${row.diagnostics.map((diagnostic) => html`<p>${diagnostic}</p>`)}
+                    </details>
+                  ` : ""}
+                </span>
+              </label>
+            `)
+          : html`
+              <div class="agent-skill-empty">
+                <strong>尚未发现本地 Skill</strong>
+                <span>请确认本机 Skill 目录存在，然后刷新目录。</span>
+              </div>
+            `}
+      </div>
+      ${errorFor(view.errors, "skills")}
+      ${view.skillCatalog.diagnostics.length > 0 ? html`
+        <details class="agent-skill-scan-diagnostics">
+          <summary>扫描诊断（${view.skillCatalog.diagnostics.length}）</summary>
+          ${view.skillCatalog.diagnostics.map((diagnostic) => html`<p>${diagnostic}</p>`)}
+        </details>
+      ` : ""}
+    </section>
+  `;
 
   const createEditor = html`
     <div class="agent-pane-header agent-editor-header">
@@ -922,6 +1216,8 @@ export function agentWorkbenchView(
           </div>
         </div>
 
+        ${skillSelector}
+
         <details class="agent-task-execution" ${taskExecutionOpen ? "open" : ""}>
           <summary>
             <span class="agent-task-summary-copy">
@@ -967,26 +1263,6 @@ export function agentWorkbenchView(
                   autocomplete="off"
                 />
                 ${errorFor(view.errors, "workdir")}
-              </div>
-            </div>
-            <div class="agent-field agent-create-field">
-              <label class="agent-field-label" for="agent-skills">
-                Skills
-                <small>逗号或换行分隔</small>
-              </label>
-              <div class="agent-field-control">
-                <input
-                  id="agent-skills"
-                  name="skills"
-                  type="text"
-                  value="${values.skills}"
-                  maxlength="4000"
-                  placeholder="code-review, web-search"
-                  aria-invalid="${skillsAttrs.invalid}"
-                  aria-describedby="${skillsAttrs.describedBy}"
-                  autocomplete="off"
-                />
-                ${errorFor(view.errors, "skills")}
               </div>
             </div>
           </div>
@@ -1051,6 +1327,7 @@ export function agentWorkbenchView(
           </div>
         </section>
       </form>
+      ${skillSelector}
       ${view.inspector ? html`
       <section class="agent-recent-runs" aria-labelledby="agent-recent-runs-heading">
         <div class="agent-runs-heading">
@@ -1255,24 +1532,6 @@ export function agentWorkbenchView(
             ${errorFor(view.errors, "workdir")}
           </div>
         </div>
-        <div class="agent-property-field">
-          <label class="agent-property-label" for="agent-skills">Skills</label>
-          <div class="agent-property-control">
-            <input
-              id="agent-skills"
-              name="skills"
-              type="text"
-              form="agent-editor-form"
-              value="${values.skills}"
-              maxlength="4000"
-              placeholder="code-review, web-search"
-              aria-invalid="${skillsAttrs.invalid}"
-              aria-describedby="${skillsAttrs.describedBy}"
-              autocomplete="off"
-            />
-            ${errorFor(view.errors, "skills")}
-          </div>
-        </div>
       </section>
       <section class="agent-inspector-section">
         <h3 class="agent-inspector-label">Provider status</h3>
@@ -1469,6 +1728,93 @@ export function agentWorkbenchView(
     syncReasoning();
   }
 
+  var skillSearch = document.getElementById('agent-skill-search');
+  var skillRows = Array.from(document.querySelectorAll('[data-skill-row]'));
+  if (skillSearch) {
+    skillSearch.addEventListener('input', function () {
+      var query = skillSearch.value.trim().toLowerCase();
+      skillRows.forEach(function (row) {
+        row.hidden = !!query && String(row.dataset.skillSearch || '').indexOf(query) === -1;
+      });
+    });
+  }
+  var skillChips = document.getElementById('agent-skill-chips');
+  var emptySkillSelection = document.getElementById('agent-skill-empty-selection');
+  function syncSelectedSkillChips() {
+    if (!skillChips || !emptySkillSelection) return;
+    skillChips.querySelectorAll('.agent-skill-chip.selected').forEach(function (chip) {
+      chip.remove();
+    });
+    var activeCount = 0;
+    skillChips.querySelectorAll('.agent-skill-chip.missing, .agent-skill-chip.legacy')
+      .forEach(function (chip) {
+        var checkbox = chip.querySelector('input[type="checkbox"]');
+        chip.hidden = !checkbox || !checkbox.checked;
+        if (!chip.hidden) activeCount += 1;
+      });
+    skillRows.forEach(function (row) {
+      var checkbox = row.querySelector('input[name="skillSourceKeys"]');
+      if (!checkbox || !checkbox.checked) return;
+      activeCount += 1;
+      var chip = document.createElement('label');
+      chip.className = 'agent-skill-chip selected';
+      var name = document.createElement('span');
+      name.textContent = row.dataset.skillName || checkbox.value;
+      var status = document.createElement('small');
+      status.textContent = '已选择';
+      var remove = document.createElement('button');
+      remove.type = 'button';
+      remove.setAttribute('aria-label', '移除 ' + name.textContent);
+      remove.dataset.removeSkill = checkbox.value;
+      remove.textContent = '×';
+      chip.append(name, status, remove);
+      skillChips.appendChild(chip);
+    });
+    skillChips.hidden = activeCount === 0;
+    emptySkillSelection.hidden = activeCount > 0;
+  }
+  if (skillChips) {
+    skillChips.addEventListener('click', function (event) {
+      var button = event.target.closest('[data-remove-skill]');
+      if (!button) return;
+      var sourceKey = button.dataset.removeSkill;
+      var checkbox = skillRows
+        .map(function (row) { return row.querySelector('input[name="skillSourceKeys"]'); })
+        .find(function (input) { return input && input.value === sourceKey; });
+      if (checkbox) {
+        checkbox.checked = false;
+        checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+  }
+  document.querySelectorAll(
+    'input[name="skillSourceKeys"], input[name="legacySkillNames"]',
+  ).forEach(function (checkbox) {
+    checkbox.addEventListener('change', function () {
+      syncSelectedSkillChips();
+      markDirty();
+    });
+  });
+  syncSelectedSkillChips();
+  function syncSkillCompatibility() {
+    if (!provider) return;
+    skillRows.forEach(function (row) {
+      var base = row.dataset.skillBaseStatus;
+      if (base === 'invalid') return;
+      var providers = String(row.dataset.skillProviders || '').split(',');
+      var compatible = providers.indexOf(provider.value) !== -1;
+      row.classList.toggle('status-incompatible', !compatible);
+      var status = row.querySelector('.agent-skill-status');
+      if (status) {
+        status.textContent = compatible
+          ? (base === 'shadowed' ? '被更高优先级来源遮蔽' : '可用于当前 Provider')
+          : '与当前 Provider 不兼容';
+      }
+    });
+  }
+  if (provider) provider.addEventListener('change', syncSkillCompatibility);
+  syncSkillCompatibility();
+
   var inspector = document.getElementById('agent-inspector');
   var overlay = document.querySelector('.agent-inspector-overlay');
   var inspectorTrigger = null;
@@ -1595,6 +1941,9 @@ export function agentWorkbenchView(
 
   return html`
     <style>${raw(AGENT_STYLE)}</style>
+    <form id="agent-skill-refresh-form" method="post" action="/agent-skills/refresh" hidden>
+      <input type="hidden" name="returnTo" value="${cancelHref}" />
+    </form>
     <div class="${workbenchClasses}">
       <aside class="agent-pane agent-list-pane" data-pane="agent-list" aria-label="Agent 列表">
         <div class="agent-pane-header">

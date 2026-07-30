@@ -1,11 +1,12 @@
 /** Daily guided-learning delivery with startup catch-up and retry-safe state. */
-import { logger } from "@homeagent/shared";
+import { logger, type SkillWarningView } from "@homeagent/shared";
 import type {
   KnowledgeEngine,
   LearningDelivery,
   LearningPlan,
   LearningSession,
 } from "@homeagent/core";
+import { formatSkillWarnings } from "@homeagent/orchestrator";
 import { dayKey, localHour, type RuntimeLoopHealth } from "./scheduler.ts";
 
 const log = logger.child("learning-scheduler");
@@ -54,11 +55,12 @@ export function shouldFollowUpLearningPlan(
 export function learningNotification(
   plan: LearningPlan,
   session: LearningSession,
+  skillWarnings?: SkillWarningView[],
 ): string {
   const lessonContext = plan.mode === "topic"
     ? [`当前步骤：${session.sectionTitle}`, "", "## 参考材料", session.excerpt]
     : [`今日范围：${session.sectionTitle}`, "", "## 今日原文", session.excerpt];
-  return [
+  const message = [
     `📖 ${plan.name} · 第 ${session.sequence} 课`,
     ...lessonContext,
     "",
@@ -66,6 +68,8 @@ export function learningNotification(
     "",
     "读完后回复并 @我，以“学习回答：”开头；如需跳过，发送 `/learn skip <计划名称或序号>`。",
   ].join("\n");
+  const warning = formatSkillWarnings(skillWarnings);
+  return warning ? `${message}\n\n${warning}` : message;
 }
 
 export function learningFollowUpNotification(

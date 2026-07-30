@@ -18,6 +18,65 @@ const selected: Agent = {
 };
 
 describe("Agent workbench view", () => {
+  test("renders an inline searchable Skill selector outside Task execution", async () => {
+    const source = {
+      sourceKey: "codex-user:review",
+      rootKind: "codex-user" as const,
+      relativeDir: "review",
+      name: "review",
+      description: "Review observable behavior.",
+      providerIds: ["codex"] as const,
+      skillFile: "C:\\Users\\alice\\.codex\\skills\\review\\SKILL.md",
+      skillFileHash: "a".repeat(64),
+      status: "available" as const,
+      diagnostics: [],
+    };
+    const view = buildAgentWorkbench({
+      agents: [selected],
+      mode: "edit",
+      selected,
+      providers: [{
+        id: "codex",
+        name: "Codex",
+        bin: "codex",
+        available: true,
+        detail: "0.42.0",
+      }],
+      models: { codex: ["gpt-5.6-sol"] },
+      defaults: { provider: "codex", model: "gpt-5.6-sol" },
+      bindings: [],
+      runs: [],
+      catalog: {
+        sources: [{ ...source, providerIds: [...source.providerIds] }],
+        entries: [{
+          key: `review:${source.skillFileHash}`,
+          name: source.name,
+          description: source.description,
+          skillFileHash: source.skillFileHash,
+          sources: [{ ...source, providerIds: [...source.providerIds] }],
+        }],
+        diagnostics: [],
+        refreshedAt: 123,
+      },
+    });
+
+    const body = String(await agentWorkbenchView(view));
+    const capabilitiesAt = body.indexOf("Agent capabilities / Skills");
+    const taskAt = body.indexOf('data-pane="agent-inspector"');
+
+    expect(capabilitiesAt).toBeGreaterThan(-1);
+    expect(capabilitiesAt).toBeLessThan(taskAt);
+    expect(body).toContain('id="agent-skill-search"');
+    expect(body).toContain('name="skillSourceKeys"');
+    expect(body).toContain('value="codex-user:review"');
+    expect(body).toContain('data-skill-name="review"');
+    expect(body).toContain('id="agent-skill-chips"');
+    expect(body).toContain("syncSelectedSkillChips");
+    expect(body).toContain('action="/agent-skills/refresh"');
+    expect(body).not.toContain('name="skills" type="text"');
+    expect(body).not.toContain("C:\\Users\\alice");
+  });
+
   test("renders a focused create workbench without an empty inspector", async () => {
     const view = buildAgentWorkbench({
       agents: [{ ...selected, name: "Codex Agent" }],
@@ -124,11 +183,11 @@ describe("Agent workbench view", () => {
       "agent-permission",
       "agent-visibility",
       "agent-workdir",
-      "agent-skills",
     ]) {
       const control = inspectorBody.slice(inspectorBody.indexOf(`id="${id}"`));
       expect(control.slice(0, control.indexOf(">"))).toContain('form="agent-editor-form"');
     }
+    expect(editorBody).toContain('id="agent-skills"');
     expect(body).not.toContain("Device");
     expect(body).not.toContain("Repositories");
   });

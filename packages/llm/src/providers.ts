@@ -134,6 +134,18 @@ export function normalizeProviderSkills(skills: readonly unknown[]): string[] {
     });
 }
 
+export function providerSkillReference(
+  id: ProviderId,
+  skill: string,
+): string | undefined {
+  const normalized = normalizeProviderSkills([skill])[0];
+  if (!normalized) return undefined;
+  if (id === "claude") return `/${normalized}`;
+  if (id === "codex") return `$${normalized}`;
+  if (id === "trae-cli") return normalized;
+  return undefined;
+}
+
 function normalizeProviderPermission(permission: unknown): ProviderExecutionPermission {
   if (permission === "write" || permission === "full") return permission;
   return "read-only";
@@ -402,11 +414,9 @@ function injectExecutionSkills(id: ProviderId, input: RunInput): RunInput {
     },
   };
   if (skills.length === 0) return prepared;
-  const references = skills.map((skill) => {
-    if (id === "claude") return `/${skill}`;
-    if (id === "codex") return `$${skill}`;
-    return skill;
-  });
+  const references = skills
+    .map((skill) => providerSkillReference(id, skill))
+    .filter((reference): reference is string => Boolean(reference));
   return {
     ...prepared,
     prompt: [

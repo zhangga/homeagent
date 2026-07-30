@@ -20,7 +20,7 @@ const agent: Agent = {
   reasoningEffort: "high",
   visibility: "Team",
   permission: "read-only",
-  skills: ["web-search"],
+  skills: [{ kind: "legacy-name", name: "web-search" }],
   createdAt: 100,
   updatedAt: 200,
 };
@@ -134,6 +134,54 @@ describe("Agent create defaults", () => {
 });
 
 describe("Agent workbench presenter", () => {
+  test("presents an available shared Skill without exposing its local file path", () => {
+    const source = {
+      sourceKey: "shared-agents:review",
+      rootKind: "shared-agents" as const,
+      relativeDir: "review",
+      name: "review",
+      description: "Review observable behavior.",
+      providerIds: ["claude", "codex", "trae-cli"] as const,
+      skillFile: "C:\\Users\\alice\\.agents\\skills\\review\\SKILL.md",
+      skillFileHash: "a".repeat(64),
+      status: "available" as const,
+      diagnostics: [],
+    };
+    const view = buildAgentWorkbench({
+      agents: [],
+      mode: "create",
+      selected: null,
+      providers,
+      models: {},
+      defaults: { provider: "codex", model: "" },
+      bindings: [],
+      runs: [],
+      catalog: {
+        sources: [{ ...source, providerIds: [...source.providerIds] }],
+        entries: [{
+          key: `review:${"a".repeat(64)}`,
+          name: "review",
+          description: source.description,
+          skillFileHash: source.skillFileHash,
+          sources: [{ ...source, providerIds: [...source.providerIds] }],
+        }],
+        diagnostics: [],
+        refreshedAt: 123,
+      },
+    });
+
+    expect(view.skillCatalog.rows).toEqual([
+      expect.objectContaining({
+        name: "review",
+        sourceKey: "shared-agents:review",
+        sourceLabel: "shared-agents · review",
+        providerIds: ["claude", "codex", "trae-cli"],
+        status: "available",
+      }),
+    ]);
+    expect(JSON.stringify(view.skillCatalog)).not.toContain("C:\\\\Users");
+  });
+
   test("exposes a durable run error without deriving one from task content", () => {
     const failedRun: TaskRun = {
       ...runs[0]!,

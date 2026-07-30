@@ -15,6 +15,92 @@ afterEach(() => {
 });
 
 describe("AgentStore", () => {
+  test("persists exact source-bound Skills in the versioned Agent schema", () => {
+    const store = new AgentStore(dir);
+    const agent = store.create({
+      name: "bound",
+      skills: [
+        { kind: "source", sourceKey: "shared-agents:review", name: "review" },
+        { kind: "source", sourceKey: "codex-user:ship", name: "ship" },
+      ],
+    });
+
+    expect(agent.skills).toEqual([
+      { kind: "source", sourceKey: "shared-agents:review", name: "review" },
+      { kind: "source", sourceKey: "codex-user:ship", name: "ship" },
+    ]);
+    const raw = JSON.parse(readFileSync(join(dir, "config", "agents.json"), "utf8"));
+    expect(raw.version).toBe(2);
+    expect(raw.agents[agent.id].skills).toEqual(agent.skills);
+  });
+
+  test("does not expose mutable Skill binding objects from AgentStore", () => {
+    const store = new AgentStore(dir);
+    const created = store.create({
+      name: "bound",
+      skills: [{
+        kind: "source",
+        sourceKey: "shared-agents:review",
+        name: "review",
+      }],
+    });
+
+    created.skills[0]!.name = "mutated";
+    created.skills.push({ kind: "legacy-name", name: "extra" });
+
+    expect(store.get(created.id)?.skills).toEqual([{
+      kind: "source",
+      sourceKey: "shared-agents:review",
+      name: "review",
+    }]);
+  });
+
+  test("rejects a newly submitted source binding that the catalog does not know", () => {
+    const store = new AgentStore(dir, {
+      validateSourceSkill: (binding) => binding.sourceKey === "shared-agents:known",
+    });
+
+    expect(() => store.create({
+      name: "invalid",
+      skills: [{
+        kind: "source",
+        sourceKey: "shared-agents:missing",
+        name: "missing",
+      }],
+    })).toThrow("Skill source");
+  });
+
+  test("rejects more than 50 Skill bindings", () => {
+    const store = new AgentStore(dir);
+    const skills = Array.from({ length: 51 }, (_, index) => ({
+      kind: "source" as const,
+      sourceKey: `shared-agents:skill-${index}`,
+      name: `skill-${index}`,
+    }));
+
+    expect(() => store.create({ name: "too-many", skills })).toThrow(
+      "at most 50",
+    );
+  });
+
+  test("leaves an Agent unchanged when a Skill binding update is rejected", () => {
+    const store = new AgentStore(dir, {
+      validateSourceSkill: (binding) => binding.sourceKey === "shared-agents:known",
+    });
+    const agent = store.create({ name: "original" });
+
+    expect(() => store.update(agent.id, {
+      name: "must-not-stick",
+      skills: [{
+        kind: "source",
+        sourceKey: "shared-agents:missing",
+        name: "missing",
+      }],
+    })).toThrow("Skill source");
+    expect(store.get(agent.id)?.name).toBe("original");
+    expect(store.get(agent.id)?.skills).toEqual([]);
+  });
+
   test("create assigns an id, defaults, and persists to agents.json", () => {
     const store = new AgentStore(dir);
     const a = store.create({ name: "知识助手", instruction: "简洁作答", model: "claude-sonnet-5" });
@@ -75,18 +161,33 @@ describe("AgentStore", () => {
     const store = new AgentStore(dir);
     const a = store.create({
       name: "runner",
-      skills: ["code-review", "web-search", "code-review", "../escape", "github:yeet"],
+      skills: [
+        { kind: "source", sourceKey: "shared-agents:code-review", name: "code-review" },
+        { kind: "source", sourceKey: "shared-agents:web-search", name: "web-search" },
+        { kind: "source", sourceKey: "shared-agents:code-review", name: "duplicate" },
+        { kind: "source", sourceKey: "codex-user:github-yeet", name: "github:yeet" },
+      ],
     });
     // permission defaults to the safest tier
     expect(a.permission).toBe("read-only");
     expect(a.workdir).toBeUndefined();
-    // Skills are identifier-only, stable-deduplicated, and safe to inject.
-    expect(a.skills).toEqual(["code-review", "web-search", "github:yeet"]);
+    // Source keys are stable-deduplicated while preserving the first selection.
+    expect(a.skills).toEqual([
+      { kind: "source", sourceKey: "shared-agents:code-review", name: "code-review" },
+      { kind: "source", sourceKey: "shared-agents:web-search", name: "web-search" },
+      { kind: "source", sourceKey: "codex-user:github-yeet", name: "github:yeet" },
+    ]);
 
-    const up = store.update(a.id, { permission: "write", workdir: " ~/proj ", skills: ["x"] });
+    const up = store.update(a.id, {
+      permission: "write",
+      workdir: " ~/proj ",
+      skills: [{ kind: "source", sourceKey: "shared-agents:x", name: "x" }],
+    });
     expect(up?.permission).toBe("write");
     expect(up?.workdir).toBe("~/proj");
-    expect(up?.skills).toEqual(["x"]);
+    expect(up?.skills).toEqual([
+      { kind: "source", sourceKey: "shared-agents:x", name: "x" },
+    ]);
 
     // unknown permission normalizes back to read-only
     expect(store.create({ name: "z", permission: "root" }).permission).toBe("read-only");
@@ -98,13 +199,17 @@ describe("AgentStore", () => {
       name: "writer",
       permission: "write",
       workdir: dir,
-      skills: "code-review, github:yeet",
+      skills: [{
+        kind: "source",
+        sourceKey: "shared-agents:code-review",
+        name: "code-review",
+      }],
     });
 
     expect(resolveAgentExecution(writable)).toEqual({
       permission: "write",
       workdir: realpathSync(dir),
-      skills: ["code-review", "github:yeet"],
+      skills: [],
     });
 
     const unsafe = store.create({ name: "unsafe", permission: "full" });
@@ -178,6 +283,46 @@ describe("AgentStore", () => {
     expect(onDisk.agents.agent_old.provider).toBe("claude");
   });
 
+  test("migrates a legacy Skill name when the catalog has one exact compatible source", () => {
+    const path = join(dir, "config", "agents.json");
+    require("node:fs").mkdirSync(join(dir, "config"), { recursive: true });
+    require("node:fs").writeFileSync(
+      path,
+      JSON.stringify({
+        agents: {
+          agent_old: {
+            id: "agent_old",
+            name: "old",
+            instruction: "",
+            model: "",
+            provider: "codex",
+            visibility: "Team",
+            permission: "read-only",
+            skills: ["review"],
+            createdAt: 1,
+            updatedAt: 1,
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    const store = new AgentStore(dir, {
+      resolveLegacySkill: (name, provider) => name === "review" && provider === "codex"
+        ? { kind: "source", sourceKey: "codex-user:review", name: "review" }
+        : undefined,
+    });
+
+    expect(store.get("agent_old")?.skills).toEqual([{
+      kind: "source",
+      sourceKey: "codex-user:review",
+      name: "review",
+    }]);
+    const onDisk = JSON.parse(readFileSync(path, "utf8"));
+    expect(onDisk.version).toBe(2);
+    expect(onDisk.agents.agent_old.skills).toEqual(store.get("agent_old")?.skills);
+  });
+
   test("the GPT-5.6 alias is migrated to the explicit Sol model id", () => {
     const path = join(dir, "config", "agents.json");
     require("node:fs").mkdirSync(join(dir, "config"), { recursive: true });
@@ -231,13 +376,18 @@ describe("AgentStore", () => {
     );
 
     const store = new AgentStore(dir);
-    expect(store.get("agent_skills")?.skills).toEqual(["code-review", "github:yeet"]);
-    expect(store.get("agent_skills")?.permission).toBe("read-only");
-    expect(JSON.parse(readFileSync(path, "utf8")).agents.agent_skills.skills).toEqual([
-      "code-review",
-      "github:yeet",
+    expect(store.get("agent_skills")?.skills).toEqual([
+      { kind: "legacy-name", name: "code-review" },
+      { kind: "legacy-name", name: "github:yeet" },
     ]);
-    expect(JSON.parse(readFileSync(path, "utf8")).agents.agent_skills.permission).toBe("read-only");
+    expect(store.get("agent_skills")?.permission).toBe("read-only");
+    const migrated = JSON.parse(readFileSync(path, "utf8"));
+    expect(migrated.version).toBe(2);
+    expect(migrated.agents.agent_skills.skills).toEqual([
+      { kind: "legacy-name", name: "code-review" },
+      { kind: "legacy-name", name: "github:yeet" },
+    ]);
+    expect(migrated.agents.agent_skills.permission).toBe("read-only");
   });
 
   test("remove deletes and persists", () => {

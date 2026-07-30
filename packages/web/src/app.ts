@@ -55,6 +55,7 @@ import {
 import { layout } from "./layout.ts";
 import { agentWorkbenchView } from "./agent-workbench-view.ts";
 import {
+  agentInputForEditor,
   buildAgentWorkbench,
   editorValuesFor,
   validateAgentEditor,
@@ -409,9 +410,21 @@ export function createWebApp(opts: WebOptions): Hono {
     body: Record<string, unknown>,
     fallback: AgentEditorValues,
   ): AgentEditorValues => {
-    const value = (name: keyof AgentEditorValues): string => (
+    type TextField = Exclude<
+      keyof AgentEditorValues,
+      "skillSourceKeys" | "legacySkillNames"
+    >;
+    const value = (name: TextField): string => (
       typeof body[name] === "string" ? body[name] : fallback[name]
     );
+    const list = (name: "skillSourceKeys" | "legacySkillNames"): string[] => {
+      const raw = body[name];
+      return (Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [])
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean);
+    };
+    const catalogSelector = body.skillSelectorPresent === "1";
     return {
       name: value("name"),
       instruction: value("instruction"),
@@ -425,6 +438,12 @@ export function createWebApp(opts: WebOptions): Hono {
       permission: value("permission"),
       workdir: value("workdir"),
       skills: value("skills"),
+      ...(catalogSelector
+        ? {
+            skillSourceKeys: list("skillSourceKeys"),
+            legacySkillNames: list("legacySkillNames"),
+          }
+        : {}),
     };
   };
   const renderAgentWorkbench = async (input: {
@@ -440,6 +459,12 @@ export function createWebApp(opts: WebOptions): Hono {
     const selected = input.selected ?? null;
     const providers = await getProviders();
     const models = await getModels();
+    let catalog;
+    try {
+      catalog = engine.skillCatalog.current();
+    } catch {
+      catalog = undefined;
+    }
     const cfg = config();
     const runLimit = input.runLimit ?? 20;
     const allRuns = selected ? engine.listAgentRuns(selected.id, 100) : [];
@@ -459,6 +484,7 @@ export function createWebApp(opts: WebOptions): Hono {
       errors: input.errors,
       flash: input.flash,
       formError: input.formError,
+      catalog,
     }));
   };
   const idleCodexLogin = (): CodexLoginSession => ({
@@ -1433,6 +1459,27 @@ export function createWebApp(opts: WebOptions): Hono {
 
   // ---- Agents --------------------------------------------------------------
 
+  app.post("/agent-skills/refresh", async (c) => {
+    const body = await c.req.parseBody();
+    const requested = typeof body.returnTo === "string" ? body.returnTo : "/agents";
+    const returnTo = requested.startsWith("/agents")
+      && !requested.startsWith("//")
+      && !/[\r\n]/u.test(requested)
+      ? requested
+      : "/agents";
+    const separator = returnTo.includes("?") ? "&" : "?";
+    try {
+      engine.skillCatalog.refresh();
+    } catch {
+      return c.redirect(
+        `${returnTo}${separator}ok=${encodeURIComponent("Skill 目录刷新失败；继续使用上次目录")}`,
+      );
+    }
+    return c.redirect(
+      `${returnTo}${separator}ok=${encodeURIComponent("Skill 目录已刷新")}`,
+    );
+  });
+
   app.get("/agents", async (c) => {
     const agents = engine.agents.list();
     const ok = c.req.query("ok") ?? undefined;
@@ -1457,6 +1504,7 @@ export function createWebApp(opts: WebOptions): Hono {
         [{ label: "Agents", href: "/agents" }, { label: "新建" }],
         await renderAgentWorkbench({
           mode: "create",
+          flash: c.req.query("ok") ?? undefined,
         }),
         "agents",
       ),
@@ -1484,7 +1532,7 @@ export function createWebApp(opts: WebOptions): Hono {
   });
 
   app.post("/agents", async (c) => {
-    const body = await c.req.parseBody();
+    const body = await c.req.parseBody({ all: true });
     const cfg = config();
     const providers = await getProviders();
     const values = agentValuesFromBody(
@@ -1495,11 +1543,13 @@ export function createWebApp(opts: WebOptions): Hono {
         { provider: cfg.defaultProvider, model: cfg.defaultModel },
       ),
     );
+    const catalog = engine.skillCatalog.current();
     const validation = validateAgentEditor(values, {
       providers,
       models: await getModels(),
       defaults: { provider: cfg.defaultProvider, model: cfg.defaultModel },
       current: null,
+      catalog,
     });
     if (!validation.ok) {
       return c.html(
@@ -1517,7 +1567,7 @@ export function createWebApp(opts: WebOptions): Hono {
         422,
       );
     }
-    const agent = engine.agents.create(values);
+    const agent = engine.agents.create(agentInputForEditor(values, catalog, null));
     return c.redirect(
       `/agents/${encodeURIComponent(agent.id)}?ok=${encodeURIComponent("已创建")}`,
     );
@@ -1527,7 +1577,7 @@ export function createWebApp(opts: WebOptions): Hono {
     const id = decodeURIComponent(c.req.param("id"));
     const current = engine.agents.get(id);
     if (!current) return c.notFound();
-    const body = await c.req.parseBody();
+    const body = await c.req.parseBody({ all: true });
     const cfg = config();
     const providers = await getProviders();
     const values = agentValuesFromBody(
@@ -1538,11 +1588,13 @@ export function createWebApp(opts: WebOptions): Hono {
         { provider: cfg.defaultProvider, model: cfg.defaultModel },
       ),
     );
+    const catalog = engine.skillCatalog.current();
     const validation = validateAgentEditor(values, {
       providers,
       models: await getModels(),
       defaults: { provider: cfg.defaultProvider, model: cfg.defaultModel },
       current,
+      catalog,
     });
     if (!validation.ok) {
       return c.html(
@@ -1562,7 +1614,7 @@ export function createWebApp(opts: WebOptions): Hono {
       );
     }
     try {
-      engine.updateAgent(id, values);
+      engine.updateAgent(id, agentInputForEditor(values, catalog, current));
     } catch (error) {
       const message = error instanceof Error ? error.message : "保存失败";
       const visibilityConflict = message.includes("解除") || message.includes("绑定");

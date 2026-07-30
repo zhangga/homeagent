@@ -112,6 +112,21 @@ export interface Citation {
   title: string;
 }
 
+export type SkillWarningCode =
+  | "missing_source"
+  | "invalid_skill"
+  | "provider_incompatible"
+  | "ambiguous_legacy_name"
+  | "shadowed_source"
+  | "invalid_invocation_name";
+
+/** Presentation-safe warning for an Agent Skill that could not be loaded. */
+export interface SkillWarningView {
+  name: string;
+  code: SkillWarningCode;
+  message: string;
+}
+
 /**
  * The result of ask(). `source` distinguishes a grounded answer (from the
  * knowledge base, with citations) from a general fallback answer (model's own
@@ -125,6 +140,8 @@ export interface AskResult {
   traceId?: string;
   /** notable gaps the knowledge base did not cover, if any */
   gaps?: string[];
+  /** Agent Skills skipped for this call; the base Agent still ran. */
+  skillWarnings?: SkillWarningView[];
 }
 
 /** Summary of one dream-cycle run. */
@@ -145,6 +162,8 @@ export interface DreamReport {
   startedAt: number;
   finishedAt: number;
   errors: string[];
+  /** Agent Skills skipped for this cycle; the base Agent still ran. */
+  skillWarnings?: SkillWarningView[];
 }
 
 /** Health probe result for the knowledge layer. */

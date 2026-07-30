@@ -16,6 +16,7 @@ import type {
   Page,
   PageRef,
   RawEntry,
+  SkillWarningView,
   SpaceId,
 } from "@homeagent/shared";
 import { Serializer, canonicalModelId, config, logger } from "@homeagent/shared";
@@ -63,6 +64,12 @@ import {
   type AgentInput,
 } from "./agents.ts";
 import {
+  defaultSkillRoots,
+  SkillCatalog,
+  skillWarningViews,
+  type ResolvedAgentSkills,
+} from "./skill-catalog.ts";
+import {
   DEFAULT_TASK_TIMEOUT_MINUTES,
   TaskStore,
   type Task,
@@ -71,6 +78,7 @@ import {
   MAX_TASK_RUN_ERROR_CHARACTERS,
   TaskRunStore,
   type TaskRun,
+  type TaskRunSkillEvidence,
   type TaskRunTrigger,
 } from "./task-runs.ts";
 import { ReminderStore, type Reminder } from "./reminders.ts";
@@ -253,6 +261,7 @@ export type LearningDelivery = (
   plan: LearningPlan,
   source: LearningSource,
   session: LearningSession,
+  skillWarnings?: SkillWarningView[],
 ) => void | Promise<void>;
 
 /** How long a research task may run before the CLI is killed (much longer than Q&A). */
@@ -827,6 +836,15 @@ export interface EngineOptions {
   learningResearch?: LearningResearchProvider;
   /** Mark task runs left active by a previous service process as failed. */
   recoverInterruptedTaskRuns?: boolean;
+  /** Local Skill catalog override for deterministic tests or custom embedding. */
+  skillCatalog?: SkillCatalog;
+}
+
+export interface SpaceAgentCallContext {
+  agent?: Agent;
+  client: LlmClient;
+  skills: ResolvedAgentSkills;
+  execution: ProviderExecution;
 }
 
 interface ProviderRunHealth {
@@ -854,6 +872,7 @@ interface DreamCycleHealth {
 export class KnowledgeEngine implements Knowledge {
   readonly registry: SpaceRegistry;
   readonly feishuBindings: FeishuGroupBindingStore;
+  readonly skillCatalog: SkillCatalog;
   readonly agents: AgentStore;
   readonly tasks: TaskStore;
   readonly taskRuns: TaskRunStore;
@@ -877,7 +896,17 @@ export class KnowledgeEngine implements Knowledge {
     this.dataDir = opts.dataDir ?? config().dataDir;
     this.registry = new SpaceRegistry(this.dataDir);
     this.feishuBindings = new FeishuGroupBindingStore(this.dataDir);
-    this.agents = new AgentStore(this.dataDir);
+    this.skillCatalog = opts.skillCatalog ?? new SkillCatalog({
+      roots: defaultSkillRoots(),
+    });
+    this.agents = new AgentStore(this.dataDir, {
+      resolveLegacySkill: (name, provider) => {
+        const binding = this.skillCatalog.resolveLegacyName(name, provider);
+        return binding ? { kind: "source", ...binding } : undefined;
+      },
+      validateSourceSkill: (binding) =>
+        this.skillCatalog.hasCatalogSourceBinding(binding),
+    });
     this.tasks = new TaskStore(this.dataDir);
     this.taskRuns = new TaskRunStore(this.dataDir, {
       recoverInterrupted: opts.recoverInterruptedTaskRuns,
@@ -1341,14 +1370,60 @@ export class KnowledgeEngine implements Knowledge {
     taskExecution = false,
     resolvedAgent?: Agent,
   ): LlmClient {
-    if (this.llm) return this.llm;
-    const agent = resolvedAgent ?? this.agentForSpace(space);
-    return this.makeSpaceCliClient(
-      space,
+    return this.agentCallContext(space, {
       timeoutMs,
       signal,
-      taskExecution ? resolveAgentExecution(agent) : undefined,
+      taskExecution,
+      resolvedAgent,
+    }).client;
+  }
+
+  agentCallContext(
+    space: SpaceId,
+    options: {
+      timeoutMs?: number;
+      signal?: AbortSignal;
+      taskExecution?: boolean;
+      webSearch?: boolean;
+      resolvedAgent?: Agent;
+      resolvedSkills?: ResolvedAgentSkills;
+    } = {},
+  ): SpaceAgentCallContext {
+    const agent = options.resolvedAgent ?? this.agentForSpace(space);
+    const selectedProvider = agent?.provider || config().defaultProvider;
+    const provider: ProviderId = isCliProvider(selectedProvider)
+      ? selectedProvider
+      : "gateway";
+    const skills = options.resolvedSkills ?? this.skillCatalog.resolveAgentBindings(
+      agent?.skills ?? [],
+      provider,
+    );
+    const baseExecution = options.taskExecution
+      ? resolveAgentExecution(agent)
+      : { permission: "read-only" as const, skills: [] };
+    const execution: ProviderExecution = {
+      ...baseExecution,
+      skills: skills.resolved.map((skill) => skill.invocationName),
+      ...(options.webSearch ? { webSearch: true } : {}),
+    };
+    const client = this.llm ?? this.makeSpaceCliClient(
+      space,
+      options.timeoutMs,
+      options.signal,
+      execution,
       agent,
+    );
+    return { agent, client, skills, execution };
+  }
+
+  skillWarningsForSpace(space: SpaceId): SkillWarningView[] {
+    const agent = this.agentForSpace(space);
+    const selectedProvider = agent?.provider || config().defaultProvider;
+    const provider: ProviderId = isCliProvider(selectedProvider)
+      ? selectedProvider
+      : "gateway";
+    return skillWarningViews(
+      this.skillCatalog.resolveAgentBindings(agent?.skills ?? [], provider),
     );
   }
 
@@ -1391,16 +1466,10 @@ export class KnowledgeEngine implements Knowledge {
     space: SpaceId,
     timeoutMs = LEARNING_RESEARCH_TIMEOUT_MS,
   ): LlmClient {
-    return this.makeSpaceCliClient(
-      space,
+    return this.agentCallContext(space, {
       timeoutMs,
-      undefined,
-      {
-        permission: "read-only",
-        skills: [],
-        webSearch: true,
-      },
-    );
+      webSearch: true,
+    }).client;
   }
 
   async remember(entry: RawEntry): Promise<string> {
@@ -1737,6 +1806,7 @@ export class KnowledgeEngine implements Knowledge {
         { ...preparedPlan },
         { ...source, rawIds: [...source.rawIds] },
         { ...session },
+        this.skillWarningsForSpace(plan.space),
       );
       return Boolean(this.learning.markDelivered(session.id, deliveredAt));
     } finally {
@@ -1946,7 +2016,14 @@ export class KnowledgeEngine implements Knowledge {
   }
 
   /** Execute while the caller holds the per-space serializer. */
-  private async executeDreamCycle(space: SpaceId, opts: DreamOptions): Promise<DreamReport> {
+  private async executeDreamCycle(
+    space: SpaceId,
+    opts: DreamOptions,
+    fixedContext?: {
+      resolvedAgent?: Agent;
+      resolvedSkills?: ResolvedAgentSkills;
+    },
+  ): Promise<DreamReport> {
     const health = this.dreamCycles.get(space) ?? { space, running: false };
     health.running = true;
     health.lastStartedAt = Date.now();
@@ -1954,9 +2031,19 @@ export class KnowledgeEngine implements Knowledge {
     try {
       throwIfTaskRunAborted(opts.signal);
       const store = this.registry.ensure(space);
-      const report = await distillSpace(store, opts, {
-        client: this.llmClientForSpace(space, undefined, opts.signal),
+      const context = this.agentCallContext(space, {
+        signal: opts.signal,
+        resolvedAgent: fixedContext?.resolvedAgent,
+        resolvedSkills: fixedContext?.resolvedSkills,
       });
+      const baseReport = await distillSpace(store, opts, {
+        client: context.client,
+      });
+      const skillWarnings = skillWarningViews(context.skills);
+      const report: DreamReport = {
+        ...baseReport,
+        ...(skillWarnings.length > 0 ? { skillWarnings } : {}),
+      };
       throwIfTaskRunAborted(opts.signal);
       this.registry.setLastDream(space, report.finishedAt);
       health.lastExamined = report.examined;
@@ -2068,7 +2155,12 @@ export class KnowledgeEngine implements Knowledge {
         version: SPACE_ARCHIVE_VERSION,
         exportedAt: Date.now(),
         space: { ...meta },
-        agent: agent ? { ...agent, skills: [...agent.skills] } : undefined,
+        agent: agent
+          ? {
+              ...agent,
+              skills: agent.skills.map((binding) => ({ ...binding })),
+            }
+          : undefined,
         purpose: store.purpose(),
         schema: store.schema(),
         pages: store.listPagesFromDisk(),
@@ -2400,7 +2492,15 @@ export class KnowledgeEngine implements Knowledge {
     let executionAgent: Agent | undefined;
     let provider: ProviderId | undefined;
     let model: string | undefined;
+    let client: LlmClient | undefined;
+    let resolvedSkills: ResolvedAgentSkills | undefined;
+    let skillEvidence: TaskRunSkillEvidence = {
+      requested: [],
+      resolved: [],
+      skipped: [],
+    };
     let setupError: unknown;
+    const controller = new AbortController();
     try {
       const configuredAgent = this.agentForSpace(task.space);
       const cfg = config();
@@ -2416,6 +2516,19 @@ export class KnowledgeEngine implements Knowledge {
       executionAgent = configuredAgent
         ? { ...configuredAgent, model: model ?? "" }
         : undefined;
+      const context = this.agentCallContext(task.space, {
+        timeoutMs,
+        signal: controller.signal,
+        taskExecution: true,
+        resolvedAgent: executionAgent,
+      });
+      client = context.client;
+      resolvedSkills = context.skills;
+      skillEvidence = {
+        requested: context.skills.requested.map((item) => ({ ...item })),
+        resolved: context.skills.resolved.map((item) => ({ ...item })),
+        skipped: context.skills.skipped.map((item) => ({ ...item })),
+      };
     } catch (error) {
       setupError = error;
     }
@@ -2425,11 +2538,11 @@ export class KnowledgeEngine implements Knowledge {
       agentId: executionAgent?.id,
       provider,
       model,
+      skillEvidence,
       retryOf,
       distill,
       timeoutMs,
     });
-    const controller = new AbortController();
     const timeout = setTimeout(() => {
       controller.abort(new TaskRunTimeoutError(timeoutMs));
     }, timeoutMs);
@@ -2443,6 +2556,8 @@ export class KnowledgeEngine implements Knowledge {
         distill,
         controller,
         executionAgent,
+        client,
+        resolvedSkills,
         setupError,
       )
         .finally(() => clearTimeout(timeout)),
@@ -2464,6 +2579,8 @@ export class KnowledgeEngine implements Knowledge {
     distill: boolean,
     controller: AbortController,
     resolvedAgent?: Agent,
+    resolvedClient?: LlmClient,
+    resolvedSkills?: ResolvedAgentSkills,
     setupError?: unknown,
   ): Promise<TaskReport> {
     const startedAt = run.startedAt;
@@ -2476,15 +2593,9 @@ export class KnowledgeEngine implements Knowledge {
       // The LLM call runs OUTSIDE the per-space serializer — research is
       // long-running and must not block captures/distillation. Only the write
       // (remember) is serialized, and it acquires the lock itself.
-      const client = this.llmClientForSpace(
-        task.space,
-        run.timeoutMs ?? TASK_TIMEOUT_MS,
-        controller.signal,
-        true,
-        agent,
-      );
+      if (!resolvedClient) throw new Error("task Agent context is unavailable");
       const res = await awaitTaskRunStep(
-        client.complete({
+        resolvedClient.complete({
           system: agent?.instruction || undefined,
           prompt: researchPrompt(task.topic),
           model: agent?.model || undefined,
@@ -2511,9 +2622,17 @@ export class KnowledgeEngine implements Knowledge {
       let pagesWritten: number | undefined;
       if (distill) {
         try {
-          const report = await this.runDreamCycle(task.space, {
-            signal: controller.signal,
-          });
+          const report = await this.serializer.run(
+            task.space,
+            async () => this.executeDreamCycle(
+              task.space,
+              { signal: controller.signal },
+              {
+                resolvedAgent: agent,
+                resolvedSkills,
+              },
+            ),
+          );
           throwIfTaskRunAborted(controller.signal);
           pagesWritten = report.pagesWritten;
         } catch (err) {
@@ -2583,7 +2702,11 @@ export class KnowledgeEngine implements Knowledge {
     // primary (write) space — the space the message belongs to.
     const stores = spaces.filter((s) => this.registry.has(s)).map((s) => this.registry.store(s));
     const primary = spaces[0] ?? stores[0]?.space;
-    const client = primary ? this.llmClientForSpace(primary) : this.llmClientForSpace(spaces[0]!);
+    const context = primary
+      ? this.agentCallContext(primary)
+      : this.agentCallContext(spaces[0]!);
+    const client = context.client;
+    const skillWarnings = skillWarningViews(context.skills);
     const startedAt = Date.now();
     try {
       const result = await askImpl(stores, question, opts, { client });
@@ -2598,10 +2721,17 @@ export class KnowledgeEngine implements Knowledge {
           latencyMs: Date.now() - startedAt,
           createdAt: startedAt,
         });
-        return { ...result, traceId: trace.id };
+        return {
+          ...result,
+          traceId: trace.id,
+          ...(skillWarnings.length > 0 ? { skillWarnings } : {}),
+        };
       } catch (err) {
         log.warn("answer quality trace persistence failed", { err: String(err) });
-        return result;
+        return {
+          ...result,
+          ...(skillWarnings.length > 0 ? { skillWarnings } : {}),
+        };
       }
     } catch (err) {
       try {

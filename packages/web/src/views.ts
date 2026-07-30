@@ -41,6 +41,7 @@ import {
   MAX_TASK_NOTIFICATION_ATTEMPTS,
   TASK_CADENCES,
   learningProgress,
+  skillWarningViews,
 } from "@homeagent/core";
 import { codexReasoningEffortsForModel, type DetectedProvider } from "@homeagent/llm";
 import type { FeishuRuntimeStatus } from "./integrations.ts";
@@ -1084,6 +1085,10 @@ export function taskRunView(
         <button type="submit" class="secondary">重试通知</button>
       </form>`
     : "";
+  const skillEvidence = run.skillEvidence;
+  const skillWarnings = skillEvidence
+    ? skillWarningViews({ skipped: skillEvidence.skipped })
+    : [];
   return html`<h1>运行详情</h1>
     <p class="subtitle">
       <a href="/tasks/${encodeURIComponent(run.taskId)}">${run.taskName}</a>
@@ -1111,6 +1116,25 @@ export function taskRunView(
         : ""}
       ${run.retryOf
         ? html`<div><strong>重试来源：</strong><a href="/tasks/runs/${encodeURIComponent(run.retryOf)}">${run.retryOf}</a></div>`
+        : ""}
+      ${skillEvidence
+        ? html`<div>
+            <strong>Skill 解析：</strong>
+            请求 ${skillEvidence.requested.length} ·
+            已加载 ${skillEvidence.resolved.length} ·
+            跳过 ${skillEvidence.skipped.length}
+            ${skillEvidence.resolved.length > 0
+              ? html`<ul>${skillEvidence.resolved.map((skill) =>
+                  html`<li><code>${skill.name}</code> · ${skill.sourceKey} ·
+                    sha256 ${skill.skillFileHash.slice(0, 12)}</li>`
+                )}</ul>`
+              : ""}
+            ${skillWarnings.length > 0
+              ? html`<ul>${skillWarnings.map((warning) =>
+                  html`<li><code>${warning.name}</code>：${warning.message}</li>`
+                )}</ul>`
+              : ""}
+          </div>`
         : ""}
       ${run.rawId
         ? html`<div><strong>原始记录：</strong><a href="/spaces/${encodeURIComponent(run.space)}/raw/${encodeURIComponent(run.rawId)}">${run.rawId}</a></div>`

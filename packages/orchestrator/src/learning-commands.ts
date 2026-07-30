@@ -1,6 +1,7 @@
 /** Explicit chat controls for durable guided-learning plans. */
 import { learningProgress, type KnowledgeEngine, type LearningPlan } from "@homeagent/core";
 import type { SpaceId } from "@homeagent/shared";
+import { formatSkillWarnings } from "./format.ts";
 import { LEARNING_HELP } from "./messages.ts";
 
 export interface LearningCommand {
@@ -18,6 +19,15 @@ export interface LearningCommandContext {
 
 export function learningCommandNeedsSource(command: LearningCommand): boolean {
   return command.verb === "new" || command.verb === "add";
+}
+
+function withSkillWarnings(
+  message: string,
+  engine: KnowledgeEngine,
+  space: SpaceId,
+): string {
+  const warning = formatSkillWarnings(engine.skillWarningsForSpace(space));
+  return warning ? `${message}\n\n${warning}` : message;
 }
 
 function withoutMentions(text: string): string {
@@ -131,15 +141,19 @@ export async function handleLearningCommand(
         topic,
       });
       if (plan.profile?.status === "assessing" && plan.assessmentQuestions?.length) {
-        return [
+        return withSkillWarnings([
           `✅ 已创建主题学习计划「${plan.name}」。开始前，我想先了解你目前的基础和目标：`,
           "",
           ...plan.assessmentQuestions.map((question, index) => `${index + 1}. ${question}`),
           "",
           "请按编号回复，并以“学习回答：”开头。完成诊断后，我会重做路线并开始每日学习。",
-        ].join("\n");
+        ].join("\n"), engine, context.space);
       }
-      return `✅ 已创建主题学习计划「${plan.name}」，共 ${plan.route.length} 个步骤，默认每天 8:00 推送一课。发送 \`/learn route ${plan.name}\` 查看路线。`;
+      return withSkillWarnings(
+        `✅ 已创建主题学习计划「${plan.name}」，共 ${plan.route.length} 个步骤，默认每天 8:00 推送一课。发送 \`/learn route ${plan.name}\` 查看路线。`,
+        engine,
+        context.space,
+      );
     } catch (error) {
       return `创建主题学习计划失败：${String(error).replace(/^Error:\s*/u, "")}`;
     }
@@ -204,13 +218,13 @@ export async function handleLearningCommand(
     }
     const resources = refreshed.onlineResources ?? [];
     if (resources.length === 0) {
-      return [
+      return withSkillWarnings([
         `这次没有为「${target.name}」获得可验证的联网资料。`,
         "课程仍会使用用户材料和明确标注的模型一般知识继续进行；你可以稍后重试。",
-      ].join("\n");
+      ].join("\n"), engine, context.space);
     }
     const retained = refreshed.resourceResearchAt === beforeAt;
-    return [
+    return withSkillWarnings([
       retained
         ? `本次联网刷新未产生新结果，以下保留「${target.name}」上次核验的资料：`
         : `🔎 已按「${refreshed.resourceResearchQuery}」为「${target.name}」核验并推荐：`,
@@ -220,7 +234,7 @@ export async function handleLearningCommand(
         `   ${resource.relevance}`,
         `   ${resource.url}`,
       ]),
-    ].join("\n");
+    ].join("\n"), engine, context.space);
   }
   if (command.verb === "add") {
     if (!context.sourceMessageId) {
@@ -281,7 +295,7 @@ export async function handleLearningAnswer(
       answer,
     );
     const profile = assessed.profile!;
-    return [
+    return withSkillWarnings([
       `🧭 已完成「${assessed.name}」入学诊断，并按你的回答重做学习路线。`,
       "",
       `当前判断：${levelLabel(profile.level)} — ${profile.levelRationale}`,
@@ -295,7 +309,7 @@ export async function handleLearningAnswer(
       ...assessed.route.map((step, index) => `${index + 1}. ${step.title} — ${step.objective}`),
       "",
       `下一课将在每天 ${assessed.hour}:00 推送；你也可以发送 \`/learn route ${assessed.name}\` 随时查看变化。`,
-    ].filter(Boolean).join("\n");
+    ].filter(Boolean).join("\n"), engine, context.space);
   }
   const target = awaiting[0]!;
   const result = await engine.answerLearningSession(target.id, context.actorId, answer);
@@ -306,7 +320,11 @@ export async function handleLearningAnswer(
     : result.session.mastery === "review"
       ? `\n\n🔁 下一课将继续当前步骤，重点补强：${result.session.nextFocus}`
       : "";
-  return `✅ 已记录「${target.name}」第 ${result.session.sequence} 课。\n\n${result.feedback}${completion}`;
+  return withSkillWarnings(
+    `✅ 已记录「${target.name}」第 ${result.session.sequence} 课。\n\n${result.feedback}${completion}`,
+    engine,
+    context.space,
+  );
 }
 
 function levelLabel(level: NonNullable<LearningPlan["profile"]>["level"]): string {

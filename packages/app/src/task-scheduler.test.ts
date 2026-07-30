@@ -3,8 +3,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type SpaceId } from "@homeagent/shared";
-import { KnowledgeEngine, type Task } from "@homeagent/core";
-import { shouldRunTask, TaskScheduler } from "./task-scheduler.ts";
+import { KnowledgeEngine, type Task, type TaskRun } from "@homeagent/core";
+import {
+  formatTaskRunNotification,
+  shouldRunTask,
+  TaskScheduler,
+} from "./task-scheduler.ts";
 
 const SPACE: SpaceId = "team/oc_tsched";
 // Fixed instants in Asia/Shanghai.
@@ -34,6 +38,38 @@ function task(over: Partial<Task>): Task {
 }
 
 describe("shouldRunTask", () => {
+  test("task notification includes persisted skipped-Skill warnings", () => {
+    const run = {
+      id: "run_skill_warning",
+      taskId: "task_1",
+      taskName: "Research",
+      space: SPACE,
+      topic: "x",
+      trigger: "scheduled",
+      distill: false,
+      status: "succeeded",
+      startedAt: 1,
+      finishedAt: 2,
+      summary: "Completed",
+      skillEvidence: {
+        requested: [{ kind: "legacy-name", name: "review" }],
+        resolved: [],
+        skipped: [{
+          name: "review",
+          code: "ambiguous_legacy_name",
+          message: "Legacy Skill name is not bound to an exact source",
+        }],
+      },
+    } satisfies TaskRun;
+
+    const message = formatTaskRunNotification(run);
+
+    expect(message).toContain("Completed");
+    expect(message).toContain("review");
+    expect(message).toContain("基础 Agent 已继续执行");
+    expect(message).not.toContain("Legacy Skill name is not bound");
+  });
+
   test("disabled never runs", () => {
     expect(shouldRunTask(task({ enabled: false }), T10)).toBe(false);
   });

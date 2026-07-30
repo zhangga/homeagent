@@ -13,11 +13,13 @@ import {
   isCodexReasoningEffortSupported,
   normalizeProviderSkills,
 } from "@homeagent/llm";
-import type { Agent } from "./agents.ts";
+import type { Agent, AgentSkillBinding } from "./agents.ts";
 import {
   AGENT_PERMISSIONS,
   AGENT_VISIBILITIES,
   agentVisibleInSpace,
+  isAgentSkillName,
+  isAgentSkillSourceKey,
 } from "./agents.ts";
 import {
   DEFAULT_TASK_TIMEOUT_MINUTES,
@@ -30,6 +32,7 @@ import {
   MAX_TASK_RUN_ERROR_CHARACTERS,
   MAX_TASK_RUN_HISTORY_PER_TASK,
   MAX_TASK_RUN_OUTPUT_CHARACTERS,
+  isTaskRunSkillEvidence,
   type TaskRun,
   type TaskRunNotification,
 } from "./task-runs.ts";
@@ -60,7 +63,9 @@ export const LEARNING_SPACE_ARCHIVE_VERSION = 2 as const;
 export const ADAPTIVE_LEARNING_SPACE_ARCHIVE_VERSION = 3 as const;
 export const KNOWLEDGE_GOVERNANCE_SPACE_ARCHIVE_VERSION = 4 as const;
 export const TASK_RUN_HISTORY_SPACE_ARCHIVE_VERSION = 5 as const;
-export const SPACE_ARCHIVE_VERSION = 6 as const;
+export const TASK_EXECUTION_SPACE_ARCHIVE_VERSION = 6 as const;
+export const AGENT_SKILL_BINDINGS_SPACE_ARCHIVE_VERSION = 7 as const;
+export const SPACE_ARCHIVE_VERSION = AGENT_SKILL_BINDINGS_SPACE_ARCHIVE_VERSION;
 
 export interface MessageRetractionRecord {
   chatId: string;
@@ -106,11 +111,15 @@ export interface SpaceArchiveV5 extends Omit<SpaceArchiveV4, "version"> {
 }
 
 export interface SpaceArchiveV6 extends Omit<SpaceArchiveV5, "version"> {
+  version: typeof TASK_EXECUTION_SPACE_ARCHIVE_VERSION;
+}
+
+export interface SpaceArchiveV7 extends Omit<SpaceArchiveV6, "version"> {
   version: typeof SPACE_ARCHIVE_VERSION;
 }
 
 /** Current normalized archive shape returned by export and parsing. */
-export type SpaceArchive = SpaceArchiveV6;
+export type SpaceArchive = SpaceArchiveV7;
 
 export interface SpaceDeleteResult {
   status: "deleted" | "not_found";
@@ -272,6 +281,7 @@ function parseRaw(value: unknown, index: number, space: SpaceId): RawRecord {
 function parseAgent(
   value: unknown,
   defaultVisibility: Agent["visibility"],
+  version: number,
 ): Agent {
   const item = record(value, "agent");
   const provider = text(item.provider, "agent.provider");
@@ -291,10 +301,43 @@ function parseAgent(
     visibility,
     workdir: optionalText(item.workdir, "agent.workdir"),
     permission,
-    skills: normalizeProviderSkills(strings(item.skills, "agent.skills")),
+    skills: parseAgentSkills(item.skills, version),
     createdAt: finiteNumber(item.createdAt, "agent.createdAt"),
     updatedAt: finiteNumber(item.updatedAt, "agent.updatedAt"),
   };
+}
+
+function parseAgentSkills(value: unknown, version: number): AgentSkillBinding[] {
+  if (version < AGENT_SKILL_BINDINGS_SPACE_ARCHIVE_VERSION) {
+    return normalizeProviderSkills(strings(value, "agent.skills")).map((name) => ({
+      kind: "legacy-name" as const,
+      name,
+    }));
+  }
+  if (!Array.isArray(value)) throw new Error("agent.skills must be an array");
+  const bindings = value.map((entry, index): AgentSkillBinding => {
+    const item = record(entry, `agent.skills[${index}]`);
+    const kind = text(item.kind, `agent.skills[${index}].kind`);
+    const name = text(item.name, `agent.skills[${index}].name`);
+    if (!isAgentSkillName(name)) {
+      throw new Error(`agent.skills[${index}].name is invalid`);
+    }
+    if (kind === "legacy-name") return { kind, name };
+    if (kind !== "source") throw new Error(`agent.skills[${index}].kind is invalid`);
+    const sourceKey = text(item.sourceKey, `agent.skills[${index}].sourceKey`);
+    if (!isAgentSkillSourceKey(sourceKey)) {
+      throw new Error(`agent.skills[${index}].sourceKey is invalid`);
+    }
+    return { kind, sourceKey, name };
+  });
+  assertUnique(
+    bindings,
+    (binding) => binding.kind === "source"
+      ? `source:${binding.sourceKey}`
+      : `legacy:${binding.name}`,
+    "agent Skill binding",
+  );
+  return bindings;
 }
 
 function parseTask(value: unknown, index: number, space: SpaceId, version: number): Task {
@@ -311,7 +354,7 @@ function parseTask(value: unknown, index: number, space: SpaceId, version: numbe
     throw new Error(`tasks[${index}].hour is invalid`);
   }
   const timeoutMinutes = item.timeoutMinutes === undefined
-    && version < SPACE_ARCHIVE_VERSION
+    && version < TASK_EXECUTION_SPACE_ARCHIVE_VERSION
     ? DEFAULT_TASK_TIMEOUT_MINUTES
     : finiteNumber(item.timeoutMinutes, `tasks[${index}].timeoutMinutes`);
   if (
@@ -364,16 +407,24 @@ function parseTaskRunNotification(
   const notification: TaskRunNotification = {
     status,
     attempts,
-    lastAttemptAt: item.lastAttemptAt === undefined
-      ? undefined
-      : finiteNumber(item.lastAttemptAt, `taskRuns[${index}].notification.lastAttemptAt`),
-    nextAttemptAt: item.nextAttemptAt === undefined
-      ? undefined
-      : finiteNumber(item.nextAttemptAt, `taskRuns[${index}].notification.nextAttemptAt`),
-    sentAt: item.sentAt === undefined
-      ? undefined
-      : finiteNumber(item.sentAt, `taskRuns[${index}].notification.sentAt`),
-    error: optionalText(item.error, `taskRuns[${index}].notification.error`),
+    ...(item.lastAttemptAt === undefined ? {} : {
+      lastAttemptAt: finiteNumber(
+        item.lastAttemptAt,
+        `taskRuns[${index}].notification.lastAttemptAt`,
+      ),
+    }),
+    ...(item.nextAttemptAt === undefined ? {} : {
+      nextAttemptAt: finiteNumber(
+        item.nextAttemptAt,
+        `taskRuns[${index}].notification.nextAttemptAt`,
+      ),
+    }),
+    ...(item.sentAt === undefined ? {} : {
+      sentAt: finiteNumber(item.sentAt, `taskRuns[${index}].notification.sentAt`),
+    }),
+    ...(item.error === undefined ? {} : {
+      error: text(item.error, `taskRuns[${index}].notification.error`),
+    }),
   };
   if (status === "sent" && notification.sentAt === undefined) {
     throw new Error(`taskRuns[${index}].notification.sentAt is required`);
@@ -397,6 +448,7 @@ function parseTaskRun(
   index: number,
   space: SpaceId,
   taskIds: Set<string>,
+  version: number,
 ): TaskRun {
   const item = record(value, `taskRuns[${index}]`);
   if (item.space !== space) {
@@ -458,6 +510,23 @@ function parseTaskRun(
   if (notification && notify === false) {
     throw new Error(`taskRuns[${index}].notification conflicts with notify=false`);
   }
+  const provider = optionalText(item.provider, `taskRuns[${index}].provider`);
+  if (provider !== undefined && !isCliProvider(provider)) {
+    throw new Error(`taskRuns[${index}].provider is invalid`);
+  }
+  const skillEvidence = version < AGENT_SKILL_BINDINGS_SPACE_ARCHIVE_VERSION
+    || item.skillEvidence === undefined
+    ? undefined
+    : (() => {
+        if (!isTaskRunSkillEvidence(item.skillEvidence)) {
+          throw new Error(`taskRuns[${index}].skillEvidence is invalid`);
+        }
+        return {
+          requested: item.skillEvidence.requested.map((entry) => ({ ...entry })),
+          resolved: item.skillEvidence.resolved.map((entry) => ({ ...entry })),
+          skipped: item.skillEvidence.skipped.map((entry) => ({ ...entry })),
+        };
+      })();
   return {
     id: nonemptyText(item.id, `taskRuns[${index}].id`),
     taskId,
@@ -465,6 +534,10 @@ function parseTaskRun(
     space,
     topic: text(item.topic, `taskRuns[${index}].topic`),
     trigger,
+    agentId: optionalText(item.agentId, `taskRuns[${index}].agentId`),
+    provider,
+    model: optionalText(item.model, `taskRuns[${index}].model`),
+    skillEvidence,
     retryOf: optionalText(item.retryOf, `taskRuns[${index}].retryOf`),
     distill: boolean(item.distill, `taskRuns[${index}].distill`),
     notify,
@@ -1031,6 +1104,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       && version !== ADAPTIVE_LEARNING_SPACE_ARCHIVE_VERSION
       && version !== KNOWLEDGE_GOVERNANCE_SPACE_ARCHIVE_VERSION
       && version !== TASK_RUN_HISTORY_SPACE_ARCHIVE_VERSION
+      && version !== TASK_EXECUTION_SPACE_ARCHIVE_VERSION
       && version !== SPACE_ARCHIVE_VERSION
     )
   ) {
@@ -1077,7 +1151,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
   const defaultVisibility = space.id.startsWith("personal/") ? "Personal" : "Team";
   const agent = root.agent === undefined
     ? undefined
-    : parseAgent(root.agent, defaultVisibility);
+    : parseAgent(root.agent, defaultVisibility, version);
   if (agent && agent.id !== space.agentId) {
     throw new Error("agent.id does not match space.agentId");
   }
@@ -1101,7 +1175,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
   const taskRuns = version < TASK_RUN_HISTORY_SPACE_ARCHIVE_VERSION
     ? []
     : (root.taskRuns as unknown[]).map((item, index) =>
-        parseTaskRun(item, index, id, taskIds)
+        parseTaskRun(item, index, id, taskIds, version)
       );
   const taskRunCounts = new Map<string, number>();
   for (const run of taskRuns) {

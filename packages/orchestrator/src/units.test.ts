@@ -173,3 +173,24 @@ describe("formatAnswer (Q1)", () => {
     expect(formatAnswer(res)).toContain("尚缺");
   });
 });
+
+describe("formatAnswer Agent Skill warnings", () => {
+  test("adds one bounded warning without hiding the answer", () => {
+    const res: AskResult = {
+      answer: "基础回答。",
+      source: "general",
+      citations: [],
+      skillWarnings: [{
+        name: "review",
+        code: "missing_source",
+        message: "Skill 当前不可用，已跳过",
+      }],
+    };
+
+    const formatted = formatAnswer(res);
+
+    expect(formatted).toContain("基础回答。");
+    expect(formatted).toContain("review");
+    expect(formatted).toContain("基础 Agent 已继续执行");
+  });
+});

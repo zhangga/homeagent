@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FakeLlm, KnowledgeEngine } from "@homeagent/core";
+import { FakeLlm, KnowledgeEngine, SkillCatalog } from "@homeagent/core";
 import {
   handleLearningAnswer,
   handleLearningCommand,
@@ -115,6 +115,66 @@ describe("learning command handling", () => {
     );
     expect(added).toContain("已添加材料「async.md」");
     expect(engine.learning.source(engine.learning.list()[0]!.id)?.materials).toHaveLength(1);
+  });
+
+  test("surfaces a safe Skill warning after a learning Agent call", async () => {
+    engine.close();
+    const skillRoot = join(dir, "skill-root");
+    const skillDir = join(skillRoot, "coach");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      ["---", "name: coach", "description: Coach.", "---"].join("\n"),
+      "utf8",
+    );
+    const catalog = new SkillCatalog({
+      roots: [{
+        kind: "shared-agents",
+        path: skillRoot,
+        providerIds: ["claude", "codex", "trae-cli"],
+      }],
+    });
+    catalog.refresh();
+    engine = new KnowledgeEngine({ dataDir: dir, llm, skillCatalog: catalog });
+    engine.ensureSpace("personal/ou_me", { chatId: "oc_p2p" });
+    const agent = engine.agents.create({
+      name: "Learning Agent",
+      provider: "claude",
+      visibility: "Personal",
+      skills: [{
+        kind: "source",
+        sourceKey: "shared-agents:coach",
+        name: "coach",
+      }],
+    });
+    engine.updateSpaceMeta("personal/ou_me", { agentId: agent.id });
+    rmSync(skillDir, { recursive: true, force: true });
+    llm.queueJSON({
+      name: "Rust",
+      assessmentQuestions: [
+        "你了解 Future 吗？",
+        "你写过异步代码吗？",
+        "你希望解决什么问题？",
+      ],
+      steps: [
+        { title: "Future", objective: "理解 Future" },
+        { title: "Runtime", objective: "理解运行时" },
+      ],
+    });
+
+    const reply = await handleLearningCommand(
+      engine,
+      { verb: "topic", arg: "Rust" },
+      {
+        space: "personal/ou_me",
+        chatId: "oc_p2p",
+        actorId: "ou_me",
+      },
+    );
+
+    expect(reply).toContain("Skill 提示");
+    expect(reply).toContain("coach");
+    expect(reply).not.toContain(skillRoot);
   });
 
   test("runs an入学诊断 before starting a personalized topic route", async () => {

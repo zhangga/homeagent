@@ -15,6 +15,7 @@ import type { Knowledge } from "./knowledge.ts";
 import { KnowledgeEngine } from "./engine.ts";
 import { FakeLlm } from "./testing.ts";
 import type { Page, SpaceId } from "@homeagent/shared";
+import { SkillCatalog } from "./skill-catalog.ts";
 
 let dir: string;
 let engine: KnowledgeEngine;
@@ -841,9 +842,25 @@ describe("Knowledge seam contract", () => {
   test("runTask passes the assigned Agent execution contract to the provider", async () => {
     const workdir = join(dir, "task-workspace");
     mkdirSync(workdir);
+    const skillRoot = join(dir, "task-skills");
+    for (const name of ["code-review", "github-yeet"]) {
+      mkdirSync(join(skillRoot, name), { recursive: true });
+      writeFileSync(
+        join(skillRoot, name, "SKILL.md"),
+        ["---", `name: ${name}`, `description: ${name}.`, "---"].join("\n"),
+        "utf8",
+      );
+    }
     let execution: unknown;
     const taskEngine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({
+        roots: [{
+          kind: "shared-agents",
+          path: skillRoot,
+          providerIds: ["claude", "codex", "trae-cli"],
+        }],
+      }),
       runProvider: async (_id, input) => {
         execution = input.execution;
         return "已按 Agent 配置执行";
@@ -854,7 +871,18 @@ describe("Knowledge seam contract", () => {
       name: "执行助手",
       permission: "write",
       workdir,
-      skills: "code-review, github:yeet",
+      skills: [
+        {
+          kind: "source",
+          sourceKey: "shared-agents:code-review",
+          name: "code-review",
+        },
+        {
+          kind: "source",
+          sourceKey: "shared-agents:github-yeet",
+          name: "github-yeet",
+        },
+      ],
     });
     taskEngine.registry.updateMeta(SPACE, { agentId: agent.id });
     const task = taskEngine.tasks.create({
@@ -865,14 +893,129 @@ describe("Knowledge seam contract", () => {
     })!;
 
     const report = await taskEngine.runTask(task.id);
+    const storedRun = taskEngine.getTaskRun(report.runId);
+    taskEngine.close();
 
     expect(report.status).toBe("succeeded");
     expect(execution).toEqual({
       permission: "write",
       workdir: realpathSync(workdir),
-      skills: ["code-review", "github:yeet"],
+      skills: ["code-review", "github-yeet"],
     });
+    expect(storedRun?.skillEvidence).toEqual({
+      requested: [
+        {
+          kind: "source",
+          sourceKey: "shared-agents:code-review",
+          name: "code-review",
+        },
+        {
+          kind: "source",
+          sourceKey: "shared-agents:github-yeet",
+          name: "github-yeet",
+        },
+      ],
+      resolved: [
+        expect.objectContaining({
+          sourceKey: "shared-agents:code-review",
+          name: "code-review",
+          invocationName: "code-review",
+          skillFileHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }),
+        expect.objectContaining({
+          sourceKey: "shared-agents:github-yeet",
+          name: "github-yeet",
+          invocationName: "github-yeet",
+          skillFileHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }),
+      ],
+      skipped: [],
+    });
+  });
+
+  test("ordinary Agent calls load resolved Skills but stay read-only without a Workdir", async () => {
+    const skillRoot = join(dir, "skills");
+    mkdirSync(join(skillRoot, "review"), { recursive: true });
+    writeFileSync(
+      join(skillRoot, "review", "SKILL.md"),
+      ["---", "name: review", "description: Review.", "---"].join("\n"),
+      "utf8",
+    );
+    const workdir = join(dir, "ordinary-workspace");
+    mkdirSync(workdir);
+    let execution: unknown;
+    const taskEngine = new KnowledgeEngine({
+      dataDir: dir,
+      skillCatalog: new SkillCatalog({
+        roots: [{ kind: "codex-user", path: skillRoot, providerIds: ["codex"] }],
+      }),
+      runProvider: async (_id, input) => {
+        execution = input.execution;
+        return "ok";
+      },
+    });
+    taskEngine.ensureSpace(SPACE);
+    const agent = taskEngine.agents.create({
+      name: "bound",
+      provider: "codex",
+      permission: "full",
+      workdir,
+      skills: [{
+        kind: "source",
+        sourceKey: "codex-user:review",
+        name: "review",
+      }],
+    });
+    taskEngine.registry.updateMeta(SPACE, { agentId: agent.id });
+
+    await taskEngine.llmClientForSpace(SPACE).complete({ prompt: "hello" });
     taskEngine.close();
+
+    expect(execution).toEqual({
+      permission: "read-only",
+      skills: ["review"],
+    });
+  });
+
+  test("ask continues with the base Agent and returns a safe warning when a Skill disappears", async () => {
+    const skillRoot = join(dir, "warning-skills");
+    const skillDir = join(skillRoot, "review");
+    mkdirSync(skillDir, { recursive: true });
+    const skillFile = join(skillDir, "SKILL.md");
+    writeFileSync(
+      skillFile,
+      ["---", "name: review", "description: Review.", "---"].join("\n"),
+      "utf8",
+    );
+    const taskEngine = new KnowledgeEngine({
+      dataDir: dir,
+      skillCatalog: new SkillCatalog({
+        roots: [{ kind: "codex-user", path: skillRoot, providerIds: ["codex"] }],
+      }),
+      runProvider: async () => "base answer",
+    });
+    taskEngine.ensureSpace(SPACE);
+    const agent = taskEngine.agents.create({
+      name: "bound",
+      provider: "codex",
+      skills: [{
+        kind: "source",
+        sourceKey: "codex-user:review",
+        name: "review",
+      }],
+    });
+    taskEngine.registry.updateMeta(SPACE, { agentId: agent.id });
+    rmSync(skillFile);
+
+    const result = await taskEngine.ask([SPACE], "hello");
+    taskEngine.close();
+
+    expect(result.answer).toBe("base answer");
+    expect(result.skillWarnings).toEqual([{
+      name: "review",
+      code: "missing_source",
+      message: "Skill 当前不可用，已跳过",
+    }]);
   });
 
   test("runTask records the Agent provider and model used for execution", async () => {

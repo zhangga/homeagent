@@ -132,6 +132,18 @@ describe("LearningScheduler", () => {
     engine = new KnowledgeEngine({ dataDir: dir, llm });
   });
 
+  test("appends safe Skill warnings to a lesson notification", () => {
+    const message = learningNotification(plan(), session(), [{
+      code: "missing_source",
+      name: "coach[*]",
+      message: "绑定的 Skill 当前不存在",
+    }]);
+
+    expect(message).toContain("Skill 提示");
+    expect(message).toContain("coach");
+    expect(message).not.toContain("*");
+  });
+
   afterEach(() => {
     engine.close();
     rmSync(dir, { recursive: true, force: true });

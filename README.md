@@ -180,14 +180,17 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 - **Agents**（三栏工作台）：左侧选择 Agent，中间编辑配置，右侧查看真实的 CLI 状态、当前空间/飞书群绑定和该 Agent 最近的研究任务运行。支持新建 / 编辑 / 删除，配置 **名称、Provider、Instruction（人格，会注入到回答）、Model、推理强度、Visibility、Permission、Workdir、Skills**；所有更改都要显式保存，不会自动写入。
   - 桌面端保持三栏并可拖拽或用方向键调整栏宽；窄屏把右侧信息收进详情抽屉，手机端在 Agent 列表和详情之间切换。页面不显示 HomeAgent 没有实现的 Mew Device、Repository、Environment、Concurrency 或 Chats 信息。
   - **Provider = 本机已安装的 agent CLI**（`claude` / `codex` / `trae-cli`）。**所有 LLM 工作（自然对话/问答 ask + 提炼 dream + 任务）都通过当前空间配置的本机 CLI 子进程执行，homeagent 不直连任何网络 API**。普通消息不再先调用一次通用意图分类：明确的副作用操作由窄规则处理，其他表达默认交给 Agent 自然回应，指代不清时只追问一个关键问题。后台**探测本机** CLI，只让可用的可选（装了但跑不了的灰显并标注原因，如 WSL 下无 Linux node 的 codex）。
+  - **Skill 绑定属于 Agent，不属于群聊**：飞书群绑定团队空间，空间再绑定 Team Agent；个人空间绑定 Personal Agent。因此不同群可以使用不同 Agent，并自然获得各自的 Instruction、Provider、Model 与 Skills。Agent 编辑器直接扫描并选择本机 Skill，不接受 Git URL 或任意路径输入。
+  - **本机 Skill 目录**：共享 Skill 来自 `~/.agents/skills`；同时识别 Codex 的 `~/.codex/skills`、插件缓存与 vendor imports，Claude 的 `~/.claude/skills`、插件缓存与 marketplaces，以及 TRAE 的 `~/.trae/skills`。选择器按来源保存精确绑定；同名同内容合并展示，同名不同内容按 Provider 优先级解析并标出遮蔽或冲突。页面只显示来源类型与相对目录，不暴露绝对路径或 `SKILL.md` 正文。
+  - **Skill 执行边界**：普通问答、提炼和学习都会加载空间 Agent 的 Skills，但始终使用 `read-only` 且不传 Workdir；研究任务加载同一组 Skills，并使用 Agent 的 Permission / Workdir。每次调用前都会重新核对文件、名称与内容哈希；缺失、损坏、不兼容或被遮蔽的 Skill 会被跳过，基础 Agent 继续运行，并在问答或任务通知中给出安全警告。
   - **图片分析使用 Codex 的原生视觉输入**：在飞书中回复图片或含图片的富文本消息，再说“分析一下”“看看这张图”等即可。每次最多传入 4 张、总计 20 MiB，回答完成后立即清理临时文件；下载失败或当前 Agent 不是 Codex 时会明确提示，不会假装已经看过图片。
   - **Model 随 Provider 变化**：切 Provider 时 Model 下拉自动换成该 provider 的维护清单（CLI 无“列模型”接口）；Codex 当前提供 `gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna / gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex-spark`。其中 `gpt-5.6-sol` 是 GPT-5.6 Sol 的完整模型 ID；HomeAgent 日常问答优先选择较快、成本更低的 `gpt-5.6-luna`，复杂研究可选择 `gpt-5.6-terra` 或 `gpt-5.6-sol`。
   - **推理强度按 Agent 配置**：Codex Agent 可选择继承默认值，或从当前模型支持的档位中选择；GPT-5.6 系列支持 `none / low / medium / high / xhigh / max`，旧模型不会显示不支持的档位。普通问答建议从 `medium` 开始，级别越高通常耗时和 token 越多。其他 Provider 暂不传递此配置。
   - **Visibility 会限制空间绑定**：Team Agent 只能绑定群空间；Personal Agent 只能绑定个人空间。群设置只展示 Team Agent，个人空间详情页只展示 Personal Agent，后端也会拒绝类型不匹配的绑定。已有不兼容绑定时不能直接切换 Visibility，必须先解除绑定；显式删除 Agent 则会先一次性清除所有绑定，让这些空间回退到默认 AI。
-  - **任务权限会真实映射到 CLI 沙箱**：`read-only` 开启只读工具并禁止写入，`write` 以 Workdir 为工作根目录并启用 Provider 的工作区写入模式，`full` 会绕过 Provider 沙箱。`write/full` 必须配置存在的 Workdir；Skills 会在任务开始前以 Provider 对应语法强制加载。以上能力只影响研究任务，普通问答、提炼和学习仍使用无工具模式。
+  - **任务权限会真实映射到 CLI 沙箱**：`read-only` 开启只读工具并禁止写入，`write` 以 Workdir 为工作根目录并启用 Provider 的工作区写入模式，`full` 会绕过 Provider 沙箱。`write/full` 必须配置存在的 Workdir。Permission 与 Workdir 只影响研究任务；Skills 则属于 Agent 的统一能力，并遵守上一条的普通调用只读边界。
 - **任务**（研究任务执行）：新建定期任务，让某空间的 Agent CLI 定期研究一个主题；产出**存为该空间的原始材料**（`source=task`），**运行结束立即触发一次本空间提炼**（当场变成 wiki 知识页，而非等夜间），并可**推送摘要到该空间绑定的飞书群/私聊**。
   - 字段：名称、目标空间、研究主题、周期（每天几点 / 每小时）、最长运行时间、启用开关、推送开关、完成后立即提炼开关。
-  - **定时**（TaskScheduler，每任务独立周期，启动即 catch-up）+ **后台「立即运行」**。每次启动会立即生成持久化运行编号，并保存启动时实际采用的 Agent、Provider 和 Model 快照；之后即使空间重新绑定或 Agent 改配置，历史归属也不会被改写。任务详情页可查看状态、触发来源、耗时、完整输出或错误，并可重试失败、取消或超时的运行；Agent 工作台按准确归属展示最近记录。
+  - **定时**（TaskScheduler，每任务独立周期，启动即 catch-up）+ **后台「立即运行」**。每次启动会立即生成持久化运行编号，并保存启动时实际采用的 Agent、Provider、Model 与 Skill 解析证据；之后即使空间重新绑定、Agent 改配置或本机 Skill 文件变化，历史归属和当次实际加载/跳过情况也不会被改写。任务详情页可查看状态、触发来源、耗时、完整输出或错误，并可重试失败、取消或超时的运行；Agent 工作台按准确归属展示最近记录。
   - 同一任务只允许一个活动运行；后台、定时调度和飞书命令共享互斥保护，不会重复执行。任务可配置 1–60 分钟的运行上限，后台可取消活动运行，超时或取消都会向本机 CLI 发出终止信号并保存独立状态。每个任务保留最近 100 条完成记录，应用异常退出时未完成记录会自动标为失败。
   - 飞书推送采用持久化通知状态：发送失败会记录错误、尝试次数和退避时间，TaskScheduler 后续自动重试，运行详情页也可手动重试；任务本身的成功结果不会因通知通道暂时故障而丢失。
   - 研究按空间 Agent 的 Permission / Workdir / Skills 执行；未指定 Agent 时默认 `read-only`。任务写入是异步的，不占用空间写锁；即时提炼始终回到无工具模式并尽力而为——失败不影响任务成功，原始材料仍会被夜间提炼兜底。
@@ -237,7 +240,7 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
   也不撤销读取飞书文档所用的用户授权。重新启用或更换 Bot 后必须重启 HomeAgent；旧 App 的群绑定会显示为
   “需要重连”，不会被新旧运行实例混用。对外共享状态也按 App ID 独立记录。
 - **运行状态**：集中展示后台托管方式、PID、启动时间、两条飞书事件消费者的详细状态、必需 CLI、知识存储、任务、提醒、学习、Dream Cycle 与四个调度器；同时展示 AI 回答延迟、失败/超时、主动参与结果和事件队列积压。质量或积压告警会标为 degraded，但不会把仍可服务的实例误判为未就绪。LaunchAgent 托管时可从页面安全重启。
-- **数据治理**：按空间导出 `homeagent.space v6` JSON 完整备份（知识页、原始记录、人工治理审计、撤回标记、任务及运行历史、运行时限、通知状态、提醒、学习计划、主题路线、多来源材料及课程历史、空间元数据及关联 Agent），兼容恢复 v1/v2/v3/v4/v5/v6 备份，或永久删除整个空间；可按保留周期立即清理已提炼的过期消息。
+- **数据治理**：按空间导出 `homeagent.space v7` JSON 完整备份（知识页、原始记录、人工治理审计、撤回标记、任务及运行历史、Skill 解析证据、运行时限、通知状态、提醒、学习计划、主题路线、多来源材料及课程历史、空间元数据及关联 Agent），兼容恢复 v1–v7 备份；v6 及更早的字符串 Skill 会保留为待解析的 legacy 绑定，不会被静默绑定到错误来源。也可永久删除整个空间，或按保留周期立即清理已提炼的过期消息。
 - **设置**：**默认 Provider + 默认 Model**（群未指定 Agent 时用它）、每日预算、提炼时刻、原始消息保留周期、端口。
 
 后台默认只监听 `127.0.0.1`，无需登录。若通过 `HOMEAGENT_WEB_HOST` 开放到非回环地址，启动时会强制要求

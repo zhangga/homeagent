@@ -12,10 +12,12 @@
 import { logger } from "@homeagent/shared";
 import {
   TaskAlreadyRunningError,
+  skillWarningViews,
   type KnowledgeEngine,
   type Task,
   type TaskRun,
 } from "@homeagent/core";
+import { formatSkillWarnings } from "@homeagent/orchestrator";
 import { localHour, dayKey, type RuntimeLoopHealth } from "./scheduler.ts";
 
 const log = logger.child("task-scheduler");
@@ -51,6 +53,20 @@ export function shouldRunTask(task: Task, now: Date): boolean {
 
 /** Called after a successful run when the task opts into notifications. */
 export type TaskNotify = (task: Task, run: TaskRun) => void | Promise<void>;
+
+export function formatTaskRunNotification(run: TaskRun): string {
+  const summary = run.summary?.trim();
+  if (!summary) throw new Error(`task run has no notification summary: ${run.taskName}`);
+  const warning = formatSkillWarnings(
+    skillWarningViews({ skipped: run.skillEvidence?.skipped ?? [] }),
+  );
+  return [
+    `🔎 任务「${run.taskName}」已完成：`,
+    "",
+    summary,
+    ...(warning ? ["", warning] : []),
+  ].join("\n");
+}
 
 export class TaskScheduler {
   private engine: KnowledgeEngine;

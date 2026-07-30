@@ -116,6 +116,17 @@ launchctl kill SIGKILL "gui/$(id -u)/com.homeagent.agent"
 KeepAlive 应自动启动新 PID。随后检查 `/readyz`，并使用第 3 节记录的名称或 ID 确认原始知识、
 任务配置、待发送提醒和学习进度均仍存在。将前后 PID、四类记录的检查结果写入发布记录。
 
+### 4.1 Agent Skill 绑定验收
+
+在发布机的 Agents 工作台完成一次本机 Skill 验收：
+
+1. 分别在两个测试群对应的团队空间绑定两个 Team Agent，并为它们选择不同的本机 Skill。
+2. 确认搜索、刷新、勾选、移除和切换 Provider 都不会丢失尚未保存的选择；页面不显示用户绝对路径或 `SKILL.md` 正文。
+3. 在两个群各发起一次 @ 问答，确认使用各自 Agent；普通调用为只读且没有 Workdir。
+4. 各运行一次研究任务，确认任务运行记录保存实际加载与跳过的 Skill 证据，并沿用 Agent 的 Permission / Workdir。
+5. 临时移走一个已绑定的 `SKILL.md` 后再次问答，确认基础 Agent 仍返回结果且飞书回复出现安全警告；恢复文件并刷新目录后警告消失。
+6. 导出并恢复该空间，确认导出格式为 `homeagent.space v7`，精确来源绑定与历史任务 Skill 证据保持不变。
+
 ## 5. 24–48 小时真实飞书 Soak
 
 完成机器人配置并确认 `/readyz` 返回 200 后运行。发布门禁模式会强制至少运行 24 小时，并要求

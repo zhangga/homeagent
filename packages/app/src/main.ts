@@ -16,7 +16,7 @@ import {
 } from "@homeagent/shared";
 import { accessSync, constants, statSync } from "node:fs";
 import { join } from "node:path";
-import { KnowledgeEngine } from "@homeagent/core";
+import { KnowledgeEngine, type TaskRun } from "@homeagent/core";
 import { CodexProviderSetup, CodexReleaseInstaller } from "@homeagent/llm";
 import { FeishuConnector, LarkCliSetup } from "@homeagent/connectors";
 import {
@@ -27,7 +27,7 @@ import {
 } from "@homeagent/orchestrator";
 import { createWebApp, FeishuIntegrationService } from "@homeagent/web";
 import { Scheduler } from "./scheduler.ts";
-import { TaskScheduler } from "./task-scheduler.ts";
+import { formatTaskRunNotification, TaskScheduler } from "./task-scheduler.ts";
 import { LearningScheduler, learningNotification } from "./learning-scheduler.ts";
 import { ReminderScheduler } from "./reminder-scheduler.ts";
 import { createSystemHealthReporter } from "./health.ts";
@@ -182,14 +182,13 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
 
   // Push a task's summary to its space-bound feishu chat (shared by the task
   // scheduler and the backend's manual "run now").
-  const notifyTaskDone = async (space: string, name: string, summary?: string) => {
-    const chatId = engine.registry.get(space as never)?.chatId;
-    if (!chatId) throw new Error(`task space has no bound Feishu chat: ${space}`);
-    if (!summary) throw new Error(`task run has no notification summary: ${name}`);
+  const notifyTaskDone = async (run: TaskRun) => {
+    const chatId = engine.registry.get(run.space)?.chatId;
+    if (!chatId) throw new Error(`task space has no bound Feishu chat: ${run.space}`);
     await sendFeishuNotice(
-      space,
+      run.space,
       chatId,
-      `🔎 任务「${name}」已完成：\n\n${summary}`,
+      formatTaskRunNotification(run),
     );
   };
 
@@ -264,7 +263,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
     onIntegrationTest: async (chatId, text) =>
       sendFeishuNotice(`team/${chatId}`, chatId, text),
     onTaskRun: async (_taskId, run) => {
-      await notifyTaskDone(run.space, run.taskName, run.summary);
+      await notifyTaskDone(run);
     },
     onServiceRestart: () => {
       setTimeout(() => process.kill(process.pid, "SIGTERM"), 250);
@@ -288,7 +287,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   // task's space-bound feishu chat when the task opts in.
   taskScheduler = new TaskScheduler(engine, {
     notify: async (_task, run) => {
-      await notifyTaskDone(run.space, run.taskName, run.summary);
+      await notifyTaskDone(run);
     },
   });
   await taskScheduler.start();
@@ -297,11 +296,11 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   // 5. guided-learning scheduler. A prepared lesson remains retryable until
   // Feishu accepts it; an accepted lesson then waits for the learner's answer.
   learningScheduler = new LearningScheduler(engine, {
-    notify: async (plan, _source, session) => {
+    notify: async (plan, _source, session, skillWarnings) => {
       await sendFeishuNotice(
         plan.space,
         plan.chatId,
-        learningNotification(plan, session),
+        learningNotification(plan, session, skillWarnings),
       );
     },
     followUp: async (plan, _session, message) => {

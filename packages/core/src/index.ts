@@ -5,6 +5,7 @@ export * from "./engine.ts";
 export * from "./registry.ts";
 export * from "./feishu-bindings.ts";
 export * from "./agents.ts";
+export * from "./skill-catalog.ts";
 export * from "./tasks.ts";
 export * from "./task-runs.ts";
 export * from "./reminders.ts";

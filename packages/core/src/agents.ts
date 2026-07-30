@@ -46,6 +46,19 @@ export const AGENT_VISIBILITIES: AgentVisibility[] = ["Team", "Personal"];
 
 export type AgentExecution = ProviderExecution;
 
+export interface SourceSkillBinding {
+  kind: "source";
+  sourceKey: string;
+  name: string;
+}
+
+export interface LegacySkillBinding {
+  kind: "legacy-name";
+  name: string;
+}
+
+export type AgentSkillBinding = SourceSkillBinding | LegacySkillBinding;
+
 /** A configurable answering persona. `model` empty => fall back to global default. */
 export interface Agent {
   id: string;
@@ -64,8 +77,8 @@ export interface Agent {
   workdir?: string;
   /** Task execution permission tier. */
   permission: AgentPermission;
-  /** Skill/plugin names the provider must load before a task begins. */
-  skills: string[];
+  /** Exact local Skill sources selected for this Agent, plus unresolved legacy names. */
+  skills: AgentSkillBinding[];
   createdAt: number;
   updatedAt: number;
 }
@@ -80,12 +93,24 @@ export interface AgentInput {
   visibility?: string;
   workdir?: string;
   permission?: string;
-  /** comma/newline-separated string or a string array */
-  skills?: string | string[];
+  /** Source-bound Skills. String values are accepted only for legacy callers. */
+  skills?: AgentSkillBinding[] | string | string[];
 }
 
 interface AgentsFile {
+  version: 2;
   agents: Record<string, Agent>;
+}
+
+export interface AgentStoreOptions {
+  resolveLegacySkill?: (
+    name: string,
+    provider: ProviderId,
+  ) => SourceSkillBinding | undefined;
+  validateSourceSkill?: (
+    binding: SourceSkillBinding,
+    provider: ProviderId,
+  ) => boolean;
 }
 
 /** Normalize a free-text provider into a valid CLI id; unknown => default CLI. */
@@ -123,10 +148,65 @@ function normalizeModel(raw?: string): string {
   return canonicalModelId(raw ?? "");
 }
 
-/** Parse skills from a string (comma/newline) or array into a clean string[]. */
-function normalizeSkills(raw?: string | string[]): string[] {
-  const parts = Array.isArray(raw) ? raw : (raw ?? "").split(/[,\n]/);
-  return normalizeProviderSkills(parts);
+export function isAgentSkillSourceKey(value: string): boolean {
+  return value.length <= 600
+    && /^(?:shared-agents|codex-user|codex-plugin|codex-vendor|claude-user|claude-plugin|claude-marketplace|trae-user):[^\u0000-\u001f\\]+$/u.test(
+      value,
+    );
+}
+
+export function isAgentSkillName(value: string): boolean {
+  return normalizeProviderSkills([value])[0] === value;
+}
+
+/** Normalize persisted bindings while preserving unresolved legacy names. */
+function normalizeSkills(
+  raw?: AgentSkillBinding[] | string | string[],
+): AgentSkillBinding[] {
+  const parts: unknown[] = typeof raw === "string"
+    ? raw.split(/[,\n]/)
+    : Array.isArray(raw) ? raw : [];
+  const bindings: AgentSkillBinding[] = [];
+  const seenSources = new Set<string>();
+  const seenLegacyNames = new Set<string>();
+  for (const part of parts) {
+    if (typeof part === "string") {
+      const name = normalizeProviderSkills([part])[0];
+      if (!name || seenLegacyNames.has(name)) continue;
+      seenLegacyNames.add(name);
+      bindings.push({ kind: "legacy-name", name });
+      continue;
+    }
+    if (!part || typeof part !== "object") continue;
+    const candidate = part as Partial<AgentSkillBinding> & { sourceKey?: unknown };
+    const name = normalizeProviderSkills([candidate.name])[0];
+    if (!name) continue;
+    if (candidate.kind === "legacy-name") {
+      if (seenLegacyNames.has(name)) continue;
+      seenLegacyNames.add(name);
+      bindings.push({ kind: "legacy-name", name });
+      continue;
+    }
+    if (
+      candidate.kind === "source"
+      && typeof candidate.sourceKey === "string"
+      && isAgentSkillSourceKey(candidate.sourceKey)
+      && !seenSources.has(candidate.sourceKey)
+    ) {
+      seenSources.add(candidate.sourceKey);
+      bindings.push({ kind: "source", sourceKey: candidate.sourceKey, name });
+    }
+  }
+  return bindings;
+}
+
+const MAX_AGENT_SKILLS = 50;
+
+function cloneAgent(agent: Agent): Agent {
+  return {
+    ...agent,
+    skills: agent.skills.map((binding) => ({ ...binding })),
+  };
 }
 
 function resolveWorkdir(raw: string): string {
@@ -150,17 +230,69 @@ export function resolveAgentExecution(agent?: Agent): AgentExecution {
   return {
     permission,
     workdir,
-    skills: [...(agent?.skills ?? [])],
+    skills: [],
   };
 }
 
 export class AgentStore {
   private configPath: string;
   private agents: Map<string, Agent>;
+  private readonly resolveLegacySkill?: AgentStoreOptions["resolveLegacySkill"];
+  private readonly validateSourceSkill?: AgentStoreOptions["validateSourceSkill"];
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, options: AgentStoreOptions = {}) {
     this.configPath = join(dataDir, "config", "agents.json");
+    this.resolveLegacySkill = options.resolveLegacySkill;
+    this.validateSourceSkill = options.validateSourceSkill;
     this.agents = this.load();
+  }
+
+  private normalizeInputSkills(
+    raw: AgentInput["skills"],
+    provider: ProviderId,
+  ): AgentSkillBinding[] {
+    if (Array.isArray(raw)) {
+      for (const candidate of raw) {
+        if (typeof candidate === "string") continue;
+        if (!candidate || typeof candidate !== "object") {
+          throw new Error("Skill binding is invalid");
+        }
+        if (
+          candidate.kind === "source"
+          && (
+            typeof candidate.sourceKey !== "string"
+            || !isAgentSkillSourceKey(candidate.sourceKey)
+            || !isAgentSkillName(candidate.name)
+          )
+        ) {
+          throw new Error("Skill source binding is invalid");
+        }
+        if (
+          candidate.kind === "legacy-name"
+          && !isAgentSkillName(candidate.name)
+        ) {
+          throw new Error("Legacy Skill binding is invalid");
+        }
+        if (candidate.kind !== "source" && candidate.kind !== "legacy-name") {
+          throw new Error("Skill binding is invalid");
+        }
+      }
+    }
+    const bindings = normalizeSkills(raw);
+    if (bindings.length > MAX_AGENT_SKILLS) {
+      throw new Error(`An Agent can bind at most ${MAX_AGENT_SKILLS} Skills`);
+    }
+    if (this.validateSourceSkill) {
+      for (const binding of bindings) {
+        if (
+          binding.kind === "source"
+          && !this.validateSourceSkill(binding, provider)
+        ) {
+          throw new Error(`Skill source is unavailable: ${binding.name}`);
+        }
+      }
+    }
+    return bindings;
   }
 
   private load(): Map<string, Agent> {
@@ -169,6 +301,8 @@ export class AgentStore {
     if (existsSync(this.configPath)) {
       try {
         const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as AgentsFile;
+        const legacySchema = parsed.version !== 2;
+        if (legacySchema) migrated = true;
         for (const [id, a] of Object.entries(parsed.agents ?? {})) {
           if (a && typeof a.id === "string") {
             // Migrate older files: unknown/legacy providers (e.g. "gateway",
@@ -186,7 +320,19 @@ export class AgentStore {
             const permission = normalizePermission(a.permission);
             if (permission !== a.permission) migrated = true;
             a.permission = permission;
-            const skills = normalizeSkills(a.skills as unknown as string | string[] | undefined);
+            let skills = normalizeSkills(
+              a.skills as unknown as AgentSkillBinding[] | string | string[] | undefined,
+            ).slice(0, MAX_AGENT_SKILLS);
+            if (legacySchema && this.resolveLegacySkill) {
+              skills = skills.map((binding) => {
+                if (binding.kind !== "legacy-name") return binding;
+                try {
+                  return this.resolveLegacySkill?.(binding.name, normalized) ?? binding;
+                } catch {
+                  return binding;
+                }
+              });
+            }
             if (JSON.stringify(skills) !== JSON.stringify(a.skills)) migrated = true;
             a.skills = skills;
             const reasoningEffort = normalizeReasoningEffort(a.reasoningEffort, a.model);
@@ -207,16 +353,19 @@ export class AgentStore {
 
   private persist(agents = this.agents): void {
     mkdirSync(join(this.configPath, ".."), { recursive: true });
-    const obj: AgentsFile = { agents: Object.fromEntries(agents) };
+    const obj: AgentsFile = { version: 2, agents: Object.fromEntries(agents) };
     writeFileSync(this.configPath, JSON.stringify(obj, null, 2), "utf8");
   }
 
   list(): Agent[] {
-    return [...this.agents.values()].sort((a, b) => a.createdAt - b.createdAt);
+    return [...this.agents.values()]
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .map(cloneAgent);
   }
 
   get(id: string): Agent | undefined {
-    return this.agents.get(id);
+    const agent = this.agents.get(id);
+    return agent ? cloneAgent(agent) : undefined;
   }
 
   has(id: string): boolean {
@@ -226,29 +375,31 @@ export class AgentStore {
   create(input: AgentInput): Agent {
     const now = Date.now();
     const model = normalizeModel(input.model);
+    const provider = normalizeProvider(input.provider);
     const agent: Agent = {
       id: `agent_${randomUUID()}`,
       name: input.name?.trim() || "未命名 Agent",
       instruction: input.instruction ?? "",
       model,
       reasoningEffort: normalizeReasoningEffort(input.reasoningEffort, model),
-      provider: normalizeProvider(input.provider),
+      provider,
       visibility: normalizeVisibility(input.visibility),
       workdir: input.workdir?.trim() || undefined,
       permission: normalizePermission(input.permission),
-      skills: normalizeSkills(input.skills),
+      skills: this.normalizeInputSkills(input.skills, provider),
       createdAt: now,
       updatedAt: now,
     };
     this.agents.set(agent.id, agent);
     this.persist();
-    return agent;
+    return cloneAgent(agent);
   }
 
   /** Patch an existing agent. Only provided fields change. Returns undefined if absent. */
   update(id: string, input: AgentInput): Agent | undefined {
-    const agent = this.agents.get(id);
-    if (!agent) return undefined;
+    const current = this.agents.get(id);
+    if (!current) return undefined;
+    const agent = cloneAgent(current);
     if (input.name !== undefined) agent.name = input.name.trim() || agent.name;
     if (input.instruction !== undefined) agent.instruction = input.instruction;
     if (input.model !== undefined) agent.model = normalizeModel(input.model);
@@ -261,10 +412,13 @@ export class AgentStore {
     if (input.visibility !== undefined) agent.visibility = normalizeVisibility(input.visibility);
     if (input.workdir !== undefined) agent.workdir = input.workdir.trim() || undefined;
     if (input.permission !== undefined) agent.permission = normalizePermission(input.permission);
-    if (input.skills !== undefined) agent.skills = normalizeSkills(input.skills);
+    if (input.skills !== undefined) {
+      agent.skills = this.normalizeInputSkills(input.skills, agent.provider);
+    }
     agent.updatedAt = Date.now();
+    this.agents.set(id, agent);
     this.persist();
-    return agent;
+    return cloneAgent(agent);
   }
 
   remove(id: string): boolean {
@@ -279,11 +433,11 @@ export class AgentStore {
   /** Restore an exact archived agent only when that id is not already present. */
   restore(agent: Agent): Agent {
     const existing = this.agents.get(agent.id);
-    if (existing) return existing;
-    const restored = { ...agent, skills: [...agent.skills] };
+    if (existing) return cloneAgent(existing);
+    const restored = cloneAgent(agent);
     this.agents.set(restored.id, restored);
     this.persist();
-    return restored;
+    return cloneAgent(restored);
   }
 }
 

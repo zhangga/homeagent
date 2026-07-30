@@ -8,6 +8,7 @@ import {
   detectProviders,
   isCliProvider,
   providerFailureDetail,
+  providerSkillReference,
   runProvider,
 } from "./providers.ts";
 
@@ -41,6 +42,14 @@ describe("Codex model capabilities", () => {
 });
 
 describe("provider detection", () => {
+  test("maps a validated Skill name to each provider's invocation syntax", () => {
+    expect(providerSkillReference("codex", "code-review")).toBe("$code-review");
+    expect(providerSkillReference("claude", "code-review")).toBe("/code-review");
+    expect(providerSkillReference("trae-cli", "code-review")).toBe("code-review");
+    expect(providerSkillReference("gateway", "code-review")).toBeUndefined();
+    expect(providerSkillReference("codex", "../escape")).toBeUndefined();
+  });
+
   test("passes visual inputs to Codex as native image attachments", async () => {
     const previous = process.env.HOMEAGENT_CODEX_BIN;
     try {
@@ -246,11 +255,17 @@ describe("provider detection", () => {
 
   test("task execution starts in the configured workdir and injects required skills", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ha-provider-workdir-"));
-    const bin = join(dir, "provider");
+    const bin = join(dir, process.platform === "win32" ? "provider.cmd" : "provider");
     const previous = process.env.HOMEAGENT_CODEX_BIN;
     try {
-      writeFileSync(bin, '#!/bin/sh\nprintf "%s\\n" "$PWD"\nprintf "%s\\n" "$*"\n', "utf8");
-      chmodSync(bin, 0o755);
+      writeFileSync(
+        bin,
+        process.platform === "win32"
+          ? "@echo off\r\necho %CD%\r\necho %*\r\n"
+          : '#!/bin/sh\nprintf "%s\\n" "$PWD"\nprintf "%s\\n" "$*"\n',
+        "utf8",
+      );
+      if (process.platform !== "win32") chmodSync(bin, 0o755);
       process.env.HOMEAGENT_CODEX_BIN = bin;
 
       const output = await runProvider("codex", {
@@ -262,7 +277,7 @@ describe("provider detection", () => {
         },
       }, 500);
 
-      expect(output.split("\n")[0]).toBe(realpathSync(dir));
+      expect(output.split(/\r?\n/u)[0]).toBe(realpathSync(dir));
       expect(output).toContain("$code-review");
       expect(output).toContain("$github:yeet");
       expect(output).not.toContain("../escape");

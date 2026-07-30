@@ -1,7 +1,17 @@
-import type { Agent, SpaceMeta, TaskRun } from "@homeagent/core";
+import type {
+  Agent,
+  AgentInput,
+  AgentSkillBinding,
+  SkillCatalogSnapshot,
+  SkillRootKind,
+  SpaceMeta,
+  TaskRun,
+} from "@homeagent/core";
 import {
   AGENT_PERMISSIONS,
   AGENT_VISIBILITIES,
+  isAgentSkillSourceKey,
+  providerSkillRootKinds,
   resolveAgentExecution,
 } from "@homeagent/core";
 import {
@@ -24,6 +34,10 @@ export interface AgentEditorValues {
   permission: string;
   workdir: string;
   skills: string;
+  /** Exact source keys submitted by the catalog selector. */
+  skillSourceKeys?: string[];
+  /** Unresolved names explicitly retained from a legacy Agent record. */
+  legacySkillNames?: string[];
 }
 
 export type AgentFieldErrors = Partial<Record<keyof AgentEditorValues, string>>;
@@ -88,8 +102,45 @@ export interface AgentWorkbenchView {
   models: Record<string, string[]>;
   defaults: { provider: string; model: string };
   inspector: AgentInspectorView | null;
+  skillCatalog: AgentSkillCatalogView;
   flash?: string;
   formError?: string;
+}
+
+export type AgentSkillCatalogStatus =
+  | "available"
+  | "invalid"
+  | "incompatible"
+  | "shadowed";
+
+export interface AgentSkillCatalogRow {
+  key: string;
+  name: string;
+  description: string;
+  sourceKey: string;
+  sourceLabel: string;
+  providerIds: string[];
+  status: AgentSkillCatalogStatus;
+  statusLabel: string;
+  selected: boolean;
+  sourceCount: number;
+  diagnostics: string[];
+}
+
+export interface AgentSkillSelectionView {
+  kind: "source" | "legacy-name";
+  name: string;
+  sourceKey?: string;
+  sourceLabel: string;
+  status: "selected" | "missing" | "legacy";
+  statusLabel: string;
+}
+
+export interface AgentSkillCatalogView {
+  rows: AgentSkillCatalogRow[];
+  selected: AgentSkillSelectionView[];
+  diagnostics: string[];
+  refreshedAt?: number;
 }
 
 export interface BuildAgentWorkbenchInput {
@@ -109,6 +160,7 @@ export interface BuildAgentWorkbenchInput {
   errors?: AgentFieldErrors;
   flash?: string;
   formError?: string;
+  catalog?: SkillCatalogSnapshot;
 }
 
 export interface AgentValidationContext {
@@ -116,6 +168,7 @@ export interface AgentValidationContext {
   models?: Record<string, string[]>;
   defaults: { provider: string; model: string };
   current?: Agent | null;
+  catalog?: SkillCatalogSnapshot;
 }
 
 export interface AgentValidationResult {
@@ -199,7 +252,156 @@ export function editorValuesFor(
     visibility: agent?.visibility ?? "Team",
     permission: agent?.permission ?? "read-only",
     workdir: agent?.workdir ?? "",
-    skills: (agent?.skills ?? []).join(", "),
+    skills: (agent?.skills ?? []).map((binding) => binding.name).join(", "),
+    skillSourceKeys: (agent?.skills ?? [])
+      .filter((binding) => binding.kind === "source")
+      .map((binding) => binding.sourceKey),
+    legacySkillNames: (agent?.skills ?? [])
+      .filter((binding) => binding.kind === "legacy-name")
+      .map((binding) => binding.name),
+  };
+}
+
+const SKILL_STATUS_LABELS: Record<AgentSkillCatalogStatus, string> = {
+  available: "可用于当前 Provider",
+  invalid: "Skill 配置无效",
+  incompatible: "与当前 Provider 不兼容",
+  shadowed: "被更高优先级来源遮蔽",
+};
+
+function rootRank(provider: string, rootKind: SkillRootKind): number {
+  if (!isCliProvider(provider)) return Number.MAX_SAFE_INTEGER;
+  const rank = providerSkillRootKinds(provider).indexOf(rootKind);
+  return rank === -1 ? Number.MAX_SAFE_INTEGER : rank;
+}
+
+function buildSkillCatalogView(
+  catalog: SkillCatalogSnapshot | undefined,
+  provider: string,
+  selected: Agent | null,
+  editor: AgentEditorValues,
+): AgentSkillCatalogView {
+  const snapshot = catalog ?? {
+    sources: [],
+    entries: [],
+    diagnostics: [],
+    refreshedAt: undefined,
+  };
+  const selectedKeys = new Set(
+    editor.skillSourceKeys
+      ?? selected?.skills
+        .filter((binding) => binding.kind === "source")
+        .map((binding) => binding.sourceKey)
+      ?? [],
+  );
+  const selectedLegacy = editor.legacySkillNames
+    ?? selected?.skills
+      .filter((binding) => binding.kind === "legacy-name")
+      .map((binding) => binding.name)
+    ?? [];
+  const highestByName = new Map<string, { rootKind: SkillRootKind; sourceKey: string }>();
+  for (const source of snapshot.sources) {
+    if (
+      source.status !== "available"
+      || !source.providerIds.includes(provider as never)
+    ) continue;
+    const key = source.name.toLowerCase();
+    const current = highestByName.get(key);
+    if (
+      !current
+      || rootRank(provider, source.rootKind) < rootRank(provider, current.rootKind)
+      || (
+        rootRank(provider, source.rootKind) === rootRank(provider, current.rootKind)
+        && source.sourceKey.localeCompare(current.sourceKey) < 0
+      )
+    ) {
+      highestByName.set(key, {
+        rootKind: source.rootKind,
+        sourceKey: source.sourceKey,
+      });
+    }
+  }
+  const rows = snapshot.entries.map((entry): AgentSkillCatalogRow => {
+    const ordered = [...entry.sources].sort((a, b) =>
+      rootRank(provider, a.rootKind) - rootRank(provider, b.rootKind)
+      || a.sourceKey.localeCompare(b.sourceKey)
+    );
+    const selectedSource = ordered.find((source) => selectedKeys.has(source.sourceKey));
+    const source = selectedSource
+      ?? ordered.find((candidate) =>
+        candidate.status === "available"
+        && candidate.providerIds.includes(provider as never)
+      )
+      ?? ordered[0]!;
+    let status: AgentSkillCatalogStatus = "available";
+    if (source.status !== "available") status = "invalid";
+    else if (!source.providerIds.includes(provider as never)) status = "incompatible";
+    else {
+      const highest = highestByName.get(source.name.toLowerCase());
+      if (
+        highest
+        && highest.sourceKey !== source.sourceKey
+        && !entry.sources.some((candidate) => candidate.sourceKey === highest.sourceKey)
+      ) {
+        status = "shadowed";
+      }
+    }
+    return {
+      key: entry.key,
+      name: entry.name,
+      description: entry.description,
+      sourceKey: source.sourceKey,
+      sourceLabel: `${source.rootKind} · ${source.relativeDir}`,
+      providerIds: [...new Set(entry.sources.flatMap((candidate) => candidate.providerIds))],
+      status,
+      statusLabel: SKILL_STATUS_LABELS[status],
+      selected: entry.sources.some((candidate) => selectedKeys.has(candidate.sourceKey)),
+      sourceCount: entry.sources.length,
+      diagnostics: entry.sources.flatMap((candidate) =>
+        candidate.diagnostics.map((diagnostic) => diagnostic.message)
+      ),
+    };
+  });
+  const knownByKey = new Map(snapshot.sources.map((source) => [source.sourceKey, source]));
+  const selectedViews: AgentSkillSelectionView[] = [];
+  for (const sourceKey of selectedKeys) {
+    const source = knownByKey.get(sourceKey);
+    selectedViews.push(source
+      ? {
+          kind: "source",
+          name: source.name,
+          sourceKey,
+          sourceLabel: `${source.rootKind} · ${source.relativeDir}`,
+          status: "selected",
+          statusLabel: "已选择",
+        }
+      : {
+          kind: "source",
+          name: selected?.skills.find(
+            (binding) => binding.kind === "source" && binding.sourceKey === sourceKey,
+          )?.name ?? "Unknown Skill",
+          sourceKey,
+          sourceLabel: sourceKey.split(":", 1)[0] ?? "unknown",
+          status: "missing",
+          statusLabel: "来源缺失，保存时将保留",
+        });
+  }
+  for (const name of selectedLegacy) {
+    selectedViews.push({
+      kind: "legacy-name",
+      name,
+      sourceLabel: "legacy-name",
+      status: "legacy",
+      statusLabel: "旧名称尚未绑定来源",
+    });
+  }
+  return {
+    rows,
+    selected: selectedViews,
+    diagnostics: snapshot.diagnostics.map((diagnostic) =>
+      `${diagnostic.rootKind}: ${diagnostic.message}`
+    ),
+    refreshedAt: snapshot.refreshedAt,
   };
 }
 
@@ -270,9 +472,38 @@ export function validateAgentEditor(
       errors.workdir = error instanceof Error ? error.message : "Workdir 无效";
     }
   }
-  if (values.skills.length > MAX_SKILLS_LENGTH) {
+  if (values.skillSourceKeys !== undefined) {
+    const sourceKeys = values.skillSourceKeys;
+    if (sourceKeys.length > 50) {
+      errors.skills = "Skills 最多配置 50 个";
+    } else if (
+      new Set(sourceKeys).size !== sourceKeys.length
+      || sourceKeys.some((sourceKey) => !isAgentSkillSourceKey(sourceKey))
+    ) {
+      errors.skills = "Skill 来源标识无效或重复";
+    } else {
+      const known = new Set(context.catalog?.sources.map((source) => source.sourceKey) ?? []);
+      const existing = new Set(
+        context.current?.skills
+          .filter((binding) => binding.kind === "source")
+          .map((binding) => binding.sourceKey)
+        ?? [],
+      );
+      if (sourceKeys.some((sourceKey) => !known.has(sourceKey) && !existing.has(sourceKey))) {
+        errors.skills = "所选 Skill 来源已不存在，请刷新目录后重试";
+      }
+    }
+    const legacyNames = values.legacySkillNames ?? [];
+    if (
+      legacyNames.length > 50
+      || normalizeProviderSkills(legacyNames).length !== new Set(legacyNames).size
+    ) {
+      errors.skills = "旧 Skill 绑定无效";
+    }
+  }
+  if (values.skillSourceKeys === undefined && values.skills.length > MAX_SKILLS_LENGTH) {
     errors.skills = `Skills 不能超过 ${MAX_SKILLS_LENGTH} 个字符`;
-  } else {
+  } else if (values.skillSourceKeys === undefined) {
     const submittedSkills = values.skills
       .split(/[,\n]/)
       .map((skill) => skill.trim())
@@ -301,6 +532,48 @@ export function validateAgentEditor(
   }
 
   return { ok: Object.keys(errors).length === 0, errors };
+}
+
+export function agentInputForEditor(
+  values: AgentEditorValues,
+  catalog: SkillCatalogSnapshot | undefined,
+  current?: Agent | null,
+): AgentInput {
+  if (values.skillSourceKeys === undefined) {
+    return { ...values, skills: values.skills };
+  }
+  const catalogByKey = new Map(
+    catalog?.sources.map((source) => [source.sourceKey, source]) ?? [],
+  );
+  const currentByKey = new Map(
+    current?.skills
+      .filter((binding) => binding.kind === "source")
+      .map((binding) => [binding.sourceKey, binding])
+    ?? [],
+  );
+  const skills: AgentSkillBinding[] = values.skillSourceKeys.map((sourceKey) => {
+    const source = catalogByKey.get(sourceKey);
+    const existing = currentByKey.get(sourceKey);
+    return {
+      kind: "source",
+      sourceKey,
+      name: source?.name ?? existing?.name ?? "unknown",
+    };
+  });
+  for (const name of values.legacySkillNames ?? []) {
+    skills.push({ kind: "legacy-name", name });
+  }
+  return {
+    name: values.name,
+    instruction: values.instruction,
+    provider: values.provider,
+    model: values.model,
+    reasoningEffort: values.reasoningEffort,
+    visibility: values.visibility,
+    permission: values.permission,
+    workdir: values.workdir,
+    skills,
+  };
 }
 
 export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkbenchView {
@@ -383,6 +656,12 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
     models: input.models,
     defaults: input.defaults,
     inspector,
+    skillCatalog: buildSkillCatalogView(
+      input.catalog,
+      editor.provider,
+      input.selected,
+      editor,
+    ),
     flash: input.flash,
     formError: input.formError,
   };

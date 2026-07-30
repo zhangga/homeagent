@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Page, SpaceId } from "@homeagent/shared";
 import { KnowledgeEngine } from "./engine.ts";
 import { parseSpaceArchive, type SpaceArchive } from "./governance.ts";
+import { SkillCatalog } from "./skill-catalog.ts";
 
 const SPACE: SpaceId = "team/oc_governance";
 const dirs: string[] = [];
@@ -20,6 +21,67 @@ afterEach(() => {
 });
 
 describe("space data governance", () => {
+  test("exports and parses exact Agent Skill source bindings", async () => {
+    const dataDir = tempDir("ha-skill-archive-");
+    const skillRoot = join(dataDir, "skills");
+    mkdirSync(join(skillRoot, "review"), { recursive: true });
+    writeFileSync(
+      join(skillRoot, "review", "SKILL.md"),
+      ["---", "name: review", "description: Review.", "---"].join("\n"),
+      "utf8",
+    );
+    const engine = new KnowledgeEngine({
+      dataDir,
+      skillCatalog: new SkillCatalog({
+        roots: [{ kind: "codex-user", path: skillRoot, providerIds: ["codex"] }],
+      }),
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "bound",
+      provider: "codex",
+      skills: [{
+        kind: "source",
+        sourceKey: "codex-user:review",
+        name: "review",
+      }],
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+
+    const archive = await engine.exportSpace(SPACE);
+    engine.close();
+    const parsed = parseSpaceArchive(archive);
+
+    expect(parsed.agent?.skills).toEqual([{
+      kind: "source",
+      sourceKey: "codex-user:review",
+      name: "review",
+    }]);
+  });
+
+  test("keeps version 6 Agent Skill names as unresolved legacy bindings", async () => {
+    const engine = new KnowledgeEngine({ dataDir: tempDir("ha-v6-skill-archive-") });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({ name: "legacy", provider: "codex" });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const archive = await engine.exportSpace(SPACE);
+    engine.close();
+
+    const parsed = parseSpaceArchive({
+      ...archive,
+      version: 6,
+      agent: {
+        ...archive.agent,
+        skills: ["review", "review", "ship"],
+      },
+    });
+
+    expect(parsed.agent?.skills).toEqual([
+      { kind: "legacy-name", name: "review" },
+      { kind: "legacy-name", name: "ship" },
+    ]);
+  });
+
   test("a versioned export restores the complete space into a fresh data directory", async () => {
     const source = new KnowledgeEngine({
       dataDir: tempDir("hb-export-"),
@@ -117,7 +179,7 @@ describe("space data governance", () => {
     expect(archive).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 6,
+        version: 7,
         space: expect.objectContaining({
           id: SPACE,
           name: "治理群",
@@ -203,7 +265,7 @@ describe("space data governance", () => {
     } = archive;
     const parsed = parseSpaceArchive({ ...withoutLearning, version: 1 });
 
-    expect(parsed.version).toBe(6);
+    expect(parsed.version).toBe(7);
     expect(parsed.learning).toEqual({ plans: [], sources: [], sessions: [] });
     expect(parsed.governanceAudit).toEqual([]);
     expect(parsed.taskRuns).toEqual([]);
@@ -235,7 +297,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(6);
+    expect(parsed.version).toBe(7);
     expect(parsed.learning.plans[0]).toEqual(expect.objectContaining({
       id: plan.id,
       mode: "reading",
@@ -283,7 +345,7 @@ describe("space data governance", () => {
     expect(target.learning.source(plan.id)?.materials).toEqual([
       expect.objectContaining({ title: "Async Book", rawIds: ["raw_async"] }),
     ]);
-    expect((await target.exportSpace(SPACE)).version).toBe(6);
+    expect((await target.exportSpace(SPACE)).version).toBe(7);
     target.close();
   });
 
@@ -387,7 +449,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(6);
+    expect(parsed.version).toBe(7);
     expect(parsed.taskRuns).toEqual([]);
   });
 
@@ -415,7 +477,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(6);
+    expect(parsed.version).toBe(7);
     expect(parsed.tasks[0]?.timeoutMinutes).toBe(12);
     expect(parsed.taskRuns).toEqual([
       expect.objectContaining({

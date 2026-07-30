@@ -144,6 +144,68 @@ describe("TaskRunStore", () => {
     }));
   });
 
+  test("persists and deep-clones the Skill evidence captured when a run starts", () => {
+    const store = new TaskRunStore(dir);
+    const run = store.start({
+      task: TASK,
+      trigger: "manual",
+      distill: false,
+      skillEvidence: {
+        requested: [{
+          kind: "source",
+          sourceKey: "codex-user:review",
+          name: "review",
+        }],
+        resolved: [{
+          sourceKey: "codex-user:review",
+          name: "review",
+          invocationName: "review",
+          reference: "$review",
+          skillFileHash: "a".repeat(64),
+        }],
+        skipped: [],
+      },
+    });
+
+    run.skillEvidence!.resolved[0]!.name = "mutated";
+    const reopened = new TaskRunStore(dir);
+    expect(reopened.get(run.id)?.skillEvidence).toEqual({
+      requested: [{
+        kind: "source",
+        sourceKey: "codex-user:review",
+        name: "review",
+      }],
+      resolved: [{
+        sourceKey: "codex-user:review",
+        name: "review",
+        invocationName: "review",
+        reference: "$review",
+        skillFileHash: "a".repeat(64),
+      }],
+      skipped: [],
+    });
+    expect(JSON.parse(readFileSync(join(dir, "config", "task-runs.json"), "utf8")).version).toBe(4);
+  });
+
+  test("rejects unbounded Skill evidence before persisting a run", () => {
+    const store = new TaskRunStore(dir);
+
+    expect(() => store.start({
+      task: TASK,
+      trigger: "manual",
+      distill: false,
+      skillEvidence: {
+        requested: Array.from({ length: 51 }, (_, index) => ({
+          kind: "legacy-name" as const,
+          name: `skill-${index}`,
+        })),
+        resolved: [],
+        skipped: [],
+      },
+    })).toThrow("Skill evidence");
+    expect(store.list()).toEqual([]);
+  });
+
   test("lists only exact Agent runs newest first with a bounded limit", () => {
     const store = new TaskRunStore(dir);
     store.start({

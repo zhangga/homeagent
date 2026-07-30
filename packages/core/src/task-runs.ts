@@ -12,6 +12,11 @@ import { dirname, join } from "node:path";
 import { isCliProvider, type ProviderId } from "@homeagent/llm";
 import { isSpaceId, type SpaceId } from "@homeagent/shared";
 import type { Task } from "./tasks.ts";
+import type {
+  ResolvedSkillSnapshot,
+  SkillRequestSnapshot,
+  SkippedSkillSnapshot,
+} from "./skill-catalog.ts";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 
 export type TaskRunStatus = "running" | "succeeded" | "failed" | "cancelled" | "timed_out";
@@ -37,6 +42,7 @@ export interface TaskRun {
   agentId?: string;
   provider?: ProviderId;
   model?: string;
+  skillEvidence?: TaskRunSkillEvidence;
   retryOf?: string;
   distill: boolean;
   notify?: boolean;
@@ -53,8 +59,14 @@ export interface TaskRun {
   notification?: TaskRunNotification;
 }
 
+export interface TaskRunSkillEvidence {
+  requested: SkillRequestSnapshot[];
+  resolved: ResolvedSkillSnapshot[];
+  skipped: SkippedSkillSnapshot[];
+}
+
 interface TaskRunsFile {
-  version: 2 | 3;
+  version: 2 | 3 | 4;
   runs: Record<string, TaskRun>;
 }
 
@@ -64,6 +76,7 @@ export interface StartTaskRunInput {
   agentId?: string;
   provider?: ProviderId;
   model?: string;
+  skillEvidence?: TaskRunSkillEvidence;
   retryOf?: string;
   distill: boolean;
   timeoutMs?: number;
@@ -86,6 +99,8 @@ export interface TaskRunStoreOptions {
 export const MAX_TASK_RUN_OUTPUT_CHARACTERS = 100_000;
 export const MAX_TASK_RUN_ERROR_CHARACTERS = 20_000;
 export const MAX_TASK_RUN_HISTORY_PER_TASK = 100;
+export const MAX_TASK_RUN_SKILLS = 50;
+export const MAX_TASK_RUN_SKILL_MESSAGE_CHARACTERS = 300;
 export const MAX_TASK_NOTIFICATION_ATTEMPTS = 5;
 const TASK_NOTIFICATION_RETRY_DELAYS_MS = [
   60_000,
@@ -99,8 +114,78 @@ const INTERRUPTED_RUN_ERROR = "应用在任务完成前停止，运行已标记�
 function clone(run: TaskRun): TaskRun {
   return {
     ...run,
+    skillEvidence: run.skillEvidence
+      ? {
+          requested: run.skillEvidence.requested.map((item) => ({ ...item })),
+          resolved: run.skillEvidence.resolved.map((item) => ({ ...item })),
+          skipped: run.skillEvidence.skipped.map((item) => ({ ...item })),
+        }
+      : undefined,
     notification: run.notification ? { ...run.notification } : undefined,
   };
+}
+
+function isSkillName(value: unknown): value is string {
+  return typeof value === "string"
+    && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,79}$/.test(value);
+}
+
+function isSourceKey(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length <= 600
+    && /^(?:shared-agents|codex-user|codex-plugin|codex-vendor|claude-user|claude-plugin|claude-marketplace|trae-user):[^\u0000-\u001f\\]+$/u.test(
+      value,
+    );
+}
+
+export function isTaskRunSkillEvidence(value: unknown): value is TaskRunSkillEvidence {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const evidence = value as Partial<TaskRunSkillEvidence>;
+  if (
+    !Array.isArray(evidence.requested)
+    || !Array.isArray(evidence.resolved)
+    || !Array.isArray(evidence.skipped)
+    || evidence.requested.length > MAX_TASK_RUN_SKILLS
+    || evidence.resolved.length > MAX_TASK_RUN_SKILLS
+    || evidence.skipped.length > MAX_TASK_RUN_SKILLS
+  ) {
+    return false;
+  }
+  const validRequested = evidence.requested.every((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    if (!isSkillName(item.name)) return false;
+    if (item.kind === "legacy-name") return true;
+    return item.kind === "source" && isSourceKey(item.sourceKey);
+  });
+  const validResolved = evidence.resolved.every((item) =>
+    item
+    && typeof item === "object"
+    && !Array.isArray(item)
+    && isSourceKey(item.sourceKey)
+    && isSkillName(item.name)
+    && isSkillName(item.invocationName)
+    && typeof item.reference === "string"
+    && item.reference.length <= 81
+    && /^[a-f0-9]{64}$/.test(item.skillFileHash)
+  );
+  const validSkipped = evidence.skipped.every((item) =>
+    item
+    && typeof item === "object"
+    && !Array.isArray(item)
+    && (item.sourceKey === undefined || isSourceKey(item.sourceKey))
+    && isSkillName(item.name)
+    && [
+      "missing_source",
+      "invalid_skill",
+      "provider_incompatible",
+      "ambiguous_legacy_name",
+      "shadowed_source",
+      "invalid_invocation_name",
+    ].includes(item.code)
+    && typeof item.message === "string"
+    && item.message.length <= MAX_TASK_RUN_SKILL_MESSAGE_CHARACTERS
+  );
+  return validRequested && validResolved && validSkipped;
 }
 
 function isTaskRun(value: unknown): value is TaskRun {
@@ -148,6 +233,7 @@ function isTaskRun(value: unknown): value is TaskRun {
     && typeof run.topic === "string"
     && ["manual", "scheduled", "chat", "retry"].includes(String(run.trigger))
     && (run.provider === undefined || isCliProvider(run.provider))
+    && (run.skillEvidence === undefined || isTaskRunSkillEvidence(run.skillEvidence))
     && typeof run.distill === "boolean"
     && (run.notify === undefined || typeof run.notify === "boolean")
     && ["running", "succeeded", "failed", "cancelled", "timed_out"].includes(String(run.status))
@@ -199,7 +285,7 @@ export class TaskRunStore {
     if (!existsSync(this.configPath)) return runs;
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<TaskRunsFile>;
-      if (parsed.version !== 2 && parsed.version !== 3) return runs;
+      if (parsed.version !== 2 && parsed.version !== 3 && parsed.version !== 4) return runs;
       for (const [id, value] of Object.entries(parsed.runs ?? {})) {
         if (!isTaskRun(value) || value.id !== id) continue;
         runs.set(id, clone(value));
@@ -214,7 +300,7 @@ export class TaskRunStore {
     const configDir = dirname(this.configPath);
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const tempPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
-    const file: TaskRunsFile = { version: 3, runs: Object.fromEntries(runs) };
+    const file: TaskRunsFile = { version: 4, runs: Object.fromEntries(runs) };
     try {
       writeFileSync(tempPath, JSON.stringify(file, null, 2), { encoding: "utf8", mode: 0o600 });
       const fileDescriptor = openSync(tempPath, "r");
@@ -279,6 +365,12 @@ export class TaskRunStore {
   }
 
   start(input: StartTaskRunInput): TaskRun {
+    if (
+      input.skillEvidence !== undefined
+      && !isTaskRunSkillEvidence(input.skillEvidence)
+    ) {
+      throw new Error("Skill evidence is invalid or exceeds persistence limits");
+    }
     return this.commit((candidate, state) => {
       const requestedStartedAt = input.startedAt ?? Date.now();
       const startedAt = Math.max(requestedStartedAt, state.lastStartedAt + 1);
@@ -293,6 +385,13 @@ export class TaskRunStore {
         agentId: input.agentId,
         provider: input.provider,
         model: input.model,
+        skillEvidence: input.skillEvidence
+          ? {
+              requested: input.skillEvidence.requested.map((item) => ({ ...item })),
+              resolved: input.skillEvidence.resolved.map((item) => ({ ...item })),
+              skipped: input.skillEvidence.skipped.map((item) => ({ ...item })),
+            }
+          : undefined,
         retryOf: input.retryOf,
         distill: input.distill,
         notify: input.task.notify,
