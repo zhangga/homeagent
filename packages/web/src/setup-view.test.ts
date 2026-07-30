@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import type { LarkProvisioningSession, LarkSetupStatus } from "@homeagent/shared";
 import { restartingView, setupLayout, setupView } from "./setup-view.ts";
 import type { SetupSnapshot, SetupStep } from "./setup.ts";
-import type { FeishuExternalSharingStatus } from "./external-sharing.ts";
 
 const providers = [
   { id: "codex" as const, name: "Codex", bin: "codex", available: true, detail: "0.144.1" },
@@ -10,14 +9,13 @@ const providers = [
 ];
 
 function snapshot(current: SetupStep): SetupSnapshot {
-  const order: SetupStep[] = ["ai", "feishu", "external_share", "activate", "invite", "done"];
+  const order: SetupStep[] = ["ai", "feishu", "activate", "done"];
   return {
     current,
     completed: order.slice(0, order.indexOf(current)),
     selectedProviderReady: current !== "ai",
-    larkReady: ["external_share", "activate", "invite", "done"].includes(current),
-    runtimeReady: ["invite", "done"].includes(current),
-    groupReady: current === "done",
+    larkReady: ["activate", "done"].includes(current),
+    runtimeReady: current === "done",
   };
 }
 
@@ -33,12 +31,6 @@ const idle: LarkProvisioningSession = {
   message: "尚未开始",
 };
 
-const externalSharing: FeishuExternalSharingStatus = {
-  state: "not_started",
-  appId: "cli_safe",
-  consoleUrl: "https://open.feishu.cn/app/cli_safe",
-};
-
 function render(current: SetupStep, overrides: Partial<Parameters<typeof setupView>[0]> = {}): string {
   return String(setupLayout(setupView({
     snapshot: snapshot(current),
@@ -47,7 +39,6 @@ function render(current: SetupStep, overrides: Partial<Parameters<typeof setupVi
     lark,
     provisioning: idle,
     runtime: { ready: false, consumers: [] },
-    externalSharing,
     groups: [],
     restartRequired: false,
     restartable: true,
@@ -136,6 +127,12 @@ describe("guided setup view", () => {
     expect(body).toContain('<option value="lark">Lark</option>');
   });
 
+  test("keeps external sharing out of the onboarding navigation", () => {
+    const body = render("activate");
+
+    expect(body).not.toContain("发布对外共享");
+  });
+
   test("manual existing-app setup preselects the configured Lark brand", () => {
     const body = render("feishu", {
       lark: { state: "unconfigured", verified: false, brand: "lark", message: "尚未配置" },
@@ -173,49 +170,7 @@ describe("guided setup view", () => {
     expect(body).not.toContain("进入飞书开放平台");
   });
 
-  test("external sharing step guides publishing and real-group verification", () => {
-    const publish = render("external_share", {
-      lark: {
-        state: "ready",
-        verified: true,
-        appId: "cli_safe",
-        brand: "feishu",
-        botName: "小脑",
-        botOpenId: "ou_bot",
-        message: "ready",
-      },
-    });
-    expect(publish).toContain("发布对外共享版本");
-    expect(publish).toContain("https://open.feishu.cn/app/cli_safe");
-    expect(publish).toContain("允许机器人被添加到外部群中使用");
-    expect(publish).toContain("允许外部用户与机器人单聊");
-    expect(publish).toContain("提交发布并完成管理员审批");
-    expect(publish).toContain('action="/setup/feishu/external-sharing/start"');
-    expect(publish).toContain('action="/setup/feishu/external-sharing/skip"');
-
-    const awaiting = render("external_share", {
-      lark: {
-        state: "ready",
-        verified: true,
-        appId: "cli_safe",
-        brand: "feishu",
-        botName: "小脑",
-        botOpenId: "ou_bot",
-        message: "ready",
-      },
-      externalSharing: {
-        ...externalSharing,
-        state: "awaiting_external_message",
-        startedAt: 100,
-      },
-      runtime: { ready: true, consumers: [] },
-    });
-    expect(awaiting).toContain("用外部群消息验证");
-    expect(awaiting).toContain("@小脑 对外共享测试");
-    expect(awaiting).toContain("我已发送，重新检查");
-  });
-
-  test("activation and invitation are written in user language", () => {
+  test("activation and completion are written in user language", () => {
     const activation = render("activate", {
       lark: { state: "ready", verified: true, botName: "小脑", botOpenId: "ou_bot", message: "ready" },
       restartRequired: true,
@@ -240,13 +195,12 @@ describe("guided setup view", () => {
     expect(runtimeFailure).toContain('action="/setup/restart"');
     expect(runtimeFailure).toContain('href="/health"');
 
-    const invite = render("invite", {
+    const done = render("done", {
       lark: { state: "ready", verified: true, botName: "小脑", botOpenId: "ou_bot", message: "ready" },
     });
-    expect(invite).toContain("小脑");
-    expect(invite).toContain("只有明确连接后");
-    expect(invite).toContain('href="/integrations/groups/connect"');
-    expect(invite).toContain("我已连接，重新检查");
+    expect(done).toContain("小脑");
+    expect(done).toContain("@小脑 启用群聊");
+    expect(done).toContain("确认前不会读取或记录群消息");
   });
 
   test("failed provisioning explains the failure without exposing CLI output", () => {
@@ -265,6 +219,8 @@ describe("guided setup view", () => {
   test("done step enters the knowledge dashboard", () => {
     const body = render("done");
     expect(body).toContain("一切就绪");
+    expect(body).toContain("把机器人加入飞书群聊");
+    expect(body).toContain("@HomeAgent 启用群聊");
     expect(body).toContain('action="/setup/finish"');
   });
 });

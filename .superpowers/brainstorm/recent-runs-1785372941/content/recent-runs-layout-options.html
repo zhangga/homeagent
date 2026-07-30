@@ -1,0 +1,487 @@
+<style>
+  .direction-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 18px;
+    margin-top: 24px;
+  }
+  .direction {
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: var(--surface);
+    cursor: pointer;
+    transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease;
+  }
+  .direction:hover {
+    transform: translateY(-2px);
+    border-color: var(--accent);
+    box-shadow: 0 12px 30px rgba(30, 35, 40, .09);
+  }
+  .direction.selected {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+  .direction-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 15px 16px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .direction-title {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .direction-letter {
+    display: grid;
+    width: 26px;
+    height: 26px;
+    place-items: center;
+    border-radius: 8px;
+    background: var(--surface-2);
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 750;
+  }
+  .direction h3 {
+    margin: 0;
+    font-size: 15px;
+  }
+  .recommended {
+    padding: 3px 7px;
+    border-radius: 999px;
+    background: #eaf7ef;
+    color: #25704c;
+    font-size: 10px;
+    font-weight: 700;
+  }
+  .mini-app {
+    display: grid;
+    grid-template-columns: 76px minmax(0, 1fr) 86px;
+    height: 430px;
+    background: #fbfbfa;
+    color: #282824;
+    font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  }
+  .mini-side,
+  .mini-inspector {
+    padding: 13px 8px;
+    background: #f3f3f0;
+    font-size: 8px;
+  }
+  .mini-side {
+    border-right: 1px solid #deded9;
+  }
+  .mini-inspector {
+    border-left: 1px solid #deded9;
+  }
+  .mini-agent {
+    margin-bottom: 5px;
+    padding: 8px 6px;
+    border-radius: 6px;
+  }
+  .mini-agent.active {
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(20,20,16,.05);
+  }
+  .mini-dot {
+    display: inline-block;
+    width: 5px;
+    height: 5px;
+    margin-right: 4px;
+    border-radius: 50%;
+    background: #47a478;
+  }
+  .mini-main {
+    min-width: 0;
+    overflow: hidden;
+    background: #fff;
+  }
+  .mini-toolbar {
+    display: flex;
+    height: 34px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 12px;
+    border-bottom: 1px solid #e8e8e3;
+    font-size: 9px;
+    font-weight: 700;
+  }
+  .mini-content {
+    padding: 16px;
+  }
+  .mini-label {
+    margin-bottom: 6px;
+    color: #74746f;
+    font-size: 8px;
+    font-weight: 700;
+  }
+  .instruction {
+    height: 55px;
+    margin-bottom: 16px;
+    padding: 8px;
+    border: 1px solid #deded8;
+    border-radius: 6px;
+    color: #55554f;
+    font-size: 8px;
+  }
+  .run-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+    font-size: 9px;
+    font-weight: 750;
+  }
+  .count {
+    color: #999990;
+    font-size: 8px;
+    font-weight: 500;
+  }
+  .run-list {
+    overflow: hidden;
+    border: 1px solid #e0e0db;
+    border-radius: 7px;
+  }
+  .run-row {
+    display: grid;
+    grid-template-columns: 10px minmax(0, 1fr) auto 8px;
+    gap: 6px;
+    min-height: 29px;
+    align-items: center;
+    padding: 0 8px;
+    border-bottom: 1px solid #efefeb;
+    font-size: 7.5px;
+  }
+  .run-row:last-child {
+    border-bottom: 0;
+  }
+  .run-icon {
+    display: grid;
+    width: 9px;
+    height: 9px;
+    place-items: center;
+    border: 1px solid #54ac80;
+    border-radius: 50%;
+    color: #278458;
+    font-size: 6px;
+  }
+  .run-icon.fail {
+    border-color: #d47970;
+    color: #c04c41;
+  }
+  .run-copy {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .run-copy strong {
+    font-weight: 650;
+  }
+  .run-copy small {
+    margin-left: 4px;
+    color: #96968f;
+  }
+  .run-time {
+    color: #8b8b84;
+    white-space: nowrap;
+  }
+  .run-arrow {
+    color: #aaa9a2;
+  }
+  .failed-row {
+    grid-template-columns: 10px minmax(0, 1fr) auto;
+    min-height: 37px;
+    color: #a83c34;
+  }
+  .retry {
+    padding: 3px 5px;
+    border: 1px solid #d9b7b2;
+    border-radius: 4px;
+    color: #a83c34;
+    background: #fff;
+    font-size: 7px;
+  }
+  .stat-strip {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 5px;
+    margin-bottom: 7px;
+  }
+  .stat {
+    padding: 7px;
+    border: 1px solid #e2e2dd;
+    border-radius: 6px;
+    background: #fafaf8;
+    font-size: 7px;
+  }
+  .stat b {
+    display: block;
+    margin-top: 2px;
+    font-size: 13px;
+  }
+  .group-title {
+    display: flex;
+    justify-content: space-between;
+    margin: 7px 1px 4px;
+    color: #777771;
+    font-size: 7px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+  .timeline {
+    padding-left: 8px;
+    border-left: 1px solid #dcdcd6;
+  }
+  .timeline-item {
+    position: relative;
+    margin-bottom: 7px;
+    padding: 7px 8px;
+    border: 1px solid #e2e2dd;
+    border-radius: 6px;
+    background: #fff;
+    font-size: 7px;
+  }
+  .timeline-item::before {
+    position: absolute;
+    top: 11px;
+    left: -12px;
+    width: 6px;
+    height: 6px;
+    border: 2px solid #fff;
+    border-radius: 50%;
+    background: #45a577;
+    box-shadow: 0 0 0 1px #bfcfc5;
+    content: "";
+  }
+  .timeline-item.fail::before {
+    background: #d35d52;
+  }
+  .timeline-meta {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 4px;
+    color: #96968f;
+  }
+  .mini-inspector h4 {
+    margin: 0 0 9px;
+    color: #777771;
+    font-size: 7px;
+    text-transform: uppercase;
+  }
+  .kv {
+    margin-bottom: 10px;
+    line-height: 1.6;
+  }
+  .direction-copy {
+    padding: 14px 16px 16px;
+  }
+  .direction-copy p {
+    min-height: 42px;
+    margin: 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.45;
+  }
+  .tradeoff {
+    display: flex;
+    gap: 6px;
+    margin-top: 10px;
+    flex-wrap: wrap;
+  }
+  .tradeoff span {
+    padding: 3px 6px;
+    border-radius: 5px;
+    background: var(--surface-2);
+    color: var(--muted);
+    font-size: 10px;
+  }
+  @media (max-width: 1050px) {
+    .direction-grid { grid-template-columns: 1fr; }
+  }
+</style>
+
+<h2>Recent Runs 放到中间栏，哪种呈现最适合 HomeAgent？</h2>
+<p class="subtitle">三种方案都保留左侧 Agent 列表和右侧配置栏；区别只在中间栏的任务历史如何被扫描和操作。</p>
+
+<div class="direction-grid">
+  <div class="direction" data-choice="a-mew-compact" onclick="toggleSelect(this)">
+    <div class="direction-head">
+      <div class="direction-title">
+        <div class="direction-letter">A</div>
+        <h3>MEW 式紧凑列表</h3>
+      </div>
+      <span class="recommended">推荐</span>
+    </div>
+    <div class="mini-app">
+      <div class="mini-side">
+        <div style="font-weight:750;margin:2px 4px 12px">Agents</div>
+        <div class="mini-agent active"><span class="mini-dot"></span>研究助手</div>
+        <div class="mini-agent"><span class="mini-dot"></span>写作助手</div>
+      </div>
+      <div class="mini-main">
+        <div class="mini-toolbar"><span>研究助手</span><span>保存 ···</span></div>
+        <div class="mini-content">
+          <div class="mini-label">INSTRUCTION</div>
+          <div class="instruction">负责深度研究、资料整理与引用核对。</div>
+          <div class="run-head"><span>Recent runs <span class="count">26</span></span><span class="count">查看全部</span></div>
+          <div class="run-list">
+            <div class="run-row">
+              <span class="run-icon">✓</span>
+              <span class="run-copy"><strong>整理 Q3 AI 行业动态</strong><small>个人空间 · Codex / gpt-5.5</small></span>
+              <span class="run-time">今天 17:49</span><span class="run-arrow">↗</span>
+            </div>
+            <div class="run-row">
+              <span class="run-icon">✓</span>
+              <span class="run-copy"><strong>调研家庭 Agent 产品</strong><small>产品群 · Codex / gpt-5.5</small></span>
+              <span class="run-time">今天 16:35</span><span class="run-arrow">↗</span>
+            </div>
+            <div class="run-row">
+              <span class="run-icon">✓</span>
+              <span class="run-copy"><strong>总结飞书会议纪要</strong><small>研发群 · Codex / gpt-5.5</small></span>
+              <span class="run-time">今天 15:57</span><span class="run-arrow">↗</span>
+            </div>
+            <div class="run-row failed-row">
+              <span class="run-icon fail">×</span>
+              <span class="run-copy"><strong>资料抓取超时</strong><small>个人空间 · 运行超时</small></span>
+              <button class="retry">重试</button>
+            </div>
+            <div class="run-row">
+              <span class="run-icon">✓</span>
+              <span class="run-copy"><strong>生成每周研究摘要</strong><small>产品群 · Codex / gpt-5.5</small></span>
+              <span class="run-time">昨天 12:19</span><span class="run-arrow">↗</span>
+            </div>
+            <div class="run-row">
+              <span class="run-icon">✓</span>
+              <span class="run-copy"><strong>竞品功能对比</strong><small>个人空间 · Codex / gpt-5.5</small></span>
+              <span class="run-time">昨天 11:58</span><span class="run-arrow">↗</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="mini-inspector">
+        <h4>Execution</h4>
+        <div class="kv">Provider<br><b>Codex</b></div>
+        <div class="kv">Model<br><b>gpt-5.5</b></div>
+        <h4>Scope</h4>
+        <div class="kv">Visibility<br><b>Team</b></div>
+      </div>
+    </div>
+    <div class="direction-copy">
+      <p>最贴近 MEW：一行一个运行，整行打开详情，失败项就地显示原因与重试。扫描速度最快。</p>
+      <div class="tradeoff"><span>信息密度高</span><span>改动集中</span><span>移动端易折叠</span></div>
+    </div>
+  </div>
+
+  <div class="direction" data-choice="b-dashboard-groups" onclick="toggleSelect(this)">
+    <div class="direction-head">
+      <div class="direction-title">
+        <div class="direction-letter">B</div>
+        <h3>概览 + 状态分组</h3>
+      </div>
+    </div>
+    <div class="mini-app">
+      <div class="mini-side">
+        <div style="font-weight:750;margin:2px 4px 12px">Agents</div>
+        <div class="mini-agent active"><span class="mini-dot"></span>研究助手</div>
+        <div class="mini-agent"><span class="mini-dot"></span>写作助手</div>
+      </div>
+      <div class="mini-main">
+        <div class="mini-toolbar"><span>研究助手</span><span>保存 ···</span></div>
+        <div class="mini-content">
+          <div class="mini-label">INSTRUCTION</div>
+          <div class="instruction">负责深度研究、资料整理与引用核对。</div>
+          <div class="run-head"><span>Recent runs <span class="count">26</span></span></div>
+          <div class="stat-strip">
+            <div class="stat">运行中<b>1</b></div>
+            <div class="stat">已完成<b>22</b></div>
+            <div class="stat">需处理<b style="color:#b64b41">3</b></div>
+          </div>
+          <div class="group-title"><span>需要处理</span><span>3</span></div>
+          <div class="run-list">
+            <div class="run-row failed-row">
+              <span class="run-icon fail">×</span>
+              <span class="run-copy"><strong>资料抓取超时</strong><small>运行超时</small></span>
+              <button class="retry">重试</button>
+            </div>
+          </div>
+          <div class="group-title"><span>最近完成</span><span>22</span></div>
+          <div class="run-list">
+            <div class="run-row"><span class="run-icon">✓</span><span class="run-copy"><strong>整理 Q3 AI 行业动态</strong></span><span class="run-time">17:49</span><span>↗</span></div>
+            <div class="run-row"><span class="run-icon">✓</span><span class="run-copy"><strong>调研家庭 Agent 产品</strong></span><span class="run-time">16:35</span><span>↗</span></div>
+            <div class="run-row"><span class="run-icon">✓</span><span class="run-copy"><strong>总结飞书会议纪要</strong></span><span class="run-time">15:57</span><span>↗</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="mini-inspector">
+        <h4>Execution</h4>
+        <div class="kv">Provider<br><b>Codex</b></div>
+        <div class="kv">Model<br><b>gpt-5.5</b></div>
+        <h4>Scope</h4>
+        <div class="kv">Visibility<br><b>Team</b></div>
+      </div>
+    </div>
+    <div class="direction-copy">
+      <p>先给运行健康度，再把失败和成功分组。问题更醒目，但会增加统计口径和页面复杂度。</p>
+      <div class="tradeoff"><span>异常优先</span><span>管理感更强</span><span>需要额外统计</span></div>
+    </div>
+  </div>
+
+  <div class="direction" data-choice="c-timeline" onclick="toggleSelect(this)">
+    <div class="direction-head">
+      <div class="direction-title">
+        <div class="direction-letter">C</div>
+        <h3>运行时间线</h3>
+      </div>
+    </div>
+    <div class="mini-app">
+      <div class="mini-side">
+        <div style="font-weight:750;margin:2px 4px 12px">Agents</div>
+        <div class="mini-agent active"><span class="mini-dot"></span>研究助手</div>
+        <div class="mini-agent"><span class="mini-dot"></span>写作助手</div>
+      </div>
+      <div class="mini-main">
+        <div class="mini-toolbar"><span>研究助手</span><span>保存 ···</span></div>
+        <div class="mini-content">
+          <div class="mini-label">INSTRUCTION</div>
+          <div class="instruction">负责深度研究、资料整理与引用核对。</div>
+          <div class="run-head"><span>Recent runs <span class="count">26</span></span></div>
+          <div class="timeline">
+            <div class="timeline-item">
+              <b>整理 Q3 AI 行业动态</b>
+              <div class="timeline-meta"><span>个人空间 · 已完成</span><span>17:49</span></div>
+            </div>
+            <div class="timeline-item">
+              <b>调研家庭 Agent 产品</b>
+              <div class="timeline-meta"><span>产品群 · 已完成</span><span>16:35</span></div>
+            </div>
+            <div class="timeline-item fail">
+              <b style="color:#ad463d">资料抓取超时</b>
+              <div class="timeline-meta"><span>个人空间 · 可重试</span><span>15:57</span></div>
+            </div>
+            <div class="timeline-item">
+              <b>生成每周研究摘要</b>
+              <div class="timeline-meta"><span>产品群 · 已完成</span><span>昨天</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="mini-inspector">
+        <h4>Execution</h4>
+        <div class="kv">Provider<br><b>Codex</b></div>
+        <div class="kv">Model<br><b>gpt-5.5</b></div>
+        <h4>Scope</h4>
+        <div class="kv">Visibility<br><b>Team</b></div>
+      </div>
+    </div>
+    <div class="direction-copy">
+      <p>强调“这个 Agent 最近发生了什么”，叙事性最好，但同屏展示数量少，不适合高频任务。</p>
+      <div class="tradeoff"><span>时间感强</span><span>视觉突出</span><span>信息密度低</span></div>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:18px">点击一个方案作为倾向；也可以直接回到对话里告诉我想混合哪些细节。</p>

@@ -20,6 +20,7 @@ import { KnowledgeEngine } from "@homeagent/core";
 import { CodexProviderSetup, CodexReleaseInstaller } from "@homeagent/llm";
 import { FeishuConnector, LarkCliSetup } from "@homeagent/connectors";
 import {
+  FEISHU_GROUP_CONFIRMATION_PROMPT,
   Orchestrator,
   createNativeExtractor,
   extractAttachmentText,
@@ -226,6 +227,8 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
     runtimeStatus: () => connector.health(),
     sendTestMessage: (chatId, text) =>
       sendFeishuNotice(`team/${chatId}`, chatId, text),
+    sendConfirmationPrompt: (chatId) =>
+      connector.notice(chatId, FEISHU_GROUP_CONFIRMATION_PROMPT),
     persistConnectionDisabledAppId: (appId) => {
       saveSettings({ feishuConnectionDisabledAppId: appId }, cfg.dataDir);
     },

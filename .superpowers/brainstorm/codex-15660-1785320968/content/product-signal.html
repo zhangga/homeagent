@@ -1,0 +1,154 @@
+<style>
+  .audit {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin: 18px 0 34px;
+  }
+  .audit-item {
+    padding: 15px 16px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: rgba(255,255,255,.72);
+  }
+  .audit-item strong { display:block; margin-bottom:4px; }
+  .audit-item span { color:var(--muted); font-size:13px; line-height:1.45; }
+  .audit-glyph {
+    width: 34px;
+    height: 34px;
+    display: grid;
+    place-items: center;
+    margin-bottom: 10px;
+    border-radius: 10px;
+    background: #f0eee7;
+    font-size: 19px;
+  }
+  .cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .card { overflow:hidden; }
+  .card-image {
+    min-height: 190px;
+    display:grid;
+    place-items:center;
+    background:
+      radial-gradient(circle at 50% 35%, rgba(255,255,255,.85), transparent 34%),
+      linear-gradient(145deg,#edf3ed,#d9e3d9);
+  }
+  .card[data-choice="home-memory"] .card-image {
+    background:linear-gradient(145deg,#f1eee4,#dce8df);
+  }
+  .card[data-choice="home-system"] .card-image {
+    background:linear-gradient(145deg,#e6ece9,#cadad3);
+  }
+  .card[data-choice="warm-companion"] .card-image {
+    background:linear-gradient(145deg,#f5eadf,#e8d7c4);
+  }
+  .mark {
+    width: 126px;
+    height: 126px;
+    filter: drop-shadow(0 14px 22px rgba(31,50,42,.16));
+  }
+  .signal {
+    display:inline-flex;
+    margin-top:9px;
+    padding:4px 8px;
+    border-radius:999px;
+    background:#eef2ed;
+    color:#486052;
+    font-size:11px;
+    font-weight:700;
+    letter-spacing:.03em;
+  }
+  .card-body p { min-height:58px; }
+  .question-note {
+    margin-top:16px;
+    padding:12px 14px;
+    border-left:3px solid #2f684c;
+    background:#f2f6f2;
+    color:var(--muted);
+    font-size:13px;
+  }
+  @media (max-width: 850px) {
+    .audit,.cards { grid-template-columns:1fr; }
+    .card-body p { min-height:auto; }
+  }
+</style>
+
+<div class="label">HomeAgent · 品牌图标诊断</div>
+<h2>需要换，而且不是“小修一下”</h2>
+<p class="subtitle">目前三个触点各说各话，用户还没有一个能记住的 HomeAgent 视觉锚点。</p>
+
+<div class="audit">
+  <div class="audit-item">
+    <div class="audit-glyph">🧠</div>
+    <strong>管理后台</strong>
+    <span>像通用 AI / 知识工具，缺少“HomeAgent 独有”的产品含义。</span>
+  </div>
+  <div class="audit-item">
+    <div class="audit-glyph">⌁</div>
+    <strong>首次设置</strong>
+    <span>气质轻巧，但意义不清，也没有与后台形成同一品牌。</span>
+  </div>
+  <div class="audit-item">
+    <div class="audit-glyph">◻</div>
+    <strong>macOS 应用</strong>
+    <span>当前没有正式 App Icon 资产，系统层面几乎无法建立识别。</span>
+  </div>
+</div>
+
+<h3>先选：用户应该一眼把它理解成什么？</h3>
+<p class="subtitle">下面不是最终图标，只是三个“产品信号”。先点最希望 HomeAgent 占据的心智。</p>
+
+<div class="cards">
+  <div class="card" data-choice="home-memory" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <svg class="mark" viewBox="0 0 128 128" aria-label="家与长期记忆">
+        <rect width="128" height="128" rx="30" fill="#234f3d"/>
+        <path d="M28 61 64 31l36 30v35a9 9 0 0 1-9 9H37a9 9 0 0 1-9-9Z" fill="none" stroke="#f5f0df" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M47 72c10-11 24-11 34 0M48 84c9-7 23-7 32 0M56 95c5-3 11-3 16 0" fill="none" stroke="#e6b955" stroke-width="5.5" stroke-linecap="round"/>
+      </svg>
+    </div>
+    <div class="card-body">
+      <h3>A · 家的长期记忆</h3>
+      <p>强调“替家人/团队持续记住、整理、在需要时想起来”。最贴近知识沉淀与上下文延续。</p>
+      <span class="signal">家 · 记忆 · 可信赖</span>
+    </div>
+  </div>
+
+  <div class="card" data-choice="home-system" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <svg class="mark" viewBox="0 0 128 128" aria-label="家庭智能中枢">
+        <rect width="128" height="128" rx="30" fill="#213b34"/>
+        <path d="M28 59 64 30l36 29" fill="none" stroke="#ecf1ea" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="64" cy="63" r="13" fill="#e9b54b"/>
+        <circle cx="39" cy="88" r="7" fill="#ecf1ea"/>
+        <circle cx="89" cy="88" r="7" fill="#ecf1ea"/>
+        <circle cx="64" cy="103" r="7" fill="#ecf1ea"/>
+        <path d="M54 71 43 82m31-11 11 11M64 77v19" stroke="#9fb9aa" stroke-width="5" stroke-linecap="round"/>
+      </svg>
+    </div>
+    <div class="card-body">
+      <h3>B · 家庭智能中枢</h3>
+      <p>强调“连接 AI、飞书、任务、提醒与知识的本地控制中心”。更像强大的基础设施产品。</p>
+      <span class="signal">连接 · 调度 · 能力</span>
+    </div>
+  </div>
+
+  <div class="card" data-choice="warm-companion" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <svg class="mark" viewBox="0 0 128 128" aria-label="温暖的家庭智能伙伴">
+        <rect width="128" height="128" rx="30" fill="#c96f43"/>
+        <path d="M27 61 64 31l37 30" fill="none" stroke="#fff4e8" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M39 61v32a11 11 0 0 0 11 11h28a11 11 0 0 0 11-11V61" fill="#fff4e8"/>
+        <path d="M53 76c4-4 8-4 12 0 4-4 9-4 12 0 5 7-3 15-12 21-9-6-17-14-12-21Z" fill="#d57a4c"/>
+        <circle cx="92" cy="39" r="8" fill="#edbb55"/>
+      </svg>
+    </div>
+    <div class="card-body">
+      <h3>C · 有温度的 AI 伙伴</h3>
+      <p>强调“在家庭/团队里主动帮忙、提醒和陪伴”。亲和力最强，但技术能力表达较弱。</p>
+      <span class="signal">陪伴 · 主动 · 温暖</span>
+    </div>
+  </div>
+</div>
+
+<div class="question-note">只选一个“第一印象”即可；其他能力仍可以在图形细节和品牌语言里作为第二层表达。</div>

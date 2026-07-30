@@ -1,9 +1,8 @@
 import type { DetectedProvider } from "@homeagent/llm";
 import type { LarkSetupStatus } from "@homeagent/shared";
 import type { FeishuRuntimeStatus } from "./integrations.ts";
-import type { FeishuExternalSharingState } from "./external-sharing.ts";
 
-export type SetupStep = "ai" | "feishu" | "external_share" | "activate" | "invite" | "done";
+export type SetupStep = "ai" | "feishu" | "activate" | "done";
 
 export interface SetupSnapshot {
   current: SetupStep;
@@ -11,7 +10,6 @@ export interface SetupSnapshot {
   selectedProviderReady: boolean;
   larkReady: boolean;
   runtimeReady: boolean;
-  groupReady: boolean;
 }
 
 export interface SetupSnapshotInput {
@@ -20,9 +18,6 @@ export interface SetupSnapshotInput {
   lark: LarkSetupStatus;
   runtime: FeishuRuntimeStatus;
   restartRequired: boolean;
-  groups: number;
-  completedAt?: number;
-  externalSharing: FeishuExternalSharingState;
 }
 
 export function buildSetupSnapshot(input: SetupSnapshotInput): SetupSnapshot {
@@ -31,21 +26,14 @@ export function buildSetupSnapshot(input: SetupSnapshotInput): SetupSnapshot {
   );
   const larkReady = input.lark.state === "ready" && input.lark.verified;
   const runtimeReady = larkReady && !input.restartRequired && input.runtime.ready;
-  const groupReady = input.groups > 0;
   const current: SetupStep = !selectedProviderReady
     ? "ai"
     : !larkReady
       ? "feishu"
-      : input.externalSharing === "not_started"
-        ? "external_share"
-        : !runtimeReady
-          ? "activate"
-          : input.externalSharing === "awaiting_external_message"
-            ? "external_share"
-            : !groupReady && !input.completedAt
-              ? "invite"
-              : "done";
-  const order: SetupStep[] = ["ai", "feishu", "external_share", "activate", "invite", "done"];
+      : !runtimeReady
+        ? "activate"
+        : "done";
+  const order: SetupStep[] = ["ai", "feishu", "activate", "done"];
 
   return {
     current,
@@ -53,6 +41,5 @@ export function buildSetupSnapshot(input: SetupSnapshotInput): SetupSnapshot {
     selectedProviderReady,
     larkReady,
     runtimeReady,
-    groupReady,
   };
 }

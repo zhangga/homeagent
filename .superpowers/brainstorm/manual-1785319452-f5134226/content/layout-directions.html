@@ -1,0 +1,431 @@
+<style>
+  .direction-intro {
+    max-width: 920px;
+    margin-bottom: 24px;
+  }
+  .direction-list {
+    display: grid;
+    gap: 22px;
+  }
+  .direction {
+    border: 1px solid #d9dde4;
+    border-radius: 16px;
+    overflow: hidden;
+    background: #fff;
+    cursor: pointer;
+    transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+  }
+  .direction:hover {
+    border-color: #8da2c0;
+    box-shadow: 0 14px 40px rgba(27, 38, 55, .10);
+    transform: translateY(-2px);
+  }
+  .direction.selected {
+    border-color: #1f6feb;
+    box-shadow: 0 0 0 3px rgba(31, 111, 235, .14), 0 16px 44px rgba(27, 38, 55, .12);
+  }
+  .direction-copy {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 20px;
+    align-items: start;
+    padding: 18px 20px 16px;
+    border-top: 1px solid #eceff3;
+  }
+  .direction-copy h3 {
+    margin: 0 0 5px;
+    font-size: 17px;
+  }
+  .direction-copy p {
+    margin: 0;
+    color: #687386;
+    line-height: 1.55;
+  }
+  .direction-tag {
+    border-radius: 999px;
+    padding: 5px 10px;
+    font-size: 12px;
+    font-weight: 700;
+    white-space: nowrap;
+    background: #edf4ff;
+    color: #1756a9;
+  }
+  .direction-tag.neutral {
+    background: #f1f3f5;
+    color: #5a6472;
+  }
+  .mini-app {
+    height: 360px;
+    display: grid;
+    background: #f8f9fb;
+    color: #2a2f37;
+    font: 11px/1.35 ui-sans-serif, system-ui, sans-serif;
+  }
+  .mini-app .rail {
+    background: #15181d;
+    color: #9da5b2;
+    padding: 13px 10px;
+  }
+  .mini-app .brand {
+    color: #fff;
+    font-weight: 800;
+    margin: 0 0 20px 4px;
+  }
+  .mini-app .nav-item {
+    padding: 7px 8px;
+    margin-bottom: 3px;
+    border-radius: 6px;
+  }
+  .mini-app .nav-item.active {
+    background: #252a33;
+    color: #fff;
+  }
+  .mini-app .pane {
+    min-width: 0;
+    background: #fff;
+    border-right: 1px solid #e7e9ed;
+  }
+  .mini-app .pane-title {
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 12px;
+    border-bottom: 1px solid #e7e9ed;
+    font-weight: 750;
+  }
+  .mini-app .agent {
+    margin: 8px;
+    padding: 10px;
+    border-radius: 8px;
+  }
+  .mini-app .agent.active {
+    background: #f2f3f5;
+  }
+  .mini-app .agent-name {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-weight: 700;
+  }
+  .mini-app .agent-sub {
+    margin: 3px 0 0 22px;
+    color: #7d8591;
+    font-size: 9px;
+  }
+  .mini-app .avatar {
+    width: 15px;
+    height: 15px;
+    border-radius: 4px;
+    display: inline-grid;
+    place-items: center;
+    background: #101418;
+    color: #78e0aa;
+    font-size: 8px;
+  }
+  .mini-app .status {
+    width: 6px;
+    height: 6px;
+    margin-left: auto;
+    border-radius: 50%;
+    background: #38bd7b;
+  }
+  .mini-app .main-head {
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 14px;
+    border-bottom: 1px solid #e7e9ed;
+    font-weight: 750;
+  }
+  .mini-app .main-body {
+    padding: 18px;
+  }
+  .mini-app .field-label,
+  .mini-app .section-label {
+    color: #6c7480;
+    margin-bottom: 6px;
+    font-size: 10px;
+  }
+  .mini-app .instruction {
+    height: 72px;
+    padding: 10px;
+    border: 1px solid #dfe2e7;
+    border-radius: 8px;
+    color: #4d5561;
+  }
+  .mini-app .runs-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 18px 0 7px;
+    font-weight: 750;
+  }
+  .mini-app .count {
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: #f0f2f5;
+    color: #7a828e;
+    font-size: 9px;
+  }
+  .mini-app .run {
+    display: grid;
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    gap: 7px;
+    padding: 9px 2px;
+    border-top: 1px solid #eef0f2;
+  }
+  .mini-app .run-status.ok { color: #1ca46c; }
+  .mini-app .run-status.fail { color: #d95d57; }
+  .mini-app .run-meta,
+  .mini-app .time {
+    color: #8a919c;
+    font-size: 9px;
+  }
+  .mini-app .inspector {
+    padding: 16px 13px;
+    background: #fff;
+  }
+  .mini-app .inspector-title {
+    color: #747c88;
+    font-weight: 700;
+    margin: 0 0 12px;
+  }
+  .mini-app .property {
+    display: grid;
+    grid-template-columns: 70px minmax(0, 1fr);
+    gap: 8px;
+    padding: 7px 0;
+  }
+  .mini-app .property span:first-child {
+    color: #747c88;
+  }
+  .mini-app .chip {
+    display: inline-block;
+    border-radius: 5px;
+    padding: 2px 6px;
+    margin: 1px 2px 1px 0;
+    background: #f0f2f5;
+    font-size: 9px;
+  }
+  .mini-app .divider {
+    height: 1px;
+    margin: 13px 0;
+    background: #eceef1;
+  }
+  .mini-app .tabs {
+    display: flex;
+    gap: 18px;
+    height: 40px;
+    align-items: end;
+    padding: 0 18px;
+    border-bottom: 1px solid #e5e8ec;
+  }
+  .mini-app .tab {
+    padding: 0 0 9px;
+    color: #7b8490;
+  }
+  .mini-app .tab.active {
+    border-bottom: 2px solid #252b33;
+    color: #252b33;
+    font-weight: 750;
+  }
+  .mini-app .settings-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin: 16px 18px;
+  }
+  .mini-app .setting-box {
+    padding: 10px;
+    border: 1px solid #e1e4e8;
+    border-radius: 8px;
+  }
+  .mini-app .agent-cards {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    padding: 14px;
+  }
+  .mini-app .agent-card {
+    padding: 12px;
+    border: 1px solid #e0e3e8;
+    border-radius: 10px;
+    background: #fff;
+  }
+  .mini-app .agent-card.active {
+    border-color: #6495d8;
+    box-shadow: 0 0 0 2px #eaf2ff;
+  }
+  .mini-app .detail-sheet {
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(220px, .7fr);
+    gap: 12px;
+    margin: 0 14px 14px;
+  }
+  .mini-app .sheet-block {
+    padding: 12px;
+    border: 1px solid #e2e5e9;
+    border-radius: 10px;
+    background: #fff;
+  }
+</style>
+
+<div class="direction-intro">
+  <h2>Agents 页面采用哪种信息架构？</h2>
+  <p class="subtitle">三个方案都只使用 HomeAgent 已有或可直接关联的数据：Provider、Model、推理强度、权限、Workdir、Skills、空间/飞书群绑定和任务运行记录；不引入 Mew 的设备、仓库、环境变量或并发系统。</p>
+</div>
+
+<div class="direction-list">
+  <div class="direction option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="mini-app" style="grid-template-columns:88px 190px minmax(330px,1fr) 230px">
+      <div class="rail">
+        <div class="brand">homeagent</div>
+        <div class="nav-item">空间 / 知识</div>
+        <div class="nav-item active">Agents</div>
+        <div class="nav-item">任务</div>
+        <div class="nav-item">飞书连接</div>
+        <div class="nav-item">运行状态</div>
+      </div>
+      <div class="pane">
+        <div class="pane-title"><span>Agents</span><span>＋</span></div>
+        <div class="agent active">
+          <div class="agent-name"><span class="avatar">C</span>Codex 团队助手<span class="status"></span></div>
+          <div class="agent-sub">Codex / gpt-5.6-luna</div>
+        </div>
+        <div class="agent">
+          <div class="agent-name"><span class="avatar">A</span>家庭知识助手<span class="status"></span></div>
+          <div class="agent-sub">Claude / sonnet</div>
+        </div>
+      </div>
+      <div class="pane">
+        <div class="main-head"><span>🤖 Codex 团队助手</span><span>•••　□</span></div>
+        <div class="main-body">
+          <div class="field-label">Instruction</div>
+          <div class="instruction">你是团队知识助手。回答时先检索空间知识，结论简洁，并保留来源引用。</div>
+          <div class="runs-head">Recent runs <span class="count">8</span></div>
+          <div class="run"><span class="run-status ok">✓</span><div>研究任务 · 每周 AI 进展<div class="run-meta">team/pst-platform · Codex / gpt-5.6-luna</div></div><span class="time">17:42 ↗</span></div>
+          <div class="run"><span class="run-status ok">✓</span><div>研究任务 · 依赖风险扫描<div class="run-meta">team/pst-platform · Codex / gpt-5.6-luna</div></div><span class="time">15:10 ↗</span></div>
+          <div class="run"><span class="run-status fail">×</span><div>任务超时 · 竞品动态汇总<div class="run-meta">可重试 · 已保留错误详情</div></div><span class="time">昨天 ↗</span></div>
+        </div>
+      </div>
+      <div class="inspector">
+        <div class="inspector-title">Execution</div>
+        <div class="property"><span>Provider</span><b>Codex⌄</b></div>
+        <div class="property"><span>Model</span><b>gpt-5.6-luna⌄</b></div>
+        <div class="property"><span>Reasoning</span><b>Medium⌄</b></div>
+        <div class="property"><span>Permission</span><b>Read only⌄</b></div>
+        <div class="divider"></div>
+        <div class="inspector-title">Scope</div>
+        <div class="property"><span>Visibility</span><b>Team⌄</b></div>
+        <div class="property"><span>Bindings</span><div><span class="chip">PST 多环境平台</span><span class="chip">AI 月刊</span></div></div>
+        <div class="divider"></div>
+        <div class="inspector-title">Task tools</div>
+        <div class="property"><span>Workdir</span><b>~/work/homeagent</b></div>
+        <div class="property"><span>Skills</span><div><span class="chip">bytedcli</span><span class="chip">codex-review</span></div></div>
+      </div>
+    </div>
+    <div class="direction-copy">
+      <div>
+        <h3>A · Mew 三栏工作台</h3>
+        <p>Agent 列表、运行上下文、配置检查器同时可见。最接近参考页，适合桌面管理后台；窄屏时右侧检查器折叠为抽屉。</p>
+      </div>
+      <span class="direction-tag">推荐</span>
+    </div>
+  </div>
+
+  <div class="direction option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="mini-app" style="grid-template-columns:88px 205px minmax(420px,1fr)">
+      <div class="rail">
+        <div class="brand">homeagent</div>
+        <div class="nav-item">空间 / 知识</div>
+        <div class="nav-item active">Agents</div>
+        <div class="nav-item">任务</div>
+        <div class="nav-item">飞书连接</div>
+        <div class="nav-item">运行状态</div>
+      </div>
+      <div class="pane">
+        <div class="pane-title"><span>Agents</span><span>＋</span></div>
+        <div class="agent active">
+          <div class="agent-name"><span class="avatar">C</span>Codex 团队助手<span class="status"></span></div>
+          <div class="agent-sub">Codex / gpt-5.6-luna</div>
+        </div>
+        <div class="agent">
+          <div class="agent-name"><span class="avatar">A</span>家庭知识助手<span class="status"></span></div>
+          <div class="agent-sub">Claude / sonnet</div>
+        </div>
+      </div>
+      <div class="pane">
+        <div class="main-head"><span>🤖 Codex 团队助手</span><span>保存　•••</span></div>
+        <div class="tabs"><span class="tab active">基本信息</span><span class="tab">执行设置</span><span class="tab">绑定与记录</span></div>
+        <div class="main-body" style="padding-top:14px">
+          <div class="field-label">Instruction</div>
+          <div class="instruction">你是团队知识助手。回答时先检索空间知识，结论简洁，并保留来源引用。</div>
+          <div class="settings-grid" style="margin:14px 0">
+            <div class="setting-box"><div class="section-label">Provider</div><b>Codex⌄</b></div>
+            <div class="setting-box"><div class="section-label">Model</div><b>gpt-5.6-luna⌄</b></div>
+            <div class="setting-box"><div class="section-label">Visibility</div><b>Team⌄</b></div>
+            <div class="setting-box"><div class="section-label">Permission</div><b>Read only⌄</b></div>
+          </div>
+          <div class="runs-head">Recent task runs <span class="count">8</span></div>
+          <div class="run"><span class="run-status ok">✓</span><div>每周 AI 进展<div class="run-meta">PST 多环境平台</div></div><span class="time">17:42 ↗</span></div>
+          <div class="run"><span class="run-status fail">×</span><div>竞品动态汇总<div class="run-meta">超时，可重试</div></div><span class="time">昨天 ↗</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="direction-copy">
+      <div>
+        <h3>B · 两栏标签页</h3>
+        <p>保留现有页面宽度习惯，把属性拆成标签页。响应式更简单，但编辑时无法同时看到全部设置与运行记录。</p>
+      </div>
+      <span class="direction-tag neutral">稳妥</span>
+    </div>
+  </div>
+
+  <div class="direction option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="mini-app" style="grid-template-columns:88px minmax(600px,1fr)">
+      <div class="rail">
+        <div class="brand">homeagent</div>
+        <div class="nav-item">空间 / 知识</div>
+        <div class="nav-item active">Agents</div>
+        <div class="nav-item">任务</div>
+        <div class="nav-item">飞书连接</div>
+        <div class="nav-item">运行状态</div>
+      </div>
+      <div class="pane">
+        <div class="main-head"><span>Agents</span><span>＋ 新建 Agent</span></div>
+        <div class="agent-cards">
+          <div class="agent-card active"><div class="agent-name"><span class="avatar">C</span>Codex 团队助手<span class="status"></span></div><div class="agent-sub">Codex · Team · 2 个绑定</div></div>
+          <div class="agent-card"><div class="agent-name"><span class="avatar">A</span>家庭知识助手<span class="status"></span></div><div class="agent-sub">Claude · Personal</div></div>
+          <div class="agent-card"><div class="agent-name"><span class="avatar">T</span>文档研究员<span class="status"></span></div><div class="agent-sub">TRAE CLI · Team</div></div>
+        </div>
+        <div class="detail-sheet">
+          <div class="sheet-block">
+            <div class="main-head" style="height:30px;padding:0;border:0"><span>Codex 团队助手</span><span>编辑</span></div>
+            <div class="field-label" style="margin-top:12px">Instruction</div>
+            <div class="instruction">你是团队知识助手。回答时先检索空间知识，结论简洁，并保留来源引用。</div>
+            <div class="runs-head">Recent task runs <span class="count">8</span></div>
+            <div class="run"><span class="run-status ok">✓</span><div>每周 AI 进展</div><span class="time">17:42 ↗</span></div>
+            <div class="run"><span class="run-status fail">×</span><div>竞品动态汇总</div><span class="time">昨天 ↗</span></div>
+          </div>
+          <div class="sheet-block">
+            <div class="inspector-title">摘要</div>
+            <div class="property"><span>Provider</span><b>Codex</b></div>
+            <div class="property"><span>Model</span><b>5.6 Luna</b></div>
+            <div class="property"><span>Scope</span><b>Team</b></div>
+            <div class="property"><span>绑定</span><b>2 个空间</b></div>
+            <div class="property"><span>Skills</span><b>2 个</b></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="direction-copy">
+      <div>
+        <h3>C · Agent 卡片总览</h3>
+        <p>先强调“有哪些 Agent”，再进入详情；对数量较少时友好，但配置效率和 Mew 相似度都最低。</p>
+      </div>
+      <span class="direction-tag neutral">总览优先</span>
+    </div>
+  </div>
+</div>

@@ -288,13 +288,74 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     }));
   });
 
-  test("bot-added events do not create a binding, space, or notice", async () => {
+  test("bot-added events do not reopen a locally disconnected group", async () => {
     engine.feishuBindings.disconnect("team/oc_team");
     await orch.start();
     await connector.sendBotAdded();
     expect(connector.notices).toEqual([]);
     expect(engine.registry.has("team/oc_team")).toBe(false);
     expect(engine.feishuBindings.activeByChatId("oc_team")).toBeUndefined();
+  });
+
+  test("a new group stays pending until an administrator confirms in-group", async () => {
+    const capableConnector = connector as CliConnector & Connector;
+    capableConnector.getBotChat = async (chatId) => ({
+      chatId,
+      name: "Product",
+    });
+    capableConnector.checkChatAdministrator = async (_chatId, userId) =>
+      userId === "ou_admin";
+    await orch.start();
+
+    await connector.inject({
+      kind: "bot_added",
+      eventId: "added-new-group",
+      chatId: "oc_product",
+      createdAt: Date.now(),
+    });
+    await connector.inject({
+      kind: "message",
+      eventId: "pending-ordinary-message",
+      chatType: "group",
+      chatId: "oc_product",
+      senderId: "ou_member",
+      text: "do not capture this",
+      messageId: "om_pending",
+      mentionsBot: false,
+      createdAt: Date.now(),
+    });
+
+    expect(engine.feishuBindings.getByChatId("oc_product")?.state)
+      .toBe("pending_confirmation");
+    expect(engine.registry.has("team/oc_product")).toBeFalse();
+    expect(connector.notices).toHaveLength(1);
+    expect(connector.notices[0]?.markdown).toContain("@HomeAgent 启用群聊");
+    expect(connector.notices[0]?.markdown).toContain(
+      "请群主或管理员在群内发送“@HomeAgent 启用群聊”。",
+    );
+
+    await connector.inject({
+      kind: "message",
+      eventId: "activate-new-group",
+      chatType: "group",
+      chatId: "oc_product",
+      senderId: "ou_admin",
+      text: "@HomeAgent 启用群聊",
+      messageId: "om_activate",
+      mentionsBot: true,
+      createdAt: Date.now(),
+    });
+
+    expect(engine.feishuBindings.getByChatId("oc_product")).toMatchObject({
+      state: "active",
+      responseMode: "mentions_only",
+      replyInThread: true,
+    });
+    expect(engine.registry.get("team/oc_product")).toMatchObject({
+      chatId: "oc_product",
+      name: "Product",
+    });
+    expect(connector.sent.at(-1)?.markdown).toContain("本群已启用");
   });
 
   test("unaddressed group message is captured but gets no reply (Q2)", async () => {

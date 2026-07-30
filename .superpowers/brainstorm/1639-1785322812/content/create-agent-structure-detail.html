@@ -1,0 +1,284 @@
+<style>
+  .stage {
+    overflow: hidden;
+    border: 1px solid #d9d9d4;
+    border-radius: 16px;
+    background: #fff;
+    box-shadow: 0 20px 55px rgba(35, 35, 31, .10);
+  }
+  .app-shell {
+    display: grid;
+    grid-template-columns: 54px 210px minmax(0, 1fr);
+    min-height: 650px;
+    color: #2e2e2a;
+    background: #fff;
+  }
+  .rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    padding: 16px 0;
+    background: #222220;
+  }
+  .rail .brand {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    margin-bottom: 12px;
+    border-radius: 8px;
+    background: #f1f1ea;
+    color: #262623;
+    font-weight: 800;
+  }
+  .rail i {
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+    background: #555550;
+  }
+  .rail i.active { background: #f1f1ea; }
+  .agent-list {
+    border-right: 1px solid #dfdfda;
+    background: #f5f5f1;
+  }
+  .list-head {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    height: 55px;
+    padding: 0 15px;
+    border-bottom:1px solid #dfdfda;
+  }
+  .list-head strong { font-size:14px; }
+  .list-head button {
+    width:26px;
+    height:26px;
+    border:1px solid #d3d3ce;
+    border-radius:7px;
+    background:#fff;
+    font-size:17px;
+  }
+  .agent-item {
+    margin: 9px;
+    padding: 11px 10px;
+    border-radius: 8px;
+    background: #fff;
+    font-size: 12px;
+    line-height: 1.45;
+  }
+  .agent-item span { display:block; color:#777770; font-size:10px; }
+  .create-pane { min-width:0; background:#fff; }
+  .topbar {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    height:55px;
+    padding:0 22px;
+    border-bottom:1px solid #e2e2dd;
+  }
+  .title-edit {
+    min-width: 240px;
+    border: 0;
+    background: transparent;
+    font: 650 15px/1.2 inherit;
+    color:#2d2d29;
+    outline:none;
+  }
+  .actions { display:flex; gap:8px; }
+  .actions button {
+    padding:7px 13px;
+    border:1px solid #d3d3ce;
+    border-radius:7px;
+    background:#fff;
+    color:#3a3a36;
+    font-size:12px;
+  }
+  .actions button.primary { border-color:#262623; background:#262623; color:#fff; }
+  .form-wrap { max-width: 980px; padding: 26px 30px 60px; }
+  .lead {
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:20px;
+    margin-bottom:20px;
+  }
+  .lead h3 { margin:0 0 5px; font-size:18px; }
+  .lead p { margin:0; color:#74746d; font-size:12px; }
+  .status-pill {
+    flex:none;
+    padding:5px 8px;
+    border-radius:99px;
+    background:#e9f5ea;
+    color:#35623c;
+    font-size:10px;
+    font-weight:700;
+  }
+  .field { margin-bottom:15px; }
+  .field label {
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    margin-bottom:6px;
+    font-size:11px;
+    font-weight:650;
+  }
+  .field label em { color:#85857e; font-size:9px; font-style:normal; font-weight:450; }
+  .control {
+    min-height:35px;
+    border:1px solid #d9d9d3;
+    border-radius:7px;
+    background:#fbfbf9;
+  }
+  .instruction { height:94px; }
+  .value {
+    display:flex;
+    align-items:center;
+    min-height:35px;
+    padding:0 10px;
+    color:#474742;
+    font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .two-col { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .task-panel {
+    margin-top:22px;
+    border:1px solid #d9d9d3;
+    border-radius:10px;
+    background:#f7f7f4;
+  }
+  .task-summary {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:13px 14px;
+    font-size:12px;
+    font-weight:700;
+  }
+  .task-summary span { color:#7a7a73; font-size:10px; font-weight:450; }
+  .task-content {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:0 16px;
+    padding:14px;
+    border-top:1px solid #deded8;
+    background:#fff;
+    border-radius:0 0 10px 10px;
+  }
+  .task-content .wide { grid-column:1 / -1; }
+  .empty-skills {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    min-height:42px;
+    padding:0 10px;
+    border:1px dashed #d0d0ca;
+    border-radius:7px;
+    color:#777770;
+    font-size:11px;
+  }
+  .empty-skills b { color:#33332f; font-size:11px; }
+  .notes {
+    display:grid;
+    grid-template-columns:repeat(3,1fr);
+    gap:10px;
+    margin-top:18px;
+  }
+  .note {
+    padding:10px;
+    border-radius:8px;
+    background:#f1f1ed;
+    color:#686861;
+    font-size:10px;
+    line-height:1.45;
+  }
+  .approve {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:18px;
+    margin-top:22px;
+    padding:15px 17px;
+    border:1px solid #d8d8d3;
+    border-radius:12px;
+    background:#fbfbf9;
+  }
+  .approve p { margin:0; color:#5f5f59; }
+  .approve button {
+    flex:none;
+    padding:9px 14px;
+    border:0;
+    border-radius:8px;
+    background:#252522;
+    color:white;
+    font-weight:700;
+  }
+  @media (max-width: 900px) {
+    .app-shell { grid-template-columns:44px 150px minmax(0,1fr); }
+    .two-col, .task-content { grid-template-columns:1fr; }
+    .task-content .wide { grid-column:auto; }
+    .notes { grid-template-columns:1fr; }
+  }
+</style>
+
+<h2>结构设计：专注式新建 Agent</h2>
+<p class="subtitle">创建态只保留导航、Agent 列表和宽编辑区。名称在顶栏直接编辑，核心配置平铺，高级执行能力按需展开。</p>
+
+<div class="stage">
+  <div class="app-shell">
+    <div class="rail">
+      <div class="brand">H</div><i></i><i class="active"></i><i></i><i></i><i></i>
+    </div>
+    <aside class="agent-list">
+      <div class="list-head"><strong>Agents</strong><button>＋</button></div>
+      <div class="agent-item">Claude Code Agent<span>Claude Code · 默认模型</span></div>
+      <div class="agent-item">Codex Agent<span>Codex · gpt-5.6-terra</span></div>
+    </aside>
+    <main class="create-pane">
+      <div class="topbar">
+        <input class="title-edit" value="Codex Agent (2)" aria-label="Agent 名称">
+        <div class="actions"><button>取消</button><button class="primary">创建</button></div>
+      </div>
+      <div class="form-wrap">
+        <div class="lead">
+          <div><h3>创建 Agent</h3><p>配置回答人格，以及研究任务使用的本地 CLI。</p></div>
+          <span class="status-pill">Codex CLI 就绪</span>
+        </div>
+
+        <div class="field">
+          <label>Instruction <em>可选 · 最多 20,000 字</em></label>
+          <div class="control instruction"></div>
+        </div>
+        <div class="two-col">
+          <div class="field"><label>Provider <em>只显示本机 CLI</em></label><div class="control value">Codex⌄</div></div>
+          <div class="field"><label>Model <em>可继承默认配置</em></label><div class="control value">gpt-5.6-terra⌄</div></div>
+          <div class="field"><label>Visibility <em>限制可绑定空间</em></label><div class="control value">Team⌄</div></div>
+          <div class="field"><label>推理强度 <em>随模型变化</em></label><div class="control value">medium⌄</div></div>
+        </div>
+
+        <div class="task-panel">
+          <div class="task-summary">任务执行 <span>只影响研究任务　⌃</span></div>
+          <div class="task-content">
+            <div class="field"><label>Permission <em>本地 CLI 沙箱</em></label><div class="control value">只读⌄</div></div>
+            <div class="field"><label>Workdir <em>可写 / 完全访问时必填</em></label><div class="control value"></div></div>
+            <div class="field wide">
+              <label>Skills <em>逗号或换行分隔</em></label>
+              <div class="empty-skills"><span>尚未添加 Skills</span><b>＋ 添加</b></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="notes">
+          <div class="note">名称随 Provider 自动生成，若已存在则添加编号；用户仍可直接覆盖。</div>
+          <div class="note">创建前不展示空的绑定或任务记录；成功后进入标准三栏详情。</div>
+          <div class="note">不引入 Device、Repositories、Environment 或其他 Mew 专属能力。</div>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<div class="approve" data-choice="approve-structure" onclick="toggleSelect(this)">
+  <p><strong>结构确认：</strong>顶栏名称 + 核心双列字段 + 可展开“任务执行”，创建态无右侧检查器。</p>
+  <button>确认这个结构</button>
+</div>

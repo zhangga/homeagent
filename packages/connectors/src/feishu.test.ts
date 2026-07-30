@@ -782,15 +782,37 @@ describe("FeishuConnector outbound", () => {
         JSON.stringify({
           ok: true,
           data: {
+            name: "Product",
             owner_id: "ou_owner",
             user_manager_id_list: ["ou_manager"],
           },
         }),
     });
 
+    expect(await connector.getBotChat("oc_1")).toEqual({
+      chatId: "oc_1",
+      name: "Product",
+    });
+    expect(await connector.checkChatAdministrator("oc_1", "ou_owner"))
+      .toBe(true);
     expect(await connector.isChatAdministrator("oc_1", "ou_owner")).toBe(true);
     expect(await connector.isChatAdministrator("oc_1", "ou_manager")).toBe(true);
     expect(await connector.isChatAdministrator("oc_1", "ou_member")).toBe(false);
+  });
+
+  test("strict administrator lookup propagates transport failure", async () => {
+    connector = new FeishuConnector({
+      spawner: new FakeSpawner(),
+      runCommand: async () => {
+        throw new Error("chat lookup unavailable");
+      },
+    });
+
+    await expect(
+      connector.checkChatAdministrator("oc_1", "ou_owner"),
+    ).rejects.toThrow("chat lookup unavailable");
+    expect(await connector.isChatAdministrator("oc_1", "ou_owner"))
+      .toBe(false);
   });
 
   test("fetchDoc parses markdown from CLI json", async () => {

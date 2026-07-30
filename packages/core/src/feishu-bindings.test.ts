@@ -19,7 +19,7 @@ afterEach(() => {
 });
 
 describe("FeishuGroupBindingStore", () => {
-  test("creates an empty version 1 registry", () => {
+  test("creates an empty version 2 registry", () => {
     dataDir = mkdtempSync(join(tmpdir(), "homeagent-feishu-bindings-"));
 
     const store = new FeishuGroupBindingStore(dataDir);
@@ -28,7 +28,151 @@ describe("FeishuGroupBindingStore", () => {
     expect(JSON.parse(readFileSync(
       join(dataDir, "config", "feishu-group-bindings.json"),
       "utf8",
-    ))).toEqual({ version: 1, bindings: [] });
+    ))).toEqual({ version: 2, bindings: [] });
+  });
+
+  test("migrates a version 1 registry without changing existing bindings", () => {
+    dataDir = mkdtempSync(join(tmpdir(), "homeagent-feishu-bindings-"));
+    const path = join(dataDir, "config", "feishu-group-bindings.json");
+    mkdirSync(join(dataDir, "config"), { recursive: true });
+    const existing = {
+      chatId: "oc_product",
+      spaceId: "team/oc_product",
+      boundAppId: "cli_current",
+      state: "active",
+      responseMode: "smart",
+      participationLevel: "balanced",
+      replyInThread: true,
+      createdAt: 10,
+      updatedAt: 20,
+    } as const;
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      bindings: [existing],
+    }));
+
+    const store = new FeishuGroupBindingStore(dataDir);
+
+    expect(store.list()).toEqual([existing]);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+      version: 2,
+      bindings: [existing],
+    });
+  });
+
+  test("registers a pending group with safe defaults and suppresses duplicate discovery", () => {
+    dataDir = mkdtempSync(join(tmpdir(), "homeagent-feishu-bindings-"));
+    const store = new FeishuGroupBindingStore(dataDir);
+
+    const pending = store.registerPending({
+      chatId: "oc_product",
+      spaceId: "team/oc_product",
+      boundAppId: "cli_current",
+    });
+    Bun.sleepSync(2);
+
+    expect(pending).toMatchObject({
+      chatId: "oc_product",
+      spaceId: "team/oc_product",
+      boundAppId: "cli_current",
+      state: "pending_confirmation",
+      responseMode: "mentions_only",
+      participationLevel: undefined,
+      replyInThread: true,
+    });
+    expect(store.registerPending({
+      chatId: "oc_product",
+      spaceId: "team/oc_product",
+      boundAppId: "cli_current",
+    })).toEqual(pending);
+    expect(new FeishuGroupBindingStore(dataDir).getByChatId("oc_product"))
+      .toEqual(pending);
+  });
+
+  test("persists prompt attempts and bounds prompt failures", () => {
+    dataDir = mkdtempSync(join(tmpdir(), "homeagent-feishu-bindings-"));
+    const store = new FeishuGroupBindingStore(dataDir);
+    store.registerPending({
+      chatId: "oc_product",
+      spaceId: "team/oc_product",
+      boundAppId: "cli_current",
+    });
+
+    store.recordConfirmationPrompt("oc_product", {
+      status: "attempting",
+      at: 1_785_000_000_000,
+    });
+    expect(store.getByChatId("oc_product")?.confirmationPrompt).toEqual({
+      status: "attempting",
+      lastAttemptAt: 1_785_000_000_000,
+    });
+
+    store.recordConfirmationPrompt("oc_product", {
+      status: "failed",
+      at: 1_785_000_000_100,
+      error: ` unavailable\r\n${"x".repeat(1_000)} `,
+    });
+    const restored = new FeishuGroupBindingStore(dataDir)
+      .getByChatId("oc_product");
+    expect(restored?.confirmationPrompt?.status).toBe("failed");
+    expect(restored?.confirmationPrompt?.lastAttemptAt)
+      .toBe(1_785_000_000_100);
+    expect(restored?.confirmationPrompt?.lastError).not.toContain("\n");
+    expect(restored?.confirmationPrompt?.lastError?.length)
+      .toBeLessThanOrEqual(500);
+  });
+
+  test("discovery respects a local disconnect while an explicit request reopens confirmation", () => {
+    dataDir = mkdtempSync(join(tmpdir(), "homeagent-feishu-bindings-"));
+    const store = new FeishuGroupBindingStore(dataDir);
+    store.registerPending({
+      chatId: "oc_product",
+      spaceId: "team/oc_product",
+      boundAppId: "cli_current",
+    });
+    store.disconnect("team/oc_product");
+
+    expect(store.registerPending({
+      chatId: "oc_product",
+      spaceId: "team/oc_product",
+      boundAppId: "cli_current",
+    })?.state).toBe("disconnected");
+    expect(store.requestConfirmation({
+      chatId: "oc_product",
+      spaceId: "team/oc_product",
+      boundAppId: "cli_current",
+    })).toMatchObject({
+      state: "pending_confirmation",
+      boundAppId: "cli_current",
+      confirmationPrompt: undefined,
+    });
+  });
+
+  test("a new app can move a reconnect-required binding back to pending", () => {
+    dataDir = mkdtempSync(join(tmpdir(), "homeagent-feishu-bindings-"));
+    const store = new FeishuGroupBindingStore(dataDir);
+    store.connect({
+      chatId: "oc_product",
+      spaceId: "team/oc_product",
+      boundAppId: "cli_old",
+      responseMode: "smart",
+      participationLevel: "active",
+      replyInThread: false,
+    });
+    store.markAppNeedsReconnect("cli_old");
+
+    expect(store.registerPending({
+      chatId: "oc_product",
+      spaceId: "team/oc_product",
+      boundAppId: "cli_new",
+    })).toMatchObject({
+      state: "pending_confirmation",
+      boundAppId: "cli_new",
+      responseMode: "mentions_only",
+      participationLevel: undefined,
+      replyInThread: true,
+      confirmationPrompt: undefined,
+    });
   });
 
   test("persists a connected group and restores it after restart", () => {
@@ -122,7 +266,7 @@ describe("FeishuGroupBindingStore", () => {
     });
   });
 
-  test("marks only active bindings for the replaced app as needing reconnect", () => {
+  test("marks active and pending bindings for the replaced app as needing reconnect", () => {
     dataDir = mkdtempSync(join(tmpdir(), "homeagent-feishu-bindings-"));
     const store = new FeishuGroupBindingStore(dataDir);
     for (const [chatId, appId] of [
@@ -139,9 +283,15 @@ describe("FeishuGroupBindingStore", () => {
       });
     }
     store.disconnect("team/oc_archived");
+    store.registerPending({
+      chatId: "oc_pending",
+      spaceId: "team/oc_pending",
+      boundAppId: "cli_old",
+    });
 
-    expect(store.markAppNeedsReconnect("cli_old")).toBe(1);
+    expect(store.markAppNeedsReconnect("cli_old")).toBe(2);
     expect(store.getByChatId("oc_product")?.state).toBe("needs_reconnect");
+    expect(store.getByChatId("oc_pending")?.state).toBe("needs_reconnect");
     expect(store.getByChatId("oc_sales")?.state).toBe("active");
     expect(store.getByChatId("oc_archived")?.state).toBe("disconnected");
   });
@@ -162,11 +312,17 @@ describe("FeishuGroupBindingStore", () => {
         replyInThread: true,
       });
     }
+    store.registerPending({
+      chatId: "oc_pending",
+      spaceId: "team/oc_pending",
+      boundAppId: "cli_old",
+    });
 
-    expect(store.markMismatchedAppNeedsReconnect("cli_current")).toBe(2);
+    expect(store.markMismatchedAppNeedsReconnect("cli_current")).toBe(3);
     expect(store.getByChatId("oc_current")?.state).toBe("active");
     expect(store.getByChatId("oc_old")?.state).toBe("needs_reconnect");
     expect(store.getByChatId("oc_unknown")?.state).toBe("needs_reconnect");
+    expect(store.getByChatId("oc_pending")?.state).toBe("needs_reconnect");
   });
 
   test("updates response policy without changing binding identity", () => {
@@ -233,7 +389,7 @@ describe("FeishuGroupBindingStore", () => {
     dataDir = mkdtempSync(join(tmpdir(), "homeagent-feishu-bindings-"));
     const path = join(dataDir, "config", "feishu-group-bindings.json");
     mkdirSync(join(dataDir, "config"), { recursive: true });
-    writeFileSync(path, JSON.stringify({ version: 2, bindings: [] }));
+    writeFileSync(path, JSON.stringify({ version: 3, bindings: [] }));
     expect(() => new FeishuGroupBindingStore(dataDir!)).toThrow("Unsupported");
 
     const valid = {
@@ -247,13 +403,13 @@ describe("FeishuGroupBindingStore", () => {
       updatedAt: 1,
     };
     writeFileSync(path, JSON.stringify({
-      version: 1,
+      version: 2,
       bindings: [valid, { ...valid, chatId: "oc_other" }],
     }));
     expect(() => new FeishuGroupBindingStore(dataDir!)).toThrow("Duplicate");
 
     writeFileSync(path, JSON.stringify({
-      version: 1,
+      version: 2,
       bindings: [{ ...valid, spaceId: "personal/ou_user" }],
     }));
     expect(() => new FeishuGroupBindingStore(dataDir!)).toThrow("Invalid");

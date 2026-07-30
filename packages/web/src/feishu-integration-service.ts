@@ -26,6 +26,7 @@ export type FeishuIntegrationErrorCode =
   | "binding_not_found"
   | "invalid_input"
   | "test_failed"
+  | "prompt_failed"
   | "operation_unavailable";
 
 export class FeishuIntegrationError extends Error {
@@ -38,11 +39,8 @@ export class FeishuIntegrationError extends Error {
   }
 }
 
-export interface ConnectFeishuGroupInput {
+export interface RequestFeishuGroupConfirmationInput {
   chatId: string;
-  responseMode: FeishuResponseMode;
-  participationLevel?: GroupParticipationLevel;
-  replyInThread: boolean;
 }
 
 export interface UpdateFeishuGroupInput {
@@ -58,6 +56,7 @@ export interface FeishuIntegrationServiceOptions {
   engine: KnowledgeEngine;
   larkSetup: LarkSetupPort;
   sendTestMessage?: (chatId: string, text: string) => Promise<void>;
+  sendConfirmationPrompt?: (chatId: string) => Promise<void>;
   activeIdentity?: () => LarkBotIdentity | undefined;
   runtimeStatus?: () => FeishuRuntimeStatus | undefined;
   persistConnectionDisabledAppId?: (appId: string) => Promise<void> | void;
@@ -67,6 +66,7 @@ export interface FeishuIntegrationServiceOptions {
 export interface FeishuGroupIntegrationView {
   binding: FeishuGroupBinding;
   space?: SpaceMeta;
+  chat?: LarkChatSummary;
   state: FeishuGroupBindingState;
   degraded: boolean;
 }
@@ -85,6 +85,7 @@ export class FeishuIntegrationService {
   private readonly engine: KnowledgeEngine;
   private readonly larkSetup: LarkSetupPort;
   private readonly sendTestMessage?: (chatId: string, text: string) => Promise<void>;
+  private readonly sendConfirmationPrompt?: (chatId: string) => Promise<void>;
   private readonly activeIdentity: () => LarkBotIdentity | undefined;
   private readonly runtimeStatus: () => FeishuRuntimeStatus | undefined;
   private readonly persistConnectionDisabledAppId?: (
@@ -96,6 +97,7 @@ export class FeishuIntegrationService {
     this.engine = opts.engine;
     this.larkSetup = opts.larkSetup;
     this.sendTestMessage = opts.sendTestMessage;
+    this.sendConfirmationPrompt = opts.sendConfirmationPrompt;
     this.activeIdentity = opts.activeIdentity ?? (() => undefined);
     this.runtimeStatus = opts.runtimeStatus ?? (() => undefined);
     this.persistConnectionDisabledAppId =
@@ -104,15 +106,19 @@ export class FeishuIntegrationService {
   }
 
   async snapshot(): Promise<FeishuIntegrationSnapshot> {
-    const [bot, capability] = await Promise.all([
+    const [bot, capability, chats] = await Promise.all([
       this.larkSetup.status(),
       this.larkSetup.fullGroupMessageCapability?.() ?? Promise.resolve("unknown" as const),
+      this.larkSetup.listBotChats
+        ? this.larkSetup.listBotChats().catch(() => [])
+        : Promise.resolve([]),
     ]);
     const activeIdentity = this.activeIdentity();
     const runtime = this.runtimeStatus();
+    const chatsById = new Map(chats.map((chat) => [chat.chatId, chat]));
     const groups = this.engine.feishuBindings.list().map((binding) => {
       const state: FeishuGroupBindingState =
-        binding.state === "active"
+        (binding.state === "active" || binding.state === "pending_confirmation")
           && bot.appId
           && binding.boundAppId !== bot.appId
           ? "needs_reconnect"
@@ -120,6 +126,7 @@ export class FeishuIntegrationService {
       return {
         binding,
         space: this.engine.registry.get(binding.spaceId),
+        chat: chatsById.get(binding.chatId),
         state,
         degraded: binding.responseMode !== "mentions_only"
           && capability !== "available",
@@ -158,14 +165,20 @@ export class FeishuIntegrationService {
     return chats.filter((chat) => {
       const binding = this.engine.feishuBindings.getByChatId(chat.chatId);
       return !binding
-        || binding.state !== "active"
-        || binding.boundAppId !== status.appId;
+        || (
+          binding.boundAppId !== status.appId
+          || (
+            binding.state !== "active"
+            && binding.state !== "pending_confirmation"
+          )
+        );
     });
   }
 
-  async connectGroup(input: ConnectFeishuGroupInput): Promise<void> {
+  async requestGroupConfirmation(
+    input: RequestFeishuGroupConfirmationInput,
+  ): Promise<void> {
     const chatId = input.chatId.trim();
-    validatePolicy(input);
     if (!chatId) {
       throw new FeishuIntegrationError("invalid_input", "Invalid group");
     }
@@ -176,13 +189,6 @@ export class FeishuIntegrationService {
         "Feishu Bot is not ready",
       );
     }
-    const existingBinding = this.engine.feishuBindings.getByChatId(chatId);
-    if (
-      input.responseMode !== "mentions_only"
-      && existingBinding?.responseMode !== input.responseMode
-    ) {
-      await this.requireFullGroupMessageCapability();
-    }
     const chat = await this.larkSetup.getBotChat?.(chatId);
     if (!chat || chat.chatId !== chatId) {
       throw new FeishuIntegrationError(
@@ -191,29 +197,43 @@ export class FeishuIntegrationService {
       );
     }
     const spaceId = teamSpace(chatId);
-    const storageOwner = this.engine.registry.storageConflict(spaceId);
-    if (storageOwner) {
+    const binding = this.engine.feishuBindings.requestConfirmation({
+      chatId,
+      spaceId,
+      boundAppId: status.appId,
+    });
+    if (binding.state === "active") return;
+    await this.deliverConfirmationPrompt(chatId);
+  }
+
+  async resendGroupConfirmation(spaceId: SpaceId): Promise<void> {
+    const binding = this.engine.feishuBindings.getBySpace(spaceId);
+    if (!binding || binding.state !== "pending_confirmation") {
       throw new FeishuIntegrationError(
-        "storage_conflict",
-        "The group workspace path is already in use",
+        "binding_not_found",
+        "Pending Feishu group binding was not found",
       );
     }
-    const existed = this.engine.registry.has(spaceId);
-    this.engine.ensureSpace(spaceId, { chatId });
-    try {
-      this.engine.feishuBindings.connect({
-        chatId,
-        spaceId,
-        boundAppId: status.appId,
-        responseMode: input.responseMode,
-        participationLevel: normalizedParticipation(input),
-        replyInThread: input.replyInThread,
-      });
-    } catch (error) {
-      if (!existed) this.engine.registry.remove(spaceId);
-      throw error;
+    const status = await this.larkSetup.status();
+    if (
+      status.state !== "ready"
+      || !status.verified
+      || !status.appId
+      || binding.boundAppId !== status.appId
+    ) {
+      throw new FeishuIntegrationError(
+        "bot_not_ready",
+        "Feishu Bot is not ready",
+      );
     }
-    this.engine.updateSpaceMeta(spaceId, { name: chat.name || undefined });
+    const chat = await this.larkSetup.getBotChat?.(binding.chatId);
+    if (!chat || chat.chatId !== binding.chatId) {
+      throw new FeishuIntegrationError(
+        "chat_not_visible",
+        "The Bot cannot access this group",
+      );
+    }
+    await this.deliverConfirmationPrompt(binding.chatId);
   }
 
   async updateGroup(input: UpdateFeishuGroupInput): Promise<void> {
@@ -341,11 +361,39 @@ export class FeishuIntegrationService {
       );
     }
   }
+
+  private async deliverConfirmationPrompt(chatId: string): Promise<void> {
+    const attemptedAt = Date.now();
+    this.engine.feishuBindings.recordConfirmationPrompt(chatId, {
+      status: "attempting",
+      at: attemptedAt,
+    });
+    try {
+      if (!this.sendConfirmationPrompt) {
+        throw new Error("Confirmation prompt delivery is unavailable");
+      }
+      await this.sendConfirmationPrompt(chatId);
+      this.engine.feishuBindings.recordConfirmationPrompt(chatId, {
+        status: "sent",
+        at: attemptedAt,
+      });
+    } catch {
+      this.engine.feishuBindings.recordConfirmationPrompt(chatId, {
+        status: "failed",
+        at: attemptedAt,
+        error: "Confirmation prompt delivery failed",
+      });
+      throw new FeishuIntegrationError(
+        "prompt_failed",
+        "Feishu confirmation prompt delivery failed",
+      );
+    }
+  }
 }
 
 function normalizedParticipation(
   input: Pick<
-    ConnectFeishuGroupInput,
+    UpdateFeishuGroupInput,
     "responseMode" | "participationLevel"
   >,
 ): GroupParticipationLevel | undefined {
@@ -366,7 +414,7 @@ const PARTICIPATION_LEVELS: GroupParticipationLevel[] = [
 
 function validatePolicy(
   input: Pick<
-    ConnectFeishuGroupInput,
+    UpdateFeishuGroupInput,
     "responseMode" | "participationLevel" | "replyInThread"
   >,
 ): void {

@@ -12,8 +12,8 @@
  *      reaches engine.ask so fuzzy language can be answered or clarified by the
  *      model instead of being trapped behind a grammatical intent label.
  *
- * bot_added events are intentionally informational only. Administrators bind
- * groups explicitly through the Integrations page.
+ * bot_added events register a pending group and request in-group administrator
+ * confirmation. Pending groups remain outside capture and reply processing.
  *
  * Events are processed one-at-a-time via a Serializer keyed globally, so the
  * runtime behaves as a single consumer queue (plan §III) while the engine's own
@@ -65,6 +65,10 @@ import {
   type ReminderDraft,
 } from "./reminder-commands.ts";
 import { inferReminderRequest } from "./reminder-inference.ts";
+import {
+  connectorFeishuGroupAdministrationPort,
+  FeishuGroupOnboardingService,
+} from "./feishu-group-onboarding.ts";
 
 const log = logger.child("orchestrator");
 const RETRACTION_COMMANDS = new Set(["别记这条", "撤回这条", "删掉这条", "不要记这条"]);
@@ -195,6 +199,7 @@ export class Orchestrator {
   private engine: KnowledgeEngine;
   private connector: Connector;
   private activeFeishuAppId?: string;
+  private groupOnboarding: FeishuGroupOnboardingService;
   private llm?: LlmClient;
   private serializer = new Serializer();
   private seen = new Set<string>();
@@ -232,6 +237,11 @@ export class Orchestrator {
     this.engine = opts.engine;
     this.connector = opts.connector;
     this.activeFeishuAppId = opts.activeFeishuAppId;
+    this.groupOnboarding = new FeishuGroupOnboardingService({
+      engine: opts.engine,
+      activeAppId: opts.activeFeishuAppId,
+      port: connectorFeishuGroupAdministrationPort(opts.connector),
+    });
     this.llm = opts.llm;
     this.dedupSize = opts.dedupSize ?? 5000;
     this.docFetcher = opts.docFetcher;
@@ -396,7 +406,10 @@ export class Orchestrator {
       log.debug("dropping duplicate event", { eventId: event.eventId });
       return;
     }
-    if (event.kind === "bot_added") return;
+    if (event.kind === "bot_added") {
+      return this.groupOnboarding.handleBotAdded(event);
+    }
+    if (await this.groupOnboarding.handleMessage(event)) return;
     return this.handleMessage(event);
   }
 

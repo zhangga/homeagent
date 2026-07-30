@@ -5,7 +5,6 @@ import type { SpaceMeta } from "@homeagent/core";
 import type { CodexLoginSession, DetectedProvider } from "@homeagent/llm";
 import type { FeishuRuntimeStatus } from "./integrations.ts";
 import type { SetupSnapshot, SetupStep } from "./setup.ts";
-import type { FeishuExternalSharingStatus } from "./external-sharing.ts";
 import {
   feishuProvisioningPollScript,
   isFeishuProvisioningActive,
@@ -21,7 +20,6 @@ export interface SetupViewInput {
   lark: LarkSetupStatus;
   provisioning: LarkProvisioningSession;
   runtime: FeishuRuntimeStatus;
-  externalSharing: FeishuExternalSharingStatus;
   groups: SpaceMeta[];
   restartRequired: boolean;
   restartable: boolean;
@@ -36,14 +34,12 @@ export interface SetupViewInput {
   flashMsg?: string;
 }
 
-const STEP_LABELS: Record<SetupStep, string> = {
+const STEP_LABELS = {
   ai: "连接 AI",
   feishu: "创建机器人",
-  external_share: "发布对外共享",
   activate: "激活监听",
-  invite: "连接群聊",
   done: "开始使用",
-};
+} as const satisfies Record<SetupStep, string>;
 
 const SETUP_STYLE = `
   :root {
@@ -164,7 +160,7 @@ function safeCodexVerificationUrl(value?: string): string | undefined {
 }
 
 function progress(snapshot: SetupSnapshot): HtmlEscapedString | Promise<HtmlEscapedString> {
-  const steps = (Object.keys(STEP_LABELS) as SetupStep[]).map((step, index) => {
+  const steps = (Object.keys(STEP_LABELS) as Array<keyof typeof STEP_LABELS>).map((step, index) => {
     const done = snapshot.completed.includes(step);
     const current = snapshot.current === step;
     return html`<div class="step ${done ? "done" : ""} ${current ? "current" : ""}">
@@ -310,33 +306,6 @@ function consumerLabel(key: string): string {
   return "飞书连接";
 }
 
-function externalSharingStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
-  if (input.externalSharing.state === "awaiting_external_message") {
-    return html`<div class="eyebrow">03 · External sharing</div><h1 class="setup-title">用外部群消息验证</h1>
-      <p class="lede">发布和管理员审批完成后，把 ${input.lark.botName ?? "HomeAgent 机器人"} 加入一个外部群，发送“@${input.lark.botName ?? "机器人"} 对外共享测试”。HomeAgent 只会用开始验证之后收到的真实外部群消息确认结果。</p>
-      <div class="waiting"><strong>正在等待外部群消息</strong><span class="muted">如果机器人刚刚创建，请先完成下一步安全重启，让消息监听接管新应用。</span></div>
-      <form method="get" action="/setup" class="actions"><button class="primary-action">我已发送，重新检查</button></form>
-      ${input.externalSharing.consoleUrl ? html`<div class="actions"><a class="button secondary-action" href="${input.externalSharing.consoleUrl}" target="_blank" rel="noreferrer">重新打开飞书应用</a></div>` : ""}`;
-  }
-  return html`<div class="eyebrow">03 · External sharing</div><h1 class="setup-title">发布对外共享版本</h1>
-    <p class="lede">飞书暂未开放用 API 自动开启对外共享。HomeAgent 已定位到当前应用；请在飞书完成一次版本发布，随后会自动验证结果。</p>
-    <div class="status-list">
-      <div class="status-row"><span>1. 创建版本</span><span>应用发布 → 版本管理与发布 → 创建版本</span></div>
-      <div class="status-row"><span>2. 开启外部群</span><span>允许机器人被添加到外部群中使用</span></div>
-      <div class="status-row"><span>3. 开启外部私聊</span><span>允许外部用户与机器人单聊</span></div>
-      <div class="status-row"><span>4. 发布</span><span>保存、提交发布并完成管理员审批</span></div>
-    </div>
-    ${input.externalSharing.consoleUrl ? html`<div class="actions"><a class="button primary-action" href="${input.externalSharing.consoleUrl}" target="_blank" rel="noreferrer">打开当前飞书应用</a></div>` : html`<div class="waiting"><strong>无法定位当前应用</strong><span class="muted">请返回机器人连接步骤重新验证 App ID。</span></div>`}
-    <form method="post" action="/setup/feishu/external-sharing/start" class="actions">
-      <input type="hidden" name="returnTo" value="/setup" />
-      <button class="primary-action">我已提交发布，开始验证</button>
-    </form>
-    <form method="post" action="/setup/feishu/external-sharing/skip" class="actions">
-      <input type="hidden" name="returnTo" value="/setup" />
-      <button class="secondary-action">暂时仅内部使用</button>
-    </form>`;
-}
-
 function activateStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
   const failed = input.runtime.consumers.some((consumer) => consumer.state === "failed");
   const rows = input.runtime.consumers.length
@@ -356,25 +325,24 @@ function activateStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEs
         : failureNotice
       : html`<div class="waiting"><strong>正在建立消息连接…</strong><span class="muted">通常只需几秒，不需要再次重启。</span></div>
           <script>setTimeout(function () { location.reload(); }, 2000);</script>`;
-  return html`<div class="eyebrow">04 · Activate</div><h1 class="setup-title">让机器人开始接收消息</h1>
+  return html`<div class="eyebrow">03 · Activate</div><h1 class="setup-title">让机器人开始接收消息</h1>
     <p class="lede">机器人身份已经确认。最后重启一次后台服务，让新的消息通道正式接管。</p>
     <div class="status-list">${rows}</div>${action}
     <details><summary>如果重启后仍未就绪</summary><p class="muted">请先在运行状态确认服务进程和消息消费者状态，再检查网络连接、飞书应用权限以及企业是否有待审批授权。HomeAgent 会保留当前进度，不必重新创建机器人。</p></details>`;
 }
 
-function inviteStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
-  return html`<div class="eyebrow">05 · Connect group</div><h1 class="setup-title">明确连接第一个群聊</h1>
-    <p class="lede">先在飞书里把机器人加入目标群，再到 HomeAgent 选择“连接群聊”。只有明确连接后，HomeAgent 才会收录群消息或参与回复。</p>
-    <div class="bot-token"><span>●</span><strong>${input.lark.botName ?? "HomeAgent 机器人"}</strong></div>
-    ${input.groups.length ? html`<p class="muted">已连接群聊，可以继续。</p>` : ""}
-    <div class="actions"><a class="primary-action" href="/integrations/groups/connect">选择要连接的群</a></div>
-    <form method="get" action="/setup" class="actions"><button class="secondary-action">我已连接，重新检查</button></form>
-    <form method="post" action="/setup/finish" class="actions"><button class="secondary-action">暂时只在私聊中使用</button></form>`;
-}
-
 function doneStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
-  return html`<div class="eyebrow">06 · Ready</div><h1 class="setup-title">一切就绪，记忆开始生长</h1>
-    <p class="lede">${input.groups.length ? `已连接 ${input.groups.length} 个群聊空间。` : "机器人已连接。"} 接下来只要在已连接群里分享、提问或发送资料，HomeAgent 会在后台持续整理。</p>
+  const botName = input.lark.botName ?? "HomeAgent";
+  return html`<div class="eyebrow">04 · Ready</div><h1 class="setup-title">一切就绪，记忆开始生长</h1>
+    <p class="lede">机器人和消息监听已经就绪。现在可以进入 HomeAgent；群聊连接不再阻塞首次设置。</p>
+    <div class="bot-token"><span>●</span><strong>${botName}</strong></div>
+    <div class="status-list">
+      <div class="status-row"><span>1. 加入群聊</span><span>把机器人加入飞书群聊</span></div>
+      <div class="status-row"><span>2. 管理员确认</span><span>@${botName} 启用群聊</span></div>
+      <div class="status-row"><span>3. 开始使用</span><span>默认仅响应 @机器人，并在线程内回复</span></div>
+    </div>
+    <p class="muted">确认前不会读取或记录群消息。之后也可以在 Integrations 查看待确认状态或重新发送提示。</p>
+    ${input.groups.length ? html`<p class="muted">当前已有 ${input.groups.length} 个已启用群聊空间。</p>` : ""}
     <form method="post" action="/setup/finish" class="actions"><button class="primary-action">进入 HomeAgent</button></form>`;
 }
 
@@ -389,10 +357,8 @@ function setupBrand(): HtmlEscapedString | Promise<HtmlEscapedString> {
 export function setupView(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
   const content = input.snapshot.current === "ai" ? aiStep(input)
     : input.snapshot.current === "feishu" ? feishuStep(input)
-      : input.snapshot.current === "external_share" ? externalSharingStep(input)
-        : input.snapshot.current === "activate" ? activateStep(input)
-          : input.snapshot.current === "invite" ? inviteStep(input)
-            : doneStep(input);
+      : input.snapshot.current === "activate" ? activateStep(input)
+        : doneStep(input);
   return html`<div class="shell">
     ${setupBrand()}
     ${progress(input.snapshot)}
@@ -403,7 +369,7 @@ export function setupView(input: SetupViewInput): HtmlEscapedString | Promise<Ht
 export function restartingView(instanceId: string): HtmlEscapedString | Promise<HtmlEscapedString> {
   return setupLayout(html`<div class="shell">${setupBrand()}
     <aside class="progress"><div class="progress-kicker">Applying connection</div></aside>
-    <main class="stage"><div class="eyebrow">04 · Activate</div><h1 class="setup-title">正在唤醒机器人</h1>
+    <main class="stage"><div class="eyebrow">03 · Activate</div><h1 class="setup-title">正在唤醒机器人</h1>
       <p class="lede">服务会短暂离线，然后自动回到这里。请不要关闭这个页面。</p><div id="restart-status" data-instance="${instanceId}" class="waiting"><strong>重新连接中…</strong></div>
     </main></div><script>
       (function () {

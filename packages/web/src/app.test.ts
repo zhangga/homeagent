@@ -619,7 +619,7 @@ describe("web backend (read-only)", () => {
     expect(readSettings(dir).onboardingCompletedAt).toBeUndefined();
   });
 
-  test("allows an explicitly private-only finish after the connection is ready", async () => {
+  test("allows setup to finish as soon as the Bot runtime is ready", async () => {
     saveSettings({ defaultProvider: "claude", onboardingStartedAt: Date.now() + 1_000 });
     const ready = createWebApp({
       engine,
@@ -645,7 +645,7 @@ describe("web backend (read-only)", () => {
     expect(readSettings(dir).onboardingCompletedAt).toEqual(expect.any(Number));
   });
 
-  test("finishes group setup only after an explicit active binding", async () => {
+  test("shows setup as ready without requiring an active group binding", async () => {
     const startedAt = Date.now() + 1_000;
     saveSettings({
       onboardingStartedAt: startedAt,
@@ -673,21 +673,21 @@ describe("web backend (read-only)", () => {
     });
 
     engine.feishuBindings.disconnect(SPACE);
-    expect(await (await setupApp.request("/setup")).text()).toContain("明确连接第一个群聊");
+    expect(await (await setupApp.request("/setup")).text()).toContain("一切就绪");
     await engine.remember({
       space: SPACE,
       source: "task",
       content: "不是飞书消息",
       createdAt: startedAt + 1,
     });
-    expect(await (await setupApp.request("/setup")).text()).toContain("明确连接第一个群聊");
+    expect(await (await setupApp.request("/setup")).text()).toContain("一切就绪");
     await engine.remember({
       space: SPACE,
       source: "message",
       content: "来自本次设置的飞书消息",
       createdAt: startedAt + 2,
     });
-    expect(await (await setupApp.request("/setup")).text()).toContain("明确连接第一个群聊");
+    expect(await (await setupApp.request("/setup")).text()).toContain("一切就绪");
     engine.feishuBindings.connect({
       chatId: "oc_web",
       spaceId: SPACE,
@@ -698,7 +698,7 @@ describe("web backend (read-only)", () => {
     expect(await (await setupApp.request("/setup")).text()).toContain("一切就绪");
   });
 
-  test("guides and verifies external sharing with a new external-group message", async () => {
+  test("keeps external sharing optional in Integrations and verifies a real external group", async () => {
     saveSettings({ defaultProvider: "claude" });
     const checkedChats: string[] = [];
     const setupApp = createWebApp({
@@ -727,8 +727,10 @@ describe("web backend (read-only)", () => {
       feishuRuntime: () => ({ ready: true, consumers: [] }),
     });
 
-    const guide = await (await setupApp.request("/setup")).text();
-    expect(guide).toContain("发布对外共享版本");
+    const onboarding = await (await setupApp.request("/setup")).text();
+    expect(onboarding).not.toContain("发布对外共享版本");
+    const guide = await (await setupApp.request("/integrations")).text();
+    expect(guide).toContain("开始对外共享验证");
     expect(guide).toContain("https://open.feishu.cn/app/cli_external");
 
     const start = await setupApp.request("/setup/feishu/external-sharing/start", {
@@ -748,7 +750,7 @@ describe("web backend (read-only)", () => {
       content: "@HomeAgent 对外共享测试",
       createdAt: started.feishuExternalSharingStartedAt! + 1,
     });
-    await setupApp.request("/setup");
+    await setupApp.request("/integrations");
 
     expect(checkedChats).toContain("oc_external");
     expect(readSettings(dir)).toEqual(expect.objectContaining({
@@ -1865,7 +1867,7 @@ describe("management backend (read-write)", () => {
     expect(meta?.mentionsOnly).toBe(true);
   });
 
-  test("integration connection page discovers and explicitly connects a Bot-visible group", async () => {
+  test("integration discovery requests in-group confirmation without activating locally", async () => {
     const larkSetup = {
       status: async () => ({
         state: "ready" as const,
@@ -1889,9 +1891,13 @@ describe("management backend (read-write)", () => {
       }),
       fullGroupMessageCapability: async () => "available" as const,
     };
+    const prompts: string[] = [];
     const service = new FeishuIntegrationService({
       engine,
       larkSetup,
+      sendConfirmationPrompt: async (chatId) => {
+        prompts.push(chatId);
+      },
     });
     const integrationApp = createWebApp({
       engine,
@@ -1904,9 +1910,10 @@ describe("management backend (read-write)", () => {
     const page = await (await integrationApp.request(
       "/integrations/groups/connect",
     )).text();
-    expect(page).toContain("连接飞书群");
+    expect(page).toContain("请求群管理员确认");
     expect(page).toContain("New product group");
     expect(page).not.toContain("Already connected");
+    expect(page).not.toContain('name="responseMode"');
 
     const response = await integrationApp.request(
       "/integrations/groups/connect",
@@ -1915,22 +1922,56 @@ describe("management backend (read-write)", () => {
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
           chatId: "oc_new",
-          responseMode: "smart",
-          participationLevel: "balanced",
-          replyInThread: "on",
         }).toString(),
       },
     );
 
     expect([302, 303]).toContain(response.status);
-    expect(engine.feishuBindings.activeByChatId("oc_new")).toMatchObject({
-      responseMode: "smart",
+    expect(engine.feishuBindings.getByChatId("oc_new")).toMatchObject({
+      state: "pending_confirmation",
+      responseMode: "mentions_only",
       replyInThread: true,
     });
+    expect(engine.registry.has("team/oc_new")).toBeFalse();
+    expect(prompts).toEqual(["oc_new"]);
 
+    const pending = await (await integrationApp.request("/integrations")).text();
+    expect(pending).toContain("FEISHU CONTROL CENTER");
+    expect(pending).toContain("New product group");
+    expect(pending).toContain("等待群管理员确认");
+    expect(pending).toContain("@HomeAgent 启用群聊");
+    expect(pending).toContain(
+      'action="/integrations/groups/team%2Foc_new/confirmation"',
+    );
+    expect(pending).toContain(
+      'action="/integrations/groups/team%2Foc_new/ignore"',
+    );
+
+    const resend = await integrationApp.request(
+      `/integrations/groups/${encodeURIComponent("team/oc_new")}/confirmation`,
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(resend.status);
+    expect(prompts).toEqual(["oc_new", "oc_new"]);
+
+    const ignore = await integrationApp.request(
+      `/integrations/groups/${encodeURIComponent("team/oc_new")}/ignore`,
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(ignore.status);
+    expect(engine.feishuBindings.getByChatId("oc_new")?.state)
+      .toBe("disconnected");
+
+    engine.ensureSpace("team/oc_new", { chatId: "oc_new" });
+    engine.updateSpaceMeta("team/oc_new", { name: "New product group" });
+    engine.feishuBindings.connect({
+      chatId: "oc_new",
+      spaceId: "team/oc_new",
+      boundAppId: "cli_current",
+      responseMode: "mentions_only",
+      replyInThread: true,
+    });
     const integrations = await (await integrationApp.request("/integrations")).text();
-    expect(integrations).toContain("FEISHU CONTROL CENTER");
-    expect(integrations).toContain("New product group");
     expect(integrations).toContain('name="responseMode"');
     expect(integrations).toContain(
       'formaction="/integrations/groups/team%2Foc_new/disconnect"',
@@ -1963,6 +2004,64 @@ describe("management backend (read-write)", () => {
     expect(engine.feishuBindings.getByChatId("oc_new")?.state)
       .toBe("disconnected");
     expect(engine.registry.has("team/oc_new")).toBeTrue();
+  });
+
+  test("failed confirmation delivery returns to the pending integration card", async () => {
+    const larkSetup = {
+      status: async () => ({
+        state: "ready" as const,
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu" as const,
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+      configure: async () => {
+        throw new Error("not used");
+      },
+      getBotChat: async (chatId: string) => ({
+        chatId,
+        name: "Prompt failure group",
+      }),
+    };
+    const service = new FeishuIntegrationService({
+      engine,
+      larkSetup,
+      sendConfirmationPrompt: async () => {
+        throw new Error("raw transport detail");
+      },
+    });
+    const integrationApp = createWebApp({
+      engine,
+      larkSetup,
+      feishuIntegration: service,
+      detectProviders: async () => [],
+      providerModels: async () => ({}),
+    });
+
+    const response = await integrationApp.request(
+      "/integrations/groups/connect",
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ chatId: "oc_prompt_failed" }).toString(),
+      },
+    );
+
+    expect([302, 303]).toContain(response.status);
+    expect(response.headers.get("location")).toStartWith("/integrations?ok=");
+    expect(response.headers.get("location")).not.toContain(
+      "raw%20transport%20detail",
+    );
+    expect(engine.feishuBindings.getByChatId("oc_prompt_failed")).toMatchObject({
+      state: "pending_confirmation",
+      confirmationPrompt: {
+        status: "failed",
+        lastError: "Confirmation prompt delivery failed",
+      },
+    });
+    expect(engine.registry.has("team/oc_prompt_failed")).toBeFalse();
   });
 
   test("Bot disconnect is local and verification clears the disable marker", async () => {

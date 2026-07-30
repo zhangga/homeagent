@@ -1,0 +1,244 @@
+{
+  "goal": "Implement the approved HomeAgent roof-and-intelligent-spark brand system across verified source assets, responsive raster assets, Web surfaces, Feishu avatar download, and macOS packaging without changing user data or existing Feishu identities.",
+  "acceptance_criteria": [
+    "Canonical SVG and responsive PNG assets match the approved geometry and palette and pass offline verification.",
+    "Admin and setup surfaces use one shared accessible brand component and no longer use the old brand symbols.",
+    "Feishu avatar downloads locally through a fixed route and remains a manual upload.",
+    "macOS bundles contain and reference HomeAgent.icns and include the avatar resource.",
+    "Targeted tests, typecheck, full tests, and visual acceptance checks pass."
+  ],
+  "status": "in_progress",
+  "current_task_id": "T7",
+  "blockers": [],
+  "last_updated": "2026-07-29T11:45:54Z",
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Add canonical SVG assets and static validation",
+      "summary": "Create approved source SVGs, brand documentation, and offline safety and palette verification.",
+      "status": "done",
+      "depends_on": [],
+      "acceptance_criteria": [
+        "Full and glyph SVGs match the approved roof and intelligent spark system.",
+        "Unsafe SVG content and off-palette colors are rejected.",
+        "Brand source documentation defines responsive and generation rules."
+      ],
+      "validation": [
+        "bun test scripts/verify-brand-assets.test.ts",
+        "bun run verify:brand",
+        "bun run typecheck"
+      ],
+      "artifacts": [
+        "assets/brand/homeagent-mark.svg",
+        "assets/brand/homeagent-glyph.svg",
+        "assets/brand/README.md",
+        "scripts/verify-brand-assets.ts",
+        "scripts/verify-brand-assets.test.ts"
+      ],
+      "validation_results": [
+        "bun test scripts/verify-brand-assets.test.ts: 11 passed, 0 failed.",
+        "bun run verify:brand: verified 2 canonical assets.",
+        "bun run typecheck: passed."
+      ],
+      "evidence": [
+        "High-resolution full mark and glyph renders match the approved roof-and-intelligent-spark design.",
+        "Actual SVG scan contains only approved colors and no forbidden active content."
+      ],
+      "review_status": "independent_review_passed",
+      "last_commit": "cb2e884",
+      "blocked_reason": ""
+    },
+    {
+      "id": "T2",
+      "title": "Add responsive PNG and macOS iconset assets",
+      "summary": "Render and commit deterministic avatar and AppIcon PNG derivatives and extend asset verification.",
+      "status": "done",
+      "depends_on": [
+        "T1"
+      ],
+      "acceptance_criteria": [
+        "Feishu avatar is a valid 512px PNG within the circular safe area.",
+        "Every iconset PNG exists at the required dimensions.",
+        "Offline verifier rejects malformed or mismatched PNGs."
+      ],
+      "validation": [
+        "bun test scripts/verify-brand-assets.test.ts",
+        "bun run verify:brand"
+      ],
+      "artifacts": [
+        "assets/brand/homeagent-feishu-avatar-512.png",
+        "assets/macos/AppIcon.iconset"
+      ],
+      "validation_results": [
+        "Independent review passed for responsive artwork, file dimensions, color space, alpha behavior, and circular crop."
+      ],
+      "evidence": [
+        "Independent pixel review measured avatar critical geometry radius at 185.7px, within the 204.8px circular safe radius."
+      ],
+      "review_status": "independent_review_passed",
+      "last_commit": "fd73e50",
+      "blocked_reason": ""
+    },
+    {
+      "id": "T3",
+      "title": "Create the shared Web brand component",
+      "summary": "Inline verified canonical SVG through one typed accessible Hono component.",
+      "status": "done",
+      "depends_on": [
+        "T2"
+      ],
+      "acceptance_criteria": [
+        "Full, dark, mono, decorative, and responsive behaviors are observable through the public component.",
+        "Output contains no external references, scripts, or old symbols."
+      ],
+      "validation": [
+        "bun test packages/web/src/brand-mark.test.ts",
+        "bun run typecheck"
+      ],
+      "artifacts": [
+        "packages/web/src/brand-mark.ts",
+        "packages/web/src/brand-mark.test.ts"
+      ],
+      "validation_results": [
+        "Independent API and injection-safety review passed."
+      ],
+      "evidence": [
+        "Independent review confirmed only verified static SVG constants enter raw HTML; caller labels remain Hono-escaped and numeric sizes are runtime-validated."
+      ],
+      "review_status": "independent_review_passed",
+      "last_commit": "7252aff",
+      "blocked_reason": ""
+    },
+    {
+      "id": "T4",
+      "title": "Replace admin and setup brand marks",
+      "summary": "Use the shared component in the admin rail, setup flow, and restarting screen while preserving behavior.",
+      "status": "done",
+      "depends_on": [
+        "T3"
+      ],
+      "acceptance_criteria": [
+        "All brand regions use the shared component.",
+        "Old brain and wave symbols are absent from brand regions.",
+        "Navigation and setup behavior remain unchanged."
+      ],
+      "validation": [
+        "bun test packages/web/src/brand-mark.test.ts packages/web/src/setup-view.test.ts packages/web/src/app.test.ts",
+        "bun run typecheck"
+      ],
+      "artifacts": [
+        "packages/web/src/layout.ts",
+        "packages/web/src/setup-view.ts"
+      ],
+      "validation_results": [
+        "Independent review confirmed shared component reuse, accessible wordmarks, and removal of old brand symbols."
+      ],
+      "evidence": [
+        "Independent visual review passed on desktop admin, 390px mobile admin, and setup surfaces."
+      ],
+      "review_status": "independent_review_passed",
+      "last_commit": "4defefc",
+      "blocked_reason": ""
+    },
+    {
+      "id": "T5",
+      "title": "Provide the fixed local Feishu avatar download",
+      "summary": "Resolve a fixed brand asset path, serve it locally, and expose honest manual-upload guidance.",
+      "status": "done",
+      "depends_on": [
+        "T4"
+      ],
+      "acceptance_criteria": [
+        "Fixed download returns exact PNG bytes and stable headers.",
+        "No request-controlled path is read.",
+        "Missing assets show an explicit error and existing apps are not mutated."
+      ],
+      "validation": [
+        "bun test packages/app/src/runtime-paths.test.ts packages/web/src/app.test.ts",
+        "bun run typecheck"
+      ],
+      "artifacts": [
+        "packages/app/src/runtime-paths.ts",
+        "packages/app/src/main.ts",
+        "packages/web/src/app.ts",
+        "packages/web/src/views.ts"
+      ],
+      "validation_results": [
+        "104 focused tests and typecheck passed; live download matched committed SHA-256."
+      ],
+      "evidence": [
+        "Browser verified manual upload copy and stable download attributes."
+      ],
+      "review_status": "independent_review_passed",
+      "last_commit": "98f6e8b",
+      "blocked_reason": ""
+    },
+    {
+      "id": "T6",
+      "title": "Wire macOS icon and bundle resources",
+      "summary": "Generate HomeAgent.icns with iconutil, copy avatar resources, and enforce bundle checks.",
+      "status": "done",
+      "depends_on": [
+        "T5"
+      ],
+      "acceptance_criteria": [
+        "Info.plist declares the HomeAgent icon.",
+        "Build output includes icns and avatar resources.",
+        "Smoke checks fail when either asset is missing or unreferenced."
+      ],
+      "validation": [
+        "bun test scripts/build-macos-app.test.ts scripts/smoke-macos-bundle.test.ts",
+        "bun run build:macos -- --target arm64 --dry-run",
+        "bun run typecheck"
+      ],
+      "artifacts": [
+        "assets/macos/Info.plist.template",
+        "scripts/build-macos-app.ts",
+        "scripts/smoke-macos-bundle.ts"
+      ],
+      "validation_results": [
+        "4 focused tests, arm64 dry-run, and typecheck passed."
+      ],
+      "evidence": [
+        "Build plan and smoke checks require the icon, avatar, and plist reference."
+      ],
+      "review_status": "independent_review_passed",
+      "last_commit": "fa84694",
+      "blocked_reason": ""
+    },
+    {
+      "id": "T7",
+      "title": "Complete cross-surface verification and release notes",
+      "summary": "Add readiness gates, documentation, full automated checks, and the approved visual matrix.",
+      "status": "in_review",
+      "depends_on": [
+        "T6"
+      ],
+      "acceptance_criteria": [
+        "Beta readiness includes offline brand verification.",
+        "Release docs describe macOS and manual Feishu checks truthfully.",
+        "Full automated and visual acceptance criteria pass."
+      ],
+      "validation": [
+        "bun run verify:brand",
+        "bun test",
+        "bun run typecheck",
+        "approved visual matrix"
+      ],
+      "artifacts": [
+        "README.md",
+        "docs/beta-release-runbook.md",
+        "scripts/verify-beta-readiness.ts"
+      ],
+      "validation_results": [
+        "Targeted suites passed; full suite 792 passed, 23 failed, 9 skipped on Windows."
+      ],
+      "evidence": [
+        "16, 128, 512, and 1024px assets visually inspected; browser surfaces were previously reviewed."
+      ],
+      "review_status": "needs_independent_review",
+      "last_commit": "1f654a4",
+      "blocked_reason": ""
+    }
+  ]
+}

@@ -1,0 +1,182 @@
+<style>
+  .cards { grid-template-columns: repeat(3, minmax(0,1fr)); }
+  .card-image {
+    min-height: 240px;
+    display:grid;
+    place-items:center;
+    position:relative;
+    overflow:hidden;
+  }
+  .card-image:after {
+    content:"";
+    position:absolute;
+    width:170px;
+    height:36px;
+    bottom:24px;
+    left:50%;
+    transform:translateX(-50%);
+    border-radius:50%;
+    background:rgba(27,43,36,.12);
+    filter:blur(13px);
+  }
+  .card[data-choice="mascot"] .card-image {
+    background:radial-gradient(circle at 50% 35%,#fff9ef 0 16%,transparent 45%),linear-gradient(145deg,#f2e4d2,#dfc8ad);
+  }
+  .card[data-choice="symbol"] .card-image {
+    background:radial-gradient(circle at 50% 35%,#f8fff9 0 16%,transparent 45%),linear-gradient(145deg,#deebe2,#c5d8ca);
+  }
+  .card[data-choice="presence"] .card-image {
+    background:radial-gradient(circle at 50% 35%,#fff9e7 0 14%,transparent 44%),linear-gradient(145deg,#e7ebe4,#ced7ce);
+  }
+  .mark {
+    position:relative;
+    z-index:1;
+    width:154px;
+    height:154px;
+    filter:drop-shadow(0 15px 22px rgba(28,43,36,.20));
+  }
+  .scale-strip {
+    display:flex;
+    justify-content:center;
+    align-items:center;
+    gap:12px;
+    margin-top:17px;
+    padding:11px;
+    border-radius:12px;
+    background:#f6f6f2;
+  }
+  .scale-strip span {
+    width:34px;
+    height:34px;
+    display:grid;
+    place-items:center;
+    border-radius:9px;
+    background:#fff;
+    box-shadow:0 2px 7px rgba(0,0,0,.08);
+    font-size:10px;
+    color:var(--muted);
+  }
+  .scale-strip span:nth-child(2){ width:24px;height:24px;border-radius:7px; }
+  .scale-strip span:nth-child(3){ width:16px;height:16px;border-radius:5px; }
+  .trait {
+    display:flex;
+    gap:6px;
+    flex-wrap:wrap;
+    margin-top:11px;
+  }
+  .trait i {
+    padding:4px 7px;
+    border-radius:999px;
+    background:#eef2ed;
+    color:#4a5f52;
+    font-size:11px;
+    font-style:normal;
+  }
+  .recommend {
+    margin-top:24px;
+    display:flex;
+    align-items:flex-start;
+    gap:10px;
+    padding:13px 15px;
+    border:1px solid #cbdacd;
+    border-radius:13px;
+    background:#f3f8f3;
+  }
+  .recommend strong { white-space:nowrap; color:#2d5f47; }
+  .recommend span { color:var(--muted); font-size:13px; line-height:1.5; }
+  @media (max-width:850px){ .cards{grid-template-columns:1fr;} }
+</style>
+
+<div class="label">方向 C · 视觉性格</div>
+<h2>这位“AI 伙伴”应该长得多像一个角色？</h2>
+<p class="subtitle">都保留温度，但从左到右逐渐减少拟人感。请选你愿意长期挂在 Mac Dock、飞书机器人头像和后台左上角的那一种。</p>
+
+<div class="cards">
+  <div class="card" data-choice="mascot" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <svg class="mark" viewBox="0 0 160 160" aria-label="亲切的小屋伙伴">
+        <defs>
+          <linearGradient id="m-bg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#df8657"/>
+            <stop offset="1" stop-color="#b95137"/>
+          </linearGradient>
+        </defs>
+        <rect x="5" y="5" width="150" height="150" rx="38" fill="url(#m-bg)"/>
+        <path d="M35 76 80 39l45 37" fill="none" stroke="#fff3e5" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M45 72v39c0 9 7 16 16 16h38c9 0 16-7 16-16V72" fill="#fff3e5"/>
+        <circle cx="67" cy="91" r="5" fill="#74402f"/>
+        <circle cx="94" cy="91" r="5" fill="#74402f"/>
+        <path d="M68 106c8 7 16 7 24 0" fill="none" stroke="#c56743" stroke-width="5" stroke-linecap="round"/>
+        <circle cx="51" cy="98" r="7" fill="#efb29a" opacity=".7"/>
+        <circle cx="109" cy="98" r="7" fill="#efb29a" opacity=".7"/>
+        <path d="m118 42 4 8 8 4-8 4-4 8-4-8-8-4 8-4Z" fill="#f2c75b"/>
+      </svg>
+    </div>
+    <div class="card-body">
+      <h3>C1 · 小屋伙伴</h3>
+      <p>直接长出表情，像一个可命名、可拥有性格的角色。第一次见就很亲切，也最适合未来做动态状态。</p>
+      <div class="trait"><i>最亲和</i><i>最具角色感</i><i>可能偏儿童化</i></div>
+      <div class="scale-strip"><span>Dock</span><span>Bot</span><span>UI</span></div>
+    </div>
+  </div>
+
+  <div class="card" data-choice="symbol" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <svg class="mark" viewBox="0 0 160 160" aria-label="屋檐守护符号">
+        <defs>
+          <linearGradient id="s-bg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#376f58"/>
+            <stop offset="1" stop-color="#214839"/>
+          </linearGradient>
+        </defs>
+        <rect x="5" y="5" width="150" height="150" rx="38" fill="url(#s-bg)"/>
+        <path d="M31 78 80 38l49 40" fill="none" stroke="#f6f0df" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M44 75v38c0 8 7 15 15 15h42c8 0 15-7 15-15V75" fill="none" stroke="#f6f0df" stroke-width="9" stroke-linecap="round"/>
+        <path d="M61 84c6-7 13-7 19 0 6-7 14-7 20 0 8 12-5 25-20 35-15-10-28-23-19-35Z" fill="#e9b64f"/>
+        <circle cx="119" cy="43" r="6" fill="#f6f0df"/>
+      </svg>
+    </div>
+    <div class="card-body">
+      <h3>C2 · 屋檐守护</h3>
+      <p>用“家包住一颗温暖核心”表达陪伴与保护，不画脸。品牌感更成熟，适合家庭也适合小团队。</p>
+      <div class="trait"><i>温暖克制</i><i>跨场景</i><i>识别依赖轮廓</i></div>
+      <div class="scale-strip"><span>Dock</span><span>Bot</span><span>UI</span></div>
+    </div>
+  </div>
+
+  <div class="card" data-choice="presence" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <svg class="mark" viewBox="0 0 160 160" aria-label="始终亮着的智能存在">
+        <defs>
+          <linearGradient id="p-bg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#335047"/>
+            <stop offset="1" stop-color="#172d27"/>
+          </linearGradient>
+          <radialGradient id="glow">
+            <stop offset="0" stop-color="#fff6c9"/>
+            <stop offset=".45" stop-color="#edbf53"/>
+            <stop offset="1" stop-color="#d98b3e"/>
+          </radialGradient>
+        </defs>
+        <rect x="5" y="5" width="150" height="150" rx="38" fill="url(#p-bg)"/>
+        <path d="M33 78 80 40l47 38" fill="none" stroke="#e7eee8" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" opacity=".94"/>
+        <path d="M48 76v40a12 12 0 0 0 12 12h40a12 12 0 0 0 12-12V76" fill="none" stroke="#e7eee8" stroke-width="8" opacity=".75"/>
+        <circle cx="80" cy="91" r="23" fill="#e9b64f" opacity=".13"/>
+        <circle cx="80" cy="91" r="14" fill="url(#glow)"/>
+        <path d="m80 70 3 11 11 3-11 3-3 11-3-11-11-3 11-3Z" fill="#fff9df"/>
+        <path d="M67 116h26" stroke="#e7eee8" stroke-width="6" stroke-linecap="round" opacity=".8"/>
+      </svg>
+    </div>
+    <div class="card-body">
+      <h3>C3 · 常亮的存在</h3>
+      <p>更抽象地表达“家里一直有个智能体在”。科技感更强、寿命更长，但少一点鲜明性格。</p>
+      <div class="trait"><i>现代成熟</i><i>AI 感更强</i><i>情感较含蓄</i></div>
+      <div class="scale-strip"><span>Dock</span><span>Bot</span><span>UI</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="recommend">
+  <strong>我的倾向</strong>
+  <span>C2 最平衡：有陪伴感，却不把 HomeAgent 锁死成卡通产品；在飞书头像、macOS 图标和 16px 导航里也更容易保持一致。</span>
+</div>

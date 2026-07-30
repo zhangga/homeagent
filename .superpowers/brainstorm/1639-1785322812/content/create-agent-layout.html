@@ -1,0 +1,216 @@
+<style>
+  .layout-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 18px;
+  }
+  .layout-card {
+    cursor: pointer;
+    overflow: hidden;
+    border: 1px solid #d8d8d3;
+    border-radius: 14px;
+    background: #fff;
+    transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+  }
+  .layout-card:hover {
+    transform: translateY(-3px);
+    border-color: #94948d;
+    box-shadow: 0 14px 34px rgba(29, 29, 26, .11);
+  }
+  .layout-card.selected {
+    border-color: #262622;
+    box-shadow: 0 0 0 2px #262622, 0 14px 34px rgba(29, 29, 26, .12);
+  }
+  .mini-app {
+    display: grid;
+    grid-template-columns: 24px 74px minmax(0, 1fr);
+    height: 250px;
+    border-bottom: 1px solid #e5e5df;
+    background: #fafaf7;
+    font-size: 7px;
+    color: #393935;
+  }
+  .mini-rail {
+    padding-top: 10px;
+    background: #20201e;
+  }
+  .mini-rail span {
+    display: block;
+    width: 10px;
+    height: 10px;
+    margin: 0 auto 8px;
+    border-radius: 3px;
+    background: #6a6a65;
+  }
+  .mini-rail span.active { background: #f2f2ec; }
+  .mini-list {
+    padding: 12px 7px;
+    border-right: 1px solid #deded8;
+    background: #f3f3ef;
+  }
+  .mini-list strong { display:block; margin-bottom:12px; font-size:8px; }
+  .mini-agent {
+    margin-bottom: 6px;
+    padding: 7px 5px;
+    border-radius: 5px;
+    background: #fff;
+  }
+  .mini-main {
+    display: grid;
+    min-width: 0;
+    background: #fff;
+  }
+  .mini-main.with-inspector { grid-template-columns: minmax(0, 1fr) 63px; }
+  .mini-editor { min-width:0; }
+  .mini-topbar {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    height: 30px;
+    padding: 0 9px;
+    border-bottom: 1px solid #e5e5df;
+    font-weight: 700;
+  }
+  .mini-actions { display:flex; gap:4px; }
+  .mini-actions i {
+    display:block;
+    padding: 3px 5px;
+    border: 1px solid #c9c9c4;
+    border-radius: 3px;
+    font-style: normal;
+    font-weight: 500;
+  }
+  .mini-actions i.primary { border-color:#242421; background:#242421; color:#fff; }
+  .mini-form { padding: 13px 12px; }
+  .mini-name { width:48%; height:10px; margin-bottom:10px; border-radius:3px; background:#d9d9d3; }
+  .mini-textarea { height:44px; margin-bottom:10px; border:1px solid #d8d8d2; border-radius:5px; }
+  .mini-row { display:grid; grid-template-columns:1fr 1fr; gap:7px; margin-bottom:7px; }
+  .mini-field { height:25px; border:1px solid #d8d8d2; border-radius:5px; background:#fbfbf9; }
+  .mini-section-label { width:34px; height:5px; margin:13px 0 7px; border-radius:2px; background:#a7a7a0; }
+  .mini-inspector {
+    padding: 12px 7px;
+    border-left:1px solid #deded8;
+    background:#f5f5f1;
+  }
+  .mini-inspector div { height:23px; margin-bottom:7px; border-radius:4px; background:#e6e6e0; }
+  .mini-checklist {
+    padding: 12px 7px;
+    border-left:1px solid #deded8;
+    background:#f5f5f1;
+  }
+  .mini-checklist strong { display:block; margin-bottom:10px; }
+  .mini-checklist p {
+    margin:0 0 7px;
+    padding-left:10px;
+    color:#6b6b65;
+    line-height:1.35;
+  }
+  .mini-checklist p::before { content:"○"; margin-left:-10px; margin-right:3px; }
+  .layout-copy { padding: 15px 16px 17px; }
+  .layout-copy h3 { display:flex; align-items:center; gap:8px; margin:0 0 7px; }
+  .badge {
+    padding: 2px 6px;
+    border-radius: 99px;
+    background: #e8f3e8;
+    color: #32623b;
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .layout-copy p { margin:0; color:#686861; font-size:13px; line-height:1.5; }
+  @media (max-width: 1000px) {
+    .layout-grid { grid-template-columns: 1fr; }
+    .mini-app { height: 220px; }
+  }
+</style>
+
+<h2>新建 Agent 时，右侧区域应该怎么处理？</h2>
+<p class="subtitle">
+  三个方案都保留 Mew 的顶部名称编辑、右上角 Cancel / Create、紧凑双列表单；
+  Device、Repositories、Environment 等 HomeAgent 不具备的能力全部省略。
+</p>
+
+<div class="layout-grid">
+  <div class="layout-card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="mini-app">
+      <div class="mini-rail"><span></span><span class="active"></span><span></span><span></span></div>
+      <div class="mini-list">
+        <strong>Agents　＋</strong>
+        <div class="mini-agent">Claude Agent</div>
+        <div class="mini-agent">Codex Agent</div>
+      </div>
+      <div class="mini-main with-inspector">
+        <div class="mini-editor">
+          <div class="mini-topbar"><span>新建 Agent</span><span class="mini-actions"><i>取消</i><i class="primary">创建</i></span></div>
+          <div class="mini-form">
+            <div class="mini-name"></div><div class="mini-textarea"></div>
+            <div class="mini-row"><div class="mini-field"></div><div class="mini-field"></div></div>
+            <div class="mini-row"><div class="mini-field"></div><div class="mini-field"></div></div>
+            <div class="mini-section-label"></div><div class="mini-row"><div class="mini-field"></div><div class="mini-field"></div></div>
+          </div>
+        </div>
+        <div class="mini-inspector"><div></div><div></div><div></div></div>
+      </div>
+    </div>
+    <div class="layout-copy">
+      <h3>A　保留运行检查器</h3>
+      <p>新建态仍展示右栏，但内容只能是空状态或 CLI 预览；结构一致，信息价值较低。</p>
+    </div>
+  </div>
+
+  <div class="layout-card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="mini-app">
+      <div class="mini-rail"><span></span><span class="active"></span><span></span><span></span></div>
+      <div class="mini-list">
+        <strong>Agents　＋</strong>
+        <div class="mini-agent">Claude Agent</div>
+        <div class="mini-agent">Codex Agent</div>
+      </div>
+      <div class="mini-main">
+        <div class="mini-editor">
+          <div class="mini-topbar"><span>未命名 Agent</span><span class="mini-actions"><i>取消</i><i class="primary">创建</i></span></div>
+          <div class="mini-form">
+            <div class="mini-name"></div><div class="mini-textarea"></div>
+            <div class="mini-row"><div class="mini-field"></div><div class="mini-field"></div></div>
+            <div class="mini-row"><div class="mini-field"></div><div class="mini-field"></div></div>
+            <div class="mini-section-label"></div><div class="mini-row"><div class="mini-field"></div><div class="mini-field"></div></div>
+            <div class="mini-row"><div class="mini-field"></div><div class="mini-field"></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="layout-copy">
+      <h3>B　专注式创建 <span class="badge">推荐</span></h3>
+      <p>创建态隐藏无内容的运行检查器，让表单双列展开；创建成功后恢复三栏并显示真实状态。</p>
+    </div>
+  </div>
+
+  <div class="layout-card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="mini-app">
+      <div class="mini-rail"><span></span><span class="active"></span><span></span><span></span></div>
+      <div class="mini-list">
+        <strong>Agents　＋</strong>
+        <div class="mini-agent">Claude Agent</div>
+        <div class="mini-agent">Codex Agent</div>
+      </div>
+      <div class="mini-main with-inspector">
+        <div class="mini-editor">
+          <div class="mini-topbar"><span>新建 Agent</span><span class="mini-actions"><i>取消</i><i class="primary">创建</i></span></div>
+          <div class="mini-form">
+            <div class="mini-name"></div><div class="mini-textarea"></div>
+            <div class="mini-row"><div class="mini-field"></div><div class="mini-field"></div></div>
+            <div class="mini-row"><div class="mini-field"></div><div class="mini-field"></div></div>
+            <div class="mini-section-label"></div><div class="mini-row"><div class="mini-field"></div><div class="mini-field"></div></div>
+          </div>
+        </div>
+        <div class="mini-checklist">
+          <strong>创建检查</strong>
+          <p>CLI 可用</p><p>模型有效</p><p>权限完整</p><p>目录可访问</p>
+        </div>
+      </div>
+    </div>
+    <div class="layout-copy">
+      <h3>C　创建检查清单</h3>
+      <p>右栏改成实时准备度检查；反馈更强，但新增了一套只服务于创建态的界面逻辑。</p>
+    </div>
+  </div>
+</div>

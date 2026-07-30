@@ -70,8 +70,8 @@ Homebrew 或 lark-cli。
 4. 确认应用自动安装并启动 LaunchAgent，然后自动打开 `/setup`。
 5. 完成 Codex 安装和 ChatGPT 登录。
 6. 创建或连接飞书机器人，确认两个事件消费者就绪。
-7. 加入测试群，在 “Integrations” 中显式连接该群并选择响应方式，再发送真实消息完成首次知识收录，
-   记下原始记录 ID。
+7. 加入测试群，确认机器人只登记待确认并发送一次提示；由群主或管理员发送“@HomeAgent 启用群聊”，
+   再发送真实消息完成首次知识收录并记下原始记录 ID。
 8. 在同一空间创建一个禁用的研究任务、一个未来提醒和一个学习计划，记下各自名称或 ID。
 9. 在后台确认知识、任务、提醒和学习计划均可查看。
 10. 运行 `"/Applications/HomeAgent.app/Contents/MacOS/homeagent" doctor --json`，保存脱敏结果到发布记录。
@@ -210,7 +210,7 @@ bun run soak:feishu -- \
 
 必须覆盖以下场景；失败的尝试使用 `--failed` 记录，修复后再记录新的成功证据：
 
-- `group_binding_lifecycle`：显式连接、断开隐私、原空间重连和状态恢复；
+- `group_binding_lifecycle`：入群待确认、管理员启用、断开隐私、原空间重连和状态恢复；
 - `message_capture`：群消息静默收录；
 - `mention_answer`：@ 问答；
 - `proactive_participation`：一次主动参与；

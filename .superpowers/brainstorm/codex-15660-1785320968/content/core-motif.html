@@ -1,0 +1,129 @@
+<style>
+  .cards { grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .card-image {
+    min-height:260px;
+    display:grid;
+    place-items:center;
+    background:
+      radial-gradient(circle at 50% 38%,rgba(255,255,255,.75),transparent 38%),
+      linear-gradient(145deg,#f4e7dc,#e2c3ac);
+  }
+  .mark {
+    width:176px;
+    height:176px;
+    filter:drop-shadow(0 19px 24px rgba(75,39,26,.21));
+  }
+  .pros-cons { margin-top:14px; font-size:12px; }
+  .pros-cons h4 { margin-bottom:5px; font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
+  .pros-cons ul { margin:0; padding-left:16px; }
+  .pros-cons li { margin:3px 0; }
+  .mini-row {
+    display:flex;
+    align-items:center;
+    gap:14px;
+    margin-top:14px;
+    padding:11px 12px;
+    border-radius:12px;
+    background:#f6f4ef;
+  }
+  .mini-row b { margin-right:auto; color:var(--muted); font-size:11px; font-weight:600; }
+  .mini-row i {
+    display:block;
+    background:#c55f42;
+    box-shadow:0 2px 7px rgba(84,42,27,.2);
+  }
+  .mini-row i:nth-of-type(1){width:36px;height:36px;border-radius:9px;}
+  .mini-row i:nth-of-type(2){width:24px;height:24px;border-radius:6px;}
+  .mini-row i:nth-of-type(3){width:16px;height:16px;border-radius:4px;}
+  .recommend {
+    margin-top:24px;
+    padding:15px 17px;
+    border:1px solid #dec0a8;
+    border-radius:14px;
+    background:#fff6ee;
+    color:#69412d;
+    line-height:1.55;
+    font-size:13px;
+  }
+  @media(max-width:850px){.cards{grid-template-columns:1fr;}}
+</style>
+
+<div class="label">C2 + P1 · 核心构形</div>
+<h2>“屋檐之下”放什么，决定它是否真正属于 HomeAgent</h2>
+<p class="subtitle">三种都温暖，但产品含义不同。此处选定后，核心图标概念就可以冻结。</p>
+
+<div class="cards">
+  <div class="card" data-choice="heart" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <svg class="mark" viewBox="0 0 180 180" aria-label="屋檐与爱心">
+        <defs><linearGradient id="hbg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#da7b51"/><stop offset="1" stop-color="#a94733"/></linearGradient></defs>
+        <rect x="6" y="6" width="168" height="168" rx="42" fill="url(#hbg)"/>
+        <path d="M35 88 90 43l55 45" fill="none" stroke="#fff3e5" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M50 85v42c0 9 7 16 16 16h48c9 0 16-7 16-16V85" fill="none" stroke="#fff3e5" stroke-width="10" stroke-linecap="round"/>
+        <path d="M68 96c7-8 15-8 22 0 7-8 16-8 23 0 9 14-6 29-23 40-17-11-32-26-22-40Z" fill="#f2c35b"/>
+        <circle cx="133" cy="49" r="6.5" fill="#fff3e5"/>
+      </svg>
+    </div>
+    <div class="card-body">
+      <h3>M1 · 守护之心</h3>
+      <p>最直白地表达关心、陪伴与家庭归属，几乎无需解释。</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>优势</h4><ul><li>亲和力最强</li><li>跨年龄易理解</li></ul></div>
+        <div class="cons"><h4>代价</h4><ul><li>“AI Agent”较弱</li><li>爱心符号较常见</li></ul></div>
+      </div>
+      <div class="mini-row"><b>小尺寸</b><i></i><i></i><i></i></div>
+    </div>
+  </div>
+
+  <div class="card" data-choice="spark" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <svg class="mark" viewBox="0 0 180 180" aria-label="屋檐与智能火种">
+        <defs>
+          <linearGradient id="sbg2" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#da7b51"/><stop offset="1" stop-color="#a94733"/></linearGradient>
+          <radialGradient id="core"><stop stop-color="#fff8d7"/><stop offset=".44" stop-color="#f6cf70"/><stop offset="1" stop-color="#e8a93f"/></radialGradient>
+        </defs>
+        <rect x="6" y="6" width="168" height="168" rx="42" fill="url(#sbg2)"/>
+        <path d="M35 88 90 43l55 45" fill="none" stroke="#fff3e5" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M50 85v42c0 9 7 16 16 16h48c9 0 16-7 16-16V85" fill="none" stroke="#fff3e5" stroke-width="10" stroke-linecap="round"/>
+        <circle cx="90" cy="105" r="27" fill="#f5bd54" opacity=".18"/>
+        <circle cx="90" cy="105" r="18" fill="url(#core)"/>
+        <path d="m90 80 5.5 17.5L113 103l-17.5 5.5L90 126l-5.5-17.5L67 103l17.5-5.5Z" fill="#fff9df"/>
+        <circle cx="133" cy="49" r="6.5" fill="#f2c35b"/>
+      </svg>
+    </div>
+    <div class="card-body">
+      <h3>M2 · 智能火种</h3>
+      <p>屋内亮着一个会思考、会行动的核心：既像 AI 星芒，也像始终有人照看的灯。</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>优势</h4><ul><li>“温暖 + Agent”最平衡</li><li>适合做运行状态动效</li></ul></div>
+        <div class="cons"><h4>代价</h4><ul><li>星芒也常见于 AI 产品</li><li>需靠屋檐轮廓建立独特性</li></ul></div>
+      </div>
+      <div class="mini-row"><b>小尺寸</b><i></i><i></i><i></i></div>
+    </div>
+  </div>
+
+  <div class="card" data-choice="dialogue" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <svg class="mark" viewBox="0 0 180 180" aria-label="屋檐与对话回环">
+        <defs><linearGradient id="dbg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#da7b51"/><stop offset="1" stop-color="#a94733"/></linearGradient></defs>
+        <rect x="6" y="6" width="168" height="168" rx="42" fill="url(#dbg)"/>
+        <path d="M35 88 90 43l55 45" fill="none" stroke="#fff3e5" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M50 85v42c0 9 7 16 16 16h48c9 0 16-7 16-16V85" fill="none" stroke="#fff3e5" stroke-width="10" stroke-linecap="round"/>
+        <path d="M66 91h48v31H91l-12 12v-12H66Z" fill="#f2c35b" stroke="#f2c35b" stroke-width="4" stroke-linejoin="round"/>
+        <path d="M77 103h26M77 112h18" stroke="#fff7dd" stroke-width="5" stroke-linecap="round"/>
+        <circle cx="133" cy="49" r="6.5" fill="#fff3e5"/>
+      </svg>
+    </div>
+    <div class="card-body">
+      <h3>M3 · 对话回环</h3>
+      <p>把沟通与记忆放在屋檐内，直接对应飞书中的主要使用方式。</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>优势</h4><ul><li>产品入口表达清楚</li><li>有“听见并记住”的意味</li></ul></div>
+        <div class="cons"><h4>代价</h4><ul><li>容易被理解成聊天软件</li><li>小尺寸细节更多</li></ul></div>
+      </div>
+      <div class="mini-row"><b>小尺寸</b><i></i><i></i><i></i></div>
+    </div>
+  </div>
+</div>
+
+<div class="recommend"><strong>推荐 M2「智能火种」。</strong>它保留你选中的成熟温暖感，同时把 HomeAgent 与普通“家庭关怀”产品拉开。屋檐负责 Home，持续发光的智能核心负责 Agent；两层含义在 16px 仍能成立。</div>

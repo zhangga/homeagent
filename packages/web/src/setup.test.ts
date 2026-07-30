@@ -10,6 +10,38 @@ const provider = {
 };
 
 describe("buildSetupSnapshot", () => {
+  test("moves directly from verified Bot identity to activation", () => {
+    expect(buildSetupSnapshot({
+      defaultProvider: "codex",
+      providers: [provider],
+      lark: {
+        state: "ready",
+        verified: true,
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      },
+      runtime: { ready: false, consumers: [] },
+      restartRequired: true,
+    }).current).toBe("activate");
+  });
+
+  test("moves directly from an active runtime to done", () => {
+    expect(buildSetupSnapshot({
+      defaultProvider: "codex",
+      providers: [provider],
+      lark: {
+        state: "ready",
+        verified: true,
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      },
+      runtime: { ready: true, consumers: [] },
+      restartRequired: false,
+    }).current).toBe("done");
+  });
+
   test("starts at AI when the selected provider is unavailable", () => {
     expect(buildSetupSnapshot({
       defaultProvider: "claude",
@@ -17,25 +49,19 @@ describe("buildSetupSnapshot", () => {
       lark: { state: "unconfigured", verified: false, message: "missing" },
       runtime: { ready: false, consumers: [] },
       restartRequired: false,
-      externalSharing: "not_started",
-      groups: 0,
-      completedAt: undefined,
     }).current).toBe("ai");
   });
 
-  test("publishes before activation, then verifies sharing after restart", () => {
+  test("finishes after activation without waiting for sharing or a group", () => {
     const base = {
       defaultProvider: "codex",
       providers: [provider],
-      groups: 0,
-      completedAt: undefined,
     };
     expect(buildSetupSnapshot({
       ...base,
       lark: { state: "unconfigured", verified: false, message: "missing" },
       runtime: { ready: false, consumers: [] },
       restartRequired: false,
-      externalSharing: "not_started",
     }).current).toBe("feishu");
     expect(buildSetupSnapshot({
       ...base,
@@ -48,8 +74,7 @@ describe("buildSetupSnapshot", () => {
       },
       runtime: { ready: false, consumers: [] },
       restartRequired: true,
-      externalSharing: "not_started",
-    }).current).toBe("external_share");
+    }).current).toBe("activate");
     expect(buildSetupSnapshot({
       ...base,
       lark: {
@@ -61,7 +86,6 @@ describe("buildSetupSnapshot", () => {
       },
       runtime: { ready: false, consumers: [] },
       restartRequired: true,
-      externalSharing: "awaiting_external_message",
     }).current).toBe("activate");
     expect(buildSetupSnapshot({
       ...base,
@@ -74,8 +98,7 @@ describe("buildSetupSnapshot", () => {
       },
       runtime: { ready: true, consumers: [] },
       restartRequired: false,
-      externalSharing: "awaiting_external_message",
-    }).current).toBe("external_share");
+    }).current).toBe("done");
     expect(buildSetupSnapshot({
       ...base,
       lark: {
@@ -87,8 +110,7 @@ describe("buildSetupSnapshot", () => {
       },
       runtime: { ready: true, consumers: [] },
       restartRequired: false,
-      externalSharing: "verified",
-    }).current).toBe("invite");
+    }).current).toBe("done");
   });
 
   test("completed setups may skip a group but still reopen broken prerequisites", () => {
@@ -104,9 +126,6 @@ describe("buildSetupSnapshot", () => {
       },
       runtime: { ready: true, consumers: [] },
       restartRequired: false,
-      groups: 0,
-      completedAt: 1,
-      externalSharing: "skipped" as const,
     };
     expect(buildSetupSnapshot(ready).current).toBe("done");
     expect(buildSetupSnapshot({

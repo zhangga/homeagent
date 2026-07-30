@@ -6,7 +6,7 @@
  * on these types, never on lark-cli — so the whole feishu surface is swappable
  * (plan R6: lark-cli breaking changes are absorbed in the feishu connector).
  */
-import type { Attachment } from "@homeagent/shared";
+import type { Attachment, LarkChatSummary } from "@homeagent/shared";
 
 export interface DownloadedAttachment {
   attachment: Attachment;
@@ -112,6 +112,10 @@ export interface Connector {
   resolveReplyTarget?(messageId: string): Promise<ReplyTarget | undefined>;
   /** whether a user may administer knowledge for the given group chat */
   isChatAdministrator?(chatId: string, userId: string): Promise<boolean>;
+  /** current Bot-visible group metadata; throws when verification is unavailable */
+  getBotChat?(chatId: string): Promise<LarkChatSummary | undefined>;
+  /** administrator check that distinguishes lookup failure by throwing */
+  checkChatAdministrator?(chatId: string, userId: string): Promise<boolean>;
   /** download direct attachments associated with a platform message */
   downloadAttachments?(messageId: string): Promise<DownloadedAttachment[]>;
   /** current transport health for readiness probes and management UI */

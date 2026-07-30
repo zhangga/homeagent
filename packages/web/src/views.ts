@@ -16,7 +16,6 @@ import type {
   SystemHealthSnapshot,
   LarkProvisioningSession,
   LarkSetupStatus,
-  LarkCapabilityState,
   LarkChatSummary,
 } from "@homeagent/shared";
 import type {
@@ -1689,17 +1688,14 @@ function feishuAvatarControl(
 
 export function feishuGroupConnectView(input: {
   candidates: LarkChatSummary[];
-  capability: LarkCapabilityState;
   flashMsg?: string;
 }): HtmlEscapedString | Promise<HtmlEscapedString> {
-  const fullMessagesAvailable = input.capability === "available";
-  const defaultMode = fullMessagesAvailable ? "smart" : "mentions_only";
   return html`<div class="integration-shell">
     <div class="integration-page-head">
       <div>
         <div class="eyebrow">FEISHU GROUPS</div>
-        <h1>连接飞书群</h1>
-        <p class="subtitle">只会列出当前 Bot 已加入且能够读取的群。连接后才会收录消息或参与回复。</p>
+        <h1>请求群管理员确认</h1>
+        <p class="subtitle">选择当前 Bot 已加入的群。HomeAgent 会向群内发送一次确认提示；群主或管理员确认前不会读取或记录群消息。</p>
       </div>
       <a class="btn secondary" href="/integrations">返回 Integrations</a>
     </div>
@@ -1715,42 +1711,18 @@ export function feishuGroupConnectView(input: {
             </select>
             <div class="hint">提交时会再次校验 Bot 是否仍在群内。</div>
           </div>
-          <div class="field">
-            <label>响应方式</label>
-            <select name="responseMode">
-              <option value="mentions_only" ${defaultMode === "mentions_only" ? "selected" : ""}>仅在 @ Bot 时回复</option>
-              <option value="smart" ${defaultMode === "smart" ? "selected" : ""} ${fullMessagesAvailable ? "" : "disabled"}>智能参与群聊</option>
-              <option value="all_messages" ${fullMessagesAvailable ? "" : "disabled"}>响应所有消息</option>
-            </select>
-            ${fullMessagesAvailable
-              ? html`<div class="hint">推荐“智能参与”：消息会收录，未 @ 时由模型判断是否值得插话。</div>`
-              : html`<div class="callout warning">当前应用缺少完整群消息权限，暂时只能选择“仅在 @ Bot 时回复”。</div>`}
+          <div class="callout">
+            <strong>群内确认后才启用</strong>
+            <div class="hint">群主或管理员发送“@HomeAgent 启用群聊”后，群聊将以“仅 @ 回复 + Topic reply”的安全默认值启用；之后可以在 Integrations 调整。</div>
           </div>
-          <details>
-            <summary>更多设置</summary>
-            <div class="grid2 details-grid">
-              <div class="field">
-                <label>智能活跃度</label>
-                <select name="participationLevel">
-                  <option value="reserved">稳重</option>
-                  <option value="balanced" selected>均衡</option>
-                  <option value="active">积极</option>
-                </select>
-              </div>
-              <label class="toggle-row compact-toggle">
-                <span><strong>Topic reply</strong><span class="hint">在飞书话题内回复</span></span>
-                <span class="switch"><input type="checkbox" name="replyInThread" checked /><span class="slider"></span></span>
-              </label>
-            </div>
-          </details>
           <div class="actions">
-            <button type="submit">连接群聊</button>
+            <button type="submit">发送确认提示</button>
             <a class="btn secondary" href="/integrations">取消</a>
           </div>
         </form>`
       : html`<div class="empty">
-          <strong>没有可连接的群</strong>
-          <p>请先把当前 Bot 加入飞书群，然后刷新此页面。已连接的群不会重复出现。</p>
+          <strong>没有需要发起确认的群</strong>
+          <p>请先把当前 Bot 加入飞书群。待确认和已启用的群不会重复出现。</p>
         </div>`}
   </div>`;
 }
@@ -1866,7 +1838,7 @@ export function integrationsView(
     : [html`<div class="empty">还没有群空间。把机器人加入飞书群即可出现在这里。</div>`];
 
   return html`<h1>飞书连接</h1>
-    <p class="subtitle">创建机器人、连接群聊，并管理每个群的回答方式。</p>
+    <p class="subtitle">创建机器人、确认群聊，并管理每个已启用群的回答方式。</p>
     ${flash(flashMsg)}
 
     <section class="card integration-card">
@@ -1889,7 +1861,7 @@ export function integrationsView(
       <div class="integration-row">
         <div>
           <strong>飞书群聊</strong>
-          <div class="muted">机器人加入群后自动建立对应工作空间。</div>
+          <div class="muted">机器人加入群后等待群主或管理员确认，确认后才建立工作空间。</div>
         </div>
         <div class="integration-actions">${runtimeBadge}${runtimeRecovery}</div>
       </div>
@@ -1958,8 +1930,8 @@ function integrationsControlCenterView(
         integrationGroupCard(group, snapshot)
       )
     : [html`<div class="empty integration-empty">
-        <strong>还没有连接群聊</strong>
-        <p>先把 Bot 加入飞书群，再使用“连接群聊”明确启用。未连接的群不会被收录或回复。</p>
+        <strong>还没有发现群聊</strong>
+        <p>把 Bot 加入飞书群后，HomeAgent 会登记为待确认，并请群主或管理员在群内启用。</p>
       </div>`];
 
   return html`<style>${raw(`
@@ -1986,9 +1958,9 @@ function integrationsControlCenterView(
       <div>
         <div class="eyebrow">FEISHU CONTROL CENTER</div>
         <h1>飞书连接</h1>
-        <p class="subtitle">一个当前 Bot，明确连接群聊，并为每个群选择参与方式。</p>
+        <p class="subtitle">Bot 入群后由群主或管理员确认启用；确认前不读取群消息。</p>
       </div>
-      <a class="btn" href="/integrations/groups/connect">连接群聊</a>
+      <a class="btn" href="/integrations/groups/connect">请求群确认</a>
     </div>
     ${flash(input.flashMsg)}
 
@@ -2023,8 +1995,8 @@ function integrationsControlCenterView(
     </section>
 
     <div class="console-head">
-      <div><h2>群聊连接</h2><p class="subtitle">断开只停止收录和回复，不删除已有知识、任务、提醒或学习计划。</p></div>
-      <span class="muted">${snapshot.groups.filter((group) => group.state === "active").length} 个正在连接</span>
+      <div><h2>群聊连接</h2><p class="subtitle">待确认群不会被收录；断开也不会删除已有知识、任务、提醒或学习计划。</p></div>
+      <span class="muted">${snapshot.groups.filter((group) => group.state === "active").length} 个已启用 · ${snapshot.groups.filter((group) => group.state === "pending_confirmation").length} 个待确认</span>
     </div>
     <div class="group-grid">${cards}</div>
 
@@ -2058,6 +2030,8 @@ function integrationGroupCard(
       : `智能参与 · ${GROUP_PARTICIPATION_LABELS[binding.participationLevel ?? "balanced"]}`;
   const stateBadge = group.state === "active"
     ? html`<span class="badge ok">已连接</span>`
+    : group.state === "pending_confirmation"
+      ? html`<span class="badge degraded">等待群管理员确认</span>`
     : group.state === "disconnected"
       ? html`<span class="badge degraded">已断开</span>`
       : html`<span class="badge degraded">需要重连</span>`;
@@ -2069,13 +2043,40 @@ function integrationGroupCard(
     ),
   ];
   if (group.state !== "active") {
+    const displayName = space?.name || group.chat?.name || binding.chatId;
+    if (group.state === "pending_confirmation") {
+      const prompt = binding.confirmationPrompt;
+      const promptLabel = prompt?.status === "sent"
+        ? `提示已发送 · ${new Date(prompt.lastAttemptAt).toISOString()}`
+        : prompt?.status === "failed"
+          ? "提示发送失败，可手动重试"
+          : prompt?.status === "attempting"
+            ? "提示发送中"
+            : "尚未发送提示";
+      const botName = snapshot.bot.botName || "HomeAgent";
+      return html`<article class="card group-card">
+        <div class="group-head">
+          <div><strong>${displayName}</strong><div class="muted">${binding.chatId}</div></div>
+          ${stateBadge}
+        </div>
+        <div class="group-summary"><span>发现于 ${new Date(binding.createdAt).toISOString()}</span><span>${promptLabel}</span></div>
+        <div class="degraded-note">请群主或管理员在群内发送“@${botName} 启用群聊”。确认前不会读取、记录或回复普通群消息。</div>
+        <div class="actions" style="margin-top:14px">
+          <form method="post" action="/integrations/groups/${encodedSpace}/confirmation"><button type="submit">重新发送提示</button></form>
+          <form method="post" action="/integrations/groups/${encodedSpace}/ignore" onsubmit="return confirm('忽略该群？之后重新入群也不会自动启用。')"><button type="submit" class="danger">忽略此群</button></form>
+        </div>
+      </article>`;
+    }
     return html`<article class="card group-card">
       <div class="group-head">
-        <div><strong>${space?.name || binding.chatId}</strong><div class="muted">${binding.chatId}</div></div>
+        <div><strong>${displayName}</strong><div class="muted">${binding.chatId}</div></div>
         ${stateBadge}
       </div>
-      <div class="group-summary"><span>${modeLabel}</span><span>知识空间保留</span></div>
-      <div class="actions" style="margin-top:14px"><a class="btn" href="/integrations/groups/connect">重新连接</a></div>
+      <div class="group-summary"><span>${modeLabel}</span>${space ? html`<span>知识空间保留</span>` : ""}</div>
+      <form method="post" action="/integrations/groups/connect" class="actions" style="margin-top:14px">
+        <input type="hidden" name="chatId" value="${binding.chatId}" />
+        <button type="submit">请求群管理员确认</button>
+      </form>
     </article>`;
   }
   return html`<article class="card group-card">

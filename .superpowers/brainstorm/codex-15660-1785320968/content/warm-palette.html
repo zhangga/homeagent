@@ -1,0 +1,164 @@
+<style>
+  .cards { grid-template-columns: repeat(3,minmax(0,1fr)); }
+  .card-image {
+    min-height:244px;
+    display:grid;
+    place-items:center;
+    position:relative;
+    background:#eeeae2;
+    overflow:hidden;
+  }
+  .card-image:before {
+    content:"";
+    position:absolute;
+    inset:18px;
+    border-radius:22px;
+    border:1px solid rgba(255,255,255,.55);
+  }
+  .mark {
+    width:160px;
+    height:160px;
+    position:relative;
+    z-index:1;
+    filter:drop-shadow(0 18px 24px rgba(69,41,26,.20));
+  }
+  .contexts {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:8px;
+    margin-top:16px;
+  }
+  .context {
+    min-height:66px;
+    padding:9px;
+    border:1px solid var(--border);
+    border-radius:11px;
+    background:#f8f7f3;
+    display:flex;
+    align-items:center;
+    gap:9px;
+    color:var(--muted);
+    font-size:11px;
+  }
+  .context.dark { background:#20231f; color:#dadad2; }
+  .mini {
+    width:34px;
+    height:34px;
+    border-radius:9px;
+    flex:0 0 auto;
+    box-shadow:0 3px 8px rgba(0,0,0,.18);
+  }
+  .mini.round { border-radius:50%; }
+  .swatches {
+    display:flex;
+    align-items:center;
+    gap:7px;
+    margin-top:13px;
+  }
+  .swatches i {
+    width:22px;
+    height:22px;
+    border-radius:50%;
+    border:2px solid white;
+    box-shadow:0 0 0 1px rgba(0,0,0,.12);
+  }
+  .swatches code {
+    margin-left:3px;
+    font-size:10px;
+    color:var(--muted);
+  }
+  .verdict {
+    margin-top:24px;
+    padding:14px 16px;
+    border:1px solid #e2c9b2;
+    border-radius:13px;
+    background:#fff7ee;
+    color:#69442f;
+    font-size:13px;
+    line-height:1.55;
+  }
+  @media (max-width:850px){ .cards{grid-template-columns:1fr;} }
+</style>
+
+<div class="label">C2 · 暖色选择</div>
+<h2>哪一种“暖”，最像 HomeAgent？</h2>
+<p class="subtitle">形状保持一致：屋檐包住温暖核心。请看它在浅色后台、深色导航和飞书圆形头像里是否都舒服。</p>
+
+<div class="cards">
+  <div class="card" data-choice="terracotta" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:linear-gradient(145deg,#f5e5d7,#e6c6ad)">
+      <svg class="mark" viewBox="0 0 160 160" aria-label="陶土橙配色">
+        <defs><linearGradient id="t-bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#d97c4f"/><stop offset="1" stop-color="#a94832"/></linearGradient></defs>
+        <rect x="5" y="5" width="150" height="150" rx="38" fill="url(#t-bg)"/>
+        <path d="M31 78 80 38l49 40" fill="none" stroke="#fff3e4" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M44 75v38c0 8 7 15 15 15h42c8 0 15-7 15-15V75" fill="none" stroke="#fff3e4" stroke-width="9" stroke-linecap="round"/>
+        <path d="M61 84c6-7 13-7 19 0 6-7 14-7 20 0 8 12-5 25-20 35-15-10-28-23-19-35Z" fill="#f2c35b"/>
+        <circle cx="119" cy="43" r="6" fill="#fff3e4"/>
+      </svg>
+    </div>
+    <div class="card-body">
+      <h3>P1 · 陶土与蜂蜜</h3>
+      <p>像晚灯、木头和陶器。最有“家”的温度，视觉也最醒目；需要克制红度，避免像餐饮或社交 App。</p>
+      <div class="swatches">
+        <i style="background:#c85f41"></i><i style="background:#fff3e4"></i><i style="background:#f2c35b"></i>
+        <code>#C85F41 · #FFF3E4 · #F2C35B</code>
+      </div>
+      <div class="contexts">
+        <div class="context dark"><span class="mini" style="background:#c85f41"></span>深色导航</div>
+        <div class="context"><span class="mini round" style="background:#c85f41"></span>飞书头像</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" data-choice="amber" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:linear-gradient(145deg,#f3e7c9,#dec797)">
+      <svg class="mark" viewBox="0 0 160 160" aria-label="琥珀棕配色">
+        <defs><linearGradient id="a-bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#c99135"/><stop offset="1" stop-color="#8d5b27"/></linearGradient></defs>
+        <rect x="5" y="5" width="150" height="150" rx="38" fill="url(#a-bg)"/>
+        <path d="M31 78 80 38l49 40" fill="none" stroke="#fff6df" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M44 75v38c0 8 7 15 15 15h42c8 0 15-7 15-15V75" fill="none" stroke="#fff6df" stroke-width="9" stroke-linecap="round"/>
+        <path d="M61 84c6-7 13-7 19 0 6-7 14-7 20 0 8 12-5 25-20 35-15-10-28-23-19-35Z" fill="#f5d778"/>
+        <circle cx="119" cy="43" r="6" fill="#fff6df"/>
+      </svg>
+    </div>
+    <div class="card-body">
+      <h3>P2 · 琥珀与奶油</h3>
+      <p>像一直亮着的灯，暖而明快。小尺寸识别最好；大面积使用容易显得偏复古或工具品牌。</p>
+      <div class="swatches">
+        <i style="background:#b8792e"></i><i style="background:#fff6df"></i><i style="background:#f5d778"></i>
+        <code>#B8792E · #FFF6DF · #F5D778</code>
+      </div>
+      <div class="contexts">
+        <div class="context dark"><span class="mini" style="background:#b8792e"></span>深色导航</div>
+        <div class="context"><span class="mini round" style="background:#b8792e"></span>飞书头像</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" data-choice="warm-moss" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:linear-gradient(145deg,#efe7d9,#d9c9af)">
+      <svg class="mark" viewBox="0 0 160 160" aria-label="暖苔绿配色">
+        <defs><linearGradient id="o-bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#6e7051"/><stop offset="1" stop-color="#454b38"/></linearGradient></defs>
+        <rect x="5" y="5" width="150" height="150" rx="38" fill="url(#o-bg)"/>
+        <path d="M31 78 80 38l49 40" fill="none" stroke="#f7eddb" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M44 75v38c0 8 7 15 15 15h42c8 0 15-7 15-15V75" fill="none" stroke="#f7eddb" stroke-width="9" stroke-linecap="round"/>
+        <path d="M61 84c6-7 13-7 19 0 6-7 14-7 20 0 8 12-5 25-20 35-15-10-28-23-19-35Z" fill="#e58d5a"/>
+        <circle cx="119" cy="43" r="6" fill="#f1bd62"/>
+      </svg>
+    </div>
+    <div class="card-body">
+      <h3>P3 · 暖苔与杏色</h3>
+      <p>延续后台现有的自然绿，但把核心改成杏色。成熟耐看、迁移成本低；第一眼的“暖”不如前两项直接。</p>
+      <div class="swatches">
+        <i style="background:#5b6048"></i><i style="background:#f7eddb"></i><i style="background:#e58d5a"></i>
+        <code>#5B6048 · #F7EDDB · #E58D5A</code>
+      </div>
+      <div class="contexts">
+        <div class="context dark"><span class="mini" style="background:#5b6048"></span>深色导航</div>
+        <div class="context"><span class="mini round" style="background:#5b6048"></span>飞书头像</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="verdict"><strong>推荐 P1：</strong>陶土橙把“温暖伙伴”表达得最直接，也和常见的 AI 紫蓝色拉开距离。正式稿会降低红感、增加一点棕，让它更像家中的灯火，而不是高刺激的社交产品。</div>

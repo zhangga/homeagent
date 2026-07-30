@@ -22,6 +22,7 @@ import type { GroupParticipationLevel, SpaceMeta } from "./types.ts";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 
 export type FeishuGroupBindingState =
+  | "pending_confirmation"
   | "active"
   | "disconnected"
   | "needs_reconnect";
@@ -32,6 +33,16 @@ export type FeishuResponseMode =
   | "all_messages";
 
 export type FeishuBindingTestStatus = "succeeded" | "failed";
+export type FeishuConfirmationPromptStatus =
+  | "attempting"
+  | "sent"
+  | "failed";
+
+export interface FeishuConfirmationPrompt {
+  lastAttemptAt: number;
+  status: FeishuConfirmationPromptStatus;
+  lastError?: string;
+}
 
 export interface FeishuGroupBinding {
   chatId: string;
@@ -44,6 +55,7 @@ export interface FeishuGroupBinding {
   createdAt: number;
   updatedAt: number;
   lastVerifiedAt?: number;
+  confirmationPrompt?: FeishuConfirmationPrompt;
   lastTestAt?: number;
   lastTestStatus?: FeishuBindingTestStatus;
   lastError?: string;
@@ -58,6 +70,12 @@ export interface ConnectFeishuGroupInput {
   replyInThread: boolean;
 }
 
+export interface RegisterPendingFeishuGroupInput {
+  chatId: string;
+  spaceId: SpaceId;
+  boundAppId?: string;
+}
+
 export type FeishuGroupPolicyPatch = Partial<Pick<
   FeishuGroupBinding,
   "responseMode" | "participationLevel" | "replyInThread"
@@ -67,10 +85,23 @@ export type FeishuBindingTestResult =
   | { status: "succeeded"; at?: number }
   | { status: "failed"; at?: number; error?: unknown };
 
-interface FeishuGroupBindingsFile {
+export type FeishuConfirmationPromptResult =
+  | { status: "attempting" | "sent"; at?: number }
+  | { status: "failed"; at?: number; error?: unknown };
+
+interface FeishuGroupBindingsFileV1 {
   version: 1;
   bindings: FeishuGroupBinding[];
 }
+
+interface FeishuGroupBindingsFileV2 {
+  version: 2;
+  bindings: FeishuGroupBinding[];
+}
+
+type FeishuGroupBindingsFile =
+  | FeishuGroupBindingsFileV1
+  | FeishuGroupBindingsFileV2;
 
 export class FeishuGroupBindingStore {
   private readonly configPath: string;
@@ -78,31 +109,72 @@ export class FeishuGroupBindingStore {
 
   constructor(dataDir: string) {
     this.configPath = join(dataDir, "config", "feishu-group-bindings.json");
-    this.bindings = this.load();
-    if (!existsSync(this.configPath)) this.persist(this.bindings);
+    const existed = existsSync(this.configPath);
+    const loaded = this.load();
+    this.bindings = loaded.bindings;
+    if (!existed || loaded.needsMigration) this.persist(this.bindings);
   }
 
   list(): FeishuGroupBinding[] {
     return [...this.bindings.values()]
       .sort((a, b) => a.chatId.localeCompare(b.chatId))
-      .map((binding) => ({ ...binding }));
+      .map(cloneBinding);
   }
 
   getByChatId(chatId: string): FeishuGroupBinding | undefined {
     const binding = this.bindings.get(chatId);
-    return binding ? { ...binding } : undefined;
+    return binding ? cloneBinding(binding) : undefined;
   }
 
   getBySpace(spaceId: SpaceId): FeishuGroupBinding | undefined {
     const binding = [...this.bindings.values()].find(
       (candidate) => candidate.spaceId === spaceId,
     );
-    return binding ? { ...binding } : undefined;
+    return binding ? cloneBinding(binding) : undefined;
   }
 
   activeByChatId(chatId: string): FeishuGroupBinding | undefined {
     const binding = this.bindings.get(chatId);
-    return binding?.state === "active" ? { ...binding } : undefined;
+    return binding?.state === "active" ? cloneBinding(binding) : undefined;
+  }
+
+  registerPending(
+    input: RegisterPendingFeishuGroupInput,
+  ): FeishuGroupBinding {
+    return this.upsertPending(input, false);
+  }
+
+  requestConfirmation(
+    input: RegisterPendingFeishuGroupInput,
+  ): FeishuGroupBinding {
+    return this.upsertPending(input, true);
+  }
+
+  recordConfirmationPrompt(
+    chatId: string,
+    result: FeishuConfirmationPromptResult,
+  ): FeishuGroupBinding | undefined {
+    const previous = this.bindings.get(chatId);
+    if (!previous || previous.state !== "pending_confirmation") {
+      return undefined;
+    }
+    const attemptedAt = result.at ?? Date.now();
+    const binding: FeishuGroupBinding = {
+      ...previous,
+      confirmationPrompt: {
+        lastAttemptAt: attemptedAt,
+        status: result.status,
+        lastError: result.status === "failed"
+          ? normalizeError(result.error)
+          : undefined,
+      },
+      updatedAt: Date.now(),
+    };
+    const candidate = new Map(this.bindings);
+    candidate.set(binding.chatId, binding);
+    this.persist(candidate);
+    this.bindings = candidate;
+    return cloneBinding(binding);
   }
 
   connect(input: ConnectFeishuGroupInput): FeishuGroupBinding {
@@ -125,7 +197,7 @@ export class FeishuGroupBindingStore {
       && previous.participationLevel === input.participationLevel
       && previous.replyInThread === input.replyInThread
     ) {
-      return { ...previous };
+      return cloneBinding(previous);
     }
     const now = Date.now();
     const binding: FeishuGroupBinding = {
@@ -138,7 +210,7 @@ export class FeishuGroupBindingStore {
     candidate.set(binding.chatId, binding);
     this.persist(candidate);
     this.bindings = candidate;
-    return { ...binding };
+    return cloneBinding(binding);
   }
 
   updatePolicy(
@@ -158,7 +230,7 @@ export class FeishuGroupBindingStore {
     candidate.set(binding.chatId, binding);
     this.persist(candidate);
     this.bindings = candidate;
-    return { ...binding };
+    return cloneBinding(binding);
   }
 
   disconnect(spaceId: SpaceId): FeishuGroupBinding | undefined {
@@ -166,7 +238,7 @@ export class FeishuGroupBindingStore {
       (binding) => binding.spaceId === spaceId,
     );
     if (!previous) return undefined;
-    if (previous.state === "disconnected") return { ...previous };
+    if (previous.state === "disconnected") return cloneBinding(previous);
     const binding: FeishuGroupBinding = {
       ...previous,
       state: "disconnected",
@@ -176,7 +248,7 @@ export class FeishuGroupBindingStore {
     candidate.set(binding.chatId, binding);
     this.persist(candidate);
     this.bindings = candidate;
-    return { ...binding };
+    return cloneBinding(binding);
   }
 
   markAppNeedsReconnect(appId: string): number {
@@ -184,7 +256,13 @@ export class FeishuGroupBindingStore {
     const now = Date.now();
     let changed = 0;
     for (const binding of candidate.values()) {
-      if (binding.state !== "active" || binding.boundAppId !== appId) continue;
+      if (
+        (binding.state !== "active"
+          && binding.state !== "pending_confirmation")
+        || binding.boundAppId !== appId
+      ) {
+        continue;
+      }
       candidate.set(binding.chatId, {
         ...binding,
         state: "needs_reconnect",
@@ -205,7 +283,8 @@ export class FeishuGroupBindingStore {
     let changed = 0;
     for (const binding of candidate.values()) {
       if (
-        binding.state !== "active"
+        (binding.state !== "active"
+          && binding.state !== "pending_confirmation")
         || binding.boundAppId === currentAppId
       ) {
         continue;
@@ -249,7 +328,7 @@ export class FeishuGroupBindingStore {
     candidate.set(binding.chatId, binding);
     this.persist(candidate);
     this.bindings = candidate;
-    return { ...binding };
+    return cloneBinding(binding);
   }
 
   migrateLegacy(spaces: SpaceMeta[], currentAppId?: string): number {
@@ -298,12 +377,69 @@ export class FeishuGroupBindingStore {
     return migrated;
   }
 
-  private load(): Map<string, FeishuGroupBinding> {
-    if (!existsSync(this.configPath)) return new Map();
+  private upsertPending(
+    input: RegisterPendingFeishuGroupInput,
+    allowDisconnected: boolean,
+  ): FeishuGroupBinding {
+    assertPendingInput(input);
+    const previous = this.bindings.get(input.chatId);
+    if (previous && previous.spaceId !== input.spaceId) {
+      throw new Error(`Feishu chat ${input.chatId} is already bound`);
+    }
+    const sameSpace = [...this.bindings.values()].find(
+      (binding) => binding.spaceId === input.spaceId,
+    );
+    if (sameSpace && sameSpace.chatId !== input.chatId) {
+      throw new Error(`Feishu space ${input.spaceId} is already bound`);
+    }
+    if (previous?.state === "disconnected" && !allowDisconnected) {
+      return cloneBinding(previous);
+    }
+    if (
+      previous?.state === "active"
+      && previous.boundAppId === input.boundAppId
+    ) {
+      return cloneBinding(previous);
+    }
+    if (
+      previous?.state === "pending_confirmation"
+      && previous.boundAppId === input.boundAppId
+      && previous.spaceId === input.spaceId
+    ) {
+      return cloneBinding(previous);
+    }
+    const now = Date.now();
+    const binding: FeishuGroupBinding = {
+      ...input,
+      state: "pending_confirmation",
+      responseMode: "mentions_only",
+      participationLevel: undefined,
+      replyInThread: true,
+      createdAt: previous?.createdAt ?? now,
+      updatedAt: now,
+      confirmationPrompt: undefined,
+    };
+    const candidate = new Map(this.bindings);
+    candidate.set(binding.chatId, binding);
+    this.persist(candidate);
+    this.bindings = candidate;
+    return cloneBinding(binding);
+  }
+
+  private load(): {
+    bindings: Map<string, FeishuGroupBinding>;
+    needsMigration: boolean;
+  } {
+    if (!existsSync(this.configPath)) {
+      return { bindings: new Map(), needsMigration: false };
+    }
     const parsed = JSON.parse(
       readFileSync(this.configPath, "utf8"),
     ) as FeishuGroupBindingsFile;
-    if (parsed.version !== 1 || !Array.isArray(parsed.bindings)) {
+    if (
+      (parsed.version !== 1 && parsed.version !== 2)
+      || !Array.isArray(parsed.bindings)
+    ) {
       throw new Error("Unsupported Feishu group binding registry");
     }
     const map = new Map<string, FeishuGroupBinding>();
@@ -316,7 +452,10 @@ export class FeishuGroupBindingStore {
       map.set(binding.chatId, binding);
       spaces.add(binding.spaceId);
     }
-    return map;
+    return {
+      bindings: map,
+      needsMigration: parsed.version === 1,
+    };
   }
 
   private persist(bindings: Map<string, FeishuGroupBinding>): void {
@@ -324,8 +463,8 @@ export class FeishuGroupBindingStore {
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const temporaryPath =
       `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
-    const file: FeishuGroupBindingsFile = {
-      version: 1,
+    const file: FeishuGroupBindingsFileV2 = {
+      version: 2,
       bindings: [...bindings.values()].sort((a, b) =>
         a.chatId.localeCompare(b.chatId)
       ),
@@ -369,6 +508,7 @@ function normalizeError(error: unknown): string {
 }
 
 const BINDING_STATES: FeishuGroupBindingState[] = [
+  "pending_confirmation",
   "active",
   "disconnected",
   "needs_reconnect",
@@ -384,6 +524,11 @@ const PARTICIPATION_LEVELS: GroupParticipationLevel[] = [
   "active",
 ];
 const TEST_STATUSES: FeishuBindingTestStatus[] = ["succeeded", "failed"];
+const PROMPT_STATUSES: FeishuConfirmationPromptStatus[] = [
+  "attempting",
+  "sent",
+  "failed",
+];
 
 function assertConnectionInput(input: ConnectFeishuGroupInput): void {
   if (
@@ -397,6 +542,26 @@ function assertConnectionInput(input: ConnectFeishuGroupInput): void {
   ) {
     throw new Error("Invalid Feishu group connection");
   }
+}
+
+function assertPendingInput(input: RegisterPendingFeishuGroupInput): void {
+  if (
+    !input.chatId.trim()
+    || !isSpaceId(input.spaceId)
+    || !input.spaceId.startsWith("team/")
+    || (input.boundAppId !== undefined && !input.boundAppId.trim())
+  ) {
+    throw new Error("Invalid pending Feishu group");
+  }
+}
+
+function cloneBinding(binding: FeishuGroupBinding): FeishuGroupBinding {
+  return {
+    ...binding,
+    confirmationPrompt: binding.confirmationPrompt
+      ? { ...binding.confirmationPrompt }
+      : undefined,
+  };
 }
 
 function parseBinding(candidate: unknown): FeishuGroupBinding {
@@ -423,6 +588,20 @@ function parseBinding(candidate: unknown): FeishuGroupBinding {
       && typeof binding.boundAppId !== "string")
     || (binding.lastVerifiedAt !== undefined
       && !Number.isFinite(binding.lastVerifiedAt))
+    || (
+      binding.confirmationPrompt !== undefined
+      && (
+        !binding.confirmationPrompt
+        || typeof binding.confirmationPrompt !== "object"
+        || !Number.isFinite(binding.confirmationPrompt.lastAttemptAt)
+        || typeof binding.confirmationPrompt.status !== "string"
+        || !PROMPT_STATUSES.includes(binding.confirmationPrompt.status)
+        || (
+          binding.confirmationPrompt.lastError !== undefined
+          && typeof binding.confirmationPrompt.lastError !== "string"
+        )
+      )
+    )
     || (binding.lastTestAt !== undefined
       && !Number.isFinite(binding.lastTestAt))
     || (binding.lastTestStatus !== undefined
@@ -432,5 +611,5 @@ function parseBinding(candidate: unknown): FeishuGroupBinding {
   ) {
     throw new Error("Invalid Feishu group binding");
   }
-  return { ...binding } as FeishuGroupBinding;
+  return cloneBinding(binding as FeishuGroupBinding);
 }

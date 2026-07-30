@@ -1,0 +1,243 @@
+<style>
+  .hero-board {
+    display:grid;
+    grid-template-columns:minmax(280px,.9fr) minmax(330px,1.1fr);
+    min-height:430px;
+    margin:20px 0 26px;
+    overflow:hidden;
+    border:1px solid #e3cbb8;
+    border-radius:24px;
+    background:#f8eee5;
+  }
+  .hero-icon {
+    display:grid;
+    place-items:center;
+    padding:42px;
+    background:
+      radial-gradient(circle at 50% 40%,rgba(255,255,255,.95),transparent 35%),
+      linear-gradient(145deg,#f1decd,#ddbaa0);
+  }
+  .hero-icon svg {
+    width:min(280px,100%);
+    filter:drop-shadow(0 28px 35px rgba(81,39,25,.22));
+  }
+  .hero-copy {
+    display:flex;
+    flex-direction:column;
+    justify-content:center;
+    padding:48px 42px;
+    color:#33251f;
+  }
+  .lockup {
+    display:flex;
+    align-items:center;
+    gap:14px;
+    margin-bottom:23px;
+  }
+  .lockup-mini { width:48px;height:48px; }
+  .wordmark {
+    font-family:"Avenir Next","Segoe UI",sans-serif;
+    font-size:34px;
+    font-weight:700;
+    letter-spacing:-.045em;
+  }
+  .hero-copy h3 { font-size:21px;margin:0 0 10px; }
+  .hero-copy p { color:#765a4b;line-height:1.65;margin:0 0 19px; }
+  .formula {
+    display:grid;
+    grid-template-columns:1fr 22px 1fr 22px 1fr;
+    align-items:center;
+    gap:7px;
+    color:#704735;
+    font-size:12px;
+    text-align:center;
+  }
+  .formula div:not(.plus) {
+    padding:9px 7px;
+    border:1px solid #e1c2aa;
+    border-radius:10px;
+    background:rgba(255,255,255,.52);
+  }
+  .plus { color:#b56a47;font-weight:800;font-size:16px; }
+  .surfaces {
+    display:grid;
+    grid-template-columns:repeat(4,minmax(0,1fr));
+    gap:12px;
+    margin:13px 0 27px;
+  }
+  .surface {
+    min-height:168px;
+    padding:15px;
+    border:1px solid var(--border);
+    border-radius:15px;
+    background:#faf9f6;
+  }
+  .surface h4 { margin:0 0 11px;font-size:12px;color:var(--muted); }
+  .preview {
+    min-height:103px;
+    display:grid;
+    place-items:center;
+    border-radius:11px;
+    background:#efede7;
+    overflow:hidden;
+  }
+  .app-icon { width:76px;height:76px;filter:drop-shadow(0 10px 10px rgba(0,0,0,.18)); }
+  .bot-bg { background:#f1f4f8; }
+  .bot {
+    width:70px;height:70px;border-radius:50%;overflow:hidden;
+    box-shadow:0 7px 14px rgba(0,0,0,.15);
+  }
+  .bot svg { width:100%;height:100%;transform:scale(1.12); }
+  .nav-bg { background:#20251f; }
+  .nav-lockup { display:flex;align-items:center;gap:8px;color:#f5eee3;font:700 14px "Avenir Next","Segoe UI",sans-serif; }
+  .nav-lockup svg { width:29px;height:29px; }
+  .mono-bg { background:#fff; }
+  .mono { width:58px;height:58px;color:#342a25; }
+  .scale-row {
+    display:flex;
+    align-items:end;
+    justify-content:center;
+    gap:14px;
+    margin-top:20px;
+  }
+  .scale { display:flex;flex-direction:column;align-items:center;gap:7px;color:var(--muted);font-size:10px; }
+  .scale i { display:grid;place-items:center;background:#c45f43;box-shadow:0 2px 7px rgba(70,36,24,.2); }
+  .scale:nth-child(1) i{width:64px;height:64px;border-radius:16px;}
+  .scale:nth-child(2) i{width:40px;height:40px;border-radius:10px;}
+  .scale:nth-child(3) i{width:24px;height:24px;border-radius:6px;}
+  .scale:nth-child(4) i{width:16px;height:16px;border-radius:4px;}
+  .rules {
+    display:grid;
+    grid-template-columns:repeat(3,minmax(0,1fr));
+    gap:12px;
+    margin-bottom:24px;
+  }
+  .rule {
+    padding:14px;
+    border-radius:13px;
+    background:#f6f4ef;
+    color:var(--muted);
+    font-size:12px;
+    line-height:1.5;
+  }
+  .rule strong { display:block;color:#3c332e;margin-bottom:4px;font-size:13px; }
+  .approval-note { color:var(--muted);font-size:13px;margin:20px 0 10px; }
+  @media(max-width:900px){
+    .hero-board{grid-template-columns:1fr;}
+    .surfaces{grid-template-columns:1fr 1fr;}
+    .rules{grid-template-columns:1fr;}
+  }
+</style>
+
+<div class="label">设计确认 · 01 核心视觉</div>
+<h2>HomeAgent = 屋檐下持续亮着的智能火种</h2>
+<p class="subtitle">不是“智能家居设备”，也不是冷冰冰的通用 AI；它是一位长期在场、会记住并主动帮忙的伙伴。</p>
+
+<div class="hero-board">
+  <div class="hero-icon">
+    <svg viewBox="0 0 180 180" aria-label="HomeAgent 正式图标概念">
+      <defs>
+        <linearGradient id="final-bg" x1="0" y1="0" x2="1" y2="1">
+          <stop stop-color="#da7b51"/>
+          <stop offset=".55" stop-color="#c45f43"/>
+          <stop offset="1" stop-color="#a94733"/>
+        </linearGradient>
+        <radialGradient id="final-core">
+          <stop stop-color="#fff9dc"/>
+          <stop offset=".48" stop-color="#f6cf70"/>
+          <stop offset="1" stop-color="#e7a43c"/>
+        </radialGradient>
+      </defs>
+      <rect x="6" y="6" width="168" height="168" rx="42" fill="url(#final-bg)"/>
+      <path d="M35 88 90 43l55 45" fill="none" stroke="#fff3e5" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M50 85v42c0 9 7 16 16 16h48c9 0 16-7 16-16V85" fill="none" stroke="#fff3e5" stroke-width="10" stroke-linecap="round"/>
+      <circle cx="90" cy="105" r="29" fill="#f7c45d" opacity=".18"/>
+      <circle cx="90" cy="105" r="18" fill="url(#final-core)"/>
+      <path d="m90 80 5.5 17.5L113 103l-17.5 5.5L90 126l-5.5-17.5L67 103l17.5-5.5Z" fill="#fff9df"/>
+      <circle cx="133" cy="49" r="6.5" fill="#f4c965"/>
+    </svg>
+  </div>
+  <div class="hero-copy">
+    <div class="lockup">
+      <svg class="lockup-mini" viewBox="0 0 48 48" aria-hidden="true">
+        <rect width="48" height="48" rx="12" fill="#c45f43"/>
+        <path d="M10 24 24 12l14 12M14 23v11c0 3 2 5 5 5h10c3 0 5-2 5-5V23" fill="none" stroke="#fff3e5" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="m24 21 2 6 6 2-6 2-2 6-2-6-6-2 6-2Z" fill="#f4c965"/>
+      </svg>
+      <span class="wordmark">homeagent</span>
+    </div>
+    <h3>智能火种 / The Hearth Intelligence</h3>
+    <p>连续屋檐表达“被容纳与守护”；中心四向星芒表达会理解、会行动的 Agent；陶土橙让它更像家中的灯火，而不是实验室里的模型。</p>
+    <div class="formula">
+      <div>屋檐<br>Home</div><div class="plus">+</div>
+      <div>火种<br>Agent</div><div class="plus">+</div>
+      <div>陶土<br>Warmth</div>
+    </div>
+  </div>
+</div>
+
+<h3>一个标志，覆盖所有真实触点</h3>
+<div class="surfaces">
+  <div class="surface">
+    <h4>macOS App Icon</h4>
+    <div class="preview">
+      <svg class="app-icon" viewBox="0 0 48 48" aria-hidden="true">
+        <defs><linearGradient id="app-bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#da7b51"/><stop offset="1" stop-color="#a94733"/></linearGradient></defs>
+        <rect width="48" height="48" rx="12" fill="url(#app-bg)"/>
+        <path d="M10 24 24 12l14 12M14 23v11c0 3 2 5 5 5h10c3 0 5-2 5-5V23" fill="none" stroke="#fff3e5" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="m24 21 2 6 6 2-6 2-2 6-2-6-6-2 6-2Z" fill="#f4c965"/>
+      </svg>
+    </div>
+  </div>
+  <div class="surface">
+    <h4>飞书 Bot 头像</h4>
+    <div class="preview bot-bg">
+      <div class="bot">
+        <svg viewBox="0 0 48 48" aria-hidden="true">
+          <rect width="48" height="48" fill="#c45f43"/>
+          <path d="M9 24 24 11l15 13M13 23v11c0 3 2 5 5 5h12c3 0 5-2 5-5V23" fill="none" stroke="#fff3e5" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="m24 20 2.1 6.2 6.2 2.1-6.2 2.1-2.1 6.2-2.1-6.2-6.2-2.1 6.2-2.1Z" fill="#f4c965"/>
+        </svg>
+      </div>
+    </div>
+  </div>
+  <div class="surface">
+    <h4>后台深色导航</h4>
+    <div class="preview nav-bg">
+      <div class="nav-lockup">
+        <svg viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M5 16 16 7l11 9M8 15v9c0 2 2 4 4 4h8c2 0 4-2 4-4v-9" fill="none" stroke="#fff3e5" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="m16 13 1.5 4.5L22 19l-4.5 1.5L16 25l-1.5-4.5L10 19l4.5-1.5Z" fill="#f4c965"/>
+        </svg>
+        homeagent
+      </div>
+    </div>
+  </div>
+  <div class="surface">
+    <h4>单色 / 系统状态</h4>
+    <div class="preview mono-bg">
+      <svg class="mono" viewBox="0 0 64 64" aria-hidden="true">
+        <path d="M8 32 32 12l24 20M14 30v18c0 5 4 8 8 8h20c4 0 8-3 8-8V30" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="m32 24 3 9 9 3-9 3-3 9-3-9-9-3 9-3Z" fill="currentColor"/>
+      </svg>
+    </div>
+  </div>
+</div>
+
+<div class="rules">
+  <div class="rule"><strong>轮廓优先</strong>16–32px 只保留屋檐与星芒，不依赖渐变、光晕或右上状态点。</div>
+  <div class="rule"><strong>字标保持小写</strong>界面品牌锁定使用 `homeagent`，正文和系统名称继续使用规范写法 `HomeAgent`。</div>
+  <div class="rule"><strong>不做吉祥物</strong>不加眼睛、嘴巴或人物肢体；温度来自颜色、圆角与“火种”隐喻。</div>
+</div>
+
+<p class="approval-note">这一步只确认核心概念与构形。若通过，下一步会确认颜色、响应式版本和交付资产规范。</p>
+<div class="options">
+  <div class="option" data-choice="approve-core" onclick="toggleSelect(this)">
+    <div class="letter">✓</div>
+    <div class="content"><h3>核心视觉通过</h3><p>屋檐 + 智能火种 + 陶土暖色符合 HomeAgent。</p></div>
+  </div>
+  <div class="option" data-choice="revise-core" onclick="toggleSelect(this)">
+    <div class="letter">↺</div>
+    <div class="content"><h3>还想调整</h3><p>点这里，并回到对话里告诉我需要改变的地方。</p></div>
+  </div>
+</div>

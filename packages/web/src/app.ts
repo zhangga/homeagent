@@ -238,6 +238,8 @@ function feishuIntegrationMessage(error: unknown): string {
       return "操作失败：没有找到该群连接";
     case "test_failed":
       return "测试失败：请检查发送权限、Bot 群成员状态和运行状态";
+    case "prompt_failed":
+      return "确认提示发送失败：待确认状态已保留，请稍后重试";
     case "storage_conflict":
       return "连接失败：群空间路径与现有空间冲突";
     case "invalid_input":
@@ -636,7 +638,6 @@ export function createWebApp(opts: WebOptions): Hono {
       .map((binding) => engine.registry.get(binding.spaceId))
       .filter((meta): meta is NonNullable<typeof meta> => meta !== undefined);
     const { restartRequired } = integrationIdentityState(lark);
-    const externalSharing = await getExternalSharing(lark);
     const health = await getHealth();
     const restartable = health.components.service?.details?.managed === true
       && opts.onServiceRestart !== undefined;
@@ -647,15 +648,11 @@ export function createWebApp(opts: WebOptions): Hono {
         lark,
         runtime,
         restartRequired,
-        groups: activeBindings.length,
-        completedAt: cfg.onboardingCompletedAt,
-        externalSharing: externalSharing.state,
       }),
       providers,
       lark,
       provisioning,
       runtime,
-      externalSharing,
       groups,
       restartRequired,
       restartable,
@@ -954,7 +951,7 @@ export function createWebApp(opts: WebOptions): Hono {
 
   app.post("/setup/finish", async (c) => {
     const setup = await getSetupContext();
-    if (setup.snapshot.current !== "invite" && setup.snapshot.current !== "done") {
+    if (setup.snapshot.current !== "done") {
       return c.redirect(`/setup?ok=${encodeURIComponent("请先完成 AI、飞书机器人和消息监听设置")}`);
     }
     saveSettings({ onboardingCompletedAt: Date.now() });
@@ -2020,10 +2017,8 @@ export function createWebApp(opts: WebOptions): Hono {
       return c.redirect(`/integrations?ok=${encodeURIComponent("群发现不可用：请先完成飞书 Bot 连接")}`);
     }
     try {
-      const [candidates, snapshot] = await Promise.all([
-        opts.feishuIntegration.listConnectionCandidates(),
-        opts.feishuIntegration.snapshot(),
-      ]);
+      const candidates =
+        await opts.feishuIntegration.listConnectionCandidates();
       return c.html(
         await layout(
           "连接飞书群",
@@ -2033,7 +2028,6 @@ export function createWebApp(opts: WebOptions): Hono {
           ],
           await feishuGroupConnectView({
             candidates,
-            capability: snapshot.capability,
             flashMsg: c.req.query("ok") ?? undefined,
           }),
           "integrations",
@@ -2052,18 +2046,59 @@ export function createWebApp(opts: WebOptions): Hono {
     }
     const body = await c.req.parseBody();
     try {
-      await opts.feishuIntegration.connectGroup({
+      await opts.feishuIntegration.requestGroupConfirmation({
         chatId: str(body, "chatId"),
-        responseMode: parseFeishuResponseMode(body),
-        participationLevel: parseGroupParticipationLevel(body),
-        replyInThread: checkbox(body, "replyInThread"),
       });
       return c.redirect(
-        `/integrations?ok=${encodeURIComponent("群聊已连接；从现在起才会收录和响应消息")}`,
+        `/integrations?ok=${encodeURIComponent("已发送确认提示；群主或管理员确认前不会收录消息")}`,
+      );
+    } catch (error) {
+      const target = error instanceof FeishuIntegrationError
+          && error.code === "prompt_failed"
+        ? "/integrations"
+        : "/integrations/groups/connect";
+      return c.redirect(
+        `${target}?ok=${encodeURIComponent(feishuIntegrationMessage(error))}`,
+      );
+    }
+  });
+
+  app.post("/integrations/groups/:space/confirmation", async (c) => {
+    const space = parseSpace(c.req.param("space"));
+    if (!space || !space.startsWith("team/")) return c.notFound();
+    if (!opts.feishuIntegration) {
+      return c.redirect(
+        `/integrations?ok=${encodeURIComponent("确认提示不可用：当前运行方式未接入飞书管理组件")}`,
+      );
+    }
+    try {
+      await opts.feishuIntegration.resendGroupConfirmation(space);
+      return c.redirect(
+        `/integrations?ok=${encodeURIComponent("确认提示已重新发送")}`,
       );
     } catch (error) {
       return c.redirect(
-        `/integrations/groups/connect?ok=${encodeURIComponent(feishuIntegrationMessage(error))}`,
+        `/integrations?ok=${encodeURIComponent(feishuIntegrationMessage(error))}`,
+      );
+    }
+  });
+
+  app.post("/integrations/groups/:space/ignore", async (c) => {
+    const space = parseSpace(c.req.param("space"));
+    if (!space || !space.startsWith("team/")) return c.notFound();
+    if (!opts.feishuIntegration) {
+      return c.redirect(
+        `/integrations?ok=${encodeURIComponent("忽略失败：当前运行方式未接入飞书管理组件")}`,
+      );
+    }
+    try {
+      await opts.feishuIntegration.disconnectGroup(space);
+      return c.redirect(
+        `/integrations?ok=${encodeURIComponent("已忽略该群；重新加入不会自动启用")}`,
+      );
+    } catch (error) {
+      return c.redirect(
+        `/integrations?ok=${encodeURIComponent(feishuIntegrationMessage(error))}`,
       );
     }
   });

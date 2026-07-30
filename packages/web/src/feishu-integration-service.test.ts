@@ -54,10 +54,8 @@ describe("FeishuIntegrationService", () => {
 
     let error: unknown;
     try {
-      await service.connectGroup({
+      await service.requestGroupConfirmation({
         chatId: "oc_product",
-        responseMode: "mentions_only",
-        replyInThread: true,
       });
     } catch (caught) {
       error = caught;
@@ -69,7 +67,7 @@ describe("FeishuIntegrationService", () => {
     expect(engine.feishuBindings.list()).toEqual([]);
   });
 
-  test("candidate discovery excludes active bindings and includes reconnectable groups", async () => {
+  test("candidate discovery excludes active and already-pending bindings", async () => {
     for (const chatId of ["oc_active", "oc_disconnected", "oc_reconnect"]) {
       engine.feishuBindings.connect({
         chatId,
@@ -88,6 +86,11 @@ describe("FeishuIntegrationService", () => {
       responseMode: "mentions_only",
       replyInThread: true,
     });
+    engine.feishuBindings.registerPending({
+      chatId: "oc_pending",
+      spaceId: "team/oc_pending",
+      boundAppId: "cli_current",
+    });
     const service = new FeishuIntegrationService({
       engine,
       larkSetup: setupPort({
@@ -95,6 +98,7 @@ describe("FeishuIntegrationService", () => {
           { chatId: "oc_active", name: "Active" },
           { chatId: "oc_disconnected", name: "Disconnected" },
           { chatId: "oc_new", name: "New" },
+          { chatId: "oc_pending", name: "Pending" },
           { chatId: "oc_reconnect", name: "Reconnect" },
         ],
       }),
@@ -307,8 +311,9 @@ describe("FeishuIntegrationService", () => {
     expect(engine.feishuBindings.getByChatId("oc_other")?.state).toBe("active");
   });
 
-  test("connect rereads membership and reconnect preserves existing knowledge", async () => {
+  test("requesting confirmation verifies membership but creates no space", async () => {
     let verifiedBeforeWrite = false;
+    const prompts: string[] = [];
     const service = new FeishuIntegrationService({
       engine,
       larkSetup: setupPort({
@@ -318,14 +323,36 @@ describe("FeishuIntegrationService", () => {
           return { chatId, name: "Product" };
         },
       }),
+      sendConfirmationPrompt: async (chatId) => {
+        prompts.push(chatId);
+      },
     });
-    await service.connectGroup({
+    await service.requestGroupConfirmation({
       chatId: "oc_product",
-      responseMode: "mentions_only",
-      replyInThread: true,
     });
     expect(verifiedBeforeWrite).toBeTrue();
-    const original = engine.feishuBindings.getByChatId("oc_product")!;
+    expect(engine.registry.has("team/oc_product")).toBeFalse();
+    expect(engine.feishuBindings.getByChatId("oc_product")).toMatchObject({
+      state: "pending_confirmation",
+      boundAppId: "cli_current",
+      responseMode: "mentions_only",
+      replyInThread: true,
+      confirmationPrompt: { status: "sent" },
+    });
+    await service.resendGroupConfirmation("team/oc_product");
+    expect(prompts).toEqual(["oc_product", "oc_product"]);
+  });
+
+  test("requesting reconfirmation preserves existing knowledge and uses the new app", async () => {
+    engine.ensureSpace("team/oc_product", { chatId: "oc_product" });
+    const original = engine.feishuBindings.connect({
+      chatId: "oc_product",
+      spaceId: "team/oc_product",
+      boundAppId: "cli_old",
+      responseMode: "smart",
+      participationLevel: "active",
+      replyInThread: false,
+    });
     const rawId = await engine.remember({
       space: original.spaceId,
       source: "message",
@@ -333,7 +360,7 @@ describe("FeishuIntegrationService", () => {
     });
     engine.feishuBindings.disconnect(original.spaceId);
 
-    const reconnect = new FeishuIntegrationService({
+    const service = new FeishuIntegrationService({
       engine,
       larkSetup: setupPort({
         status: async () => ({
@@ -347,54 +374,47 @@ describe("FeishuIntegrationService", () => {
         }),
         getBotChat: async (chatId) => ({ chatId, name: "Product" }),
       }),
+      sendConfirmationPrompt: async () => {},
     });
-    await reconnect.connectGroup({
+    await service.requestGroupConfirmation({
       chatId: "oc_product",
-      responseMode: "mentions_only",
-      replyInThread: false,
     });
 
     expect(engine.feishuBindings.getByChatId("oc_product")).toMatchObject({
-      state: "active",
+      state: "pending_confirmation",
       boundAppId: "cli_new",
       createdAt: original.createdAt,
+      responseMode: "mentions_only",
+      replyInThread: true,
     });
     expect(await engine.getRawGovernanceDetail(original.spaceId, rawId))
       .not.toBeNull();
   });
 
-  test("a failed binding write rolls back only a newly created workspace", async () => {
+  test("a failed prompt leaves a bounded pending record for explicit retry", async () => {
     const service = new FeishuIntegrationService({
       engine,
       larkSetup: setupPort({
         getBotChat: async (chatId) => ({ chatId, name: "Product" }),
       }),
+      sendConfirmationPrompt: async () => {
+        throw new Error(`private prompt failure ${"x".repeat(1_000)}`);
+      },
     });
-    const originalConnect = engine.feishuBindings.connect.bind(
-      engine.feishuBindings,
-    );
-    engine.feishuBindings.connect = () => {
-      throw new Error("forced binding failure");
-    };
 
-    await expect(service.connectGroup({
+    await expect(service.requestGroupConfirmation({
       chatId: "oc_new",
-      responseMode: "mentions_only",
-      replyInThread: true,
-    })).rejects.toThrow("forced binding failure");
+    })).rejects.toMatchObject({ code: "prompt_failed" });
     expect(engine.registry.has("team/oc_new")).toBeFalse();
-
-    engine.ensureSpace("team/oc_existing", { chatId: "oc_existing" });
-    await expect(service.connectGroup({
-      chatId: "oc_existing",
-      responseMode: "mentions_only",
-      replyInThread: true,
-    })).rejects.toThrow("forced binding failure");
-    expect(engine.registry.has("team/oc_existing")).toBeTrue();
-    engine.feishuBindings.connect = originalConnect;
+    const pending = engine.feishuBindings.getByChatId("oc_new");
+    expect(pending).toMatchObject({
+      state: "pending_confirmation",
+      confirmationPrompt: { status: "failed" },
+    });
+    expect(pending?.confirmationPrompt?.lastError).not.toContain("private");
   });
 
-  test("mentions-only bypasses full-message permission while smart fails closed", async () => {
+  test("requesting confirmation does not depend on full-message permission", async () => {
     let membershipReads = 0;
     const service = new FeishuIntegrationService({
       engine,
@@ -405,44 +425,16 @@ describe("FeishuIntegrationService", () => {
           return { chatId, name: "Product" };
         },
       }),
+      sendConfirmationPrompt: async () => {},
     });
 
-    await expect(service.connectGroup({
-      chatId: "oc_smart",
-      responseMode: "smart",
-      replyInThread: true,
-    })).rejects.toMatchObject({ code: "capability_required" });
-    expect(membershipReads).toBe(0);
-    expect(engine.registry.has("team/oc_smart")).toBeFalse();
-
-    await service.connectGroup({
+    await service.requestGroupConfirmation({
       chatId: "oc_mentions",
-      responseMode: "mentions_only",
-      replyInThread: true,
     });
     expect(membershipReads).toBe(1);
-    expect(engine.feishuBindings.activeByChatId("oc_mentions")).toBeDefined();
-
-    engine.ensureSpace("team/oc_degraded", { chatId: "oc_degraded" });
-    engine.feishuBindings.connect({
-      chatId: "oc_degraded",
-      spaceId: "team/oc_degraded",
-      boundAppId: "cli_current",
-      responseMode: "smart",
-      participationLevel: "balanced",
-      replyInThread: true,
-    });
-    engine.feishuBindings.disconnect("team/oc_degraded");
-    await service.connectGroup({
-      chatId: "oc_degraded",
-      responseMode: "smart",
-      participationLevel: "balanced",
-      replyInThread: true,
-    });
-    expect(membershipReads).toBe(2);
-    expect(engine.feishuBindings.activeByChatId("oc_degraded")).toMatchObject({
-      responseMode: "smart",
-      participationLevel: "balanced",
+    expect(engine.feishuBindings.getByChatId("oc_mentions")).toMatchObject({
+      state: "pending_confirmation",
+      responseMode: "mentions_only",
     });
   });
 

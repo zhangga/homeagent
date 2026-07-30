@@ -593,29 +593,55 @@ export class FeishuConnector implements Connector {
 
   async isChatAdministrator(chatId: string, userId: string): Promise<boolean> {
     try {
-      const out = await this.runCommand([
-        this.larkBin,
-        "im",
-        "chats",
-        "get",
-        "--as",
-        "bot",
-        "--chat-id",
-        chatId,
-        "--user-id-type",
-        "open_id",
-        "--json",
-      ]);
-      const parsed = JSON.parse(out) as Record<string, unknown>;
-      const data = parsed.data as Record<string, unknown> | undefined;
-      const managers = Array.isArray(data?.user_manager_id_list)
-        ? data.user_manager_id_list.map(String)
-        : [];
-      return data?.owner_id === userId || managers.includes(userId);
+      return await this.checkChatAdministrator(chatId, userId);
     } catch (err) {
       log.warn("chat administrator lookup failed", { chatId, userId, err: String(err) });
       return false;
     }
+  }
+
+  async getBotChat(chatId: string): Promise<{
+    chatId: string;
+    name: string;
+  } | undefined> {
+    const data = await this.fetchBotChat(chatId);
+    if (!data) return undefined;
+    return {
+      chatId,
+      name: typeof data.name === "string" ? data.name : "",
+    };
+  }
+
+  async checkChatAdministrator(
+    chatId: string,
+    userId: string,
+  ): Promise<boolean> {
+    const data = await this.fetchBotChat(chatId);
+    if (!data) return false;
+    const managers = Array.isArray(data.user_manager_id_list)
+      ? data.user_manager_id_list.map(String)
+      : [];
+    return data.owner_id === userId || managers.includes(userId);
+  }
+
+  private async fetchBotChat(
+    chatId: string,
+  ): Promise<Record<string, unknown> | undefined> {
+    const out = await this.runCommand([
+      this.larkBin,
+      "im",
+      "chats",
+      "get",
+      "--as",
+      "bot",
+      "--chat-id",
+      chatId,
+      "--user-id-type",
+      "open_id",
+      "--json",
+    ]);
+    const parsed = JSON.parse(out) as Record<string, unknown>;
+    return parsed.data as Record<string, unknown> | undefined;
   }
 
   // ---- doc sync (Q8) ------------------------------------------------------
