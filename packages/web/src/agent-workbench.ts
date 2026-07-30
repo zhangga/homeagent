@@ -52,6 +52,7 @@ export interface AgentRunView {
   taskName: string;
   topic: string;
   status: TaskRun["status"];
+  error?: string;
   startedAt: number;
   finishedAt?: number;
   provider: string;
@@ -356,6 +357,7 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
         taskName: run.taskName,
         topic: run.topic,
         status: run.status,
+        error: run.error,
         startedAt: run.startedAt,
         finishedAt: run.finishedAt,
         provider: run.provider ?? "未记录",

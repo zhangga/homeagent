@@ -134,6 +134,32 @@ describe("Agent create defaults", () => {
 });
 
 describe("Agent workbench presenter", () => {
+  test("exposes a durable run error without deriving one from task content", () => {
+    const failedRun: TaskRun = {
+      ...runs[0]!,
+      id: "run_failed",
+      status: "failed",
+      error: "Provider process exited before producing a result",
+    };
+    const view = buildAgentWorkbench({
+      agents: [agent],
+      mode: "edit",
+      selected: agent,
+      providers,
+      models: { codex: ["gpt-5.6-sol"] },
+      defaults: { provider: "codex", model: "gpt-5.6-sol" },
+      bindings,
+      runs: [failedRun],
+    });
+
+    expect(view.inspector?.runs[0]).toEqual(
+      expect.objectContaining({
+        id: "run_failed",
+        error: "Provider process exited before producing a result",
+      }),
+    );
+  });
+
   test("derives honest readiness, effective model, bindings, and run snapshots", () => {
     const view = buildAgentWorkbench({
       agents: [agent],

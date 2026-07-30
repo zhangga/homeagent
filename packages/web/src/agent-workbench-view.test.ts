@@ -84,6 +84,7 @@ describe("Agent workbench view", () => {
         model: "gpt-5.6-sol",
         distill: true,
         status: "failed",
+        error: "Provider process exited before producing a result",
         startedAt: 1_785_283_200_000,
         finishedAt: 1_785_283_260_000,
       }],
@@ -96,6 +97,13 @@ describe("Agent workbench view", () => {
     expect(body).toContain('data-pane="agent-list"');
     expect(body).toContain('data-pane="agent-editor"');
     expect(body).toContain('data-pane="agent-inspector"');
+    expect(body).toContain('class="agent-edit-name"');
+    const editorBody = body.slice(
+      body.indexOf('data-pane="agent-editor"'),
+      body.indexOf('data-pane="agent-inspector"'),
+    );
+    expect(editorBody).toContain("Recent runs");
+    expect(editorBody).toContain("Provider process exited before producing a result");
     expect(body).toContain("运营研究员");
     expect(body).toContain("CLI 就绪");
     expect(body).toContain("运营群");
@@ -106,6 +114,21 @@ describe("Agent workbench view", () => {
     expect(body).toContain('data-agent-name="运营研究员"');
     expect(body).toContain('data-binding-count="1"');
     expect(body).toContain("保存更改");
+    const inspectorBody = body.slice(body.indexOf('data-pane="agent-inspector"'));
+    expect(inspectorBody).toContain(">Agent 设置<");
+    expect(inspectorBody).not.toContain("Recent task runs");
+    for (const id of [
+      "agent-provider",
+      "agent-model",
+      "agent-reasoning-effort",
+      "agent-permission",
+      "agent-visibility",
+      "agent-workdir",
+      "agent-skills",
+    ]) {
+      const control = inspectorBody.slice(inspectorBody.indexOf(`id="${id}"`));
+      expect(control.slice(0, control.indexOf(">"))).toContain('form="agent-editor-form"');
+    }
     expect(body).not.toContain("Device");
     expect(body).not.toContain("Repositories");
   });

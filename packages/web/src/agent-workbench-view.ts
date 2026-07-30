@@ -190,8 +190,8 @@ const AGENT_STYLE = `
     text-overflow:ellipsis;
     white-space:nowrap;
   }
-  .agent-create-name-wrap { min-width:0; width:min(420px, 44vw); }
-  .agent-create-name {
+  .agent-create-name-wrap, .agent-edit-name-wrap { min-width:0; width:min(420px, 44vw); }
+  .agent-create-name, .agent-edit-name {
     width:100%;
     min-height:34px;
     border:1px solid transparent;
@@ -202,15 +202,17 @@ const AGENT_STYLE = `
     font-size:14px;
     font-weight:650;
   }
-  .agent-create-name:hover { border-color:#e0e0da; background:#fafaf7; }
-  .agent-create-name:focus {
+  .agent-create-name:hover, .agent-edit-name:hover { border-color:#e0e0da; background:#fafaf7; }
+  .agent-create-name:focus, .agent-edit-name:focus {
     border-color:#777771;
     outline:0;
     background:#fff;
     box-shadow:0 0 0 3px #efefeb;
   }
-  .agent-create-name[aria-invalid="true"] { border-color:#c95c51; }
-  .agent-create-name-wrap .agent-field-error { margin:3px 9px 6px; }
+  .agent-create-name[aria-invalid="true"], .agent-edit-name[aria-invalid="true"] { border-color:#c95c51; }
+  .agent-create-name-wrap .agent-field-error, .agent-edit-name-wrap .agent-field-error {
+    margin:3px 9px 6px;
+  }
   .agent-save-state {
     display:none;
     padding:2px 7px;
@@ -236,6 +238,18 @@ const AGENT_STYLE = `
   .agent-danger { border:1px solid #e1c6c2; background:#fff; color:#a7372c; }
   .agent-danger:hover { filter:none; background:#fff2f0; }
   .agent-editor-scroll { max-width:820px; margin:0 auto; padding:34px 46px 96px; }
+  .agent-editor-context { max-width:960px; padding-top:30px; }
+  .agent-context-section { padding-bottom:28px; }
+  .agent-context-heading {
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    gap:18px;
+    margin-bottom:8px;
+  }
+  .agent-context-label { color:#353530; font-size:12px; font-weight:700; }
+  .agent-context-heading .agent-field-hint { margin:0; }
+  .agent-context-section .agent-field-control textarea { min-height:150px; }
   .is-create .agent-editor-scroll { max-width:1080px; padding-top:28px; }
   .agent-create-intro {
     display:flex;
@@ -417,50 +431,161 @@ const AGENT_STYLE = `
   .agent-provider-state .agent-status-mark { margin-top:6px; }
   .agent-provider-name { font-size:13px; font-weight:650; }
   .agent-provider-detail { margin-top:2px; color:#85857f; font-size:11px; overflow-wrap:anywhere; }
-  .agent-binding, .agent-run {
+  .agent-property-field { display:grid; gap:6px; margin:0 0 14px; }
+  .agent-property-field:last-child { margin-bottom:0; }
+  .agent-property-label {
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    gap:8px;
+    color:#55554f;
+    font-size:11px;
+    font-weight:620;
+  }
+  .agent-property-hint { color:#92928b; font-size:9.5px; font-weight:400; }
+  .agent-property-control input,
+  .agent-property-control select {
+    width:100%;
+    min-height:34px;
+    border:1px solid #d5d5cf;
+    border-radius:7px;
+    padding:6px 9px;
+    background:#fff;
+    color:#282824;
+    font-size:12px;
+    box-shadow:0 1px 1px rgba(20,20,16,.02);
+  }
+  .agent-property-control input:focus,
+  .agent-property-control select:focus {
+    border-color:#777771;
+    outline:0;
+    box-shadow:0 0 0 3px #e8e8e3;
+  }
+  .agent-property-control [aria-invalid="true"] { border-color:#c95c51; }
+  .agent-property-control .agent-field-error { margin-top:5px; font-size:11px; }
+  .agent-binding {
     display:block;
     margin:0 -8px 3px;
     padding:8px;
     border-radius:7px;
     color:inherit;
   }
-  .agent-run:hover { background:#ebebe7; }
-  .agent-run-title:hover { text-decoration:underline; }
-  .agent-binding-title, .agent-run-title { color:#33332f; font-size:12px; font-weight:620; }
-  .agent-binding-meta, .agent-run-meta { margin-top:3px; color:#85857f; font-size:10.5px; line-height:1.4; overflow-wrap:anywhere; }
-  .agent-run-row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
-  .agent-run-status {
+  .agent-binding-title { color:#33332f; font-size:12px; font-weight:620; }
+  .agent-binding-meta {
+    margin-top:3px;
+    color:#85857f;
+    font-size:10.5px;
+    line-height:1.4;
+    overflow-wrap:anywhere;
+  }
+  .agent-recent-runs { padding-top:22px; border-top:1px solid #e9e9e4; }
+  .agent-runs-heading { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+  .agent-runs-heading h2 {
+    display:flex;
+    align-items:baseline;
+    gap:7px;
+    margin:0;
+    color:#353530;
+    font-size:12px;
+    font-weight:700;
+  }
+  .agent-run-list { overflow:hidden; border:1px solid #dfdfda; border-radius:9px; background:#fff; }
+  .agent-run-item { display:flex; min-width:0; border-bottom:1px solid #eeeeea; }
+  .agent-run-item:last-child { border-bottom:0; }
+  .agent-run-link {
+    display:grid;
+    min-width:0;
+    flex:1 1 auto;
+    grid-template-columns:18px minmax(0, 1fr) auto 12px;
+    align-items:center;
+    gap:10px;
+    padding:10px 11px;
+    color:inherit;
+  }
+  .agent-run-link:hover { background:#fafaf7; text-decoration:none; }
+  .agent-run-link:focus-visible {
+    position:relative;
+    z-index:1;
+    outline:2px solid #74746e;
+    outline-offset:-2px;
+  }
+  .agent-run-icon {
+    display:inline-flex;
+    width:16px;
+    height:16px;
+    align-items:center;
+    justify-content:center;
+    border:1px solid #b8b8b1;
+    border-radius:50%;
+    color:#777771;
+    font-size:10px;
+    font-weight:750;
+  }
+  .agent-run-item.succeeded .agent-run-icon {
+    border-color:#84c5a4;
+    background:#eff9f3;
+    color:#21845a;
+  }
+  .agent-run-item.running .agent-run-icon {
+    border-color:#d6a85f;
+    background:#fff8eb;
+    color:#9a620d;
+  }
+  .agent-run-item.failed .agent-run-icon,
+  .agent-run-item.timed_out .agent-run-icon {
+    border-color:#dc9b94;
+    background:#fff3f1;
+    color:#b34237;
+  }
+  .agent-run-copy { display:block; min-width:0; }
+  .agent-run-primary,
+  .agent-run-secondary {
+    display:block;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .agent-run-primary { color:#30302c; font-size:12px; font-weight:630; }
+  .agent-run-item.failed .agent-run-primary,
+  .agent-run-item.timed_out .agent-run-primary { color:#a63d34; }
+  .agent-run-secondary { margin-top:2px; color:#8a8a83; font-size:10.5px; }
+  .agent-run-status-text { color:#666660; font-weight:620; }
+  .agent-run-time { color:#898983; font-size:10.5px; white-space:nowrap; }
+  .agent-run-open { color:#aaa9a2; font-size:11px; }
+  .agent-run-item > form {
+    display:flex;
     flex:0 0 auto;
-    padding:1px 6px;
-    border-radius:999px;
-    background:#e8e8e3;
-    color:#64645f;
-    font-size:10px;
+    align-items:center;
+    padding:7px 10px 7px 0;
   }
-  .agent-run-status.running { background:#f8e8cf; color:#85530c; }
-  .agent-run-status.succeeded { background:#dff1e6; color:#246947; }
-  .agent-run-status.failed, .agent-run-status.timed_out { background:#f7dfdc; color:#9c382f; }
-  .agent-run-actions { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:5px; }
   .agent-run-retry {
-    padding:2px 7px;
-    border:1px solid #d8d8d2;
-    border-radius:5px;
+    min-height:30px;
+    padding:4px 9px;
+    border:1px solid #d9b8b4;
+    border-radius:6px;
     background:#fff;
-    color:#55554f;
-    font-size:10px;
+    color:#a63d34;
+    font-size:11px;
+    font-weight:620;
   }
-  .agent-run-retry:hover { background:#f3f3ef; filter:none; }
+  .agent-run-retry:hover { background:#fff3f1; filter:none; }
+  .agent-runs-empty {
+    padding:18px;
+    border:1px dashed #d8d8d2;
+    border-radius:9px;
+    color:#8b8b84;
+    font-size:12px;
+    text-align:center;
+  }
   .agent-load-more {
     display:block;
-    margin-top:8px;
-    padding:6px 8px;
-    border:1px solid #d8d8d2;
-    border-radius:6px;
-    color:#55554f;
+    margin-top:10px;
+    padding:8px;
+    color:#666660;
     font-size:11px;
     text-align:center;
   }
-  .agent-load-more:hover { background:#ebebe7; text-decoration:none; }
+  .agent-load-more:hover { color:#252520; text-decoration:underline; }
   .agent-inspector-empty { padding:4px 0; color:#989891; font-size:12px; }
   .agent-delete-note { margin:0 0 10px; color:#8b8b85; font-size:11px; }
   .agent-inspector-overlay { display:none; }
@@ -519,7 +644,7 @@ const AGENT_STYLE = `
     .agent-editor-actions { gap:5px; }
     .agent-editor-actions button { padding-right:9px; padding-left:9px; }
     .agent-editor-scroll { padding:26px 18px 90px; }
-    .agent-create-name-wrap { width:min(48vw, 320px); }
+    .agent-create-name-wrap, .agent-edit-name-wrap { width:min(48vw, 320px); }
     .agent-create-intro { display:block; }
     .agent-create-readiness { margin-top:14px; }
     .agent-create-core-grid, .agent-task-fields { grid-template-columns:1fr; }
@@ -527,11 +652,17 @@ const AGENT_STYLE = `
     .agent-field { grid-template-columns:1fr; gap:7px; }
     .agent-field-label { padding-top:0; }
     .agent-field-control textarea { min-height:190px; }
+    .agent-context-section .agent-field-control textarea { min-height:140px; }
+    .agent-run-link { min-height:44px; padding:10px 9px; }
+    .agent-run-retry { min-height:40px; }
     .agent-resizer { display:none; }
   }
   @media (max-width:540px) {
     body:has(main.agent-page) nav.rail { display:none; }
     .agent-title-text { max-width:28vw; }
+    .agent-run-secondary { display:none; }
+    .agent-run-link { grid-template-columns:18px minmax(0, 1fr) auto 12px; gap:8px; }
+    .agent-run-time { font-size:10px; }
   }
   @media (prefers-reduced-motion:reduce) {
     .agent-inspector-pane, .agent-inspector-overlay { transition:none; }
@@ -868,7 +999,24 @@ export function agentWorkbenchView(
     <div class="agent-pane-header agent-editor-header">
       <div class="agent-editor-heading">
         <a class="agent-mobile-back" href="/agents?view=list" aria-label="返回 Agent 列表">返回</a>
-        <span class="agent-title-text">${isEditing ? view.selected!.name : "新建 Agent"}</span>
+        <div class="agent-edit-name-wrap">
+          <label class="agent-visually-hidden" for="agent-name">Agent 名称</label>
+          <input
+            class="agent-edit-name"
+            id="agent-name"
+            name="name"
+            type="text"
+            form="agent-editor-form"
+            value="${values.name}"
+            placeholder="例如：研究助手"
+            maxlength="100"
+            required
+            aria-invalid="${nameAttrs.invalid}"
+            aria-describedby="${nameAttrs.describedBy}"
+            autocomplete="off"
+          />
+          ${errorFor(view.errors, "name")}
+        </div>
         <span class="agent-save-state" id="agent-save-state">未保存</span>
       </div>
       <div class="agent-editor-actions">
@@ -881,201 +1029,94 @@ export function agentWorkbenchView(
         </button>
       </div>
     </div>
-    <div class="agent-editor-scroll">
-      <div class="agent-form-intro">
-        <h1>${isEditing ? view.selected!.name : "创建 Agent"}</h1>
-        <p>配置回答人格和本地 CLI。任务执行权限仅影响研究任务，不改变普通问答、提炼或学习流程。</p>
-      </div>
+    <div class="agent-editor-scroll agent-editor-context">
       ${view.flash ? html`<div class="agent-flash" role="status">${view.flash}</div>` : ""}
       ${view.formError ? html`<div class="agent-form-alert" role="alert">${view.formError}</div>` : ""}
-      <form method="post" action="${formAction}" id="agent-editor-form" class="stack">
-        <section class="agent-form-section" aria-labelledby="agent-section-identity">
-          <h2 class="agent-section-heading" id="agent-section-identity">Identity</h2>
-          <div class="agent-field">
-            <label class="agent-field-label" for="agent-name">名称</label>
-            <div class="agent-field-control">
-              <input
-                id="agent-name"
-                name="name"
-                type="text"
-                value="${values.name}"
-                placeholder="例如：研究助手"
-                maxlength="100"
-                required
-                aria-invalid="${nameAttrs.invalid}"
-                aria-describedby="${nameAttrs.describedBy}"
-                autocomplete="off"
-              />
-              ${errorFor(view.errors, "name")}
-            </div>
+      <form method="post" action="${formAction}" id="agent-editor-form" class="agent-context-form">
+        <section class="agent-context-section" aria-labelledby="agent-instruction-label">
+          <div class="agent-context-heading">
+            <label class="agent-context-label" id="agent-instruction-label" for="agent-instruction">Instruction</label>
+            <span class="agent-field-hint"><span id="agent-instruction-count">${values.instruction.length}</span> / 20,000</span>
           </div>
-          <div class="agent-field">
-            <label class="agent-field-label" for="agent-instruction">
-              Instruction
-              <small>注入回答与研究任务的角色指令</small>
-            </label>
-            <div class="agent-field-control">
-              <textarea
-                id="agent-instruction"
-                name="instruction"
-                maxlength="20000"
-                aria-invalid="${instructionAttrs.invalid}"
-                aria-describedby="${instructionAttrs.describedBy}"
-                placeholder="描述这个 Agent 的职责、判断原则和表达方式"
-              >${values.instruction}</textarea>
-              <p class="agent-field-hint"><span id="agent-instruction-count">${values.instruction.length}</span> / 20,000</p>
-              ${errorFor(view.errors, "instruction")}
-            </div>
-          </div>
-        </section>
-
-        <section class="agent-form-section" aria-labelledby="agent-section-model">
-          <h2 class="agent-section-heading" id="agent-section-model">Model</h2>
-          <div class="agent-field">
-            <label class="agent-field-label" for="agent-provider">
-              Provider
-              <small>只显示本机支持的 CLI</small>
-            </label>
-            <div class="agent-field-control">
-              <select
-                id="agent-provider"
-                name="provider"
-                aria-invalid="${providerAttrs.invalid}"
-                aria-describedby="${providerAttrs.describedBy}"
-              >
-                ${providerOptions.map((provider) => html`
-                  <option
-                    value="${provider.id}"
-                    ${provider.id === values.provider ? "selected" : ""}
-                    ${!provider.available && provider.id !== values.provider ? "disabled" : ""}
-                  >
-                    ${provider.name} · ${provider.available ? "CLI 就绪" : `不可用：${provider.detail}`}
-                  </option>
-                `)}
-              </select>
-              ${errorFor(view.errors, "provider")}
-            </div>
-          </div>
-          <div class="agent-field">
-            <label class="agent-field-label" for="agent-model">
-              Model
-              <small>留空时继承适用的默认配置</small>
-            </label>
-            <div class="agent-field-control">
-              <select
-                id="agent-model"
-                name="model"
-                aria-invalid="${modelAttrs.invalid}"
-                aria-describedby="${modelAttrs.describedBy}"
-              >
-                <option value="" ${values.model === "" ? "selected" : ""}>使用默认模型</option>
-                ${modelOptions}
-              </select>
-              ${errorFor(view.errors, "model")}
-            </div>
-          </div>
-          <div class="agent-field">
-            <label class="agent-field-label" for="agent-reasoning-effort">
-              推理强度
-              <small>仅 Codex；可用档位随模型变化</small>
-            </label>
-            <div class="agent-field-control">
-              <select
-                id="agent-reasoning-effort"
-                name="reasoningEffort"
-                ${values.provider !== "codex" ? "disabled" : ""}
-                aria-invalid="${reasoningAttrs.invalid}"
-                aria-describedby="${reasoningAttrs.describedBy}"
-              >
-                <option value="" ${values.reasoningEffort === "" ? "selected" : ""}>继承 Codex 默认配置</option>
-                ${reasoningOptions}
-              </select>
-              ${errorFor(view.errors, "reasoningEffort")}
-            </div>
-          </div>
-        </section>
-
-        <section class="agent-form-section" aria-labelledby="agent-section-access">
-          <h2 class="agent-section-heading" id="agent-section-access">Access</h2>
-          <div class="agent-field">
-            <label class="agent-field-label" for="agent-visibility">
-              Visibility
-              <small>限制可绑定的空间类型</small>
-            </label>
-            <div class="agent-field-control">
-              <select
-                id="agent-visibility"
-                name="visibility"
-                aria-invalid="${visibilityAttrs.invalid}"
-                aria-describedby="${visibilityAttrs.describedBy}"
-              >
-                <option value="Team" ${values.visibility === "Team" ? "selected" : ""}>Team</option>
-                <option value="Personal" ${values.visibility === "Personal" ? "selected" : ""}>Personal</option>
-              </select>
-              ${errorFor(view.errors, "visibility")}
-            </div>
-          </div>
-          <div class="agent-field">
-            <label class="agent-field-label" for="agent-permission">
-              Permission
-              <small>仅影响研究任务的本地 CLI</small>
-            </label>
-            <div class="agent-field-control">
-              <select
-                id="agent-permission"
-                name="permission"
-                aria-invalid="${permissionAttrs.invalid}"
-                aria-describedby="${permissionAttrs.describedBy}"
-              >
-                ${Object.entries(PERMISSION_LABELS).map(([permission, label]) => html`
-                  <option value="${permission}" ${values.permission === permission ? "selected" : ""}>${label}</option>
-                `)}
-              </select>
-              ${errorFor(view.errors, "permission")}
-            </div>
-          </div>
-          <div class="agent-field">
-            <label class="agent-field-label" for="agent-workdir">
-              Workdir
-              <small>可写与完全访问权限必填</small>
-            </label>
-            <div class="agent-field-control">
-              <input
-                id="agent-workdir"
-                name="workdir"
-                type="text"
-                value="${values.workdir}"
-                maxlength="2048"
-                placeholder="~/work/project"
-                aria-invalid="${workdirAttrs.invalid}"
-                aria-describedby="${workdirAttrs.describedBy}"
-                autocomplete="off"
-              />
-              ${errorFor(view.errors, "workdir")}
-            </div>
-          </div>
-          <div class="agent-field">
-            <label class="agent-field-label" for="agent-skills">
-              Skills
-              <small>逗号或换行分隔，任务启动前加载</small>
-            </label>
-            <div class="agent-field-control">
-              <input
-                id="agent-skills"
-                name="skills"
-                type="text"
-                value="${values.skills}"
-                maxlength="4000"
-                placeholder="code-review, web-search"
-                aria-invalid="${skillsAttrs.invalid}"
-                aria-describedby="${skillsAttrs.describedBy}"
-                autocomplete="off"
-              />
-              ${errorFor(view.errors, "skills")}
-            </div>
+          <div class="agent-field-control">
+            <textarea
+              id="agent-instruction"
+              name="instruction"
+              maxlength="20000"
+              aria-invalid="${instructionAttrs.invalid}"
+              aria-describedby="${instructionAttrs.describedBy}"
+              placeholder="描述这个 Agent 的职责、判断原则和表达方式"
+            >${values.instruction}</textarea>
+            ${errorFor(view.errors, "instruction")}
           </div>
         </section>
       </form>
+      ${view.inspector ? html`
+      <section class="agent-recent-runs" aria-labelledby="agent-recent-runs-heading">
+        <div class="agent-runs-heading">
+          <h2 id="agent-recent-runs-heading">
+            Recent runs
+            <span class="agent-count">${view.inspector!.runTotal}</span>
+          </h2>
+        </div>
+        ${view.inspector!.runs.length > 0
+          ? html`
+            <div class="agent-run-list" aria-label="Recent runs">
+              ${view.inspector!.runs.map((run) => html`
+                <div class="agent-run-item ${run.status}">
+                  <a
+                    class="agent-run-link"
+                    href="/tasks/runs/${encodeURIComponent(run.id)}"
+                    aria-label="${STATUS_LABELS[run.status]}：${run.taskName}，${run.space}，${run.provider} / ${run.model}"
+                  >
+                    <span class="agent-run-icon" aria-hidden="true">
+                      ${run.status === "succeeded"
+                        ? "✓"
+                        : run.status === "running"
+                          ? "…"
+                          : run.status === "timed_out"
+                            ? "!"
+                            : run.status === "cancelled"
+                              ? "–"
+                              : "×"}
+                    </span>
+                    <span class="agent-run-copy">
+                      <span class="agent-run-primary">
+                        ${run.retryable && run.error ? run.error : run.taskName}
+                      </span>
+                      <span class="agent-run-secondary">
+                        <span class="agent-run-status-text">${STATUS_LABELS[run.status]}</span>
+                        · ${run.retryable && run.error ? html`${run.taskName} · ` : ""}
+                        ${run.space} · ${run.provider} / ${run.model}
+                      </span>
+                    </span>
+                    <time class="agent-run-time" datetime="${new Date(run.startedAt).toISOString()}">
+                      ${formatTime(run.startedAt)}
+                    </time>
+                    <span class="agent-run-open" aria-hidden="true">↗</span>
+                  </a>
+                  ${run.retryable ? html`
+                    <form method="post" action="/tasks/runs/${encodeURIComponent(run.id)}/retry">
+                      <button
+                        type="submit"
+                        class="agent-run-retry"
+                        aria-label="重试任务：${run.taskName}"
+                      >重试</button>
+                    </form>
+                  ` : ""}
+                </div>
+              `)}
+            </div>
+          `
+          : html`<div class="agent-runs-empty">还没有由此 Agent 执行的研究任务</div>`}
+        ${view.inspector!.hasMoreRuns ? html`
+          <a
+            class="agent-load-more"
+            href="/agents/${encodeURIComponent(view.selected!.id)}?runs=${Math.min(100, view.inspector!.runLimit + 20)}"
+          >加载更多（${view.inspector!.runs.length} / ${view.inspector!.runTotal}）</a>
+        ` : ""}
+      </section>
+      ` : ""}
     </div>
   ` : html`
     <div class="agent-empty-editor">
@@ -1095,10 +1136,144 @@ export function agentWorkbenchView(
 
   const inspector = view.inspector ? html`
     <div class="agent-pane-header">
-      <h2 class="agent-pane-title">运行与绑定</h2>
+      <h2 class="agent-pane-title">Agent 设置</h2>
       <button type="button" class="agent-icon-button agent-inspector-toggle" data-inspector-toggle aria-label="关闭详情">×</button>
     </div>
     <div class="agent-inspector-content">
+      <section class="agent-inspector-section agent-properties-section">
+        <h3 class="agent-inspector-label">Execution</h3>
+        <div class="agent-property-field">
+          <label class="agent-property-label" for="agent-provider">Provider</label>
+          <div class="agent-property-control">
+            <select
+              id="agent-provider"
+              name="provider"
+              form="agent-editor-form"
+              aria-invalid="${providerAttrs.invalid}"
+              aria-describedby="${providerAttrs.describedBy}"
+            >
+              ${providerOptions.map((provider) => html`
+                <option
+                  value="${provider.id}"
+                  ${provider.id === values.provider ? "selected" : ""}
+                  ${!provider.available && provider.id !== values.provider ? "disabled" : ""}
+                >
+                  ${provider.name} · ${provider.available ? "CLI 就绪" : `不可用：${provider.detail}`}
+                </option>
+              `)}
+            </select>
+            ${errorFor(view.errors, "provider")}
+          </div>
+        </div>
+        <div class="agent-property-field">
+          <label class="agent-property-label" for="agent-model">Model</label>
+          <div class="agent-property-control">
+            <select
+              id="agent-model"
+              name="model"
+              form="agent-editor-form"
+              aria-invalid="${modelAttrs.invalid}"
+              aria-describedby="${modelAttrs.describedBy}"
+            >
+              <option value="" ${values.model === "" ? "selected" : ""}>使用默认模型</option>
+              ${modelOptions}
+            </select>
+            ${errorFor(view.errors, "model")}
+          </div>
+        </div>
+        <div class="agent-property-field">
+          <label class="agent-property-label" for="agent-reasoning-effort">
+            推理强度
+            <span class="agent-property-hint">仅 Codex</span>
+          </label>
+          <div class="agent-property-control">
+            <select
+              id="agent-reasoning-effort"
+              name="reasoningEffort"
+              form="agent-editor-form"
+              ${values.provider !== "codex" ? "disabled" : ""}
+              aria-invalid="${reasoningAttrs.invalid}"
+              aria-describedby="${reasoningAttrs.describedBy}"
+            >
+              <option value="" ${values.reasoningEffort === "" ? "selected" : ""}>继承 Codex 默认配置</option>
+              ${reasoningOptions}
+            </select>
+            ${errorFor(view.errors, "reasoningEffort")}
+          </div>
+        </div>
+        <div class="agent-property-field">
+          <label class="agent-property-label" for="agent-permission">Permission</label>
+          <div class="agent-property-control">
+            <select
+              id="agent-permission"
+              name="permission"
+              form="agent-editor-form"
+              aria-invalid="${permissionAttrs.invalid}"
+              aria-describedby="${permissionAttrs.describedBy}"
+            >
+              ${Object.entries(PERMISSION_LABELS).map(([permission, label]) => html`
+                <option value="${permission}" ${values.permission === permission ? "selected" : ""}>${label}</option>
+              `)}
+            </select>
+            ${errorFor(view.errors, "permission")}
+          </div>
+        </div>
+      </section>
+      <section class="agent-inspector-section agent-properties-section">
+        <h3 class="agent-inspector-label">Scope & tools</h3>
+        <div class="agent-property-field">
+          <label class="agent-property-label" for="agent-visibility">Visibility</label>
+          <div class="agent-property-control">
+            <select
+              id="agent-visibility"
+              name="visibility"
+              form="agent-editor-form"
+              aria-invalid="${visibilityAttrs.invalid}"
+              aria-describedby="${visibilityAttrs.describedBy}"
+            >
+              <option value="Team" ${values.visibility === "Team" ? "selected" : ""}>Team</option>
+              <option value="Personal" ${values.visibility === "Personal" ? "selected" : ""}>Personal</option>
+            </select>
+            ${errorFor(view.errors, "visibility")}
+          </div>
+        </div>
+        <div class="agent-property-field">
+          <label class="agent-property-label" for="agent-workdir">Workdir</label>
+          <div class="agent-property-control">
+            <input
+              id="agent-workdir"
+              name="workdir"
+              type="text"
+              form="agent-editor-form"
+              value="${values.workdir}"
+              maxlength="2048"
+              placeholder="~/work/project"
+              aria-invalid="${workdirAttrs.invalid}"
+              aria-describedby="${workdirAttrs.describedBy}"
+              autocomplete="off"
+            />
+            ${errorFor(view.errors, "workdir")}
+          </div>
+        </div>
+        <div class="agent-property-field">
+          <label class="agent-property-label" for="agent-skills">Skills</label>
+          <div class="agent-property-control">
+            <input
+              id="agent-skills"
+              name="skills"
+              type="text"
+              form="agent-editor-form"
+              value="${values.skills}"
+              maxlength="4000"
+              placeholder="code-review, web-search"
+              aria-invalid="${skillsAttrs.invalid}"
+              aria-describedby="${skillsAttrs.describedBy}"
+              autocomplete="off"
+            />
+            ${errorFor(view.errors, "skills")}
+          </div>
+        </div>
+      </section>
       <section class="agent-inspector-section">
         <h3 class="agent-inspector-label">Provider status</h3>
         <div class="agent-provider-state">
@@ -1123,38 +1298,6 @@ export function agentWorkbenchView(
             `)
           : html`<div class="agent-inspector-empty">尚未绑定任何空间</div>`}
       </section>
-      <section class="agent-inspector-section">
-        <h3 class="agent-inspector-label">
-          Recent task runs
-          <span>${view.inspector.runTotal}</span>
-        </h3>
-        ${view.inspector.runs.length > 0
-          ? view.inspector.runs.map((run) => html`
-              <div class="agent-run">
-                <div class="agent-run-row">
-                  <a class="agent-run-title" href="/tasks/runs/${encodeURIComponent(run.id)}">${run.taskName}</a>
-                  <span class="agent-run-status ${run.status}">${STATUS_LABELS[run.status]}</span>
-                </div>
-                <div class="agent-run-meta">${formatTime(run.startedAt)} · ${run.provider} / ${run.model}</div>
-                <div class="agent-run-meta">${run.space}</div>
-                <div class="agent-run-actions">
-                  <a class="agent-run-meta" href="/tasks/runs/${encodeURIComponent(run.id)}">查看详情</a>
-                  ${run.retryable ? html`
-                    <form method="post" action="/tasks/runs/${encodeURIComponent(run.id)}/retry">
-                      <button type="submit" class="agent-run-retry">重试</button>
-                    </form>
-                  ` : ""}
-                </div>
-              </div>
-            `)
-          : html`<div class="agent-inspector-empty">还没有由此 Agent 执行的研究任务</div>`}
-        ${view.inspector.hasMoreRuns ? html`
-          <a
-            class="agent-load-more"
-            href="/agents/${encodeURIComponent(view.selected!.id)}?runs=${Math.min(100, view.inspector.runLimit + 20)}"
-          >加载更多（${view.inspector.runs.length} / ${view.inspector.runTotal}）</a>
-        ` : ""}
-      </section>
       ${isEditing ? html`
         <section class="agent-inspector-section">
           <h3 class="agent-inspector-label">Danger zone</h3>
@@ -1176,7 +1319,7 @@ export function agentWorkbenchView(
       data-resize="inspector"
       role="separator"
       tabindex="0"
-      aria-label="调整运行与绑定面板宽度"
+      aria-label="调整 Agent 设置面板宽度"
       aria-orientation="vertical"
       aria-valuemin="260"
       aria-valuemax="420"
@@ -1240,8 +1383,10 @@ export function agentWorkbenchView(
     if (saveState) saveState.classList.toggle('visible', dirty);
   }
   if (form) {
-    form.addEventListener('input', markDirty);
-    form.addEventListener('change', markDirty);
+    Array.from(form.elements).forEach(function (control) {
+      control.addEventListener('input', markDirty);
+      control.addEventListener('change', markDirty);
+    });
     form.addEventListener('submit', function () { dirty = false; });
   }
   if (nameInput) {
@@ -1324,9 +1469,6 @@ export function agentWorkbenchView(
     syncReasoning();
   }
 
-  var firstInvalid = document.querySelector('[aria-invalid="true"]');
-  if (firstInvalid && typeof firstInvalid.focus === 'function') firstInvalid.focus();
-
   var inspector = document.getElementById('agent-inspector');
   var overlay = document.querySelector('.agent-inspector-overlay');
   var inspectorTrigger = null;
@@ -1354,6 +1496,13 @@ export function agentWorkbenchView(
       setInspectorOpen(open, button);
     });
   });
+  var firstInvalid = document.querySelector('[aria-invalid="true"]');
+  if (firstInvalid && typeof firstInvalid.focus === 'function') {
+    if (inspector && inspector.contains(firstInvalid) && window.innerWidth < 1180) {
+      setInspectorOpen(true, document.querySelector('[data-inspector-toggle]'));
+    }
+    firstInvalid.focus();
+  }
   if (overlay) overlay.addEventListener('click', function () { setInspectorOpen(false); });
   document.addEventListener('keydown', function (event) {
     if (!inspector || !inspector.classList.contains('open') || window.innerWidth >= 1180) return;
@@ -1474,7 +1623,7 @@ export function agentWorkbenchView(
       </aside>
       <section class="agent-pane agent-editor-pane" data-pane="agent-editor">${editor}</section>
       ${view.mode === "create" ? "" : html`
-        <aside class="agent-pane agent-inspector-pane" id="agent-inspector" data-pane="agent-inspector" aria-label="Agent 运行与绑定">
+        <aside class="agent-pane agent-inspector-pane" id="agent-inspector" data-pane="agent-inspector" aria-label="Agent 设置">
           ${inspector}
         </aside>
         <button class="agent-inspector-overlay" type="button" aria-label="关闭详情"></button>

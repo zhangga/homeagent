@@ -1694,6 +1694,15 @@ describe("management backend (read-write)", () => {
     expect(body).toContain('data-pane="agent-inspector"');
     expect(body).toContain("产品讨论群");
     expect(body).toContain("CLI 就绪");
+    const editorBody = body.slice(
+      body.indexOf('data-pane="agent-editor"'),
+      body.indexOf('data-pane="agent-inspector"'),
+    );
+    const inspectorBody = body.slice(body.indexOf('data-pane="agent-inspector"'));
+    expect(editorBody).toContain("Recent runs");
+    expect(inspectorBody).toContain(">Agent 设置<");
+    expect(inspectorBody).toContain('id="agent-provider"');
+    expect(inspectorBody).toContain('form="agent-editor-form"');
 
     const mobileList = await app.request("/agents?view=list");
     expect(mobileList.status).toBe(200);
