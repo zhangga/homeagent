@@ -49,6 +49,7 @@ import {
   type FeishuResponseMode,
   type GroupParticipationLevel,
   type Agent,
+  type ChatRun,
   type KnowledgeEngine,
   type TaskRun,
 } from "@homeagent/core";
@@ -93,6 +94,7 @@ import {
   spaceDetailView,
   spaceGovernanceView,
   spaceListView,
+  chatRunView,
   taskRunView,
   tasksView,
 } from "./views.ts";
@@ -130,6 +132,8 @@ export interface WebOptions {
    * unset (tests / no connector) => run still writes to the KB, just no push.
    */
   onTaskRun?: (taskId: string, run: TaskRun) => void | Promise<void>;
+  /** Retry a durable text Chat Run through the live orchestrator/connector. */
+  onChatRunRetry?: (runId: string) => Promise<ChatRun>;
   /** Gracefully terminate a launchd-managed process so KeepAlive can restart it. */
   onServiceRestart?: () => void;
 }
@@ -469,8 +473,8 @@ export function createWebApp(opts: WebOptions): Hono {
     const cfg = config();
     const runLimit = input.runLimit ?? 20;
     const allRuns = selected ? engine.listAgentRuns(selected.id, 100) : [];
-    const allChatRecords = selected
-      ? engine.listAgentChatRecords(selected.id, 100)
+    const activityRuns = selected
+      ? engine.listAgentActivityRuns(selected.id, 100)
       : [];
     return agentWorkbenchView(buildAgentWorkbench({
       agents,
@@ -481,8 +485,8 @@ export function createWebApp(opts: WebOptions): Hono {
       defaults: { provider: cfg.defaultProvider, model: cfg.defaultModel },
       bindings: selected ? engine.agentBindings(selected.id) : [],
       runs: allRuns,
-      chatRecords: allChatRecords,
-      runTotal: allRuns.length + allChatRecords.length,
+      activityRuns,
+      runTotal: activityRuns.length,
       runLimit,
       listRuns: engine.listTaskRuns(),
       values: input.values,
@@ -1689,6 +1693,53 @@ export function createWebApp(opts: WebOptions): Hono {
           "agents",
         ),
         500,
+      );
+    }
+  });
+
+  // ---- Chat Runs -----------------------------------------------------------
+
+  app.get("/chats/runs/:runId", async (c) => {
+    const runId = decodeURIComponent(c.req.param("runId"));
+    const run = engine.chatRuns.get(runId);
+    if (!run) return c.notFound();
+    const ok = c.req.query("ok") ?? undefined;
+    return c.html(
+      await layout(
+        "Chat Run 详情",
+        [
+          ...(run.agentId
+            ? [{
+                label: "Agents",
+                href: `/agents/${encodeURIComponent(run.agentId)}`,
+              }]
+            : []),
+          { label: "Chat Run 详情" },
+        ],
+        await chatRunView(run, ok),
+        "agents",
+      ),
+    );
+  });
+
+  app.post("/chats/runs/:runId/retry", async (c) => {
+    const runId = decodeURIComponent(c.req.param("runId"));
+    if (!engine.chatRuns.get(runId)) return c.notFound();
+    if (!opts.onChatRunRetry) {
+      return c.redirect(
+        `/chats/runs/${encodeURIComponent(runId)}?ok=${encodeURIComponent("飞书重试通道未配置")}`,
+      );
+    }
+    try {
+      const retried = await opts.onChatRunRetry(runId);
+      const message = retried.id === runId ? "投递已重试" : "文本回答已重试";
+      return c.redirect(
+        `/chats/runs/${encodeURIComponent(retried.id)}?ok=${encodeURIComponent(message)}`,
+      );
+    } catch (err) {
+      log.warn("chat run retry failed", { runId, err: String(err) });
+      return c.redirect(
+        `/chats/runs/${encodeURIComponent(runId)}?ok=${encodeURIComponent("重试失败，请查看错误后再试")}`,
       );
     }
   });

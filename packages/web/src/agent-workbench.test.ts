@@ -2,7 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Agent, SpaceMeta, TaskRun } from "@homeagent/core";
+import type {
+  Agent,
+  AgentActivityRun,
+  SpaceMeta,
+  TaskRun,
+} from "@homeagent/core";
 import type { DetectedProvider } from "@homeagent/llm";
 import {
   buildAgentWorkbench,
@@ -134,6 +139,66 @@ describe("Agent create defaults", () => {
 });
 
 describe("Agent workbench presenter", () => {
+  test("presents a durable Chat Run from the unified activity query", () => {
+    const activityRuns: AgentActivityRun[] = [{
+      kind: "chat",
+      legacy: false,
+      startedAt: 400,
+      run: {
+        id: "chat_run_failed",
+        space: "team/oc_product",
+        rawId: "raw_failed",
+        chatId: "oc_product",
+        messageId: "om_failed",
+        input: "继续分析",
+        trigger: "message",
+        agentId: agent.id,
+        provider: "claude",
+        model: "sonnet",
+        status: "failed",
+        delivery: { status: "sent", attempts: 1, sentAt: 410 },
+        startedAt: 400,
+        finishedAt: 405,
+        error: {
+          kind: "authentication",
+          message: "Provider authentication expired",
+        },
+      },
+      record: {
+        id: "raw_failed",
+        agentId: agent.id,
+        space: "team/oc_product",
+        content: "继续分析",
+        createdAt: 390,
+      },
+    }];
+
+    const view = buildAgentWorkbench({
+      agents: [agent],
+      mode: "edit",
+      selected: agent,
+      providers,
+      models: {},
+      defaults: { provider: "codex", model: "gpt-5.6-sol" },
+      bindings: [],
+      runs: [],
+      activityRuns,
+    });
+
+    expect(view.inspector?.runs).toEqual([
+      expect.objectContaining({
+        id: "chat_run_failed",
+        kind: "chat",
+        href: "/chats/runs/chat_run_failed",
+        status: "failed",
+        error: "Provider authentication expired",
+        provider: "claude",
+        model: "sonnet",
+        retryable: true,
+      }),
+    ]);
+  });
+
   test("presents an available shared Skill without exposing its local file path", () => {
     const source = {
       sourceKey: "shared-agents:review",

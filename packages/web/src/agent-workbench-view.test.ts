@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { Agent } from "@homeagent/core";
+import type { Agent, AgentActivityRun } from "@homeagent/core";
 import { buildAgentWorkbench } from "./agent-workbench.ts";
 import { agentWorkbenchView } from "./agent-workbench-view.ts";
 
@@ -18,6 +18,50 @@ const selected: Agent = {
 };
 
 describe("Agent workbench view", () => {
+  test("renders Chat delivery failure and its Chat retry endpoint", async () => {
+    const activityRuns: AgentActivityRun[] = [{
+      kind: "chat",
+      legacy: false,
+      startedAt: 300,
+      run: {
+        id: "chat_run_delivery",
+        space: "team/oc_ops",
+        chatId: "oc_ops",
+        messageId: "om_delivery",
+        input: "继续分析",
+        trigger: "message",
+        agentId: selected.id,
+        provider: "codex",
+        model: "gpt-5.6-sol",
+        status: "succeeded",
+        delivery: {
+          status: "failed",
+          attempts: 1,
+          error: "Feishu unavailable",
+        },
+        startedAt: 300,
+        finishedAt: 320,
+        output: "分析结果",
+      },
+    }];
+    const view = buildAgentWorkbench({
+      agents: [selected],
+      mode: "edit",
+      selected,
+      providers: [],
+      models: {},
+      defaults: { provider: "codex", model: "gpt-5.6-sol" },
+      bindings: [],
+      runs: [],
+      activityRuns,
+    });
+
+    const body = String(await agentWorkbenchView(view));
+    expect(body).toContain("投递失败");
+    expect(body).toContain("/chats/runs/chat_run_delivery");
+    expect(body).toContain("/chats/runs/chat_run_delivery/retry");
+  });
+
   test("renders an inline searchable Skill selector outside Task execution", async () => {
     const source = {
       sourceKey: "shared-agents:review",

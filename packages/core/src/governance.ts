@@ -36,6 +36,11 @@ import {
   type TaskRun,
   type TaskRunNotification,
 } from "./task-runs.ts";
+import {
+  MAX_CHAT_RUN_HISTORY_PER_AGENT,
+  isChatRun,
+  type ChatRun,
+} from "./chat-runs.ts";
 import type { Reminder } from "./reminders.ts";
 import type {
   LearningArchive,
@@ -65,7 +70,8 @@ export const KNOWLEDGE_GOVERNANCE_SPACE_ARCHIVE_VERSION = 4 as const;
 export const TASK_RUN_HISTORY_SPACE_ARCHIVE_VERSION = 5 as const;
 export const TASK_EXECUTION_SPACE_ARCHIVE_VERSION = 6 as const;
 export const AGENT_SKILL_BINDINGS_SPACE_ARCHIVE_VERSION = 7 as const;
-export const SPACE_ARCHIVE_VERSION = AGENT_SKILL_BINDINGS_SPACE_ARCHIVE_VERSION;
+export const CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION = 8 as const;
+export const SPACE_ARCHIVE_VERSION = CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION;
 
 export interface MessageRetractionRecord {
   chatId: string;
@@ -115,11 +121,16 @@ export interface SpaceArchiveV6 extends Omit<SpaceArchiveV5, "version"> {
 }
 
 export interface SpaceArchiveV7 extends Omit<SpaceArchiveV6, "version"> {
-  version: typeof SPACE_ARCHIVE_VERSION;
+  version: typeof AGENT_SKILL_BINDINGS_SPACE_ARCHIVE_VERSION;
+}
+
+export interface SpaceArchiveV8 extends Omit<SpaceArchiveV7, "version"> {
+  version: typeof CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION;
+  chatRuns: ChatRun[];
 }
 
 /** Current normalized archive shape returned by export and parsing. */
-export type SpaceArchive = SpaceArchiveV7;
+export type SpaceArchive = SpaceArchiveV8;
 
 export interface SpaceDeleteResult {
   status: "deleted" | "not_found";
@@ -567,6 +578,50 @@ function parseTaskRun(
     rawId: optionalText(item.rawId, `taskRuns[${index}].rawId`),
     pagesWritten,
     notification,
+  };
+}
+
+function parseChatRun(value: unknown, index: number, space: SpaceId): ChatRun {
+  if (!isChatRun(value)) throw new Error(`chatRuns[${index}] is invalid`);
+  if (value.space !== space) {
+    throw new Error(`chatRuns[${index}].space does not match archive space`);
+  }
+  if (value.status === "running") {
+    throw new Error(`chatRuns[${index}] cannot restore a running record`);
+  }
+  return {
+    id: nonemptyText(value.id, `chatRuns[${index}].id`),
+    space,
+    rawId: value.rawId,
+    chatId: value.chatId,
+    messageId: value.messageId,
+    author: value.author,
+    input: value.input,
+    inputTruncated: value.inputTruncated,
+    trigger: value.trigger,
+    agentId: value.agentId,
+    provider: value.provider,
+    model: value.model,
+    reasoningEffort: value.reasoningEffort,
+    skillEvidence: value.skillEvidence
+      ? {
+          requested: value.skillEvidence.requested.map((item) => ({ ...item })),
+          resolved: value.skillEvidence.resolved.map((item) => ({ ...item })),
+          skipped: value.skillEvidence.skipped.map((item) => ({ ...item })),
+        }
+      : undefined,
+    execution: value.execution
+      ? { ...value.execution, skills: [...value.execution.skills] }
+      : undefined,
+    retryOf: value.retryOf,
+    status: value.status,
+    delivery: { ...value.delivery },
+    startedAt: value.startedAt,
+    finishedAt: value.finishedAt,
+    output: value.output,
+    outputTruncated: value.outputTruncated,
+    traceId: value.traceId,
+    error: value.error ? { ...value.error } : undefined,
   };
 }
 
@@ -1120,7 +1175,8 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       && version !== KNOWLEDGE_GOVERNANCE_SPACE_ARCHIVE_VERSION
       && version !== TASK_RUN_HISTORY_SPACE_ARCHIVE_VERSION
       && version !== TASK_EXECUTION_SPACE_ARCHIVE_VERSION
-      && version !== SPACE_ARCHIVE_VERSION
+      && version !== AGENT_SKILL_BINDINGS_SPACE_ARCHIVE_VERSION
+      && version !== CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION
     )
   ) {
     throw new Error("unsupported space archive format or version");
@@ -1159,6 +1215,10 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
     || (
       version >= TASK_RUN_HISTORY_SPACE_ARCHIVE_VERSION
       && !Array.isArray(root.taskRuns)
+    )
+    || (
+      version >= CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION
+      && !Array.isArray(root.chatRuns)
     )
   ) {
     throw new Error("archive collections must be arrays");
@@ -1208,6 +1268,25 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       throw new Error(`task run rawId is unknown: ${run.id}`);
     }
   }
+  const chatRuns = version < CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION
+    ? []
+    : (root.chatRuns as unknown[]).map((item, index) =>
+        parseChatRun(item, index, id)
+      );
+  const chatRunCounts = new Map<string, number>();
+  for (const run of chatRuns) {
+    const owner = run.agentId ? `agent:${run.agentId}` : `space:${run.space}`;
+    const count = (chatRunCounts.get(owner) ?? 0) + 1;
+    if (count > MAX_CHAT_RUN_HISTORY_PER_AGENT) {
+      throw new Error(
+        `chatRuns exceeds ${MAX_CHAT_RUN_HISTORY_PER_AGENT} records for ${owner}`,
+      );
+    }
+    chatRunCounts.set(owner, count);
+    if (run.rawId && !rawIds.has(run.rawId)) {
+      throw new Error(`chat run rawId is unknown: ${run.id}`);
+    }
+  }
   const reminders = (root.reminders ?? []).map(
     (item: unknown, index: number) => parseReminder(item, index, id),
   );
@@ -1216,6 +1295,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
   assertUnique(retractions, (entry) => `${entry.chatId}\0${entry.messageId}`, "retraction");
   assertUnique(tasks, (task) => task.id, "task id");
   assertUnique(taskRuns, (run) => run.id, "task run id");
+  assertUnique(chatRuns, (run) => run.id, "chat run id");
   assertUnique(reminders, (reminder) => reminder.id, "reminder id");
   const learning = parseLearningArchive(root.learning, version, id);
   const governanceAudit = version < KNOWLEDGE_GOVERNANCE_SPACE_ARCHIVE_VERSION
@@ -1237,6 +1317,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
     retractions,
     tasks,
     taskRuns,
+    chatRuns,
     reminders,
     learning,
     governanceAudit,

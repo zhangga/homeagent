@@ -186,7 +186,7 @@ describe("space data governance", () => {
     expect(archive).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 7,
+        version: 8,
         space: expect.objectContaining({
           id: SPACE,
           name: "治理群",
@@ -278,7 +278,7 @@ describe("space data governance", () => {
     } = archive;
     const parsed = parseSpaceArchive({ ...withoutLearning, version: 1 });
 
-    expect(parsed.version).toBe(7);
+    expect(parsed.version).toBe(8);
     expect(parsed.learning).toEqual({ plans: [], sources: [], sessions: [] });
     expect(parsed.governanceAudit).toEqual([]);
     expect(parsed.taskRuns).toEqual([]);
@@ -310,7 +310,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(7);
+    expect(parsed.version).toBe(8);
     expect(parsed.learning.plans[0]).toEqual(expect.objectContaining({
       id: plan.id,
       mode: "reading",
@@ -358,7 +358,7 @@ describe("space data governance", () => {
     expect(target.learning.source(plan.id)?.materials).toEqual([
       expect.objectContaining({ title: "Async Book", rawIds: ["raw_async"] }),
     ]);
-    expect((await target.exportSpace(SPACE)).version).toBe(7);
+    expect((await target.exportSpace(SPACE)).version).toBe(8);
     target.close();
   });
 
@@ -462,7 +462,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(7);
+    expect(parsed.version).toBe(8);
     expect(parsed.taskRuns).toEqual([]);
   });
 
@@ -490,7 +490,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(7);
+    expect(parsed.version).toBe(8);
     expect(parsed.tasks[0]?.timeoutMinutes).toBe(12);
     expect(parsed.taskRuns).toEqual([
       expect.objectContaining({
@@ -535,6 +535,21 @@ describe("space data governance", () => {
       finishedAt: taskRun.startedAt,
       output: "空间任务结果",
     });
+    const chatRun = engine.chatRuns.start({
+      space: SPACE,
+      rawId,
+      chatId: "oc_governance",
+      messageId: "om_chat",
+      input: "空间 Chat",
+      trigger: "message",
+      agentId: agent.id,
+      provider: "codex",
+      startedAt: 3,
+    });
+    engine.chatRuns.succeed(chatRun.id, {
+      finishedAt: chatRun.startedAt,
+      output: "空间 Chat 结果",
+    });
     engine.reminders.create({
       title: "空间提醒",
       space: SPACE,
@@ -567,6 +582,7 @@ describe("space data governance", () => {
     expect(await engine.getPage(SPACE, "concepts/deleted")).toBeNull();
     expect(engine.tasks.list()).toEqual([]);
     expect(engine.listTaskRuns(task.id)).toEqual([]);
+    expect(engine.chatRuns.get(chatRun.id)).toBeUndefined();
     expect(engine.reminders.list()).toEqual([]);
     expect(engine.learning.get(learningPlan.id)).toBeUndefined();
     expect(engine.agents.has(agent.id)).toBe(true);
@@ -584,6 +600,7 @@ describe("space data governance", () => {
     expect(await engine.getPage(SPACE, "concepts/deleted")).not.toBeNull();
     expect(engine.tasks.list()).toEqual(backup.tasks);
     expect(engine.listTaskRuns(task.id)).toEqual(backup.taskRuns);
+    expect(engine.chatRuns.list(SPACE)).toEqual(backup.chatRuns);
     expect(engine.reminders.list()).toEqual(backup.reminders);
     expect(engine.learning.exportBySpace(SPACE)).toEqual(backup.learning);
     engine.close();
@@ -616,6 +633,16 @@ describe("space data governance", () => {
       retractions: [],
       tasks: [],
     });
+    const retainedRun = engine.chatRuns.start({
+      space: SPACE,
+      rawId: "old-ingested",
+      input: "old-ingested",
+      trigger: "message",
+    });
+    engine.chatRuns.succeed(retainedRun.id, {
+      finishedAt: retainedRun.startedAt,
+      output: "expired answer",
+    });
 
     expect(await engine.pruneRawMessages(30, now)).toEqual({
       retentionDays: 30,
@@ -630,6 +657,42 @@ describe("space data governance", () => {
       "recent-ingested",
     ]);
     expect((await engine.pruneRawMessages(0, now)).deleted).toBe(0);
+    expect(engine.chatRuns.get(retainedRun.id)).toBeUndefined();
+    engine.close();
+  });
+
+  test("message retraction removes the matching Chat Run copy", async () => {
+    const engine = new KnowledgeEngine({ dataDir: tempDir("hb-chat-retraction-") });
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "message",
+      author: "ou_owner",
+      chatId: "oc_governance",
+      messageId: "om_chat_retract",
+      content: "需要撤回的 Chat",
+    });
+    const run = engine.chatRuns.start({
+      space: SPACE,
+      rawId,
+      chatId: "oc_governance",
+      messageId: "om_chat_retract",
+      author: "ou_owner",
+      input: "需要撤回的 Chat",
+      trigger: "message",
+    });
+    engine.chatRuns.succeed(run.id, {
+      finishedAt: run.startedAt,
+      output: "需要一并删除的回答",
+    });
+
+    const result = await engine.retractMessage(SPACE, {
+      chatId: "oc_governance",
+      messageId: "om_chat_retract",
+      requestedBy: "ou_owner",
+    });
+
+    expect(result.status).toBe("retracted");
+    expect(engine.chatRuns.get(run.id)).toBeUndefined();
     engine.close();
   });
 

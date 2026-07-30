@@ -8,6 +8,7 @@ export * from "./agents.ts";
 export * from "./skill-catalog.ts";
 export * from "./tasks.ts";
 export * from "./task-runs.ts";
+export * from "./chat-runs.ts";
 export * from "./reminders.ts";
 export * from "./space.ts";
 export * from "./sqlite.ts";

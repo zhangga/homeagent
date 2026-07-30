@@ -276,6 +276,12 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       updatedAt: Date.now(),
       contentHash: "health-failure",
     });
+    const failureAgent = engine.agents.create({
+      name: "Failure diagnostics Agent",
+      provider: "claude",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: failureAgent.id });
     orch = new Orchestrator({ engine, connector, llm: failing });
     await orch.start();
     await connector.sendGroup("@agent 谁负责后端服务？", true);
@@ -286,6 +292,19 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       failed: 1,
       recent: expect.objectContaining({ sampleSize: 1, failureRate: 1 }),
     }));
+    expect(engine.chatRuns.listByAgent(failureAgent.id, 10)).toEqual([
+      expect.objectContaining({
+        status: "failed",
+        error: {
+          kind: "unknown",
+          message: "provider failed",
+        },
+        delivery: expect.objectContaining({
+          status: "sent",
+          attempts: 1,
+        }),
+      }),
+    ]);
   });
 
   test("bot-added events do not reopen a locally disconnected group", async () => {
@@ -432,6 +451,28 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       agentResponse: connector.sent[0]!.markdown,
       agentRespondedAt: expect.any(Number),
     });
+    expect(engine.chatRuns.listByAgent(agent.id, 10)).toEqual([
+      expect.objectContaining({
+        rawId: chats[0]!.id,
+        agentId: agent.id,
+        provider: "claude",
+        status: "succeeded",
+        output: connector.sent[0]!.markdown,
+        delivery: expect.objectContaining({
+          status: "sent",
+          attempts: 1,
+          sentAt: expect.any(Number),
+        }),
+      }),
+    ]);
+    expect(engine.listAgentActivityRuns(agent.id, 10)).toEqual([
+      expect.objectContaining({
+        kind: "chat",
+        legacy: false,
+        run: expect.objectContaining({ status: "succeeded" }),
+        record: expect.objectContaining({ id: chats[0]!.id }),
+      }),
+    ]);
   });
 
   test("a failed outbound delivery is not recorded as an Agent response", async () => {
@@ -442,6 +483,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       visibility: "Team",
     });
     engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const deliver = connector.reply.bind(connector);
     connector.reply = async () => {
       throw new Error("Feishu delivery failed");
     };
@@ -455,6 +497,101 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     const detail = await engine.getRawGovernanceDetail("team/oc_team", chats[0]!.id);
     expect(detail?.raw.agentResponse).toBeUndefined();
     expect(detail?.raw.agentRespondedAt).toBeUndefined();
+    expect(engine.chatRuns.listByAgent(agent.id, 10)).toEqual([
+      expect.objectContaining({
+        rawId: chats[0]!.id,
+        status: "succeeded",
+        delivery: expect.objectContaining({
+          status: "failed",
+          attempts: 1,
+          error: "Feishu delivery failed",
+        }),
+      }),
+    ]);
+
+    const failedDeliveryRun = engine.chatRuns.listByAgent(agent.id, 10)[0]!;
+    connector.reply = deliver;
+    const retried = await orch.retryChatRun(failedDeliveryRun.id);
+
+    expect(retried).toEqual(expect.objectContaining({
+      id: failedDeliveryRun.id,
+      status: "succeeded",
+      delivery: expect.objectContaining({
+        status: "sent",
+        attempts: 2,
+      }),
+    }));
+    expect(connector.sent).toHaveLength(1);
+  });
+
+  test("retrying a failed text Chat creates a linked Run with the current execution", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Retry Agent",
+      provider: "claude",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const previous = engine.chatRuns.start({
+      space: "team/oc_team",
+      chatId: "oc_team",
+      messageId: "om_retry_source",
+      author: "ou_me",
+      input: "请重新给出结论",
+      trigger: "message",
+      agentId: agent.id,
+      provider: "claude",
+    });
+    engine.chatRuns.fail(previous.id, {
+      finishedAt: previous.startedAt,
+      error: {
+        kind: "provider_unavailable",
+        message: "Provider unavailable",
+      },
+    });
+
+    const retried = await orch.retryChatRun(previous.id);
+
+    expect(retried).toEqual(expect.objectContaining({
+      id: expect.not.stringMatching(previous.id),
+      retryOf: previous.id,
+      trigger: "retry",
+      agentId: agent.id,
+      provider: "claude",
+      status: "succeeded",
+      delivery: expect.objectContaining({
+        status: "sent",
+        attempts: 1,
+      }),
+    }));
+    expect(engine.chatRuns.get(previous.id)?.status).toBe("failed");
+  });
+
+  test("a retry does not duplicate a reply when delivery succeeded before Run persistence failed", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Idempotent delivery Agent",
+      provider: "claude",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const persistDelivery = engine.chatRuns.deliverySent.bind(engine.chatRuns);
+    engine.chatRuns.deliverySent = () => {
+      throw new Error("disk unavailable after delivery");
+    };
+    await orch.start();
+
+    await connector.sendGroup("@agent hello", true);
+
+    const run = engine.chatRuns.listByAgent(agent.id, 10)[0]!;
+    expect(run.delivery.status).toBe("pending");
+    expect(connector.sent).toHaveLength(1);
+
+    engine.chatRuns.deliverySent = persistDelivery;
+    const retried = await orch.retryChatRun(run.id);
+
+    expect(retried.delivery.status).toBe("sent");
+    expect(connector.sent).toHaveLength(1);
   });
 
   test("a capture-only group message is not shown as an Agent Chat run", async () => {

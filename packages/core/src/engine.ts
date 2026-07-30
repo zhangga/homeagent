@@ -25,6 +25,7 @@ import {
   isCodexReasoningEffortSupported,
   isProviderTimeoutError,
   runProvider as runLocalProvider,
+  type CodexReasoningEffort,
   type ProviderExecution,
   type ProviderId,
 } from "@homeagent/llm";
@@ -81,6 +82,7 @@ import {
   type TaskRunSkillEvidence,
   type TaskRunTrigger,
 } from "./task-runs.ts";
+import { ChatRunStore, type ChatRun } from "./chat-runs.ts";
 import { ReminderStore, type Reminder } from "./reminders.ts";
 import {
   LearningPlanStore,
@@ -836,6 +838,8 @@ export interface EngineOptions {
   learningResearch?: LearningResearchProvider;
   /** Mark task runs left active by a previous service process as failed. */
   recoverInterruptedTaskRuns?: boolean;
+  /** Mark chat runs left active by a previous service process as failed. */
+  recoverInterruptedChatRuns?: boolean;
   /** Local Skill catalog override for deterministic tests or custom embedding. */
   skillCatalog?: SkillCatalog;
 }
@@ -852,10 +856,39 @@ export interface AgentChatRecord {
   createdAt: number;
 }
 
+export type AgentActivityRun =
+  | {
+      kind: "task";
+      startedAt: number;
+      run: TaskRun;
+    }
+  | {
+      kind: "chat";
+      legacy: false;
+      startedAt: number;
+      run: ChatRun;
+      record?: AgentChatRecord;
+    }
+  | {
+      kind: "chat";
+      legacy: true;
+      startedAt: number;
+      record: AgentChatRecord;
+    };
+
 export interface SpaceAgentCallContext {
   agent?: Agent;
   client: LlmClient;
   skills: ResolvedAgentSkills;
+  execution: ProviderExecution;
+}
+
+export interface AgentRunExecutionSnapshot {
+  agent?: Agent;
+  provider?: ProviderId;
+  model?: string;
+  reasoningEffort?: CodexReasoningEffort;
+  skillEvidence: TaskRunSkillEvidence;
   execution: ProviderExecution;
 }
 
@@ -888,6 +921,7 @@ export class KnowledgeEngine implements Knowledge {
   readonly agents: AgentStore;
   readonly tasks: TaskStore;
   readonly taskRuns: TaskRunStore;
+  readonly chatRuns: ChatRunStore;
   readonly reminders: ReminderStore;
   readonly learning: LearningPlanStore;
   readonly quality: QualityStore;
@@ -922,6 +956,9 @@ export class KnowledgeEngine implements Knowledge {
     this.tasks = new TaskStore(this.dataDir);
     this.taskRuns = new TaskRunStore(this.dataDir, {
       recoverInterrupted: opts.recoverInterruptedTaskRuns,
+    });
+    this.chatRuns = new ChatRunStore(this.dataDir, {
+      recoverInterrupted: opts.recoverInterruptedChatRuns,
     });
     this.reconcileTaskRunHealth();
     this.reminders = new ReminderStore(this.dataDir);
@@ -1386,6 +1423,47 @@ export class KnowledgeEngine implements Knowledge {
       .slice(0, safeLimit);
   }
 
+  /**
+   * Unified Agent activity query. Task and Chat keep independent durable
+   * stores, while callers consume one chronological Run stream. Raw-only Chat
+   * history remains visible as a legacy entry until it naturally ages out.
+   */
+  listAgentActivityRuns(id: string, limit = 20): AgentActivityRun[] {
+    const safeLimit = Math.max(0, Math.floor(limit));
+    if (safeLimit === 0) return [];
+    const taskRuns: AgentActivityRun[] = this.taskRuns
+      .listByAgent(id, safeLimit)
+      .map((run) => ({ kind: "task", startedAt: run.startedAt, run }));
+    const chatRuns = this.chatRuns.listByAgent(id, safeLimit);
+    const chatRecords = this.listAgentChatRecords(id, safeLimit * 2);
+    const recordsById = new Map(chatRecords.map((record) => [record.id, record]));
+    const referencedRawIds = new Set(
+      chatRuns.flatMap((run) => run.rawId ? [run.rawId] : []),
+    );
+    const durableChats: AgentActivityRun[] = chatRuns.map((run) => ({
+      kind: "chat",
+      legacy: false,
+      startedAt: run.startedAt,
+      run,
+      record: run.rawId ? recordsById.get(run.rawId) : undefined,
+    }));
+    const legacyChats: AgentActivityRun[] = chatRecords
+      .filter((record) => !referencedRawIds.has(record.id))
+      .map((record) => ({
+        kind: "chat",
+        legacy: true,
+        startedAt: record.createdAt,
+        record,
+      }));
+    return [...taskRuns, ...durableChats, ...legacyChats]
+      .sort((a, b) => b.startedAt - a.startedAt || (
+        a.kind === "task" ? a.run.id : a.legacy ? a.record.id : a.run.id
+      ).localeCompare(
+        b.kind === "task" ? b.run.id : b.legacy ? b.record.id : b.run.id,
+      ))
+      .slice(0, safeLimit);
+  }
+
   removeAgentAndUnbind(id: string): { agent: Agent; bindings: SpaceMeta[] } | undefined {
     const agent = this.agents.get(id);
     if (!agent) return undefined;
@@ -1451,6 +1529,56 @@ export class KnowledgeEngine implements Knowledge {
       agent,
     );
     return { agent, client, skills, execution };
+  }
+
+  /**
+   * Resolve the immutable execution choices recorded on a Run without starting
+   * a provider client. This is safe for local/canned Chat responses too.
+   */
+  agentRunExecutionSnapshot(
+    space: SpaceId,
+    taskExecution = false,
+  ): AgentRunExecutionSnapshot {
+    const agent = this.agentForSpace(space);
+    const cfg = config();
+    const selectedProvider = agent?.provider || cfg.defaultProvider;
+    const provider = isCliProvider(selectedProvider) ? selectedProvider : undefined;
+    const resolutionProvider: ProviderId = provider ?? "gateway";
+    const inheritedModel = !agent || agent.provider === cfg.defaultProvider
+      ? cfg.defaultModel
+      : "";
+    const selectedModel = agent?.model || inheritedModel || undefined;
+    const model = selectedProvider === "codex" && selectedModel
+      ? canonicalModelId(selectedModel)
+      : selectedModel;
+    const reasoningEffort =
+      selectedProvider === "codex"
+      && agent?.reasoningEffort
+      && isCodexReasoningEffortSupported(model, agent.reasoningEffort)
+        ? agent.reasoningEffort
+        : undefined;
+    const skills = this.skillCatalog.resolveAgentBindings(
+      agent?.skills ?? [],
+      resolutionProvider,
+    );
+    const baseExecution = taskExecution
+      ? resolveAgentExecution(agent)
+      : { permission: "read-only" as const, skills: [] };
+    return {
+      agent,
+      provider,
+      model,
+      reasoningEffort,
+      skillEvidence: {
+        requested: skills.requested.map((item) => ({ ...item })),
+        resolved: skills.resolved.map((item) => ({ ...item })),
+        skipped: skills.skipped.map((item) => ({ ...item })),
+      },
+      execution: {
+        ...baseExecution,
+        skills: skills.resolved.map((skill) => skill.invocationName),
+      },
+    };
   }
 
   skillWarningsForSpace(space: SpaceId): SkillWarningView[] {
@@ -2063,6 +2191,9 @@ export class KnowledgeEngine implements Knowledge {
       // graph before deleting the raw provenance so retraction cannot leave a
       // second copy of the book behind.
       this.learning.removeByRawIds(removedSourceIds);
+      // Chat Runs retain retryable input and delivered output. Remove the
+      // matching operational copy before deleting its raw provenance.
+      this.chatRuns.removeByRawIds(removedSourceIds);
       for (const rawRecord of matchingRawRecords) index.deleteRaw(rawRecord.id);
       index.markPending([...survivingSourceIds]);
       if (affectedPages.length > 0) refreshDigest(store);
@@ -2217,8 +2348,12 @@ export class KnowledgeEngine implements Knowledge {
       const index = store.index();
       const agent = meta.agentId ? this.agents.get(meta.agentId) : undefined;
       const tasks = this.tasks.list().filter((task) => task.space === space);
+      const chatRuns = this.chatRuns.list(space);
       if (tasks.some((task) => this.activeTaskRunId(task.id) !== undefined)) {
         throw new Error(`space has running tasks: ${space}`);
+      }
+      if (chatRuns.some((run) => run.status === "running")) {
+        throw new Error(`space has running chat runs: ${space}`);
       }
       const taskIds = new Set(tasks.map((task) => task.id));
       return {
@@ -2241,6 +2376,7 @@ export class KnowledgeEngine implements Knowledge {
         taskRuns: this.taskRuns.list().filter(
           (run) => run.space === space && taskIds.has(run.taskId),
         ),
+        chatRuns,
         reminders: this.reminders.list().filter((reminder) => reminder.space === space),
         learning: this.learning.exportBySpace(space),
         governanceAudit: listKnowledgeGovernanceAudit(store),
@@ -2266,6 +2402,8 @@ export class KnowledgeEngine implements Knowledge {
       if (taskConflict) throw new Error(`task id already exists: ${taskConflict.id}`);
       const taskRunConflict = archive.taskRuns.find((run) => this.taskRuns.has(run.id));
       if (taskRunConflict) throw new Error(`task run id already exists: ${taskRunConflict.id}`);
+      const chatRunConflict = archive.chatRuns.find((run) => this.chatRuns.has(run.id));
+      if (chatRunConflict) throw new Error(`chat run id already exists: ${chatRunConflict.id}`);
       const reminderConflict = archive.reminders.find((reminder) => this.reminders.has(reminder.id));
       if (reminderConflict) throw new Error(`reminder id already exists: ${reminderConflict.id}`);
       if (this.learning.listBySpace(space).length > 0) {
@@ -2278,6 +2416,7 @@ export class KnowledgeEngine implements Knowledge {
       }
       const taskIdsBefore = new Set(this.tasks.list().map((task) => task.id));
       const taskRunIdsBefore = new Set(this.taskRuns.list().map((run) => run.id));
+      const chatRunIdsBefore = new Set(this.chatRuns.list().map((run) => run.id));
       const reminderIdsBefore = new Set(this.reminders.list().map((reminder) => reminder.id));
       const agentWasPresent = Boolean(existingAgent);
       let learningRestored = false;
@@ -2292,6 +2431,7 @@ export class KnowledgeEngine implements Knowledge {
         for (const page of archive.pages) store.writePage(page);
         this.tasks.restore(archive.tasks);
         this.taskRuns.restore(archive.taskRuns);
+        this.chatRuns.restore(archive.chatRuns);
         this.reminders.restore(archive.reminders);
         this.learning.restore(archive.learning);
         learningRestored = archive.learning.plans.length > 0;
@@ -2303,6 +2443,9 @@ export class KnowledgeEngine implements Knowledge {
       } catch (err) {
         for (const run of this.taskRuns.list()) {
           if (run.space === space && !taskRunIdsBefore.has(run.id)) this.taskRuns.remove(run.id);
+        }
+        for (const run of this.chatRuns.list(space)) {
+          if (!chatRunIdsBefore.has(run.id)) this.chatRuns.remove(run.id);
         }
         for (const task of this.tasks.list()) {
           if (task.space === space && !taskIdsBefore.has(task.id)) this.tasks.remove(task.id);
@@ -2342,10 +2485,14 @@ export class KnowledgeEngine implements Knowledge {
       if (!this.registry.has(space)) return empty();
       const tasks = this.tasks.list().filter((task) => task.space === space);
       const taskRuns = this.taskRuns.list().filter((run) => run.space === space);
+      const chatRuns = this.chatRuns.list(space);
       const reminders = this.reminders.list().filter((reminder) => reminder.space === space);
       const learning = this.learning.listBySpace(space);
       if (tasks.some((task) => this.activeTaskRunId(task.id) !== undefined)) {
         throw new Error(`space has running tasks: ${space}`);
+      }
+      if (chatRuns.some((run) => run.status === "running")) {
+        throw new Error(`space has running chat runs: ${space}`);
       }
       if (reminders.some(
         (reminder) => (this.deliveringReminderCounts.get(reminder.id) ?? 0) > 0,
@@ -2367,6 +2514,7 @@ export class KnowledgeEngine implements Knowledge {
       const learningArchive = this.learning.exportBySpace(space);
       try {
         this.taskRuns.removeBySpace(space);
+        this.chatRuns.removeBySpace(space);
         tasksDeleted = this.tasks.removeBySpace(space);
         remindersDeleted = this.reminders.removeBySpace(space);
         learningPlansDeleted = this.learning.removeBySpace(space);
@@ -2374,6 +2522,8 @@ export class KnowledgeEngine implements Knowledge {
       } catch (err) {
         const missingTaskRuns = taskRuns.filter((run) => !this.taskRuns.has(run.id));
         if (missingTaskRuns.length > 0) this.taskRuns.restore(missingTaskRuns);
+        const missingChatRuns = chatRuns.filter((run) => !this.chatRuns.has(run.id));
+        if (missingChatRuns.length > 0) this.chatRuns.restore(missingChatRuns);
         const missingTasks = tasks.filter((task) => !this.tasks.has(task.id));
         if (missingTasks.length > 0) this.tasks.restore(missingTasks);
         const missingReminders = reminders.filter((reminder) => !this.reminders.has(reminder.id));
@@ -2438,16 +2588,33 @@ export class KnowledgeEngine implements Knowledge {
     for (const meta of this.registry.list()) {
       const deleted = await this.serializer.run(meta.id, async () => {
         if (!this.registry.has(meta.id)) return 0;
+        const index = this.registry.store(meta.id).index();
         const protectedRawIds = new Set(
           [
             ...this.learning.exportBySpace(meta.id).sources.flatMap((source) => source.rawIds),
             ...listQuarantineRecords(this.registry.store(meta.id)).flatMap((record) => record.rawIds),
           ],
         );
-        return this.registry
-          .store(meta.id)
-          .index()
-          .deleteExpiredRawMessages(cutoff, protectedRawIds);
+        const expiredRawIds = new Set(
+          index.listRaw({})
+            .filter((raw) =>
+              raw.source === "message"
+              && raw.ingested
+              && raw.createdAt < cutoff
+              && !protectedRawIds.has(raw.id)
+            )
+            .map((raw) => raw.id),
+        );
+        const removedChatRuns = this.chatRuns.list(meta.id).filter(
+          (run) => run.rawId && expiredRawIds.has(run.rawId),
+        );
+        this.chatRuns.removeByRawIds(expiredRawIds);
+        try {
+          return index.deleteExpiredRawMessages(cutoff, protectedRawIds);
+        } catch (error) {
+          if (removedChatRuns.length > 0) this.chatRuns.restore(removedChatRuns);
+          throw error;
+        }
       });
       if (deleted === 0) continue;
       report.bySpace[meta.id] = deleted;

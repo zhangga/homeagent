@@ -21,6 +21,7 @@ import type {
 import type {
   SpaceMeta,
   Agent,
+  ChatRun,
   Task,
   TaskRun,
   Reminder,
@@ -673,7 +674,7 @@ export function governanceView(
     </div>
     <div class="card">
       <h2 style="margin-top:0">恢复空间</h2>
-      <p class="muted">接受 homeagent.space v1/v2/v3/v4/v5/v6 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，已有同名空间不会被覆盖。</p>
+      <p class="muted">接受 homeagent.space v1–v8 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史；已有同名空间不会被覆盖。</p>
       <form method="post" action="/governance/restore" enctype="multipart/form-data" class="actions">
         <input type="file" name="archive" accept="application/json,.json" required />
         <button type="submit">上传并恢复</button>
@@ -1166,6 +1167,104 @@ export function taskRunView(
         : ""}
       ${run.error ? html`<div><strong>错误</strong><div class="contentbox" style="margin-top:8px">${run.error}</div></div>` : ""}
       <div class="actions">${cancelForm}${retryForm}${notificationRetry}</div>
+    </div>`;
+}
+
+const CHAT_RUN_ERROR_LABELS: Record<NonNullable<ChatRun["error"]>["kind"], string> = {
+  interrupted: "进程中断",
+  timeout: "Provider 超时",
+  authentication: "鉴权失败",
+  provider_unavailable: "Provider 不可用",
+  process_exit: "Provider 进程退出",
+  unknown: "未知错误",
+};
+
+export function chatRunView(
+  run: ChatRun,
+  flashMsg?: string,
+): HtmlEscapedString | Promise<HtmlEscapedString> {
+  const retryable =
+    ["failed", "timed_out"].includes(run.status)
+    || (
+      run.status === "succeeded"
+      && run.delivery.status !== "sent"
+      && Boolean(run.output)
+    );
+  const status = run.status === "running"
+    ? html`<span class="badge">运行中</span>`
+    : run.status === "succeeded"
+      ? html`<span class="badge knowledge">成功</span>`
+      : run.status === "timed_out"
+        ? html`<span class="badge general">已超时</span>`
+        : html`<span class="badge general">失败</span>`;
+  const deliveryLabel = run.delivery.status === "sent"
+    ? "已发送"
+    : run.delivery.status === "failed"
+      ? "发送失败"
+      : "待发送";
+  const milliseconds = run.finishedAt
+    ? Math.max(0, run.finishedAt - run.startedAt)
+    : undefined;
+  const duration = milliseconds === undefined
+    ? "运行中"
+    : milliseconds < 1000
+      ? `${milliseconds} ms`
+      : `${(milliseconds / 1000).toFixed(1)} 秒`;
+  const skillEvidence = run.skillEvidence;
+  return html`<h1>Chat Run 详情</h1>
+    <p class="subtitle">${run.id}</p>
+    ${flash(flashMsg)}
+    <div class="card stack">
+      <div><strong>状态：</strong>${status}</div>
+      <div><strong>开始时间：</strong>${fmtTime(run.startedAt)}</div>
+      <div><strong>完成时间：</strong>${fmtTime(run.finishedAt)} · ${duration}</div>
+      <div><strong>执行快照：</strong>${run.provider ?? "未记录"} / ${run.model || "CLI 默认模型"}
+        ${run.reasoningEffort ? ` · reasoning ${run.reasoningEffort}` : ""}</div>
+      <div><strong>空间：</strong>${run.space}</div>
+      <div><strong>投递：</strong>${deliveryLabel} · 已尝试 ${run.delivery.attempts} 次</div>
+      ${run.delivery.lastAttemptAt
+        ? html`<div><strong>最近投递：</strong>${fmtTime(run.delivery.lastAttemptAt)}</div>`
+        : ""}
+      ${run.delivery.error
+        ? html`<div><strong>投递错误：</strong><span class="muted">${run.delivery.error}</span></div>`
+        : ""}
+      ${run.retryOf
+        ? html`<div><strong>重试来源：</strong><a href="/chats/runs/${encodeURIComponent(run.retryOf)}">${run.retryOf}</a></div>`
+        : ""}
+      ${run.rawId
+        ? html`<div><strong>原始记录：</strong><a href="/spaces/${encodeURIComponent(run.space)}/raw/${encodeURIComponent(run.rawId)}">${run.rawId}</a></div>`
+        : ""}
+      ${skillEvidence
+        ? html`<div><strong>Skill 解析：</strong>
+            请求 ${skillEvidence.requested.length} ·
+            已加载 ${skillEvidence.resolved.length} ·
+            跳过 ${skillEvidence.skipped.length}
+            ${skillEvidence.resolved.length > 0
+              ? html`<ul>${skillEvidence.resolved.map((skill) =>
+                  html`<li><code>${skill.name}</code> · ${skill.sourceKey} ·
+                    sha256 ${skill.skillFileHash.slice(0, 12)}</li>`
+                )}</ul>`
+              : ""}
+          </div>`
+        : ""}
+      <div><strong>输入</strong><div class="contentbox" style="margin-top:8px">${run.input}</div>
+        ${run.inputTruncated ? html`<div class="muted">输入过长，重试只会使用已保留的前 100,000 个字符。</div>` : ""}
+      </div>
+      ${run.output
+        ? html`<div><strong>模型输出</strong><div class="contentbox" style="margin-top:8px">${run.output}</div>
+            ${run.outputTruncated ? html`<div class="muted">输出过长，运行记录仅保留前 100,000 个字符。</div>` : ""}</div>`
+        : ""}
+      ${run.error
+        ? html`<div><strong>${CHAT_RUN_ERROR_LABELS[run.error.kind]}</strong>
+            <div class="contentbox" style="margin-top:8px">${run.error.message}</div></div>`
+        : ""}
+      ${retryable
+        ? html`<div class="actions">
+            <form method="post" action="/chats/runs/${encodeURIComponent(run.id)}/retry" class="inline-form">
+              <button type="submit">${run.status === "succeeded" ? "重试投递" : "重试文本回答"}</button>
+            </form>
+          </div>`
+        : ""}
     </div>`;
 }
 

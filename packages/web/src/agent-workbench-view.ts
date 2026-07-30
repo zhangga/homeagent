@@ -1419,6 +1419,13 @@ export function agentWorkbenchView(
                       </span>
                       <span class="agent-run-secondary">
                         <span class="agent-run-status-text">${STATUS_LABELS[run.status]}</span>
+                        ${run.kind === "chat" && run.deliveryStatus === "failed"
+                          ? " · 投递失败"
+                          : run.kind === "chat"
+                            && run.status !== "running"
+                            && run.deliveryStatus === "pending"
+                            ? " · 待投递"
+                            : ""}
                         · ${run.retryable && run.error ? html`${run.taskName} · ` : ""}
                         ${run.space} · ${run.provider} / ${run.model}
                       </span>
@@ -1429,11 +1436,13 @@ export function agentWorkbenchView(
                     <span class="agent-run-open" aria-hidden="true">↗</span>
                   </a>
                   ${run.retryable ? html`
-                    <form method="post" action="/tasks/runs/${encodeURIComponent(run.id)}/retry">
+                    <form method="post" action="${run.kind === "chat"
+                      ? `/chats/runs/${encodeURIComponent(run.id)}/retry`
+                      : `/tasks/runs/${encodeURIComponent(run.id)}/retry`}">
                       <button
                         type="submit"
                         class="agent-run-retry"
-                        aria-label="重试任务：${run.taskName}"
+                        aria-label="${run.kind === "chat" ? "重试 Chat" : "重试任务"}：${run.taskName}"
                       >重试</button>
                     </form>
                   ` : ""}

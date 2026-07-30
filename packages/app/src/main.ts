@@ -116,7 +116,10 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
     webPort: cfg.webPort,
   });
 
-  const engine = new KnowledgeEngine({ recoverInterruptedTaskRuns: true });
+  const engine = new KnowledgeEngine({
+    recoverInterruptedTaskRuns: true,
+    recoverInterruptedChatRuns: true,
+  });
   const larkSetup = new LarkCliSetup({ larkBin: runtimePaths.larkBin });
   const feishuStartup = await prepareFeishuStartup(
     engine,
@@ -264,6 +267,12 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
       sendFeishuNotice(`team/${chatId}`, chatId, text),
     onTaskRun: async (_taskId, run) => {
       await notifyTaskDone(run);
+    },
+    onChatRunRetry: async (runId) => {
+      if (!feishuOutboundEnabled) {
+        throw new Error("Feishu delivery is disabled until restart");
+      }
+      return orchestrator.retryChatRun(runId);
     },
     onServiceRestart: () => {
       setTimeout(() => process.kill(process.pid, "SIGTERM"), 250);

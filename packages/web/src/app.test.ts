@@ -1471,7 +1471,7 @@ describe("management backend (read-write)", () => {
     const governanceBody = await governance.text();
     expect(governanceBody).toContain("数据治理");
     expect(governanceBody).toContain("原始消息保留");
-    expect(governanceBody).toContain("homeagent.space v1/v2/v3/v4/v5/v6");
+    expect(governanceBody).toContain("homeagent.space v1–v8");
 
     const exported = await app.request(`/spaces/${encodeURIComponent(SPACE)}/export`);
     expect(exported.status).toBe(200);
@@ -1480,10 +1480,11 @@ describe("management backend (read-write)", () => {
     expect(JSON.parse(archiveText)).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 7,
+        version: 8,
         learning: { plans: [], sources: [], sessions: [] },
         governanceAudit: [],
         taskRuns: [],
+        chatRuns: [],
       }),
     );
 
@@ -1870,6 +1871,52 @@ describe("management backend (read-write)", () => {
     expect(editorBody).toContain(
       `/spaces/${encodeURIComponent(SPACE)}/raw/${encodeURIComponent(rawId)}`,
     );
+  });
+
+  test("shows Chat Run diagnostics and delegates a text retry", async () => {
+    const selected = engine.agents.create({ name: "Retry Chat Agent", provider: "claude" });
+    engine.updateSpaceMeta(SPACE, { agentId: selected.id });
+    const run = engine.chatRuns.start({
+      space: SPACE,
+      chatId: "oc_web",
+      messageId: "om_retry",
+      author: "ou_retry",
+      input: "请继续分析",
+      trigger: "message",
+      agentId: selected.id,
+      provider: "claude",
+      model: "sonnet",
+    });
+    engine.chatRuns.fail(run.id, {
+      finishedAt: run.startedAt,
+      error: {
+        kind: "authentication",
+        message: "Provider authentication expired",
+      },
+    });
+    let retriedRunId: string | undefined;
+    const retryApp = createWebApp({
+      engine,
+      onChatRunRetry: async (runId) => {
+        retriedRunId = runId;
+        return engine.chatRuns.get(runId)!;
+      },
+    });
+
+    const detail = await retryApp.request(`/chats/runs/${encodeURIComponent(run.id)}`);
+    const body = await detail.text();
+    expect(detail.status).toBe(200);
+    expect(body).toContain("Chat Run 详情");
+    expect(body).toContain("鉴权失败");
+    expect(body).toContain("Provider authentication expired");
+    expect(body).toContain(`/chats/runs/${encodeURIComponent(run.id)}/retry`);
+
+    const retry = await retryApp.request(
+      `/chats/runs/${encodeURIComponent(run.id)}/retry`,
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(retry.status);
+    expect(retriedRunId).toBe(run.id);
   });
 
   test("Chat history remains with the Agent that handled it after a space is rebound", async () => {

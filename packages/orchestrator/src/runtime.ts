@@ -25,6 +25,8 @@ import { isProviderTimeoutError } from "@homeagent/llm";
 import {
   resolveGroupParticipationLevel,
   type AnswerOutcome,
+  type ChatRun,
+  type ChatRunError,
   type FeishuGroupBinding,
   type KnowledgeEngine,
   type LlmClient,
@@ -80,6 +82,31 @@ const MAX_REPLY_SOURCE_CHARS = 50_000;
 const RECENT_CONTEXT_LOOKBACK_MS = 24 * 60 * 60_000;
 const RECENT_CONTEXT_SCAN_LIMIT = 50;
 const RECENT_ANSWER_SAMPLE_SIZE = 50;
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function chatRunError(error: unknown): ChatRunError {
+  const message = errorMessage(error);
+  if (isProviderTimeoutError(error)) return { kind: "timeout", message };
+  if (
+    /authentication|authorization|unauthorized|forbidden|credentials?|login|token.{0,20}expired|\b40[13]\b/iu
+      .test(message)
+  ) {
+    return { kind: "authentication", message };
+  }
+  if (/exited?\s+\d+|exit code|spawn.{0,80}enoent/iu.test(message)) {
+    return { kind: "process_exit", message };
+  }
+  if (
+    /no provider|not configured|not found|unavailable|econnrefused|command not found|\benoent\b/iu
+      .test(message)
+  ) {
+    return { kind: "provider_unavailable", message };
+  }
+  return { kind: "unknown", message };
+}
 
 interface PendingReminderConfirmation {
   draft: ReminderDraft;
@@ -257,6 +284,64 @@ export class Orchestrator {
   async stop(): Promise<void> {
     await this.connector.stop();
     await this.serializer.drain("main");
+  }
+
+  /**
+   * Retry a text Chat Run. A completed provider result is delivered again
+   * without re-running the model; provider failures create a new linked Run.
+   */
+  async retryChatRun(runId: string): Promise<ChatRun> {
+    return this.serializer.run("main", async () => {
+      const previous = this.engine.chatRuns.get(runId);
+      if (!previous) throw new Error(`unknown chat run: ${runId}`);
+      if (!previous.chatId || !previous.messageId) {
+        throw new Error("chat run is missing its delivery target");
+      }
+      const msg: InboundMessage = {
+        kind: "message",
+        eventId: `chat-retry:${previous.id}:${Date.now()}`,
+        chatType: previous.space.startsWith("team/") ? "group" : "p2p",
+        chatId: previous.chatId,
+        senderId: previous.author
+          ?? (previous.space.startsWith("personal/")
+            ? previous.space.slice("personal/".length)
+            : "unknown"),
+        text: previous.input,
+        messageId: previous.messageId,
+        mentionsBot: true,
+        createdAt: previous.startedAt,
+      };
+
+      if (
+        previous.status === "succeeded"
+        && previous.delivery.status !== "sent"
+        && previous.output
+      ) {
+        if (previous.rawId) {
+          const detail = await this.engine.getRawGovernanceDetail(
+            previous.space,
+            previous.rawId,
+          );
+          if (detail?.raw.agentResponse === previous.output) {
+            this.engine.chatRuns.deliverySent(
+              previous.id,
+              detail.raw.agentRespondedAt ?? Date.now(),
+            );
+            return this.engine.chatRuns.get(previous.id)!;
+          }
+        }
+        await this.send(msg, previous.output, previous.id);
+        return this.engine.chatRuns.get(previous.id)!;
+      }
+      if (!["failed", "timed_out"].includes(previous.status)) {
+        throw new Error("chat run is not retryable");
+      }
+
+      const { readSpaces, writeSpace } = attribute(msg);
+      const retry = this.startChatRun(msg, writeSpace, previous.rawId, previous.id);
+      await this.answer(msg, readSpaces, writeSpace, retry.id, previous.input);
+      return this.engine.chatRuns.get(retry.id)!;
+    });
   }
 
   /** Process one event. Exposed for tests; connectors call it via start(). */
@@ -669,23 +754,80 @@ export class Orchestrator {
         disposition: interpretation.disposition,
         chatType: msg.chatType,
       });
+      const chatRun = this.startChatRun(
+        msg,
+        writeSpace,
+        capturedMessageRawId,
+      );
 
       switch (interpretation.disposition) {
         case "conversation":
-          return this.answer(msg, readSpaces, writeSpace, interpretation.text);
+          return this.answer(
+            msg,
+            readSpaces,
+            writeSpace,
+            chatRun.id,
+            interpretation.text,
+          );
         case "remember":
-          return this.send(msg, "好的，我记下了。");
+          return this.completeChatRunAndSend(
+            msg,
+            chatRun.id,
+            "好的，我记下了。",
+          );
         case "chitchat":
         default:
-          return this.send(msg, "👋 我在。有需要随时问我，或把要记住的事告诉我。");
+          return this.completeChatRunAndSend(
+            msg,
+            chatRun.id,
+            "👋 我在。有需要随时问我，或把要记住的事告诉我。",
+          );
       }
     });
+  }
+
+  private startChatRun(
+    msg: InboundMessage,
+    writeSpace: SpaceId,
+    rawId?: string,
+    retryOf?: string,
+  ): ChatRun {
+    const snapshot = this.engine.agentRunExecutionSnapshot(writeSpace);
+    return this.engine.chatRuns.start({
+      space: writeSpace,
+      rawId,
+      chatId: msg.chatId,
+      messageId: msg.messageId,
+      author: msg.senderId,
+      input: msg.text,
+      trigger: retryOf ? "retry" : "message",
+      agentId: snapshot.agent?.id,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      reasoningEffort: snapshot.reasoningEffort,
+      skillEvidence: snapshot.skillEvidence,
+      execution: snapshot.execution,
+      retryOf,
+    });
+  }
+
+  private async completeChatRunAndSend(
+    msg: InboundMessage,
+    runId: string,
+    markdown: string,
+  ): Promise<void> {
+    this.engine.chatRuns.succeed(runId, {
+      finishedAt: Date.now(),
+      output: markdown,
+    });
+    await this.send(msg, markdown, runId);
   }
 
   private async answer(
     msg: InboundMessage,
     readSpaces: SpaceId[],
     writeSpace: SpaceId,
+    runId: string,
     userText = normalizeConversationText(msg.text),
   ): Promise<void> {
     const answerStartedAt = Date.now();
@@ -712,7 +854,19 @@ export class Orchestrator {
           err: String(err),
         });
         outcome = isProviderTimeoutError(err) ? "timed_out" : "failed";
-        await this.send(msg, providerNotice(err));
+        const failure = chatRunError(err);
+        if (outcome === "timed_out") {
+          this.engine.chatRuns.timeout(runId, {
+            finishedAt: Date.now(),
+            error: failure,
+          });
+        } else {
+          this.engine.chatRuns.fail(runId, {
+            finishedAt: Date.now(),
+            error: failure,
+          });
+        }
+        await this.send(msg, providerNotice(err), runId);
         return;
       } finally {
         this.cleanupDownloads(context.images, msg.messageId);
@@ -723,9 +877,28 @@ export class Orchestrator {
       if (res.source === "general" && (await this.isColdStart(readSpaces))) {
         text = `${text}\n\n${coldStartNote()}`;
       }
-      await this.send(msg, text);
+      this.engine.chatRuns.succeed(runId, {
+        finishedAt: Date.now(),
+        output: text,
+        traceId: res.traceId,
+      });
+      await this.send(msg, text, runId);
       outcome = "succeeded";
     } catch (err) {
+      if (this.engine.chatRuns.get(runId)?.status === "running") {
+        const failure = chatRunError(err);
+        if (failure.kind === "timeout") {
+          this.engine.chatRuns.timeout(runId, {
+            finishedAt: Date.now(),
+            error: failure,
+          });
+        } else {
+          this.engine.chatRuns.fail(runId, {
+            finishedAt: Date.now(),
+            error: failure,
+          });
+        }
+      }
       outcome ??= isProviderTimeoutError(err) ? "timed_out" : "failed";
       throw err;
     } finally {
@@ -1044,20 +1217,58 @@ export class Orchestrator {
     }
   }
 
-  private async send(msg: InboundMessage, markdown: string): Promise<void> {
+  private async send(
+    msg: InboundMessage,
+    markdown: string,
+    chatRunId?: string,
+  ): Promise<void> {
     // Recheck immediately before outbound delivery so an administrator can
     // disconnect a group while a slow answer is being generated.
     const groupBinding = msg.chatType === "group"
       ? this.activeGroupBinding(msg.chatId)
       : undefined;
-    if (msg.chatType === "group" && !groupBinding) return;
+    if (msg.chatType === "group" && !groupBinding) {
+      if (chatRunId) {
+        this.engine.chatRuns.deliveryFailed(
+          chatRunId,
+          "Group disconnected before delivery.",
+        );
+      }
+      return;
+    }
     const inThread = groupBinding?.replyInThread ?? false;
-    await this.connector.reply({
-      chatId: msg.chatId,
-      replyToMessageId: msg.messageId,
-      markdown,
-      inThread,
-    });
+    if (chatRunId) this.engine.chatRuns.startDeliveryAttempt(chatRunId, Date.now());
+    try {
+      await this.connector.reply({
+        chatId: msg.chatId,
+        replyToMessageId: msg.messageId,
+        markdown,
+        inThread,
+      });
+    } catch (err) {
+      if (chatRunId) {
+        try {
+          this.engine.chatRuns.deliveryFailed(chatRunId, errorMessage(err));
+        } catch (persistenceError) {
+          log.error("chat delivery failure persistence failed", {
+            runId: chatRunId,
+            err: String(persistenceError),
+          });
+        }
+      }
+      throw err;
+    }
+    if (chatRunId) {
+      try {
+        this.engine.chatRuns.deliverySent(chatRunId, Date.now());
+      } catch (err) {
+        // Delivery already succeeded; never throw and invite an external retry.
+        log.warn("chat delivery success persistence failed", {
+          runId: chatRunId,
+          err: String(err),
+        });
+      }
+    }
     const { writeSpace } = attribute(msg);
     try {
       await this.engine.recordAgentResponse(writeSpace, {

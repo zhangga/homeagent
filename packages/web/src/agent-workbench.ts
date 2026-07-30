@@ -1,5 +1,6 @@
 import type {
   Agent,
+  AgentActivityRun,
   AgentChatRecord,
   AgentInput,
   AgentSkillBinding,
@@ -69,6 +70,7 @@ export interface AgentRunView {
   taskName: string;
   topic: string;
   status: TaskRun["status"] | "recorded";
+  deliveryStatus?: "pending" | "sent" | "failed";
   error?: string;
   startedAt: number;
   finishedAt?: number;
@@ -155,6 +157,8 @@ export interface BuildAgentWorkbenchInput {
   defaults: { provider: string; model: string };
   bindings: SpaceMeta[];
   runs: TaskRun[];
+  /** Preferred unified Task + durable/legacy Chat activity stream. */
+  activityRuns?: AgentActivityRun[];
   chatRecords?: AgentChatRecord[];
   /** Runs for all Agents, used only for the left-list running indicator. */
   listRuns?: TaskRun[];
@@ -602,6 +606,14 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
       .filter((run) => run.status === "running" && run.agentId)
       .map((run) => run.agentId!),
   );
+  for (const activity of input.activityRuns ?? []) {
+    const run = activity.kind === "task"
+      ? activity.run
+      : activity.legacy
+        ? undefined
+        : activity.run;
+    if (run?.status === "running" && run.agentId) runningAgentIds.add(run.agentId);
+  }
   const list = input.agents.map((agent) => {
     const provider = detectedProvider(input.providers, agent.provider);
     const available = provider?.available === true;
@@ -620,22 +632,72 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
   let inspector: AgentInspectorView | null = null;
   if (input.selected) {
     const provider = detectedProvider(input.providers, input.selected.provider);
-    inspector = {
-      provider: {
-        id: input.selected.provider,
-        name: provider?.name ?? input.selected.provider,
-        available: provider?.available === true,
-        statusLabel: provider?.available ? "CLI 就绪" : "CLI 不可用",
-        detail: provider?.detail ?? "未检测到此 CLI",
+    const activityRunViews: AgentRunView[] | undefined = input.activityRuns?.map(
+      (activity): AgentRunView => {
+        if (activity.kind === "task") {
+          const run = activity.run;
+          return {
+            id: run.id,
+            kind: "task",
+            href: `/tasks/runs/${encodeURIComponent(run.id)}`,
+            taskId: run.taskId,
+            taskName: run.taskName,
+            topic: run.topic,
+            status: run.status,
+            error: run.error,
+            startedAt: run.startedAt,
+            finishedAt: run.finishedAt,
+            provider: run.provider ?? "未记录",
+            model: run.model || "CLI 默认模型",
+            space: run.space,
+            retryable: ["failed", "cancelled", "timed_out"].includes(run.status),
+          };
+        }
+        if (activity.legacy) {
+          const record = activity.record;
+          return {
+            id: record.id,
+            kind: "chat",
+            href:
+              `/spaces/${encodeURIComponent(record.space)}/raw/${encodeURIComponent(record.id)}`,
+            taskName: "Chat",
+            topic: record.content,
+            status: "recorded",
+            startedAt: record.createdAt,
+            provider: input.selected!.provider,
+            model: effectiveModel(input.selected!, input.defaults),
+            space: record.space,
+            retryable: false,
+          };
+        }
+        const run = activity.run;
+        return {
+          id: run.id,
+          kind: "chat",
+          href: `/chats/runs/${encodeURIComponent(run.id)}`,
+          taskName: "Chat",
+          topic: activity.record?.content ?? run.input,
+          status: run.status,
+          deliveryStatus: run.delivery.status,
+          error: run.error?.message
+            ?? (run.delivery.status === "failed" ? run.delivery.error : undefined),
+          startedAt: run.startedAt,
+          finishedAt: run.finishedAt,
+          provider: run.provider ?? "未记录",
+          model: run.model || "CLI 默认模型",
+          space: run.space,
+          retryable:
+            ["failed", "timed_out"].includes(run.status)
+            || (
+              run.status === "succeeded"
+              && run.delivery.status !== "sent"
+              && Boolean(run.output)
+            ),
+        };
       },
-      bindings: input.bindings.map((binding) => ({
-        id: binding.id,
-        label: binding.name?.trim() || binding.chatId?.trim() || binding.id,
-        detail: binding.id,
-        typeLabel: binding.id.startsWith("team/") ? "团队空间" : "个人空间",
-      })),
-      runs: [
-        ...input.runs.map((run): AgentRunView => ({
+    );
+    const legacyRunViews: AgentRunView[] = [
+      ...input.runs.map((run): AgentRunView => ({
         id: run.id,
         kind: "task",
         href: `/tasks/runs/${encodeURIComponent(run.id)}`,
@@ -650,29 +712,44 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
         model: run.model || "CLI 默认模型",
         space: run.space,
         retryable: ["failed", "cancelled", "timed_out"].includes(run.status),
-        })),
-        ...(input.chatRecords ?? []).map((record): AgentRunView => ({
-          id: record.id,
-          kind: "chat",
-          href:
-            `/spaces/${encodeURIComponent(record.space)}/raw/${encodeURIComponent(record.id)}`,
-          taskName: "Chat",
-          topic: record.content,
-          status: "recorded",
-          startedAt: record.createdAt,
-          provider: input.selected!.provider,
-          model: effectiveModel(input.selected!, input.defaults),
-          space: record.space,
-          retryable: false,
-        })),
-      ]
+      })),
+      ...(input.chatRecords ?? []).map((record): AgentRunView => ({
+        id: record.id,
+        kind: "chat",
+        href:
+          `/spaces/${encodeURIComponent(record.space)}/raw/${encodeURIComponent(record.id)}`,
+        taskName: "Chat",
+        topic: record.content,
+        status: "recorded",
+        startedAt: record.createdAt,
+        provider: input.selected!.provider,
+        model: effectiveModel(input.selected!, input.defaults),
+        space: record.space,
+        retryable: false,
+      })),
+    ];
+    const runViews = activityRunViews ?? legacyRunViews;
+    const runTotal = input.runTotal ?? runViews.length;
+    inspector = {
+      provider: {
+        id: input.selected.provider,
+        name: provider?.name ?? input.selected.provider,
+        available: provider?.available === true,
+        statusLabel: provider?.available ? "CLI 就绪" : "CLI 不可用",
+        detail: provider?.detail ?? "未检测到此 CLI",
+      },
+      bindings: input.bindings.map((binding) => ({
+        id: binding.id,
+        label: binding.name?.trim() || binding.chatId?.trim() || binding.id,
+        detail: binding.id,
+        typeLabel: binding.id.startsWith("team/") ? "团队空间" : "个人空间",
+      })),
+      runs: runViews
         .sort((a, b) => b.startedAt - a.startedAt || a.id.localeCompare(b.id))
         .slice(0, input.runLimit ?? 20),
-      runTotal: input.runTotal ?? input.runs.length + (input.chatRecords?.length ?? 0),
+      runTotal,
       runLimit: input.runLimit ?? 20,
-      hasMoreRuns:
-        (input.runTotal ?? input.runs.length + (input.chatRecords?.length ?? 0))
-          > (input.runLimit ?? 20),
+      hasMoreRuns: runTotal > (input.runLimit ?? 20),
     };
   }
 
