@@ -30,6 +30,9 @@ import {
   type FeishuGroupBinding,
   type KnowledgeEngine,
   type LlmClient,
+  RunQueueCancelledError,
+  RunQueueTimeoutError,
+  type RunSchedulerSnapshot,
 } from "@homeagent/core";
 import type {
   Connector,
@@ -82,6 +85,14 @@ const MAX_REPLY_SOURCE_CHARS = 50_000;
 const RECENT_CONTEXT_LOOKBACK_MS = 24 * 60 * 60_000;
 const RECENT_CONTEXT_SCAN_LIMIT = 50;
 const RECENT_ANSWER_SAMPLE_SIZE = 50;
+const CHAT_QUEUE_TIMEOUT_MS = 2 * 60_000;
+
+class ChatRunCancelledError extends Error {
+  constructor() {
+    super("Chat Run was cancelled before it completed.");
+    this.name = "ChatRunCancelledError";
+  }
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -89,6 +100,7 @@ function errorMessage(error: unknown): string {
 
 function chatRunError(error: unknown): ChatRunError {
   const message = errorMessage(error);
+  if (error instanceof ChatRunCancelledError) return { kind: "cancelled", message };
   if (isProviderTimeoutError(error)) return { kind: "timeout", message };
   if (
     /authentication|authorization|unauthorized|forbidden|credentials?|login|token.{0,20}expired|\b40[13]\b/iu
@@ -129,6 +141,7 @@ interface RuntimeTimingMetrics {
 
 export interface OrchestratorHealth {
   queue: SerializerSnapshot;
+  runs: RunSchedulerSnapshot;
   events: {
     total: number;
     completed: number;
@@ -220,6 +233,8 @@ export interface RuntimeOptions {
   attachmentDownloader?: (messageId: string) => Promise<DownloadedAttachment[]>;
   /** Optional local extraction boundary; defaults to the built-in extractor. */
   attachmentExtractor?: (attachment: DownloadedAttachment) => Promise<string | null>;
+  /** Maximum time a Chat Run may wait for admission. */
+  chatQueueTimeoutMs?: number;
 }
 
 export class Orchestrator {
@@ -232,10 +247,13 @@ export class Orchestrator {
   private seen = new Set<string>();
   private seenOrder: string[] = [];
   private pendingReminderConfirmations = new Map<string, PendingReminderConfirmation>();
+  private chatRunControllers = new Map<string, AbortController>();
+  private pendingEvents = new Set<Promise<void>>();
   private dedupSize: number;
   private docFetcher?: (urlOrToken: string) => Promise<string | null>;
   private attachmentDownloader?: (messageId: string) => Promise<DownloadedAttachment[]>;
   private attachmentExtractor: (attachment: DownloadedAttachment) => Promise<string | null>;
+  private chatQueueTimeoutMs: number;
   private eventMetrics = {
     total: 0,
     completed: 0,
@@ -275,15 +293,20 @@ export class Orchestrator {
     this.attachmentDownloader = opts.attachmentDownloader
       ?? this.connector.downloadAttachments?.bind(this.connector);
     this.attachmentExtractor = opts.attachmentExtractor ?? extractAttachmentText;
+    this.chatQueueTimeoutMs = opts.chatQueueTimeoutMs ?? CHAT_QUEUE_TIMEOUT_MS;
+    if (!Number.isFinite(this.chatQueueTimeoutMs) || this.chatQueueTimeoutMs <= 0) {
+      throw new Error("chatQueueTimeoutMs must be positive");
+    }
   }
 
   async start(): Promise<void> {
     await this.connector.start((event) => this.enqueue(event));
+    this.resumeQueuedChatRuns();
   }
 
   async stop(): Promise<void> {
     await this.connector.stop();
-    await this.serializer.drain("main");
+    await Promise.allSettled([...this.pendingEvents]);
   }
 
   /**
@@ -291,7 +314,10 @@ export class Orchestrator {
    * without re-running the model; provider failures create a new linked Run.
    */
   async retryChatRun(runId: string): Promise<ChatRun> {
-    return this.serializer.run("main", async () => {
+    const previousForKey = this.engine.chatRuns.get(runId);
+    return this.serializer.run(
+      `chat:${previousForKey?.chatId ?? "retry"}`,
+      async () => {
       const previous = this.engine.chatRuns.get(runId);
       if (!previous) throw new Error(`unknown chat run: ${runId}`);
       if (!previous.chatId || !previous.messageId) {
@@ -333,21 +359,25 @@ export class Orchestrator {
         await this.send(msg, previous.output, previous.id);
         return this.engine.chatRuns.get(previous.id)!;
       }
-      if (!["failed", "timed_out"].includes(previous.status)) {
+      if (!["failed", "cancelled", "timed_out"].includes(previous.status)) {
         throw new Error("chat run is not retryable");
       }
 
       const { readSpaces, writeSpace } = attribute(msg);
       const retry = this.startChatRun(msg, writeSpace, previous.rawId, previous.id);
-      await this.answer(msg, readSpaces, writeSpace, retry.id, previous.input);
+      await this.scheduleChatRun(msg, writeSpace, retry, (signal) =>
+        this.answer(msg, readSpaces, writeSpace, retry.id, previous.input, signal)
+      );
       return this.engine.chatRuns.get(retry.id)!;
-    });
+      },
+    );
   }
 
   /** Process one event. Exposed for tests; connectors call it via start(). */
   enqueue(event: InboundEvent): Promise<void> {
     this.eventMetrics.total += 1;
-    return this.serializer.run("main", async () => {
+    const key = event.kind === "message" ? `chat:${event.chatId}` : "main";
+    const pending = this.serializer.run(key, async () => {
       const startedAt = Date.now();
       try {
         await this.handle(event);
@@ -361,6 +391,12 @@ export class Orchestrator {
         this.eventMetrics.maxLatencyMs = Math.max(this.eventMetrics.maxLatencyMs, latencyMs);
       }
     });
+    this.pendingEvents.add(pending);
+    void pending.then(
+      () => this.pendingEvents.delete(pending),
+      () => this.pendingEvents.delete(pending),
+    );
+    return pending;
   }
 
   health(): OrchestratorHealth {
@@ -378,7 +414,8 @@ export class Orchestrator {
     ).length;
     const recentSampleSize = this.recentAnswerOutcomes.length;
     return {
-      queue: this.serializer.snapshot("main"),
+      queue: this.serializer.snapshotAll("main"),
+      runs: this.engine.runScheduler.snapshot(),
       events: {
         total: this.eventMetrics.total,
         completed: this.eventMetrics.completed,
@@ -762,25 +799,41 @@ export class Orchestrator {
 
       switch (interpretation.disposition) {
         case "conversation":
-          return this.answer(
+          return this.scheduleChatRun(
             msg,
-            readSpaces,
             writeSpace,
-            chatRun.id,
-            interpretation.text,
+            chatRun,
+            (signal) => this.answer(
+              msg,
+              readSpaces,
+              writeSpace,
+              chatRun.id,
+              interpretation.text,
+              signal,
+            ),
           );
         case "remember":
-          return this.completeChatRunAndSend(
+          return this.scheduleChatRun(
             msg,
-            chatRun.id,
-            "好的，我记下了。",
+            writeSpace,
+            chatRun,
+            () => this.completeChatRunAndSend(
+              msg,
+              chatRun.id,
+              "好的，我记下了。",
+            ),
           );
         case "chitchat":
         default:
-          return this.completeChatRunAndSend(
+          return this.scheduleChatRun(
             msg,
-            chatRun.id,
-            "👋 我在。有需要随时问我，或把要记住的事告诉我。",
+            writeSpace,
+            chatRun,
+            () => this.completeChatRunAndSend(
+              msg,
+              chatRun.id,
+              "👋 我在。有需要随时问我，或把要记住的事告诉我。",
+            ),
           );
       }
     });
@@ -811,6 +864,167 @@ export class Orchestrator {
     });
   }
 
+  private async scheduleChatRun(
+    msg: InboundMessage,
+    writeSpace: SpaceId,
+    run: ChatRun,
+    execute: (signal: AbortSignal) => Promise<void>,
+  ): Promise<void> {
+    const controller = new AbortController();
+    this.chatRunControllers.set(run.id, controller);
+    try {
+      await this.engine.runScheduler.schedule({
+        id: run.id,
+        priority: run.priority,
+        queueTimeoutMs: this.chatQueueTimeoutMs,
+        layers: this.engine.runConcurrencyLayers({
+          provider: run.provider,
+          model: run.model,
+          agentId: run.agentId,
+          conversationId: writeSpace,
+        }),
+        execute: async () => {
+          if (!this.engine.chatRuns.begin(run.id)) {
+            throw new Error(`queued chat run is no longer active: ${run.id}`);
+          }
+          await execute(controller.signal);
+        },
+      });
+    } catch (error) {
+      const current = this.engine.chatRuns.get(run.id);
+      if (error instanceof RunQueueCancelledError && current?.status === "cancelled") {
+        return;
+      }
+      if (current?.status === "queued") {
+        const finishedAt = Date.now();
+        if (error instanceof RunQueueTimeoutError) {
+          this.engine.chatRuns.timeout(run.id, {
+            finishedAt,
+            error: {
+              kind: "timeout",
+              message: `Chat Run waited more than ${this.chatQueueTimeoutMs}ms in the queue.`,
+            },
+          });
+          await this.send(msg, "当前请求排队时间过长，请稍后重试。");
+          return;
+        }
+        if (error instanceof RunQueueCancelledError) {
+          this.engine.chatRuns.cancel(run.id, {
+            finishedAt,
+            error: {
+              kind: "cancelled",
+              message: "Chat Run was cancelled while queued.",
+            },
+          });
+          return;
+        }
+        this.engine.chatRuns.fail(run.id, {
+          finishedAt,
+          error: chatRunError(error),
+        });
+      } else if (current?.status === "running") {
+        const finishedAt = Date.now();
+        const failure = chatRunError(error);
+        if (failure.kind === "cancelled") {
+          this.engine.chatRuns.cancel(run.id, { finishedAt, error: failure });
+        } else if (failure.kind === "timeout") {
+          this.engine.chatRuns.timeout(run.id, { finishedAt, error: failure });
+        } else {
+          this.engine.chatRuns.fail(run.id, { finishedAt, error: failure });
+        }
+      }
+      throw error;
+    } finally {
+      this.chatRunControllers.delete(run.id);
+    }
+  }
+
+  cancelChatRun(runId: string): boolean {
+    const run = this.engine.chatRuns.get(runId);
+    if (!run || !["queued", "running"].includes(run.status)) return false;
+    if (run.status === "queued") {
+      if (!this.engine.runScheduler.cancel(runId)) return false;
+      this.engine.chatRuns.cancel(runId, {
+        finishedAt: Date.now(),
+        error: {
+          kind: "cancelled",
+          message: "Chat Run was cancelled while queued.",
+        },
+      });
+      return true;
+    }
+    const controller = this.chatRunControllers.get(runId);
+    if (!controller) return false;
+    controller.abort(new ChatRunCancelledError());
+    return true;
+  }
+
+  private resumeQueuedChatRuns(): void {
+    const queued = this.engine.chatRuns.list()
+      .filter((run) => run.status === "queued")
+      .sort((a, b) => a.queuedAt - b.queuedAt || a.id.localeCompare(b.id));
+    for (const run of queued) {
+      if (!run.chatId || !run.messageId) {
+        this.engine.chatRuns.fail(run.id, {
+          finishedAt: Date.now(),
+          error: {
+            kind: "interrupted",
+            message: "Queued Chat Run cannot resume without a delivery target.",
+          },
+        });
+        continue;
+      }
+      const msg: InboundMessage = {
+        kind: "message",
+        eventId: `chat-resume:${run.id}`,
+        chatType: run.space.startsWith("team/") ? "group" : "p2p",
+        chatId: run.chatId,
+        senderId: run.author
+          ?? (run.space.startsWith("personal/")
+            ? run.space.slice("personal/".length)
+            : "unknown"),
+        text: run.input,
+        messageId: run.messageId,
+        mentionsBot: true,
+        createdAt: run.startedAt,
+      };
+      const { readSpaces } = attribute(msg);
+      const interpretation = interpretConversation(run.input);
+      const pending = this.scheduleChatRun(
+        msg,
+        run.space,
+        run,
+        (signal) => interpretation.disposition === "conversation"
+          ? this.answer(
+              msg,
+              readSpaces,
+              run.space,
+              run.id,
+              interpretation.text,
+              signal,
+            )
+          : this.completeChatRunAndSend(
+              msg,
+              run.id,
+              interpretation.disposition === "remember"
+                ? "好的，我记下了。"
+                : "👋 我在。有需要随时问我，或把要记住的事告诉我。",
+            ),
+      );
+      this.pendingEvents.add(pending);
+      void pending.then(
+        () => this.pendingEvents.delete(pending),
+        (error) => {
+          this.pendingEvents.delete(pending);
+          log.error("queued Chat Run resume failed", {
+            runId: run.id,
+            err: String(error),
+          });
+        },
+      );
+    }
+  }
+
   private async completeChatRunAndSend(
     msg: InboundMessage,
     runId: string,
@@ -829,6 +1043,7 @@ export class Orchestrator {
     writeSpace: SpaceId,
     runId: string,
     userText = normalizeConversationText(msg.text),
+    signal?: AbortSignal,
   ): Promise<void> {
     const answerStartedAt = Date.now();
     let outcome: AnswerOutcome | undefined;
@@ -845,6 +1060,7 @@ export class Orchestrator {
           model: agent?.model || undefined,
           instruction: agent?.instruction || undefined,
           images: context.images.map((image) => ({ path: image.localPath })),
+          signal,
         });
       } catch (err) {
         // No runnable provider (unset agent + no usable default CLI), or the CLI
@@ -855,7 +1071,12 @@ export class Orchestrator {
         });
         outcome = isProviderTimeoutError(err) ? "timed_out" : "failed";
         const failure = chatRunError(err);
-        if (outcome === "timed_out") {
+        if (failure.kind === "cancelled") {
+          this.engine.chatRuns.cancel(runId, {
+            finishedAt: Date.now(),
+            error: failure,
+          });
+        } else if (outcome === "timed_out") {
           this.engine.chatRuns.timeout(runId, {
             finishedAt: Date.now(),
             error: failure,
@@ -866,7 +1087,11 @@ export class Orchestrator {
             error: failure,
           });
         }
-        await this.send(msg, providerNotice(err), runId);
+        await this.send(
+          msg,
+          failure.kind === "cancelled" ? "本次请求已取消。" : providerNotice(err),
+          runId,
+        );
         return;
       } finally {
         this.cleanupDownloads(context.images, msg.messageId);
@@ -887,7 +1112,12 @@ export class Orchestrator {
     } catch (err) {
       if (this.engine.chatRuns.get(runId)?.status === "running") {
         const failure = chatRunError(err);
-        if (failure.kind === "timeout") {
+        if (failure.kind === "cancelled") {
+          this.engine.chatRuns.cancel(runId, {
+            finishedAt: Date.now(),
+            error: failure,
+          });
+        } else if (failure.kind === "timeout") {
           this.engine.chatRuns.timeout(runId, {
             finishedAt: Date.now(),
             error: failure,

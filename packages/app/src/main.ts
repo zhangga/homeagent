@@ -195,6 +195,19 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
     );
   };
 
+  for (const resumed of engine.resumeQueuedTaskRuns()) {
+    void resumed.completion.then(async (report) => {
+      if (!report.ok) return;
+      const run = engine.getTaskRun(report.runId);
+      if (run?.notification) await notifyTaskDone(run);
+    }).catch((err) => {
+      log.warn("resumed task completion hook failed", {
+        runId: resumed.run.id,
+        err: String(err),
+      });
+    });
+  }
+
   let scheduler: Scheduler | undefined;
   let taskScheduler: TaskScheduler | undefined;
   let learningScheduler: LearningScheduler | undefined;
@@ -274,6 +287,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
       }
       return orchestrator.retryChatRun(runId);
     },
+    onChatRunCancel: (runId) => orchestrator.cancelChatRun(runId),
     onServiceRestart: () => {
       setTimeout(() => process.kill(process.pid, "SIGTERM"), 250);
     },

@@ -47,8 +47,11 @@ describe("shouldRunTask", () => {
       topic: "x",
       trigger: "scheduled",
       distill: false,
+      priority: "scheduled",
       status: "succeeded",
+      queuedAt: 1,
       startedAt: 1,
+      runStartedAt: 1,
       finishedAt: 2,
       summary: "Completed",
       skillEvidence: {

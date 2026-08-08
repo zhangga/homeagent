@@ -29,6 +29,8 @@ export interface AskOptions {
   maxPages?: number;
   /** when true, never fall back to general knowledge (knowledge-only) */
   knowledgeOnly?: boolean;
+  /** cancel the active provider call when the owning Run is cancelled. */
+  signal?: AbortSignal;
 }
 
 export interface SearchOptions {

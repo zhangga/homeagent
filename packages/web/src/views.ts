@@ -33,6 +33,7 @@ import type {
   QuarantineRecord,
   AnswerFeedbackReview,
   QualitySnapshot,
+  RunQueueInfo,
 } from "@homeagent/core";
 import {
   ANSWER_FEEDBACK_KINDS,
@@ -1048,6 +1049,7 @@ export function tasksView(
 }
 
 function taskRunStatus(status: TaskRun["status"]): HtmlEscapedString | Promise<HtmlEscapedString> {
+  if (status === "queued") return html`<span class="badge general">排队中</span>`;
   if (status === "running") return html`<span class="badge general">运行中</span>`;
   if (status === "succeeded") return html`<span class="badge knowledge">成功</span>`;
   if (status === "cancelled") return html`<span class="badge general">已取消</span>`;
@@ -1065,8 +1067,8 @@ function taskRunTrigger(trigger: TaskRun["trigger"]): string {
 }
 
 function taskRunDuration(run: TaskRun): string {
-  if (!run.finishedAt) return "运行中";
-  const milliseconds = Math.max(0, run.finishedAt - run.startedAt);
+  if (!run.finishedAt) return run.status === "queued" ? "排队中" : "运行中";
+  const milliseconds = Math.max(0, run.finishedAt - (run.runStartedAt ?? run.startedAt));
   if (milliseconds < 1000) return `${milliseconds} ms`;
   return `${(milliseconds / 1000).toFixed(1)} 秒`;
 }
@@ -1081,13 +1083,14 @@ export function taskRunView(
   run: TaskRun,
   task: Task | undefined,
   flashMsg?: string,
+  queue?: RunQueueInfo,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const retryForm = ["failed", "cancelled", "timed_out"].includes(run.status) && task
     ? html`<form method="post" action="/tasks/runs/${encodeURIComponent(run.id)}/retry" class="inline-form">
         <button type="submit">重新运行</button>
       </form>`
     : "";
-  const cancelForm = run.status === "running"
+  const cancelForm = run.status === "queued" || run.status === "running"
     ? html`<form method="post" action="/tasks/runs/${encodeURIComponent(run.id)}/cancel" class="inline-form"
         onsubmit="return confirm('取消这次运行？')">
         <button type="submit" class="danger">取消运行</button>
@@ -1119,7 +1122,11 @@ export function taskRunView(
     <div class="card stack">
       <div><strong>状态：</strong>${taskRunStatus(run.status)}</div>
       <div><strong>触发方式：</strong>${taskRunTrigger(run.trigger)}</div>
-      <div><strong>开始时间：</strong>${fmtTime(run.startedAt)}</div>
+      <div><strong>排队时间：</strong>${fmtTime(run.queuedAt)}</div>
+      <div><strong>开始时间：</strong>${fmtTime(run.runStartedAt)}</div>
+      ${queue
+        ? html`<div><strong>队列位置：</strong>第 ${queue.position} 位 · 已等待 ${Math.round(queue.waitedMs / 1000)} 秒</div>`
+        : ""}
       <div><strong>完成时间：</strong>${fmtTime(run.finishedAt)} · ${taskRunDuration(run)}</div>
       <div><strong>运行上限：</strong>${taskRunTimeout(run)}</div>
       <div><strong>飞书通知：</strong>${notificationLabel}${notification ? ` · 已尝试 ${notification.attempts} 次` : ""}</div>
@@ -1172,7 +1179,8 @@ export function taskRunView(
 
 const CHAT_RUN_ERROR_LABELS: Record<NonNullable<ChatRun["error"]>["kind"], string> = {
   interrupted: "进程中断",
-  timeout: "Provider 超时",
+  cancelled: "已取消",
+  timeout: "请求超时",
   authentication: "鉴权失败",
   provider_unavailable: "Provider 不可用",
   process_exit: "Provider 进程退出",
@@ -1182,15 +1190,19 @@ const CHAT_RUN_ERROR_LABELS: Record<NonNullable<ChatRun["error"]>["kind"], strin
 export function chatRunView(
   run: ChatRun,
   flashMsg?: string,
+  queue?: RunQueueInfo,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const retryable =
-    ["failed", "timed_out"].includes(run.status)
+    ["failed", "cancelled", "timed_out"].includes(run.status)
     || (
       run.status === "succeeded"
       && run.delivery.status !== "sent"
       && Boolean(run.output)
     );
-  const status = run.status === "running"
+  const cancellable = run.status === "queued" || run.status === "running";
+  const status = run.status === "queued"
+    ? html`<span class="badge">排队中</span>`
+    : run.status === "running"
     ? html`<span class="badge">运行中</span>`
     : run.status === "succeeded"
       ? html`<span class="badge knowledge">成功</span>`
@@ -1203,10 +1215,10 @@ export function chatRunView(
       ? "发送失败"
       : "待发送";
   const milliseconds = run.finishedAt
-    ? Math.max(0, run.finishedAt - run.startedAt)
+    ? Math.max(0, run.finishedAt - (run.runStartedAt ?? run.startedAt))
     : undefined;
   const duration = milliseconds === undefined
-    ? "运行中"
+    ? run.status === "queued" ? "排队中" : "运行中"
     : milliseconds < 1000
       ? `${milliseconds} ms`
       : `${(milliseconds / 1000).toFixed(1)} 秒`;
@@ -1216,7 +1228,11 @@ export function chatRunView(
     ${flash(flashMsg)}
     <div class="card stack">
       <div><strong>状态：</strong>${status}</div>
-      <div><strong>开始时间：</strong>${fmtTime(run.startedAt)}</div>
+      <div><strong>排队时间：</strong>${fmtTime(run.queuedAt)}</div>
+      <div><strong>开始时间：</strong>${fmtTime(run.runStartedAt)}</div>
+      ${queue
+        ? html`<div><strong>队列位置：</strong>第 ${queue.position} 位 · 已等待 ${Math.round(queue.waitedMs / 1000)} 秒</div>`
+        : ""}
       <div><strong>完成时间：</strong>${fmtTime(run.finishedAt)} · ${duration}</div>
       <div><strong>执行快照：</strong>${run.provider ?? "未记录"} / ${run.model || "CLI 默认模型"}
         ${run.reasoningEffort ? ` · reasoning ${run.reasoningEffort}` : ""}</div>
@@ -1258,11 +1274,19 @@ export function chatRunView(
         ? html`<div><strong>${CHAT_RUN_ERROR_LABELS[run.error.kind]}</strong>
             <div class="contentbox" style="margin-top:8px">${run.error.message}</div></div>`
         : ""}
-      ${retryable
+      ${cancellable || retryable
         ? html`<div class="actions">
+            ${cancellable
+              ? html`<form method="post" action="/chats/runs/${encodeURIComponent(run.id)}/cancel" class="inline-form"
+                  onsubmit="return confirm('取消这次 Chat Run？')">
+                  <button type="submit" class="danger">取消运行</button>
+                </form>`
+              : ""}
+            ${retryable ? html`
             <form method="post" action="/chats/runs/${encodeURIComponent(run.id)}/retry" class="inline-form">
               <button type="submit">${run.status === "succeeded" ? "重试投递" : "重试文本回答"}</button>
             </form>
+            ` : ""}
           </div>`
         : ""}
     </div>`;

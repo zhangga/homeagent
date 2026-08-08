@@ -148,4 +148,49 @@ export class Serializer {
       maxDurationMs: metrics.maxDurationMs,
     };
   }
+
+  /** Aggregate queue metrics across every key while preserving a stable label. */
+  snapshotAll(key = "all"): SerializerSnapshot {
+    const snapshots = [...this.metrics.keys()].map((metricKey) => this.snapshot(metricKey));
+    const settled = snapshots.reduce(
+      (total, snapshot) => total + snapshot.completed + snapshot.failed,
+      0,
+    );
+    const started = snapshots.reduce(
+      (total, snapshot) => total + snapshot.completed + snapshot.failed + snapshot.running,
+      0,
+    );
+    return {
+      key,
+      queued: snapshots.reduce((total, snapshot) => total + snapshot.queued, 0),
+      running: snapshots.reduce((total, snapshot) => total + snapshot.running, 0),
+      pending: snapshots.reduce((total, snapshot) => total + snapshot.pending, 0),
+      maxPending: snapshots.reduce((total, snapshot) => total + snapshot.maxPending, 0),
+      completed: snapshots.reduce((total, snapshot) => total + snapshot.completed, 0),
+      failed: snapshots.reduce((total, snapshot) => total + snapshot.failed, 0),
+      averageWaitMs: started === 0
+        ? 0
+        : Math.round(snapshots.reduce(
+            (total, snapshot) =>
+              total + snapshot.averageWaitMs
+                * (snapshot.completed + snapshot.failed + snapshot.running),
+            0,
+          ) / started),
+      maxWaitMs: snapshots.reduce(
+        (maximum, snapshot) => Math.max(maximum, snapshot.maxWaitMs),
+        0,
+      ),
+      averageDurationMs: settled === 0
+        ? 0
+        : Math.round(snapshots.reduce(
+            (total, snapshot) =>
+              total + snapshot.averageDurationMs * (snapshot.completed + snapshot.failed),
+            0,
+          ) / settled),
+      maxDurationMs: snapshots.reduce(
+        (maximum, snapshot) => Math.max(maximum, snapshot.maxDurationMs),
+        0,
+      ),
+    };
+  }
 }

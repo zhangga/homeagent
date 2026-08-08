@@ -8,6 +8,7 @@ import {
 } from "./agent-workbench.ts";
 
 const STATUS_LABELS = {
+  queued: "排队中",
   running: "运行中",
   succeeded: "已完成",
   failed: "失败",
@@ -1401,7 +1402,7 @@ export function agentWorkbenchView(
                         ? "◆"
                         : run.status === "succeeded"
                         ? "✓"
-                        : run.status === "running"
+                        : run.status === "running" || run.status === "queued"
                           ? "…"
                           : run.status === "timed_out"
                             ? "!"
@@ -1422,10 +1423,15 @@ export function agentWorkbenchView(
                         ${run.kind === "chat" && run.deliveryStatus === "failed"
                           ? " · 投递失败"
                           : run.kind === "chat"
-                            && run.status !== "running"
+                            && run.status === "succeeded"
                             && run.deliveryStatus === "pending"
                             ? " · 待投递"
                             : ""}
+                        ${run.status === "queued"
+                          ? html` · 队列第 ${run.queuePosition ?? "—"} 位${
+                              run.queueReason ? ` · 等待 ${run.queueReason}` : ""
+                            }`
+                          : ""}
                         · ${run.retryable && run.error ? html`${run.taskName} · ` : ""}
                         ${run.space} · ${run.provider} / ${run.model}
                       </span>

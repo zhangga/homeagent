@@ -73,11 +73,26 @@ export interface AgentRunView {
   deliveryStatus?: "pending" | "sent" | "failed";
   error?: string;
   startedAt: number;
+  runStartedAt?: number;
+  queuePosition?: number;
+  queueWaitMs?: number;
+  queueReason?: string;
   finishedAt?: number;
   provider: string;
   model: string;
   space: string;
   retryable: boolean;
+}
+
+function queueReason(keys: string[] | undefined): string | undefined {
+  const labels = (keys ?? []).map((key) => {
+    if (key === "run:global") return "全局额度";
+    if (key.startsWith("run:provider-model:")) return "Provider/模型额度";
+    if (key.startsWith("run:agent:")) return "Agent 额度";
+    if (key.startsWith("run:conversation:")) return "会话额度";
+    return "并发额度";
+  });
+  return [...new Set(labels)].join("、") || undefined;
 }
 
 export interface AgentInspectorView {
@@ -646,6 +661,10 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
             status: run.status,
             error: run.error,
             startedAt: run.startedAt,
+            runStartedAt: run.runStartedAt,
+            queuePosition: activity.queue?.position,
+            queueWaitMs: activity.queue?.waitedMs,
+            queueReason: queueReason(activity.queue?.blockedBy),
             finishedAt: run.finishedAt,
             provider: run.provider ?? "未记录",
             model: run.model || "CLI 默认模型",
@@ -682,12 +701,16 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
           error: run.error?.message
             ?? (run.delivery.status === "failed" ? run.delivery.error : undefined),
           startedAt: run.startedAt,
+          runStartedAt: run.runStartedAt,
+          queuePosition: activity.queue?.position,
+          queueWaitMs: activity.queue?.waitedMs,
+          queueReason: queueReason(activity.queue?.blockedBy),
           finishedAt: run.finishedAt,
           provider: run.provider ?? "未记录",
           model: run.model || "CLI 默认模型",
           space: run.space,
           retryable:
-            ["failed", "timed_out"].includes(run.status)
+            ["failed", "cancelled", "timed_out"].includes(run.status)
             || (
               run.status === "succeeded"
               && run.delivery.status !== "sent"
@@ -707,6 +730,7 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
         status: run.status,
         error: run.error,
         startedAt: run.startedAt,
+        runStartedAt: run.runStartedAt,
         finishedAt: run.finishedAt,
         provider: run.provider ?? "未记录",
         model: run.model || "CLI 默认模型",

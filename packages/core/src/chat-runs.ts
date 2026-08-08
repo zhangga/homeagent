@@ -22,12 +22,20 @@ import {
   isTaskRunSkillEvidence,
   type TaskRunSkillEvidence,
 } from "./task-runs.ts";
+import type { RunPriority } from "./run-scheduler.ts";
 
 export type ChatRunTrigger = "message" | "retry";
-export type ChatRunStatus = "running" | "succeeded" | "failed" | "timed_out";
+export type ChatRunStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "timed_out";
 export type ChatRunDeliveryStatus = "pending" | "sent" | "failed";
 export type ChatRunErrorKind =
   | "interrupted"
+  | "cancelled"
   | "timeout"
   | "authentication"
   | "provider_unavailable"
@@ -64,9 +72,12 @@ export interface ChatRun {
   skillEvidence?: TaskRunSkillEvidence;
   execution?: ProviderExecution;
   retryOf?: string;
+  priority: RunPriority;
   status: ChatRunStatus;
   delivery: ChatRunDelivery;
+  queuedAt: number;
   startedAt: number;
+  runStartedAt?: number;
   finishedAt?: number;
   output?: string;
   outputTruncated?: boolean;
@@ -89,6 +100,7 @@ export interface StartChatRunInput {
   skillEvidence?: TaskRunSkillEvidence;
   execution?: ProviderExecution;
   retryOf?: string;
+  priority?: RunPriority;
   startedAt?: number;
 }
 
@@ -108,7 +120,7 @@ export interface FinishChatRunFailureInput {
 }
 
 interface ChatRunsFile {
-  version: 1;
+  version: 1 | 2;
   runs: Record<string, ChatRun>;
 }
 
@@ -139,6 +151,10 @@ function isProviderId(value: unknown): value is ProviderId {
   return ["gateway", "claude", "codex", "trae-cli"].includes(String(value));
 }
 
+function isRunPriority(value: unknown): value is RunPriority {
+  return ["interactive", "manual", "scheduled", "background"].includes(String(value));
+}
+
 function isExecution(value: unknown): value is ProviderExecution {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const execution = value as Partial<ProviderExecution>;
@@ -167,13 +183,22 @@ export function isChatRun(value: unknown): value is ChatRun {
     && run.input.length <= MAX_CHAT_RUN_INPUT_CHARACTERS
     && (run.inputTruncated === undefined || typeof run.inputTruncated === "boolean")
     && ["message", "retry"].includes(String(run.trigger))
-    && ["running", "succeeded", "failed", "timed_out"].includes(String(run.status))
+    && ["queued", "running", "succeeded", "failed", "cancelled", "timed_out"]
+      .includes(String(run.status))
+    && isRunPriority(run.priority)
+    && typeof run.queuedAt === "number"
+    && Number.isFinite(run.queuedAt)
     && typeof run.startedAt === "number"
     && Number.isFinite(run.startedAt)
+    && run.queuedAt === run.startedAt
+    && (run.runStartedAt === undefined
+      || (typeof run.runStartedAt === "number"
+        && Number.isFinite(run.runStartedAt)
+        && run.runStartedAt >= run.queuedAt))
     && (run.finishedAt === undefined
       || (typeof run.finishedAt === "number"
         && Number.isFinite(run.finishedAt)
-        && run.finishedAt >= run.startedAt))
+        && run.finishedAt >= (run.runStartedAt ?? run.startedAt)))
     && [run.rawId, run.chatId, run.messageId, run.author, run.agentId, run.model, run.retryOf]
       .every((item) => item === undefined || typeof item === "string")
     && [run.output, run.traceId]
@@ -190,6 +215,7 @@ export function isChatRun(value: unknown): value is ChatRun {
       && !Array.isArray(run.error)
       && [
         "interrupted",
+        "cancelled",
         "timeout",
         "authentication",
         "provider_unavailable",
@@ -211,9 +237,14 @@ export function isChatRun(value: unknown): value is ChatRun {
     && (delivery.error === undefined || typeof delivery.error === "string")
     && (delivery.error === undefined
       || delivery.error.length <= MAX_CHAT_RUN_ERROR_CHARACTERS)
-    && (run.status === "running" || typeof run.finishedAt === "number")
     && (
-      !["failed", "timed_out"].includes(String(run.status))
+      run.status === "queued"
+      || run.status === "running"
+      || typeof run.finishedAt === "number"
+    )
+    && (run.status !== "running" || typeof run.runStartedAt === "number")
+    && (
+      !["failed", "cancelled", "timed_out"].includes(String(run.status))
       || run.error !== undefined
     )
     && (delivery.status !== "sent" || typeof delivery.sentAt === "number")
@@ -241,10 +272,19 @@ export class ChatRunStore {
     if (!existsSync(this.configPath)) return runs;
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<ChatRunsFile>;
-      if (parsed.version !== 1) return runs;
+      if (parsed.version !== 1 && parsed.version !== 2) return runs;
       for (const [id, value] of Object.entries(parsed.runs ?? {})) {
-        if (!isChatRun(value) || value.id !== id) continue;
-        runs.set(id, clone(value));
+        const legacy = value as Partial<ChatRun>;
+        const normalized = parsed.version === 1
+          ? {
+              ...legacy,
+              priority: "interactive",
+              queuedAt: legacy.startedAt,
+              runStartedAt: legacy.status === "queued" ? undefined : legacy.startedAt,
+            }
+          : legacy;
+        if (!isChatRun(normalized) || normalized.id !== id) continue;
+        runs.set(id, clone(normalized));
       }
     } catch {
       // Corrupt history must not prevent the application from starting.
@@ -256,7 +296,7 @@ export class ChatRunStore {
     const configDir = dirname(this.configPath);
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const tempPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
-    const file: ChatRunsFile = { version: 1, runs: Object.fromEntries(runs) };
+    const file: ChatRunsFile = { version: 2, runs: Object.fromEntries(runs) };
     try {
       writeFileSync(tempPath, JSON.stringify(file, null, 2), {
         encoding: "utf8",
@@ -301,7 +341,7 @@ export class ChatRunStore {
       for (const run of candidate.values()) {
         if (run.status !== "running") continue;
         run.status = "failed";
-        run.finishedAt = Math.max(now, run.startedAt);
+        run.finishedAt = Math.max(now, run.runStartedAt ?? run.startedAt);
         run.error = {
           kind: "interrupted",
           message: "The application stopped before the chat response completed.",
@@ -314,7 +354,7 @@ export class ChatRunStore {
   private pruneCompletedRuns(runs = this.runs): void {
     const completedByOwner = new Map<string, ChatRun[]>();
     for (const run of runs.values()) {
-      if (run.status === "running") continue;
+      if (run.status === "queued" || run.status === "running") continue;
       const owner = run.agentId ? `agent:${run.agentId}` : `space:${run.space}`;
       const completed = completedByOwner.get(owner) ?? [];
       completed.push(run);
@@ -356,11 +396,23 @@ export class ChatRunStore {
         execution: input.execution
           ? { ...input.execution, skills: [...input.execution.skills] }
           : undefined,
-        status: "running",
+        priority: input.priority ?? "interactive",
+        status: "queued",
         delivery: { status: "pending", attempts: 0 },
+        queuedAt: startedAt,
         startedAt,
       };
       candidate.set(run.id, run);
+      return clone(run);
+    });
+  }
+
+  begin(id: string, runStartedAt = Date.now()): ChatRun | undefined {
+    if (this.runs.get(id)?.status !== "queued") return undefined;
+    return this.commit((candidate) => {
+      const run = candidate.get(id)!;
+      run.status = "running";
+      run.runStartedAt = Math.max(runStartedAt, run.queuedAt);
       return clone(run);
     });
   }
@@ -369,6 +421,7 @@ export class ChatRunStore {
     if (!this.runs.has(id)) return undefined;
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
+      run.runStartedAt ??= run.startedAt;
       run.status = "succeeded";
       run.finishedAt = Math.max(result.finishedAt, run.startedAt);
       run.output = result.output.slice(0, MAX_CHAT_RUN_OUTPUT_CHARACTERS);
@@ -389,16 +442,21 @@ export class ChatRunStore {
     return this.finishFailure(id, "timed_out", result);
   }
 
+  cancel(id: string, result: FinishChatRunFailureInput): ChatRun | undefined {
+    return this.finishFailure(id, "cancelled", result);
+  }
+
   private finishFailure(
     id: string,
-    status: "failed" | "timed_out",
+    status: "failed" | "cancelled" | "timed_out",
     result: FinishChatRunFailureInput,
   ): ChatRun | undefined {
     if (!this.runs.has(id)) return undefined;
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
+      if (run.status !== "queued") run.runStartedAt ??= run.startedAt;
       run.status = status;
-      run.finishedAt = Math.max(result.finishedAt, run.startedAt);
+      run.finishedAt = Math.max(result.finishedAt, run.runStartedAt ?? run.startedAt);
       run.error = {
         kind: result.error.kind,
         message: result.error.message.slice(0, MAX_CHAT_RUN_ERROR_CHARACTERS),
@@ -477,8 +535,8 @@ export class ChatRunStore {
     const incomingIds = new Set<string>();
     for (const run of runs) {
       if (!isChatRun(run)) throw new Error("invalid chat run");
-      if (run.status === "running") {
-        throw new Error(`cannot restore a running chat run: ${run.id}`);
+      if (run.status === "queued" || run.status === "running") {
+        throw new Error(`cannot restore an active chat run: ${run.id}`);
       }
       if (this.runs.has(run.id) || incomingIds.has(run.id)) {
         throw new Error(`chat run id already exists: ${run.id}`);

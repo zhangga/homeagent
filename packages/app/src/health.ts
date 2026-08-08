@@ -164,10 +164,11 @@ export function createSystemHealthReporter(
         const answerTimeoutRate = runtime.answers.recent.timeoutRate;
         const degraded =
           runtime.queue.pending >= 10
+          || runtime.runs.queued >= 10
           || (runtime.answers.recent.sampleSize >= 5 && answerFailureRate >= 0.2);
         components.aiRuntime = {
           status: degraded ? "degraded" : "ok",
-          summary: `${runtime.answers.succeeded}/${runtime.answers.total} 次回答成功，${runtime.answers.timedOut} 次超时，队列积压 ${runtime.queue.pending}`,
+          summary: `${runtime.answers.succeeded}/${runtime.answers.total} 次回答成功，${runtime.answers.timedOut} 次超时，Run 排队 ${runtime.runs.queued}`,
           details: {
             ...runtime,
             answerFailureRate,

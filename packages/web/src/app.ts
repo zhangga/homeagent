@@ -134,6 +134,8 @@ export interface WebOptions {
   onTaskRun?: (taskId: string, run: TaskRun) => void | Promise<void>;
   /** Retry a durable text Chat Run through the live orchestrator/connector. */
   onChatRunRetry?: (runId: string) => Promise<ChatRun>;
+  /** Cancel a queued or running Chat Run through the live orchestrator. */
+  onChatRunCancel?: (runId: string) => boolean;
   /** Gracefully terminate a launchd-managed process so KeepAlive can restart it. */
   onServiceRestart?: () => void;
 }
@@ -1716,7 +1718,7 @@ export function createWebApp(opts: WebOptions): Hono {
             : []),
           { label: "Chat Run 详情" },
         ],
-        await chatRunView(run, ok),
+        await chatRunView(run, ok, engine.runScheduler.queueInfo(run.id)),
         "agents",
       ),
     );
@@ -1742,6 +1744,16 @@ export function createWebApp(opts: WebOptions): Hono {
         `/chats/runs/${encodeURIComponent(runId)}?ok=${encodeURIComponent("重试失败，请查看错误后再试")}`,
       );
     }
+  });
+
+  app.post("/chats/runs/:runId/cancel", async (c) => {
+    const runId = decodeURIComponent(c.req.param("runId"));
+    if (!engine.chatRuns.get(runId)) return c.notFound();
+    const cancelled = opts.onChatRunCancel?.(runId) ?? false;
+    const message = cancelled ? "已发送取消请求" : "该运行已结束，无法取消";
+    return c.redirect(
+      `/chats/runs/${encodeURIComponent(runId)}?ok=${encodeURIComponent(message)}`,
+    );
   });
 
   // ---- Tasks ---------------------------------------------------------------
@@ -1775,7 +1787,12 @@ export function createWebApp(opts: WebOptions): Hono {
           { label: run.taskName, href: `/tasks/${encodeURIComponent(run.taskId)}` },
           { label: "运行详情" },
         ],
-        await taskRunView(run, engine.tasks.get(run.taskId), ok),
+        await taskRunView(
+          run,
+          engine.tasks.get(run.taskId),
+          ok,
+          engine.runScheduler.queueInfo(run.id),
+        ),
         "tasks",
       ),
     );

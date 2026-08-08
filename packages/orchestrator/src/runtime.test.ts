@@ -250,6 +250,12 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       pending: 0,
       completed: 2,
     }));
+    expect(health.runs).toEqual(expect.objectContaining({
+      queued: 0,
+      running: 0,
+      completed: 1,
+      limited: 0,
+    }));
     expect(JSON.stringify(health)).not.toContain("Alice 今天更新了后端服务");
     expect(JSON.stringify(health)).not.toContain("oc_team");
   });
@@ -565,6 +571,129 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       }),
     }));
     expect(engine.chatRuns.get(previous.id)?.status).toBe("failed");
+  });
+
+  test("a queued Chat Run resumes with the same durable id after restart", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const queued = engine.chatRuns.start({
+      space: "team/oc_team",
+      chatId: "oc_team",
+      messageId: "om_queued_restart",
+      author: "ou_me",
+      input: "@agent 请继续分析",
+      trigger: "message",
+    });
+
+    await orch.start();
+    await orch.stop();
+
+    expect(engine.chatRuns.get(queued.id)).toEqual(expect.objectContaining({
+      id: queued.id,
+      status: "succeeded",
+      runStartedAt: expect.any(Number),
+      delivery: expect.objectContaining({ status: "sent" }),
+    }));
+  });
+
+  test("different chats run concurrently while the provider/model layer queues overflow", async () => {
+    const completions: Array<(text: string) => void> = [];
+    const blockingLlm: LlmClient = {
+      complete: async () => new Promise((resolve) => {
+        completions.push((text) => resolve({
+          text,
+          model: "blocking",
+          inputTokens: 1,
+          outputTokens: 1,
+          costUsd: 0,
+        }));
+      }),
+      completeJSON: (options) => fake.completeJSON(options),
+    };
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: blockingLlm });
+    for (const chatId of ["oc_layer_a", "oc_layer_b", "oc_layer_c"]) {
+      engine.feishuBindings.connect({
+        chatId,
+        spaceId: `team/${chatId}`,
+        responseMode: "mentions_only",
+        replyInThread: true,
+      });
+    }
+    orch = new Orchestrator({ engine, connector, llm: blockingLlm });
+    const send = (chatId: string) => orch.enqueue({
+      kind: "message",
+      eventId: `event_${chatId}`,
+      chatType: "group",
+      chatId,
+      senderId: "ou_me",
+      text: "@agent 请分析",
+      messageId: `message_${chatId}`,
+      mentionsBot: true,
+      createdAt: Date.now(),
+    });
+
+    const pending = ["oc_layer_a", "oc_layer_b", "oc_layer_c"].map(send);
+    for (let attempt = 0; attempt < 200 && completions.length < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(completions).toHaveLength(2);
+    expect(engine.runScheduler.snapshot()).toEqual(expect.objectContaining({
+      running: 2,
+      queued: 1,
+      limited: 1,
+    }));
+    expect(engine.chatRuns.list().filter((run) => run.status === "queued")).toHaveLength(1);
+
+    completions.shift()!("first");
+    for (let attempt = 0; attempt < 200 && completions.length < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(completions).toHaveLength(2);
+
+    completions.splice(0).forEach((resolve, index) => resolve(`answer ${index}`));
+    await Promise.all(pending);
+    expect(engine.chatRuns.list().every((run) => run.status === "succeeded")).toBeTrue();
+  });
+
+  test("a running Chat Run can be cancelled through its provider boundary", async () => {
+    const blockingLlm: LlmClient = {
+      complete: async () => new Promise(() => undefined),
+      completeJSON: (options) => fake.completeJSON(options),
+    };
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: blockingLlm });
+    engine.feishuBindings.connect({
+      chatId: "oc_cancel_chat",
+      spaceId: "team/oc_cancel_chat",
+      responseMode: "mentions_only",
+      replyInThread: true,
+    });
+    orch = new Orchestrator({ engine, connector, llm: blockingLlm });
+    const pending = orch.enqueue({
+      kind: "message",
+      eventId: "event_cancel_chat",
+      chatType: "group",
+      chatId: "oc_cancel_chat",
+      senderId: "ou_me",
+      text: "@agent 请分析",
+      messageId: "message_cancel_chat",
+      mentionsBot: true,
+      createdAt: Date.now(),
+    });
+    let running;
+    for (let attempt = 0; attempt < 200 && !running; attempt += 1) {
+      running = engine.chatRuns.list().find((run) => run.status === "running");
+      if (!running) await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(running).toBeDefined();
+    expect(orch.cancelChatRun(running!.id)).toBe(true);
+    await pending;
+    expect(engine.chatRuns.get(running!.id)).toEqual(expect.objectContaining({
+      status: "cancelled",
+      error: expect.objectContaining({ kind: "cancelled" }),
+    }));
   });
 
   test("a retry does not duplicate a reply when delivery succeeded before Run persistence failed", async () => {

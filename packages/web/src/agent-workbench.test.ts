@@ -69,8 +69,11 @@ const runs: TaskRun[] = [
     provider: "codex",
     model: "gpt-5.6-sol",
     distill: true,
+    priority: "manual",
     status: "running",
+    queuedAt: 300,
     startedAt: 300,
+    runStartedAt: 300,
   },
 ];
 
@@ -155,9 +158,12 @@ describe("Agent workbench presenter", () => {
         agentId: agent.id,
         provider: "claude",
         model: "sonnet",
+        priority: "interactive",
         status: "failed",
         delivery: { status: "sent", attempts: 1, sentAt: 410 },
+        queuedAt: 400,
         startedAt: 400,
+        runStartedAt: 400,
         finishedAt: 405,
         error: {
           kind: "authentication",

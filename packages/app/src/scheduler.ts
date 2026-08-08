@@ -197,7 +197,11 @@ export class Scheduler {
         try {
           // Per-space agent model (management backend), if assigned.
           const model = this.engine.agentForSpace(meta.id)?.model || undefined;
-          await this.engine.runDreamCycle(meta.id, { model });
+          await this.engine.scheduleBackgroundRun(
+            `background:dream:${meta.id}:${now.getTime()}`,
+            meta.id,
+            () => this.engine.runDreamCycle(meta.id, { model }),
+          );
           ran.push(meta.id);
         } catch (err) {
           errors.push(`${meta.id}: ${String(err)}`);

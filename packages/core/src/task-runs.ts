@@ -18,8 +18,15 @@ import type {
   SkippedSkillSnapshot,
 } from "./skill-catalog.ts";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
+import type { RunPriority } from "./run-scheduler.ts";
 
-export type TaskRunStatus = "running" | "succeeded" | "failed" | "cancelled" | "timed_out";
+export type TaskRunStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "timed_out";
 export type TaskRunTrigger = "manual" | "scheduled" | "chat" | "retry";
 export type TaskRunNotificationStatus = "pending" | "sent" | "failed";
 
@@ -47,8 +54,11 @@ export interface TaskRun {
   distill: boolean;
   notify?: boolean;
   timeoutMs?: number;
+  priority: RunPriority;
   status: TaskRunStatus;
+  queuedAt: number;
   startedAt: number;
+  runStartedAt?: number;
   finishedAt?: number;
   output?: string;
   outputTruncated?: boolean;
@@ -66,7 +76,7 @@ export interface TaskRunSkillEvidence {
 }
 
 interface TaskRunsFile {
-  version: 2 | 3 | 4;
+  version: 2 | 3 | 4 | 5;
   runs: Record<string, TaskRun>;
 }
 
@@ -80,6 +90,7 @@ export interface StartTaskRunInput {
   retryOf?: string;
   distill: boolean;
   timeoutMs?: number;
+  priority?: RunPriority;
   startedAt?: number;
 }
 
@@ -200,7 +211,12 @@ function isTaskRun(value: unknown): value is TaskRun {
     run.error,
     run.rawId,
   ].every((item) => item === undefined || typeof item === "string");
-  const optionalNumbers = [run.finishedAt, run.pagesWritten, run.timeoutMs].every(
+  const optionalNumbers = [
+    run.finishedAt,
+    run.pagesWritten,
+    run.timeoutMs,
+    run.runStartedAt,
+  ].every(
     (item) => item === undefined || (typeof item === "number" && Number.isFinite(item)),
   );
   const notification = run.notification;
@@ -236,21 +252,33 @@ function isTaskRun(value: unknown): value is TaskRun {
     && (run.skillEvidence === undefined || isTaskRunSkillEvidence(run.skillEvidence))
     && typeof run.distill === "boolean"
     && (run.notify === undefined || typeof run.notify === "boolean")
-    && ["running", "succeeded", "failed", "cancelled", "timed_out"].includes(String(run.status))
+    && ["interactive", "manual", "scheduled", "background"].includes(String(run.priority))
+    && ["queued", "running", "succeeded", "failed", "cancelled", "timed_out"]
+      .includes(String(run.status))
+    && typeof run.queuedAt === "number"
+    && Number.isFinite(run.queuedAt)
     && typeof run.startedAt === "number"
     && Number.isFinite(run.startedAt)
+    && run.queuedAt === run.startedAt
+    && (run.runStartedAt === undefined || run.runStartedAt >= run.queuedAt)
     && optionalStrings
     && optionalNumbers
     && validNotification
     && (run.notification === undefined || run.status === "succeeded")
     && (run.notification === undefined || run.notify !== false)
     && (run.outputTruncated === undefined || typeof run.outputTruncated === "boolean")
-    && (run.status === "running" || typeof run.finishedAt === "number")
+    && (
+      run.status === "queued"
+      || run.status === "running"
+      || typeof run.finishedAt === "number"
+    )
+    && (run.status !== "running" || typeof run.runStartedAt === "number")
     && (
       !["failed", "cancelled", "timed_out"].includes(String(run.status))
       || typeof run.error === "string"
     )
-    && (run.finishedAt === undefined || run.finishedAt >= run.startedAt)
+    && (run.finishedAt === undefined
+      || run.finishedAt >= (run.runStartedAt ?? run.startedAt))
     && (run.output === undefined || run.output.length <= MAX_TASK_RUN_OUTPUT_CHARACTERS)
     && (run.error === undefined || run.error.length <= MAX_TASK_RUN_ERROR_CHARACTERS)
     && (!run.outputTruncated || run.output !== undefined)
@@ -285,10 +313,23 @@ export class TaskRunStore {
     if (!existsSync(this.configPath)) return runs;
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<TaskRunsFile>;
-      if (parsed.version !== 2 && parsed.version !== 3 && parsed.version !== 4) return runs;
+      if (![2, 3, 4, 5].includes(parsed.version ?? 0)) return runs;
       for (const [id, value] of Object.entries(parsed.runs ?? {})) {
-        if (!isTaskRun(value) || value.id !== id) continue;
-        runs.set(id, clone(value));
+        const legacy = value as Partial<TaskRun>;
+        const normalized = parsed.version === 5
+          ? legacy
+          : {
+              ...legacy,
+              priority: legacy.trigger === "scheduled"
+                ? "scheduled"
+                : legacy.trigger === "chat"
+                  ? "interactive"
+                  : "manual",
+              queuedAt: legacy.startedAt,
+              runStartedAt: legacy.status === "queued" ? undefined : legacy.startedAt,
+            };
+        if (!isTaskRun(normalized) || normalized.id !== id) continue;
+        runs.set(id, clone(normalized));
       }
     } catch {
       // Corrupt history must not prevent the application from starting.
@@ -300,7 +341,7 @@ export class TaskRunStore {
     const configDir = dirname(this.configPath);
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const tempPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
-    const file: TaskRunsFile = { version: 4, runs: Object.fromEntries(runs) };
+    const file: TaskRunsFile = { version: 5, runs: Object.fromEntries(runs) };
     try {
       writeFileSync(tempPath, JSON.stringify(file, null, 2), { encoding: "utf8", mode: 0o600 });
       const fileDescriptor = openSync(tempPath, "r");
@@ -357,7 +398,10 @@ export class TaskRunStore {
 
   private pruneCompletedRuns(taskId: string, runs = this.runs): void {
     const completed = [...runs.values()].filter(
-      (run) => run.taskId === taskId && run.status !== "running",
+      (run) =>
+        run.taskId === taskId
+        && run.status !== "queued"
+        && run.status !== "running",
     );
     const excess = completed.length - MAX_TASK_RUN_HISTORY_PER_TASK;
     if (excess <= 0) return;
@@ -396,7 +440,15 @@ export class TaskRunStore {
         distill: input.distill,
         notify: input.task.notify,
         timeoutMs: input.timeoutMs,
-        status: "running",
+        priority: input.priority ?? (
+          input.trigger === "scheduled"
+            ? "scheduled"
+            : input.trigger === "chat"
+              ? "interactive"
+              : "manual"
+        ),
+        status: "queued",
+        queuedAt: startedAt,
         startedAt,
       };
       candidate.set(run.id, run);
@@ -409,6 +461,7 @@ export class TaskRunStore {
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
       const output = result.output ?? "";
+      run.runStartedAt ??= run.startedAt;
       run.status = "succeeded";
       run.finishedAt = result.finishedAt;
       run.output = output.slice(0, MAX_TASK_RUN_OUTPUT_CHARACTERS);
@@ -481,6 +534,7 @@ export class TaskRunStore {
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
       const output = result.output;
+      if (run.status !== "queued") run.runStartedAt ??= run.startedAt;
       run.status = status;
       run.finishedAt = result.finishedAt;
       run.error = (result.error ?? defaultError).slice(0, MAX_TASK_RUN_ERROR_CHARACTERS);
@@ -523,6 +577,16 @@ export class TaskRunStore {
       .map(clone);
   }
 
+  begin(id: string, runStartedAt = Date.now()): TaskRun | undefined {
+    if (this.runs.get(id)?.status !== "queued") return undefined;
+    return this.commit((candidate) => {
+      const run = candidate.get(id)!;
+      run.status = "running";
+      run.runStartedAt = Math.max(runStartedAt, run.queuedAt);
+      return clone(run);
+    });
+  }
+
   listByAgent(agentId: string, limit = 20): TaskRun[] {
     const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 20));
     return [...this.runs.values()]
@@ -554,7 +618,9 @@ export class TaskRunStore {
       if (this.runs.has(run.id) || incomingIds.has(run.id)) {
         throw new Error(`task run id already exists: ${run.id}`);
       }
-      if (run.status === "running") throw new Error(`cannot restore a running task run: ${run.id}`);
+      if (run.status === "queued" || run.status === "running") {
+        throw new Error(`cannot restore an active task run: ${run.id}`);
+      }
       incomingIds.add(run.id);
     }
     if (runs.length === 0) return [];

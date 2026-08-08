@@ -691,6 +691,114 @@ describe("Knowledge seam contract", () => {
     healthEngine.close();
   });
 
+  test("task runs in the same space queue behind the conversation layer", async () => {
+    const completions: Array<(value: string) => void> = [];
+    const queuedEngine = new KnowledgeEngine({
+      dataDir: join(dir, "layered-task-queue"),
+      runProvider: async () => new Promise<string>((resolve) => completions.push(resolve)),
+    });
+    queuedEngine.ensureSpace(SPACE);
+    const firstTask = queuedEngine.tasks.create({
+      name: "first layered task",
+      space: SPACE,
+      topic: "first",
+    })!;
+    const secondTask = queuedEngine.tasks.create({
+      name: "second layered task",
+      space: SPACE,
+      topic: "second",
+    })!;
+
+    const first = queuedEngine.startTaskRun(firstTask.id, { distill: false });
+    const second = queuedEngine.startTaskRun(secondTask.id, { distill: false });
+    await Promise.resolve();
+
+    expect(queuedEngine.getTaskRun(first.run.id)?.status).toBe("running");
+    expect(queuedEngine.getTaskRun(second.run.id)?.status).toBe("queued");
+    expect(completions).toHaveLength(1);
+
+    completions[0]!("first complete");
+    await first.completion;
+    await Promise.resolve();
+    expect(queuedEngine.getTaskRun(second.run.id)?.status).toBe("running");
+    expect(completions).toHaveLength(2);
+
+    completions[1]!("second complete");
+    await second.completion;
+    queuedEngine.close();
+  });
+
+  test("a queued task can be cancelled before provider execution starts", async () => {
+    const completions: Array<(value: string) => void> = [];
+    const queuedEngine = new KnowledgeEngine({
+      dataDir: join(dir, "queued-task-cancel"),
+      runProvider: async () => new Promise<string>((resolve) => completions.push(resolve)),
+    });
+    queuedEngine.ensureSpace(SPACE);
+    const firstTask = queuedEngine.tasks.create({
+      name: "blocking task",
+      space: SPACE,
+      topic: "block",
+    })!;
+    const queuedTask = queuedEngine.tasks.create({
+      name: "cancel queued task",
+      space: SPACE,
+      topic: "cancel",
+    })!;
+
+    const first = queuedEngine.startTaskRun(firstTask.id, { distill: false });
+    const queued = queuedEngine.startTaskRun(queuedTask.id, { distill: false });
+
+    expect(queued.run.status).toBe("queued");
+    expect(queuedEngine.cancelTaskRun(queued.run.id)).toBe(true);
+    expect(await queued.completion).toEqual(expect.objectContaining({
+      status: "cancelled",
+      ok: false,
+    }));
+    expect(completions).toHaveLength(1);
+
+    completions[0]!("done");
+    await first.completion;
+    queuedEngine.close();
+  });
+
+  test("a queued task times out before provider execution when its deadline expires", async () => {
+    const completions: Array<(value: string) => void> = [];
+    const queuedEngine = new KnowledgeEngine({
+      dataDir: join(dir, "queued-task-timeout"),
+      runProvider: async () => new Promise<string>((resolve) => completions.push(resolve)),
+    });
+    queuedEngine.ensureSpace(SPACE);
+    const firstTask = queuedEngine.tasks.create({
+      name: "blocking timeout task",
+      space: SPACE,
+      topic: "block",
+    })!;
+    const queuedTask = queuedEngine.tasks.create({
+      name: "queue timeout task",
+      space: SPACE,
+      topic: "timeout",
+    })!;
+
+    const first = queuedEngine.startTaskRun(firstTask.id, { distill: false });
+    const queued = queuedEngine.startTaskRun(queuedTask.id, {
+      distill: false,
+      timeoutMs: 10,
+    });
+    const report = await queued.completion;
+
+    expect(report).toEqual(expect.objectContaining({
+      status: "timed_out",
+      ok: false,
+    }));
+    expect(queuedEngine.getTaskRun(queued.run.id)?.runStartedAt).toBeUndefined();
+    expect(completions).toHaveLength(1);
+
+    completions[0]!("done");
+    await first.completion;
+    queuedEngine.close();
+  });
+
   test("task setup failures become durable failed runs and clear running health", async () => {
     const healthEngine = new KnowledgeEngine({
       dataDir: join(dir, "setup-failure-health"),
@@ -1430,6 +1538,41 @@ describe("Knowledge seam contract", () => {
     taskEngine.close();
   });
 
+  test("a queued task run resumes with the same durable id after restart", async () => {
+    const recoveryDir = join(dir, "queued-task-recovery");
+    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    first.ensureSpace(SPACE);
+    const task = first.tasks.create({
+      name: "queued recovery",
+      space: SPACE,
+      topic: "resume me",
+      distillOnRun: false,
+    })!;
+    const queued = first.taskRuns.start({
+      task,
+      trigger: "scheduled",
+      distill: false,
+    });
+    first.close();
+
+    const reopened = new KnowledgeEngine({
+      dataDir: recoveryDir,
+      runProvider: async () => "resumed output",
+      recoverInterruptedTaskRuns: true,
+    });
+    const resumed = reopened.resumeQueuedTaskRuns();
+
+    expect(resumed).toHaveLength(1);
+    expect(resumed[0]?.run.id).toBe(queued.id);
+    const report = await resumed[0]!.completion;
+    expect(report).toEqual(expect.objectContaining({
+      runId: queued.id,
+      status: "succeeded",
+      ok: true,
+    }));
+    reopened.close();
+  });
+
   test("recovered interrupted runs update the task's latest health", () => {
     const recoveryDir = join(dir, "interrupted-task-health");
     const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
@@ -1445,6 +1588,7 @@ describe("Knowledge seam contract", () => {
       trigger: "scheduled",
       distill: false,
     });
+    first.taskRuns.begin(interrupted.id);
     first.close();
 
     const secondary = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });

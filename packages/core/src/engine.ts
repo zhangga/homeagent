@@ -83,6 +83,12 @@ import {
   type TaskRunTrigger,
 } from "./task-runs.ts";
 import { ChatRunStore, type ChatRun } from "./chat-runs.ts";
+import {
+  RunQueueCancelledError,
+  RunQueueTimeoutError,
+  RunScheduler,
+  type RunConcurrencyLayer,
+} from "./run-scheduler.ts";
 import { ReminderStore, type Reminder } from "./reminders.ts";
 import {
   LearningPlanStore,
@@ -141,6 +147,19 @@ import {
 } from "./knowledge-governance.ts";
 
 const log = logger.child("core");
+export interface RunConcurrencyConfig {
+  global: number;
+  providerModel: number;
+  agent: number;
+  conversation: number;
+}
+
+export const DEFAULT_RUN_CONCURRENCY: RunConcurrencyConfig = {
+  global: 4,
+  providerModel: 2,
+  agent: 1,
+  conversation: 1,
+};
 
 /** Thrown when a space has no runnable LLM provider (agent unset / CLI missing). */
 export class NoProviderError extends Error {
@@ -826,6 +845,10 @@ function topicLearningFeedbackPrompt(
 export interface EngineOptions {
   dataDir?: string;
   serializer?: Serializer;
+  /** Shared admission controller for Chat and Task runs. */
+  runScheduler?: RunScheduler;
+  /** Layered Run admission limits; omitted values use conservative local defaults. */
+  runConcurrency?: Partial<RunConcurrencyConfig>;
   /**
    * Override the LLM client. When set (tests), it is used for ALL spaces,
    * bypassing CLI routing. When unset (production), each space uses a
@@ -861,6 +884,7 @@ export type AgentActivityRun =
       kind: "task";
       startedAt: number;
       run: TaskRun;
+      queue?: ReturnType<RunScheduler["queueInfo"]>;
     }
   | {
       kind: "chat";
@@ -868,6 +892,7 @@ export type AgentActivityRun =
       startedAt: number;
       run: ChatRun;
       record?: AgentChatRecord;
+      queue?: ReturnType<RunScheduler["queueInfo"]>;
     }
   | {
       kind: "chat";
@@ -890,6 +915,13 @@ export interface AgentRunExecutionSnapshot {
   reasoningEffort?: CodexReasoningEffort;
   skillEvidence: TaskRunSkillEvidence;
   execution: ProviderExecution;
+}
+
+export interface RunAdmissionContext {
+  provider?: ProviderId;
+  model?: string;
+  agentId?: string;
+  conversationId: string;
 }
 
 interface ProviderRunHealth {
@@ -926,6 +958,7 @@ export class KnowledgeEngine implements Knowledge {
   readonly learning: LearningPlanStore;
   readonly quality: QualityStore;
   readonly serializer: Serializer;
+  readonly runScheduler: RunScheduler;
   private dataDir: string;
   private llm?: LlmClient;
   private runProvider: RunProviderFn;
@@ -937,6 +970,7 @@ export class KnowledgeEngine implements Knowledge {
   private deliveringTaskRunNotifications = new Set<string>();
   private deliveringReminderCounts = new Map<string, number>();
   private deliveringLearningCounts = new Map<string, number>();
+  private readonly runConcurrency: RunConcurrencyConfig;
 
   constructor(opts: EngineOptions = {}) {
     this.dataDir = opts.dataDir ?? config().dataDir;
@@ -965,6 +999,16 @@ export class KnowledgeEngine implements Knowledge {
     this.learning = new LearningPlanStore(this.dataDir);
     this.quality = new QualityStore(this.dataDir);
     this.serializer = opts.serializer ?? new Serializer();
+    this.runScheduler = opts.runScheduler ?? new RunScheduler();
+    this.runConcurrency = {
+      ...DEFAULT_RUN_CONCURRENCY,
+      ...opts.runConcurrency,
+    };
+    if (Object.values(this.runConcurrency).some(
+      (limit) => !Number.isInteger(limit) || limit < 1,
+    )) {
+      throw new Error("Run concurrency limits must be positive integers");
+    }
     this.llm = opts.llm;
     this.learningResearch = opts.learningResearch;
     const providerRunner = opts.runProvider ?? runLocalProvider;
@@ -980,10 +1024,8 @@ export class KnowledgeEngine implements Knowledge {
         run.lastError = undefined;
         return output;
       } catch (err) {
-        const abortReason = signal?.aborted ? signal.reason : undefined;
-        const callerStoppedTask = abortReason instanceof TaskRunTimeoutError
-          || abortReason instanceof TaskRunCancelledError;
-        if (!callerStoppedTask) {
+        const callerStoppedRun = signal?.aborted === true;
+        if (!callerStoppedRun) {
           run.lastFailureAt = Date.now();
           run.lastStatus = isProviderTimeoutError(err) ? "timeout" : "error";
           run.lastError = String(err);
@@ -1015,7 +1057,9 @@ export class KnowledgeEngine implements Knowledge {
 
   private activeTaskRunId(taskId: string): string | undefined {
     return this.activeTaskRuns.get(taskId)
-      ?? this.taskRuns.list(taskId).find((run) => run.status === "running")?.id;
+      ?? this.taskRuns.list(taskId).find(
+        (run) => run.status === "queued" || run.status === "running",
+      )?.id;
   }
 
   /** Ensure a space exists (used by connectors when a group is joined). */
@@ -1433,7 +1477,12 @@ export class KnowledgeEngine implements Knowledge {
     if (safeLimit === 0) return [];
     const taskRuns: AgentActivityRun[] = this.taskRuns
       .listByAgent(id, safeLimit)
-      .map((run) => ({ kind: "task", startedAt: run.startedAt, run }));
+      .map((run) => ({
+        kind: "task",
+        startedAt: run.startedAt,
+        run,
+        queue: run.status === "queued" ? this.runScheduler.queueInfo(run.id) : undefined,
+      }));
     const chatRuns = this.chatRuns.listByAgent(id, safeLimit);
     const chatRecords = this.listAgentChatRecords(id, safeLimit * 2);
     const recordsById = new Map(chatRecords.map((record) => [record.id, record]));
@@ -1446,6 +1495,7 @@ export class KnowledgeEngine implements Knowledge {
       startedAt: run.startedAt,
       run,
       record: run.rawId ? recordsById.get(run.rawId) : undefined,
+      queue: run.status === "queued" ? this.runScheduler.queueInfo(run.id) : undefined,
     }));
     const legacyChats: AgentActivityRun[] = chatRecords
       .filter((record) => !referencedRawIds.has(record.id))
@@ -1579,6 +1629,46 @@ export class KnowledgeEngine implements Knowledge {
         skills: skills.resolved.map((skill) => skill.invocationName),
       },
     };
+  }
+
+  runConcurrencyLayers(context: RunAdmissionContext): RunConcurrencyLayer[] {
+    const providerModel = `${context.provider ?? "gateway"}:${context.model ?? "default"}`;
+    return [
+      { key: "run:global", limit: this.runConcurrency.global },
+      {
+        key: `run:provider-model:${providerModel}`,
+        limit: this.runConcurrency.providerModel,
+      },
+      {
+        key: `run:agent:${context.agentId ?? `conversation:${context.conversationId}`}`,
+        limit: this.runConcurrency.agent,
+      },
+      {
+        key: `run:conversation:${context.conversationId}`,
+        limit: this.runConcurrency.conversation,
+      },
+    ];
+  }
+
+  scheduleBackgroundRun<T>(
+    id: string,
+    space: SpaceId,
+    execute: () => Promise<T>,
+    queueTimeoutMs = 60 * 60_000,
+  ): Promise<T> {
+    const snapshot = this.agentRunExecutionSnapshot(space);
+    return this.runScheduler.schedule({
+      id,
+      priority: "background",
+      queueTimeoutMs,
+      layers: this.runConcurrencyLayers({
+        provider: snapshot.provider,
+        model: snapshot.model,
+        agentId: snapshot.agent?.id,
+        conversationId: space,
+      }),
+      execute,
+    });
   }
 
   skillWarningsForSpace(space: SpaceId): SkillWarningView[] {
@@ -2352,8 +2442,8 @@ export class KnowledgeEngine implements Knowledge {
       if (tasks.some((task) => this.activeTaskRunId(task.id) !== undefined)) {
         throw new Error(`space has running tasks: ${space}`);
       }
-      if (chatRuns.some((run) => run.status === "running")) {
-        throw new Error(`space has running chat runs: ${space}`);
+      if (chatRuns.some((run) => run.status === "queued" || run.status === "running")) {
+        throw new Error(`space has active chat runs: ${space}`);
       }
       const taskIds = new Set(tasks.map((task) => task.id));
       return {
@@ -2491,8 +2581,8 @@ export class KnowledgeEngine implements Knowledge {
       if (tasks.some((task) => this.activeTaskRunId(task.id) !== undefined)) {
         throw new Error(`space has running tasks: ${space}`);
       }
-      if (chatRuns.some((run) => run.status === "running")) {
-        throw new Error(`space has running chat runs: ${space}`);
+      if (chatRuns.some((run) => run.status === "queued" || run.status === "running")) {
+        throw new Error(`space has active chat runs: ${space}`);
       }
       if (reminders.some(
         (reminder) => (this.deliveringReminderCounts.get(reminder.id) ?? 0) > 0,
@@ -2691,7 +2781,15 @@ export class KnowledgeEngine implements Knowledge {
 
   cancelTaskRun(runId: string): boolean {
     const run = this.taskRuns.get(runId);
-    if (!run || run.status !== "running") return false;
+    if (!run || !["queued", "running"].includes(run.status)) return false;
+    if (run.status === "queued") {
+      if (!this.runScheduler.cancel(runId)) return false;
+      this.taskRuns.cancel(runId, {
+        finishedAt: Date.now(),
+        error: new TaskRunCancelledError().message,
+      });
+      return true;
+    }
     const controller = this.taskRunControllers.get(runId);
     if (!controller) return false;
     controller.abort(new TaskRunCancelledError());
@@ -2781,25 +2879,187 @@ export class KnowledgeEngine implements Knowledge {
       distill,
       timeoutMs,
     });
-    const timeout = setTimeout(() => {
-      controller.abort(new TaskRunTimeoutError(timeoutMs));
-    }, timeoutMs);
+    const completion = this.scheduleTaskRun({
+      task,
+      run,
+      distill,
+      timeoutMs,
+      controller,
+      executionAgent,
+      client,
+      resolvedSkills,
+      setupError,
+    });
+    return {
+      run: this.taskRuns.get(run.id) ?? run,
+      completion,
+    };
+  }
+
+  private scheduleTaskRun(input: {
+    task: Task;
+    run: TaskRun;
+    distill: boolean;
+    timeoutMs: number;
+    controller: AbortController;
+    executionAgent?: Agent;
+    client?: LlmClient;
+    resolvedSkills?: ResolvedAgentSkills;
+    setupError?: unknown;
+  }): Promise<TaskReport> {
+    const {
+      task,
+      run,
+      distill,
+      timeoutMs,
+      controller,
+      executionAgent,
+      client,
+      resolvedSkills,
+      setupError,
+    } = input;
+    const taskId = task.id;
     this.activeTaskRuns.set(taskId, run.id);
     this.taskRunControllers.set(run.id, controller);
-    return {
-      run,
-      completion: this.executeTaskRun(
+    return this.runScheduler.schedule({
+      id: run.id,
+      priority: run.priority,
+      queueTimeoutMs: timeoutMs,
+      layers: this.runConcurrencyLayers({
+        provider: run.provider,
+        model: run.model,
+        agentId: run.agentId,
+        conversationId: run.space,
+      }),
+      execute: async () => {
+        const running = this.taskRuns.begin(run.id);
+        if (!running) throw new Error(`queued task run is no longer active: ${run.id}`);
+        const timeout = setTimeout(() => {
+          controller.abort(new TaskRunTimeoutError(timeoutMs));
+        }, timeoutMs);
+        try {
+          return await this.executeTaskRun(
+            task,
+            running,
+            distill,
+            controller,
+            executionAgent,
+            client,
+            resolvedSkills,
+            setupError,
+          );
+        } finally {
+          clearTimeout(timeout);
+        }
+      },
+    }).catch((error): TaskReport => {
+      let current = this.taskRuns.get(run.id);
+      if (current?.status === "queued") {
+        const finishedAt = Date.now();
+        if (error instanceof RunQueueTimeoutError) {
+          current = this.taskRuns.timeout(run.id, {
+            finishedAt,
+            error: `任务排队超过 ${timeoutMs} ms，已自动终止`,
+          });
+        } else if (error instanceof RunQueueCancelledError) {
+          current = this.taskRuns.cancel(run.id, {
+            finishedAt,
+            error: new TaskRunCancelledError().message,
+          });
+        } else {
+          current = this.taskRuns.fail(run.id, {
+            finishedAt,
+            error: String(error),
+          });
+        }
+      }
+      const settled = current ?? this.taskRuns.get(run.id)!;
+      return {
+        runId: settled.id,
+        taskId: settled.taskId,
+        space: settled.space,
+        ok: false,
+        status: settled.status,
+        error: settled.error,
+        startedAt: settled.startedAt,
+        finishedAt: settled.finishedAt ?? Date.now(),
+      };
+    }).finally(() => {
+      if (this.activeTaskRuns.get(taskId) === run.id) {
+        this.activeTaskRuns.delete(taskId);
+      }
+      this.taskRunControllers.delete(run.id);
+    });
+  }
+
+  /** Re-enqueue durable Task Runs that had not started when the service stopped. */
+  resumeQueuedTaskRuns(): StartedTaskRun[] {
+    const resumed: StartedTaskRun[] = [];
+    const queued = this.taskRuns.list()
+      .filter((run) => run.status === "queued")
+      .sort((a, b) => a.queuedAt - b.queuedAt || a.id.localeCompare(b.id));
+    for (const run of queued) {
+      const storedTask = this.tasks.get(run.taskId);
+      if (!storedTask) {
+        this.taskRuns.fail(run.id, {
+          finishedAt: Date.now(),
+          error: `Queued task no longer exists: ${run.taskId}`,
+        });
+        continue;
+      }
+      const task: Task = {
+        ...storedTask,
+        name: run.taskName,
+        space: run.space,
+        topic: run.topic,
+        notify: run.notify ?? storedTask.notify,
+      };
+      const timeoutMs = run.timeoutMs ?? storedTask.timeoutMinutes * 60_000;
+      const controller = new AbortController();
+      let executionAgent: Agent | undefined;
+      let client: LlmClient | undefined;
+      let resolvedSkills: ResolvedAgentSkills | undefined;
+      let setupError: unknown;
+      try {
+        const storedAgent = run.agentId ? this.agents.get(run.agentId) : undefined;
+        if (run.agentId && !storedAgent) {
+          throw new Error(`Queued run Agent no longer exists: ${run.agentId}`);
+        }
+        executionAgent = storedAgent
+          ? {
+              ...storedAgent,
+              provider: run.provider ?? storedAgent.provider,
+              model: run.model ?? storedAgent.model,
+            }
+          : undefined;
+        const context = this.agentCallContext(task.space, {
+          timeoutMs,
+          signal: controller.signal,
+          taskExecution: true,
+          resolvedAgent: executionAgent,
+        });
+        client = context.client;
+        resolvedSkills = context.skills;
+      } catch (error) {
+        setupError = error;
+      }
+      const completion = this.scheduleTaskRun({
         task,
         run,
-        distill,
+        distill: run.distill,
+        timeoutMs,
         controller,
         executionAgent,
         client,
         resolvedSkills,
         setupError,
-      )
-        .finally(() => clearTimeout(timeout)),
-    };
+      });
+      resumed.push({
+        run: this.taskRuns.get(run.id) ?? run,
+        completion,
+      });
+    }
+    return resumed;
   }
 
   /**
@@ -2941,13 +3201,16 @@ export class KnowledgeEngine implements Knowledge {
     const stores = spaces.filter((s) => this.registry.has(s)).map((s) => this.registry.store(s));
     const primary = spaces[0] ?? stores[0]?.space;
     const context = primary
-      ? this.agentCallContext(primary)
-      : this.agentCallContext(spaces[0]!);
+      ? this.agentCallContext(primary, { signal: opts.signal })
+      : this.agentCallContext(spaces[0]!, { signal: opts.signal });
     const client = context.client;
     const skillWarnings = skillWarningViews(context.skills);
     const startedAt = Date.now();
     try {
-      const result = await askImpl(stores, question, opts, { client });
+      const asking = askImpl(stores, question, opts, { client });
+      const result = opts.signal
+        ? await awaitTaskRunStep(asking, opts.signal)
+        : await asking;
       try {
         const trace = this.quality.recordTrace({
           spaces,

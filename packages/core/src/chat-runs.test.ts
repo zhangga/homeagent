@@ -21,6 +21,31 @@ afterEach(() => {
 });
 
 describe("ChatRunStore", () => {
+  test("persists queued work and only marks it running when admitted", () => {
+    const store = new ChatRunStore(dir);
+    const queued = store.start({
+      space: SPACE,
+      input: "queued chat",
+      trigger: "message",
+      startedAt: 100,
+    });
+
+    expect(queued).toEqual(expect.objectContaining({
+      status: "queued",
+      priority: "interactive",
+      queuedAt: 100,
+    }));
+    expect(new ChatRunStore(dir, { recoverInterrupted: true }).get(queued.id)?.status)
+      .toBe("queued");
+
+    const running = store.begin(queued.id, 120);
+    expect(running).toEqual(expect.objectContaining({
+      status: "running",
+      queuedAt: 100,
+      runStartedAt: 120,
+    }));
+  });
+
   test("persists the source and execution snapshot captured when a run starts", () => {
     const store = new ChatRunStore(dir);
     const run = store.start({
@@ -81,8 +106,10 @@ describe("ChatRunStore", () => {
         permission: "read-only",
         skills: ["meeting-summary"],
       },
-      status: "running",
+      priority: "interactive",
+      status: "queued",
       delivery: { status: "pending", attempts: 0 },
+      queuedAt: 100,
       startedAt: 100,
     });
   });
@@ -96,6 +123,7 @@ describe("ChatRunStore", () => {
       trigger: "message",
       startedAt: 100,
     });
+    store.begin(run.id, 110);
 
     expect(new ChatRunStore(dir).get(run.id)?.status).toBe("running");
 

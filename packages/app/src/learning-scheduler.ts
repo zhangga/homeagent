@@ -181,13 +181,19 @@ export class LearningScheduler {
         }
         if (!shouldRunLearningPlan(plan, current, now)) continue;
         try {
-          const advanced = await this.engine.deliverLearningSession(
-            plan.id,
-            now.getTime(),
-            async (currentPlan, source, session) => {
-              if (!this.notify) throw new Error("learning notification transport is unavailable");
-              await this.notify(currentPlan, source, session);
-            },
+          const advanced = await this.engine.scheduleBackgroundRun(
+            `background:learning:${plan.id}:${now.getTime()}`,
+            plan.space,
+            () => this.engine.deliverLearningSession(
+              plan.id,
+              now.getTime(),
+              async (currentPlan, source, session) => {
+                if (!this.notify) {
+                  throw new Error("learning notification transport is unavailable");
+                }
+                await this.notify(currentPlan, source, session);
+              },
+            ),
           );
           if (advanced) delivered.push(plan.id);
         } catch (error) {

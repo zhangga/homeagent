@@ -1480,7 +1480,7 @@ describe("management backend (read-write)", () => {
     expect(JSON.parse(archiveText)).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 8,
+        version: 9,
         learning: { plans: [], sources: [], sessions: [] },
         governanceAudit: [],
         taskRuns: [],
@@ -1917,6 +1917,62 @@ describe("management backend (read-write)", () => {
     );
     expect([302, 303]).toContain(retry.status);
     expect(retriedRunId).toBe(run.id);
+  });
+
+  test("shows queued Chat position and delegates cancellation", async () => {
+    const run = engine.chatRuns.start({
+      space: SPACE,
+      chatId: "oc_web",
+      messageId: "om_queued",
+      author: "ou_queued",
+      input: "queued request",
+      trigger: "message",
+    });
+    let release!: () => void;
+    const blocker = engine.runScheduler.schedule({
+      id: "blocking_run",
+      priority: "manual",
+      layers: [{ key: "test:global", limit: 1 }],
+      execute: () => new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    });
+    const queued = engine.runScheduler.schedule({
+      id: run.id,
+      priority: "interactive",
+      layers: [{ key: "test:global", limit: 1 }],
+      execute: async () => undefined,
+    });
+    void queued.catch(() => undefined);
+    const queuedApp = createWebApp({
+      engine,
+      onChatRunCancel: (runId) => {
+        const cancelled = engine.runScheduler.cancel(runId);
+        if (cancelled) {
+          engine.chatRuns.cancel(runId, {
+            finishedAt: Date.now(),
+            error: { kind: "cancelled", message: "cancelled by test" },
+          });
+        }
+        return cancelled;
+      },
+    });
+
+    const detail = await queuedApp.request(`/chats/runs/${encodeURIComponent(run.id)}`);
+    const body = await detail.text();
+    expect(body).toContain("排队中");
+    expect(body).toContain("第 1 位");
+    expect(body).toContain(`/chats/runs/${encodeURIComponent(run.id)}/cancel`);
+
+    const cancelled = await queuedApp.request(
+      `/chats/runs/${encodeURIComponent(run.id)}/cancel`,
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(cancelled.status);
+    expect(engine.chatRuns.get(run.id)?.status).toBe("cancelled");
+
+    release();
+    await blocker;
   });
 
   test("Chat history remains with the Agent that handled it after a space is rebound", async () => {

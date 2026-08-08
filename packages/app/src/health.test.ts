@@ -179,6 +179,17 @@ describe("system health reporter", () => {
         averageDurationMs: 500,
         maxDurationMs: 2000,
       },
+      runs: {
+        queued: 0,
+        running: 0,
+        completed: 10,
+        failed: 0,
+        cancelled: 0,
+        timedOut: 0,
+        limited: 0,
+        averageWaitMs: 0,
+        maxWaitMs: 0,
+      },
       events: {
         total: 100,
         completed: 100,

@@ -116,4 +116,20 @@ describe("Serializer", () => {
       maxDurationMs: 80,
     });
   });
+
+  test("aggregates metrics across independent conversation keys", async () => {
+    const serializer = new Serializer();
+    await Promise.all([
+      serializer.run("chat:a", async () => "a"),
+      serializer.run("chat:b", async () => "b"),
+    ]);
+
+    expect(serializer.snapshotAll("events")).toEqual(expect.objectContaining({
+      key: "events",
+      queued: 0,
+      running: 0,
+      completed: 2,
+      failed: 0,
+    }));
+  });
 });

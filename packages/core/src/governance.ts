@@ -71,7 +71,8 @@ export const TASK_RUN_HISTORY_SPACE_ARCHIVE_VERSION = 5 as const;
 export const TASK_EXECUTION_SPACE_ARCHIVE_VERSION = 6 as const;
 export const AGENT_SKILL_BINDINGS_SPACE_ARCHIVE_VERSION = 7 as const;
 export const CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION = 8 as const;
-export const SPACE_ARCHIVE_VERSION = CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION;
+export const RUN_QUEUE_SPACE_ARCHIVE_VERSION = 9 as const;
+export const SPACE_ARCHIVE_VERSION = RUN_QUEUE_SPACE_ARCHIVE_VERSION;
 
 export interface MessageRetractionRecord {
   chatId: string;
@@ -129,8 +130,12 @@ export interface SpaceArchiveV8 extends Omit<SpaceArchiveV7, "version"> {
   chatRuns: ChatRun[];
 }
 
+export interface SpaceArchiveV9 extends Omit<SpaceArchiveV8, "version"> {
+  version: typeof RUN_QUEUE_SPACE_ARCHIVE_VERSION;
+}
+
 /** Current normalized archive shape returned by export and parsing. */
-export type SpaceArchive = SpaceArchiveV8;
+export type SpaceArchive = SpaceArchiveV9;
 
 export interface SpaceDeleteResult {
   status: "deleted" | "not_found";
@@ -491,8 +496,34 @@ function parseTaskRun(
     throw new Error(`taskRuns[${index}].trigger is invalid`);
   }
   const startedAt = finiteNumber(item.startedAt, `taskRuns[${index}].startedAt`);
+  const priority = version < RUN_QUEUE_SPACE_ARCHIVE_VERSION
+    ? trigger === "scheduled"
+      ? "scheduled"
+      : trigger === "chat"
+        ? "interactive"
+        : "manual"
+    : text(item.priority, `taskRuns[${index}].priority`) as TaskRun["priority"];
+  if (!["interactive", "manual", "scheduled", "background"].includes(priority)) {
+    throw new Error(`taskRuns[${index}].priority is invalid`);
+  }
+  const queuedAt = version < RUN_QUEUE_SPACE_ARCHIVE_VERSION
+    ? startedAt
+    : finiteNumber(item.queuedAt, `taskRuns[${index}].queuedAt`);
+  const runStartedAt = version < RUN_QUEUE_SPACE_ARCHIVE_VERSION
+    ? startedAt
+    : item.runStartedAt === undefined
+      ? undefined
+      : finiteNumber(item.runStartedAt, `taskRuns[${index}].runStartedAt`);
+  if (
+    queuedAt !== startedAt
+    || (runStartedAt !== undefined && runStartedAt < queuedAt)
+  ) {
+    throw new Error(`taskRuns[${index}] queue timestamps are invalid`);
+  }
   const finishedAt = finiteNumber(item.finishedAt, `taskRuns[${index}].finishedAt`);
-  if (finishedAt < startedAt) throw new Error(`taskRuns[${index}].finishedAt is invalid`);
+  if (finishedAt < (runStartedAt ?? queuedAt)) {
+    throw new Error(`taskRuns[${index}].finishedAt is invalid`);
+  }
   const output = optionalText(item.output, `taskRuns[${index}].output`);
   if (output && output.length > MAX_TASK_RUN_OUTPUT_CHARACTERS) {
     throw new Error(
@@ -568,8 +599,11 @@ function parseTaskRun(
     distill: boolean(item.distill, `taskRuns[${index}].distill`),
     notify,
     timeoutMs,
+    priority,
     status,
+    queuedAt,
     startedAt,
+    runStartedAt,
     finishedAt,
     output,
     outputTruncated,
@@ -581,47 +615,64 @@ function parseTaskRun(
   };
 }
 
-function parseChatRun(value: unknown, index: number, space: SpaceId): ChatRun {
-  if (!isChatRun(value)) throw new Error(`chatRuns[${index}] is invalid`);
-  if (value.space !== space) {
+function parseChatRun(
+  value: unknown,
+  index: number,
+  space: SpaceId,
+  version: number,
+): ChatRun {
+  const legacy = record(value, `chatRuns[${index}]`);
+  const normalized = version < RUN_QUEUE_SPACE_ARCHIVE_VERSION
+    ? {
+        ...legacy,
+        priority: "interactive",
+        queuedAt: legacy.startedAt,
+        runStartedAt: legacy.startedAt,
+      }
+    : legacy;
+  if (!isChatRun(normalized)) throw new Error(`chatRuns[${index}] is invalid`);
+  if (normalized.space !== space) {
     throw new Error(`chatRuns[${index}].space does not match archive space`);
   }
-  if (value.status === "running") {
-    throw new Error(`chatRuns[${index}] cannot restore a running record`);
+  if (normalized.status === "queued" || normalized.status === "running") {
+    throw new Error(`chatRuns[${index}] cannot restore an active record`);
   }
   return {
-    id: nonemptyText(value.id, `chatRuns[${index}].id`),
+    id: nonemptyText(normalized.id, `chatRuns[${index}].id`),
     space,
-    rawId: value.rawId,
-    chatId: value.chatId,
-    messageId: value.messageId,
-    author: value.author,
-    input: value.input,
-    inputTruncated: value.inputTruncated,
-    trigger: value.trigger,
-    agentId: value.agentId,
-    provider: value.provider,
-    model: value.model,
-    reasoningEffort: value.reasoningEffort,
-    skillEvidence: value.skillEvidence
+    rawId: normalized.rawId,
+    chatId: normalized.chatId,
+    messageId: normalized.messageId,
+    author: normalized.author,
+    input: normalized.input,
+    inputTruncated: normalized.inputTruncated,
+    trigger: normalized.trigger,
+    agentId: normalized.agentId,
+    provider: normalized.provider,
+    model: normalized.model,
+    reasoningEffort: normalized.reasoningEffort,
+    skillEvidence: normalized.skillEvidence
       ? {
-          requested: value.skillEvidence.requested.map((item) => ({ ...item })),
-          resolved: value.skillEvidence.resolved.map((item) => ({ ...item })),
-          skipped: value.skillEvidence.skipped.map((item) => ({ ...item })),
+          requested: normalized.skillEvidence.requested.map((item) => ({ ...item })),
+          resolved: normalized.skillEvidence.resolved.map((item) => ({ ...item })),
+          skipped: normalized.skillEvidence.skipped.map((item) => ({ ...item })),
         }
       : undefined,
-    execution: value.execution
-      ? { ...value.execution, skills: [...value.execution.skills] }
+    execution: normalized.execution
+      ? { ...normalized.execution, skills: [...normalized.execution.skills] }
       : undefined,
-    retryOf: value.retryOf,
-    status: value.status,
-    delivery: { ...value.delivery },
-    startedAt: value.startedAt,
-    finishedAt: value.finishedAt,
-    output: value.output,
-    outputTruncated: value.outputTruncated,
-    traceId: value.traceId,
-    error: value.error ? { ...value.error } : undefined,
+    retryOf: normalized.retryOf,
+    priority: normalized.priority,
+    status: normalized.status,
+    delivery: { ...normalized.delivery },
+    queuedAt: normalized.queuedAt,
+    startedAt: normalized.startedAt,
+    runStartedAt: normalized.runStartedAt,
+    finishedAt: normalized.finishedAt,
+    output: normalized.output,
+    outputTruncated: normalized.outputTruncated,
+    traceId: normalized.traceId,
+    error: normalized.error ? { ...normalized.error } : undefined,
   };
 }
 
@@ -1177,6 +1228,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       && version !== TASK_EXECUTION_SPACE_ARCHIVE_VERSION
       && version !== AGENT_SKILL_BINDINGS_SPACE_ARCHIVE_VERSION
       && version !== CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION
+      && version !== RUN_QUEUE_SPACE_ARCHIVE_VERSION
     )
   ) {
     throw new Error("unsupported space archive format or version");
@@ -1271,7 +1323,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
   const chatRuns = version < CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION
     ? []
     : (root.chatRuns as unknown[]).map((item, index) =>
-        parseChatRun(item, index, id)
+        parseChatRun(item, index, id, version)
       );
   const chatRunCounts = new Map<string, number>();
   for (const run of chatRuns) {

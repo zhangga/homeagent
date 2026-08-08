@@ -37,9 +37,32 @@ afterEach(() => {
 });
 
 describe("TaskRunStore", () => {
+  test("persists queued work and only marks it running when admitted", () => {
+    const store = new TaskRunStore(dir);
+    const queued = store.start({
+      task: TASK,
+      trigger: "scheduled",
+      distill: false,
+      startedAt: 100,
+    });
+
+    expect(queued).toEqual(expect.objectContaining({
+      status: "queued",
+      priority: "scheduled",
+      queuedAt: 100,
+    }));
+    expect(new TaskRunStore(dir, { recoverInterrupted: true }).get(queued.id)?.status)
+      .toBe("queued");
+    expect(store.begin(queued.id, 120)).toEqual(expect.objectContaining({
+      status: "running",
+      runStartedAt: 120,
+    }));
+  });
+
   test("recovers an interrupted running record as a durable failure", () => {
     const store = new TaskRunStore(dir);
     const run = store.start({ task: TASK, trigger: "manual", distill: false });
+    store.begin(run.id);
 
     const secondary = new TaskRunStore(dir);
     expect(secondary.get(run.id)?.status).toBe("running");
@@ -184,7 +207,7 @@ describe("TaskRunStore", () => {
       }],
       skipped: [],
     });
-    expect(JSON.parse(readFileSync(join(dir, "config", "task-runs.json"), "utf8")).version).toBe(4);
+    expect(JSON.parse(readFileSync(join(dir, "config", "task-runs.json"), "utf8")).version).toBe(5);
   });
 
   test("rejects unbounded Skill evidence before persisting a run", () => {
