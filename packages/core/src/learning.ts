@@ -803,7 +803,7 @@ export class LearningPlanStore {
     };
     try {
       writeFileSync(temporaryPath, JSON.stringify(file, null, 2), { encoding: "utf8", mode: 0o600 });
-      const fileDescriptor = openSync(temporaryPath, "r");
+      const fileDescriptor = openSync(temporaryPath, "r+");
       try {
         durableFsyncSync(fileDescriptor);
       } finally {
@@ -812,7 +812,9 @@ export class LearningPlanStore {
       durableRenameSync(temporaryPath, this.configPath);
       const directoryDescriptor = openSync(configDir, "r");
       try {
-        durableFsyncSync(directoryDescriptor);
+        durableFsyncSync(directoryDescriptor, {
+          allowUnsupportedDirectoryOnWindows: true,
+        });
       } finally {
         closeSync(directoryDescriptor);
       }

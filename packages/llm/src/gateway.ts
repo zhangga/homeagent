@@ -14,6 +14,7 @@
  */
 import { config, logger, type Logger } from "@homeagent/shared";
 import { estimateCost } from "./pricing.ts";
+import type { CompletionUsage } from "./providers.ts";
 import {
   BudgetExceededError,
   checkBudget,
@@ -52,9 +53,13 @@ export interface CompleteOptions {
 export interface CompleteResult {
   text: string;
   model: string;
-  inputTokens: number;
-  outputTokens: number;
-  costUsd: number;
+  /** @deprecated Prefer usage.inputTokens. Absent means the provider did not report it. */
+  inputTokens?: number;
+  /** @deprecated Prefer usage.outputTokens. Absent means the provider did not report it. */
+  outputTokens?: number;
+  /** @deprecated Prefer usage.costUsd. Absent means the cost is unavailable. */
+  costUsd?: number;
+  usage?: CompletionUsage;
 }
 
 interface AnthropicUsage {
@@ -137,10 +142,29 @@ async function postMessages(
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
-function usageOf(json: AnthropicResponse): { input: number; output: number } {
+function usageNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function usageOf(json: AnthropicResponse): { input?: number; output?: number } {
   return {
-    input: json.usage?.input_tokens ?? 0,
-    output: json.usage?.output_tokens ?? 0,
+    input: usageNumber(json.usage?.input_tokens),
+    output: usageNumber(json.usage?.output_tokens),
+  };
+}
+
+function gatewayUsage(model: string, input?: number, output?: number): CompletionUsage {
+  if (input === undefined || output === undefined) {
+    return { costBasis: "unavailable", source: "gateway" };
+  }
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    costUsd: estimateCost(model, input, output),
+    costBasis: "estimated",
+    source: "gateway",
   };
 }
 
@@ -166,20 +190,28 @@ export async function complete(opts: CompleteOptions): Promise<CompleteResult> {
 
   const started = Date.now();
   let ok = false;
-  let input = 0;
-  let output = 0;
+  let input: number | undefined;
+  let output: number | undefined;
+  let usage = gatewayUsage(model);
   try {
     const json = await postMessages(body, opts.retries ?? 3);
     const u = usageOf(json);
     input = u.input;
     output = u.output;
+    usage = gatewayUsage(model, input, output);
     const text = (json.content ?? [])
       .filter((b) => b.type === "text" && typeof b.text === "string")
       .map((b) => b.text as string)
       .join("");
     ok = true;
-    const costUsd = estimateCost(model, input, output);
-    return { text, model: json.model ?? model, inputTokens: input, outputTokens: output, costUsd };
+    return {
+      text,
+      model: json.model ?? model,
+      ...(input === undefined ? {} : { inputTokens: input }),
+      ...(output === undefined ? {} : { outputTokens: output }),
+      ...(usage.costUsd === undefined ? {} : { costUsd: usage.costUsd }),
+      usage,
+    };
   } finally {
     recordCall({
       t: new Date().toISOString(),
@@ -187,7 +219,9 @@ export async function complete(opts: CompleteOptions): Promise<CompleteResult> {
       purpose,
       inputTokens: input,
       outputTokens: output,
-      costUsd: estimateCost(model, input, output),
+      costUsd: usage.costUsd,
+      usage,
+      provider: "gateway",
       space: opts.space,
       ok,
       ms: Date.now() - started,
@@ -242,13 +276,15 @@ export async function completeJSON<T = unknown>(opts: JSONOptions<T>): Promise<{
 
   const started = Date.now();
   let ok = false;
-  let input = 0;
-  let output = 0;
+  let input: number | undefined;
+  let output: number | undefined;
+  let usage = gatewayUsage(model);
   try {
     const json = await postMessages(body, opts.retries ?? 3);
     const u = usageOf(json);
     input = u.input;
     output = u.output;
+    usage = gatewayUsage(model, input, output);
     // Find the structured block by TYPE, not name (gateway mangles the name).
     const block = (json.content ?? []).find((b) => b.type === "tool_use");
     if (!block || block.input === undefined) {
@@ -256,10 +292,16 @@ export async function completeJSON<T = unknown>(opts: JSONOptions<T>): Promise<{
     }
     const value = opts.validate ? opts.validate(block.input) : (block.input as T);
     ok = true;
-    const costUsd = estimateCost(model, input, output);
     return {
       value,
-      result: { text: "", model: json.model ?? model, inputTokens: input, outputTokens: output, costUsd },
+      result: {
+        text: "",
+        model: json.model ?? model,
+        ...(input === undefined ? {} : { inputTokens: input }),
+        ...(output === undefined ? {} : { outputTokens: output }),
+        ...(usage.costUsd === undefined ? {} : { costUsd: usage.costUsd }),
+        usage,
+      },
     };
   } finally {
     recordCall({
@@ -268,7 +310,9 @@ export async function completeJSON<T = unknown>(opts: JSONOptions<T>): Promise<{
       purpose,
       inputTokens: input,
       outputTokens: output,
-      costUsd: estimateCost(model, input, output),
+      costUsd: usage.costUsd,
+      usage,
+      provider: "gateway",
       space: opts.space,
       ok,
       ms: Date.now() - started,

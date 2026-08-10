@@ -18,6 +18,13 @@ import type { Hit, Page, PageRef, RawEntry, RawRecord } from "@homeagent/shared"
 import type { MessageRetractionRecord } from "./governance.ts";
 import { toMatchQuery, toSearchText } from "./tokenize.ts";
 
+export const MAX_SEARCH_RESULTS = 100;
+
+export function normalizeSearchLimit(limit: number): number {
+  if (!Number.isSafeInteger(limit) || limit <= 0) return 0;
+  return Math.min(limit, MAX_SEARCH_RESULTS);
+}
+
 export class SpaceIndex {
   private db: Database;
 
@@ -184,6 +191,8 @@ export class SpaceIndex {
   // ---- search --------------------------------------------------------------
 
   search(query: string, limit = 10): Hit[] {
+    const safeLimit = normalizeSearchLimit(limit);
+    if (safeLimit === 0) return [];
     const match = toMatchQuery(query);
     if (!match) return [];
     try {
@@ -197,7 +206,7 @@ export class SpaceIndex {
            ORDER BY score
            LIMIT ?`,
         )
-        .all(match, limit) as Record<string, unknown>[];
+        .all(match, safeLimit) as Record<string, unknown>[];
       return rows.map((r) => ({
         slug: String(r.slug),
         title: String(r.title),

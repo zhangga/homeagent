@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Page, SpaceId } from "@homeagent/shared";
 import { KnowledgeEngine } from "./engine.ts";
 import { parseSpaceArchive, type SpaceArchive } from "./governance.ts";
+import type { LlmClient } from "./llm.ts";
 import { SkillCatalog } from "./skill-catalog.ts";
 
 const SPACE: SpaceId = "team/oc_governance";
@@ -16,11 +17,1088 @@ function tempDir(label: string): string {
   return dir;
 }
 
+function persistArchiveFixture(dataDir: string, version: number, archive: unknown): unknown {
+  const path = join(dataDir, `candidate-space-v${version}.json`);
+  writeFileSync(path, `${JSON.stringify(archive, null, 2)}\n`, "utf8");
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 describe("space data governance", () => {
+  test("archive v14 restores the source trace referenced by a durable Chat Run", async () => {
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-quality-archive-source-") });
+    source.ensureSpace(SPACE);
+    const trace = source.quality.recordTrace({
+      spaces: [SPACE],
+      question: "Who owns the backend?",
+      outcome: "succeeded",
+      source: "knowledge",
+      answer: "Alice",
+      citations: [{ slug: "people/alice", title: "Alice" }],
+      latencyMs: 10,
+      createdAt: 1_000,
+    });
+    const run = source.chatRuns.start({
+      space: SPACE,
+      input: "Who owns the backend?",
+      trigger: "message",
+      executionPlan: {
+        version: 1,
+        instruction: "Use the archived knowledge.",
+        provider: "codex",
+      },
+      startedAt: 1_100,
+    });
+    source.chatRuns.begin(run.id, 1_200);
+    source.chatRuns.succeed(run.id, {
+      finishedAt: 1_300,
+      output: "Alice",
+      traceId: trace.id,
+    });
+
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+
+    expect(archive.version).toBe(14);
+    expect(archive.quality).toEqual({ traces: [trace], reruns: [] });
+    const llm: LlmClient = {
+      async complete() {
+        return {
+          text: "Bob",
+          model: "archive-test-model",
+          usage: {
+            inputTokens: 10,
+            outputTokens: 2,
+            costBasis: "unavailable",
+            source: "legacy-text",
+          },
+        };
+      },
+      async completeJSON<T>(): Promise<T> {
+        throw new Error("empty archived knowledge must use general completion");
+      },
+    };
+    const target = new KnowledgeEngine({
+      dataDir: tempDir("ha-quality-archive-target-"),
+      llm,
+    });
+    await target.restoreSpace(archive);
+
+    expect(target.chatRuns.get(run.id)?.traceId).toBe(trace.id);
+    expect(target.answerTrace(trace.id)).toEqual(trace);
+    const rerun = await target.rerunChatRunForEvaluation(run.id);
+    expect(rerun.status).toBe("completed");
+    expect(target.answerTrace(rerun.candidateTraceId!)?.answer).toBe("Bob");
+    target.close();
+
+    const legacy = structuredClone(archive) as Record<string, any>;
+    legacy.version = 13;
+    delete legacy.quality;
+    const normalizedLegacy = parseSpaceArchive(legacy);
+    expect(normalizedLegacy.chatRuns[0]?.traceId).toBeUndefined();
+    expect(normalizedLegacy.quality).toEqual({ traces: [], reruns: [] });
+
+    const wrongSpace = structuredClone(archive);
+    wrongSpace.quality.traces[0]!.spaces = ["team/oc_other"];
+    expect(() => parseSpaceArchive(wrongSpace)).toThrow(/chat run trace.*space/i);
+  });
+
+  test("merges a shared multi-space trace in either restore order and stays fail-closed while incomplete", async () => {
+    const secondary: SpaceId = "team/oc_governance_secondary";
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-shared-quality-source-") });
+    source.ensureSpace(SPACE);
+    source.ensureSpace(secondary);
+    const trace = source.quality.recordTrace({
+      spaces: [SPACE, secondary],
+      question: "What changed across both teams?",
+      outcome: "succeeded",
+      answer: "Both teams changed their release process.",
+      citations: [],
+      latencyMs: 10,
+      createdAt: 1_000,
+    });
+    const createRun = (space: SpaceId, startedAt: number) => {
+      const run = source.chatRuns.start({
+        space,
+        input: "What changed?",
+        trigger: "message",
+        executionPlan: {
+          version: 1,
+          instruction: "Compare both archived spaces.",
+          provider: "codex",
+        },
+        startedAt,
+      });
+      source.chatRuns.begin(run.id, startedAt + 1);
+      source.chatRuns.succeed(run.id, {
+        finishedAt: startedAt + 2,
+        output: "Both teams changed their release process.",
+        traceId: trace.id,
+      });
+      return run;
+    };
+    const firstRun = createRun(SPACE, 1_100);
+    const secondRun = createRun(secondary, 1_200);
+    const firstArchive = await source.exportSpace(SPACE);
+    const secondArchive = await source.exportSpace(secondary);
+    source.close();
+
+    expect(firstArchive.quality.traces).toEqual([trace]);
+    expect(secondArchive.quality.traces).toEqual([trace]);
+    const target = new KnowledgeEngine({ dataDir: tempDir("ha-shared-quality-target-") });
+    await target.restoreSpace(secondArchive);
+    await expect(target.rerunChatRunForEvaluation(secondRun.id))
+      .rejects.toThrow(/trace spaces are unavailable/i);
+    await target.restoreSpace(firstArchive);
+    expect(target.answerTrace(trace.id)?.spaces).toEqual([SPACE, secondary]);
+    expect(target.chatRuns.get(firstRun.id)?.traceId).toBe(trace.id);
+    target.close();
+
+    const reverse = new KnowledgeEngine({ dataDir: tempDir("ha-shared-quality-reverse-") });
+    await reverse.restoreSpace(firstArchive);
+    await reverse.restoreSpace(secondArchive);
+    expect(reverse.answerTrace(trace.id)).toEqual(trace);
+    expect(reverse.chatRuns.get(secondRun.id)?.traceId).toBe(trace.id);
+    reverse.close();
+  });
+
+  test("archive v14 preserves durable retry disposition and honest usage", async () => {
+    const dataDir = tempDir("ha-retry-archive-");
+    const source = new KnowledgeEngine({ dataDir });
+    source.ensureSpace(SPACE);
+    const task = source.tasks.create({
+      name: "archived retry",
+      space: SPACE,
+      topic: "preserve automatic retry audit",
+      distillOnRun: false,
+    })!;
+    const run = source.taskRuns.start({
+      task,
+      trigger: "scheduled",
+      provider: "claude",
+      executionPlan: {
+        version: 1,
+        instruction: "Frozen retry archive plan.",
+        provider: "claude",
+        execution: { permission: "read-only", skills: [] },
+      },
+      distill: false,
+      startedAt: 100,
+    });
+    source.taskRuns.begin(run.id, 110);
+    source.taskRuns.fail(run.id, {
+      finishedAt: 120,
+      error: "Error: provider overloaded (503)",
+      failure: { phase: "provider", kind: "overloaded", retryable: true },
+      retry: {
+        attempt: 1,
+        maxAttempts: 2,
+        status: "waiting",
+        nextAttemptAt: 60_120,
+      },
+    });
+    const child = source.taskRuns.claimRetry(run.id, 60_120)!;
+    source.taskRuns.begin(child.id, 60_121);
+    source.taskRuns.fail(child.id, {
+      finishedAt: 60_122,
+      error: "Error: provider overloaded (503)",
+      failure: { phase: "provider", kind: "overloaded", retryable: true },
+      retry: {
+        attempt: 2,
+        maxAttempts: 2,
+        status: "exhausted",
+      },
+      usage: {
+        calls: 1,
+        knownTokenCalls: 1,
+        unknownTokenCalls: 0,
+        knownCostCalls: 0,
+        unknownCostCalls: 1,
+        inputTokens: 42,
+        costBasis: "unavailable",
+        sources: ["codex-jsonl"],
+      },
+    });
+
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+    expect(archive.version).toBe(14);
+    const archivedChild = archive.taskRuns.find((item) => item.id === child.id)!;
+    expect(archivedChild).toEqual(expect.objectContaining({
+      failure: { phase: "provider", kind: "overloaded", retryable: true },
+      retry: {
+        attempt: 2,
+        maxAttempts: 2,
+        status: "exhausted",
+      },
+      usage: expect.objectContaining({
+        calls: 1,
+        knownTokenCalls: 1,
+        unknownCostCalls: 1,
+        inputTokens: 42,
+      }),
+    }));
+    expect("costUsd" in archivedChild.usage!).toBe(false);
+
+    const target = new KnowledgeEngine({ dataDir: tempDir("ha-retry-archive-restore-") });
+    await target.restoreSpace(archive);
+    expect(target.getTaskRun(child.id)).toEqual(archivedChild);
+    target.close();
+
+    const corrupt = structuredClone(archive) as Record<string, any>;
+    const corruptChild = corrupt.taskRuns.find((item: any) => item.id === child.id);
+    corruptChild.retry.maxAttempts = 3;
+    expect(() => parseSpaceArchive(corrupt)).toThrow(/retry/i);
+  });
+
+  test("refuses to export a waiting retry as ordinary terminal history", async () => {
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-waiting-retry-export-") });
+    source.ensureSpace(SPACE);
+    const task = source.tasks.create({
+      name: "waiting retry export guard",
+      space: SPACE,
+      topic: "potential future execution",
+      distillOnRun: false,
+    })!;
+    const run = source.taskRuns.start({
+      task,
+      trigger: "scheduled",
+      executionPlan: {
+        version: 1,
+        instruction: "Do not make this portable.",
+        provider: "claude",
+        execution: { permission: "read-only", skills: [] },
+      },
+      distill: false,
+      startedAt: 1,
+    });
+    source.taskRuns.begin(run.id, 2);
+    source.taskRuns.fail(run.id, {
+      finishedAt: 3,
+      error: "Error: provider overloaded (503)",
+      failure: { phase: "provider", kind: "overloaded", retryable: true },
+      retry: {
+        attempt: 1,
+        maxAttempts: 2,
+        status: "waiting",
+        nextAttemptAt: 60_003,
+      },
+    });
+
+    await expect(source.exportSpace(SPACE)).rejects.toThrow(/active|waiting|retry/i);
+    source.close();
+  });
+
+  test("archive preserves expired approval deadlines and notification audit", async () => {
+    const dataDir = tempDir("ha-expired-approval-archive-");
+    const source = new KnowledgeEngine({ dataDir });
+    source.ensureSpace(SPACE);
+    const task = source.tasks.create({
+      name: "expired archived approval",
+      space: SPACE,
+      topic: "preserve the closed approval request",
+      distillOnRun: false,
+    })!;
+    const run = source.taskRuns.start({
+      task,
+      trigger: "manual",
+      distill: false,
+      startedAt: 100,
+      approvalRequired: true,
+      executionPlan: {
+        version: 1,
+        instruction: "Archived expired write request.",
+        provider: "codex",
+        execution: { permission: "write", workdir: dataDir, skills: [] },
+      },
+    });
+    await source.deliverTaskRunApprovalNotification(
+      run.id,
+      async () => {},
+      { attemptedAt: 101 },
+    );
+    source.expireTaskRunApprovals(run.approval!.expiresAt!);
+
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+    expect(archive.version).toBe(14);
+    expect(archive.taskRuns[0]).toEqual(expect.objectContaining({
+      approval: expect.objectContaining({
+        status: "expired",
+        expiresAt: run.approval!.expiresAt,
+      }),
+      approvalNotification: expect.objectContaining({
+        status: "sent",
+        attempts: 1,
+      }),
+    }));
+
+    const targetDir = tempDir("ha-expired-approval-restore-");
+    const target = new KnowledgeEngine({ dataDir: targetDir });
+    await target.restoreSpace(archive);
+    expect(target.getTaskRun(run.id)).toEqual(expect.objectContaining({
+      approval: expect.objectContaining({ status: "expired" }),
+      approvalNotification: expect.objectContaining({ status: "sent" }),
+    }));
+    target.close();
+  });
+
+  test("archive v12 preserves Agent revision history and Task approval audit", async () => {
+    const dataDir = tempDir("ha-lifecycle-archive-");
+    const source = new KnowledgeEngine({
+      dataDir,
+      runProvider: async () => "approved archive output",
+    });
+    source.ensureSpace(SPACE);
+    const created = source.agents.create({
+      name: "Archived Agent",
+      instruction: "release one",
+      provider: "claude",
+      permission: "write",
+      workdir: dataDir,
+    });
+    const draft = source.saveAgentDraft(created.id, { instruction: "release two" })!;
+    source.releaseAgent(created.id, draft.id);
+    source.updateSpaceMeta(SPACE, { agentId: created.id });
+    const task = source.tasks.create({
+      name: "approved archive task",
+      space: SPACE,
+      topic: "preserve approval",
+      distillOnRun: false,
+    })!;
+    const pending = source.startTaskRun(task.id);
+    const completed = await source.approveTaskRun(pending.run.id, "archive-admin").completion;
+    expect(completed.status).toBe("succeeded");
+
+    const expectedRevisions = source.agents.listRevisions(created.id);
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+    expect(archive.version).toBe(14);
+    expect(archive.agentRevisions).toEqual(expectedRevisions);
+    expect(archive.taskRuns[0]?.approval).toEqual(expect.objectContaining({
+      status: "approved",
+      decidedBy: "archive-admin",
+    }));
+
+    const targetDir = tempDir("ha-lifecycle-restore-");
+    const target = new KnowledgeEngine({ dataDir: targetDir });
+    await target.restoreSpace(archive);
+    expect(target.agents.listRevisions(created.id)).toEqual(expectedRevisions);
+    expect(target.listTaskRuns(task.id)[0]?.approval).toEqual(expect.objectContaining({
+      status: "approved",
+      decidedBy: "archive-admin",
+    }));
+    target.close();
+
+    const restarted = new KnowledgeEngine({ dataDir: targetDir });
+    expect(restarted.agents.get(created.id)).toEqual(archive.agent);
+    expect(restarted.agents.listRevisions(created.id)).toEqual(expectedRevisions);
+    restarted.close();
+  });
+
+  test("v12 rejects Task approval fields that TaskRunStore cannot reopen", async () => {
+    const dataDir = tempDir("ha-approval-schema-source-");
+    const source = new KnowledgeEngine({
+      dataDir,
+      runProvider: async () => "approved output",
+    });
+    source.ensureSpace(SPACE);
+    const agent = source.agents.create({
+      name: "Approval schema Agent",
+      provider: "claude",
+      permission: "write",
+      workdir: dataDir,
+    });
+    source.updateSpaceMeta(SPACE, { agentId: agent.id });
+    const task = source.tasks.create({
+      name: "approval schema task",
+      space: SPACE,
+      topic: "validate approval archive",
+      distillOnRun: false,
+    })!;
+    const pending = source.startTaskRun(task.id);
+    await source.approveTaskRun(pending.run.id, "archive-admin").completion;
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+
+    const negativeRequestedAt = structuredClone(archive);
+    negativeRequestedAt.taskRuns[0]!.approval!.requestedAt = -1;
+    expect(() => parseSpaceArchive(negativeRequestedAt)).toThrow(/requestedAt|timestamp/i);
+
+    const emptyDecider = structuredClone(archive);
+    emptyDecider.taskRuns[0]!.approval!.decidedBy = "";
+    expect(() => parseSpaceArchive(emptyDecider)).toThrow(/decidedBy|empty/i);
+
+    const executionBeforeApproval = structuredClone(archive);
+    executionBeforeApproval.taskRuns[0]!.runStartedAt =
+      executionBeforeApproval.taskRuns[0]!.approval!.decidedAt! - 1;
+    expect(() => parseSpaceArchive(executionBeforeApproval))
+      .toThrow(/approval|runStartedAt|timestamp/i);
+
+    const completionBeforeApproval = structuredClone(archive);
+    completionBeforeApproval.taskRuns[0]!.runStartedAt = undefined;
+    completionBeforeApproval.taskRuns[0]!.approval!.decidedAt =
+      completionBeforeApproval.taskRuns[0]!.finishedAt! + 1;
+    expect(() => parseSpaceArchive(completionBeforeApproval))
+      .toThrow(/approval|finishedAt|timestamp/i);
+  });
+
+  test("v12 rejects Agent lifecycle states that AgentStore cannot reopen", async () => {
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-lifecycle-invalid-") });
+    source.ensureSpace(SPACE);
+    const created = source.agents.create({
+      name: "Lifecycle invariant",
+      instruction: "release one",
+      provider: "claude",
+    });
+    const draft = source.saveAgentDraft(created.id, { instruction: "release two" })!;
+    source.releaseAgent(created.id, draft.id);
+    source.updateSpaceMeta(SPACE, { agentId: created.id });
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+
+    const publishedDraft = structuredClone(archive);
+    publishedDraft.agentRevisions.find(
+      (revision) => revision.id === publishedDraft.agent?.publishedRevisionId,
+    )!.source = "draft";
+    expect(() => parseSpaceArchive(publishedDraft)).toThrow(/published.*draft/i);
+
+    const staleMaterialization = structuredClone(archive);
+    staleMaterialization.agent!.updatedAt += 1;
+    expect(() => parseSpaceArchive(staleMaterialization)).toThrow(/updatedAt|materialized/i);
+
+    const futureAncestor = structuredClone(archive);
+    const newest = futureAncestor.agentRevisions[0]!;
+    const oldest = futureAncestor.agentRevisions.at(-1)!;
+    oldest.basedOnRevisionId = newest.id;
+    expect(() => parseSpaceArchive(futureAncestor)).toThrow(/ancestry|references/i);
+
+    const badRevisionId = structuredClone(archive);
+    const published = badRevisionId.agentRevisions.find(
+      (revision) => revision.id === badRevisionId.agent?.publishedRevisionId,
+    )!;
+    published.id = "bad";
+    badRevisionId.agent!.publishedRevisionId = "bad";
+    expect(() => parseSpaceArchive(badRevisionId)).toThrow(/revision.*invalid/i);
+
+    const oversized = structuredClone(archive);
+    oversized.agentRevisions = Array.from(
+      { length: 10_001 },
+      () => structuredClone(archive.agentRevisions[0]!),
+    );
+    expect(() => parseSpaceArchive(oversized)).toThrow(/10,?000|too many/i);
+  });
+
+  test("v10 JSON archive preserves a frozen execution plan across restart and v14 round-trip", async () => {
+    const sourceDir = tempDir("ha-v10-disk-source-");
+    const source = new KnowledgeEngine({
+      dataDir: sourceDir,
+      runProvider: async () => "archived read-only output",
+    });
+    source.ensureSpace(SPACE);
+    const agent = source.agents.create({
+      name: "v10 execution plan Agent",
+      instruction: "Use the frozen v10 instruction.",
+      provider: "claude",
+      permission: "read-only",
+    });
+    source.updateSpaceMeta(SPACE, { agentId: agent.id });
+    const task = source.tasks.create({
+      name: "v10 execution plan task",
+      space: SPACE,
+      topic: "preserve the frozen execution plan",
+      distillOnRun: false,
+    })!;
+    const started = source.startTaskRun(task.id);
+    expect((await started.completion).status).toBe("succeeded");
+    const current = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    const expectedPlan = structuredClone(current.taskRuns[0].executionPlan);
+    source.close();
+
+    current.version = 10;
+    delete current.agentRevisions;
+    delete current.agent.publishedRevisionId;
+    delete current.quality;
+    for (const run of current.taskRuns) {
+      delete run.approval;
+      delete run.approvalNotification;
+      delete run.failure;
+      delete run.retry;
+      delete run.usage;
+    }
+    const parsed = parseSpaceArchive(persistArchiveFixture(sourceDir, 10, current));
+    expect(parsed.taskRuns[0]?.executionPlan).toEqual(expectedPlan);
+
+    const restoredDir = tempDir("ha-v10-disk-restored-");
+    const restored = new KnowledgeEngine({ dataDir: restoredDir });
+    await restored.restoreSpace(parsed);
+    restored.close();
+
+    const restarted = new KnowledgeEngine({ dataDir: restoredDir });
+    expect(restarted.listTaskRuns(task.id)[0]?.executionPlan).toEqual(expectedPlan);
+    const upgraded = await restarted.exportSpace(SPACE);
+    expect(upgraded.version).toBe(14);
+    expect(upgraded.taskRuns[0]?.executionPlan).toEqual(expectedPlan);
+    restarted.close();
+
+    const fresh = new KnowledgeEngine({ dataDir: tempDir("ha-v10-disk-fresh-") });
+    await fresh.restoreSpace(parseSpaceArchive(upgraded));
+    expect(fresh.listTaskRuns(task.id)[0]?.executionPlan).toEqual(expectedPlan);
+    fresh.close();
+  });
+
+  test("v10 terminal writable runs normalize to a closed legacy approval audit", async () => {
+    const sourceDir = tempDir("ha-v10-writable-source-");
+    const source = new KnowledgeEngine({
+      dataDir: sourceDir,
+      runProvider: async () => "legacy writable output",
+    });
+    source.ensureSpace(SPACE);
+    const agent = source.agents.create({
+      name: "Legacy writable Agent",
+      provider: "claude",
+      permission: "write",
+      workdir: sourceDir,
+    });
+    source.updateSpaceMeta(SPACE, { agentId: agent.id });
+    const task = source.tasks.create({
+      name: "legacy writable task",
+      space: SPACE,
+      topic: "legacy writable history",
+      distillOnRun: false,
+    })!;
+    const pending = source.startTaskRun(task.id);
+    await source.approveTaskRun(pending.run.id, "pre-v11-admin").completion;
+    const legacy = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    source.close();
+    legacy.version = 10;
+    delete legacy.agentRevisions;
+    delete legacy.agent.publishedRevisionId;
+    delete legacy.taskRuns[0].approval;
+
+    const normalized = parseSpaceArchive(legacy);
+    expect(normalized.taskRuns[0]?.approval).toMatchObject({
+      status: "legacy",
+      decidedBy: "homeagent.archive-v10",
+    });
+
+    const targetDir = tempDir("ha-v10-writable-target-");
+    const target = new KnowledgeEngine({ dataDir: targetDir });
+    await target.restoreSpace(legacy);
+    target.close();
+    const restarted = new KnowledgeEngine({ dataDir: targetDir });
+    const reexported = await restarted.exportSpace(SPACE);
+    const reparsed = parseSpaceArchive(reexported);
+    expect(reexported.taskRuns[0]?.approval?.status).toBe("legacy");
+    restarted.close();
+    const dishonest = structuredClone(reexported) as Record<string, any>;
+    dishonest.taskRuns[0].approval.decidedAt = dishonest.taskRuns[0].finishedAt + 1;
+    expect(() => parseSpaceArchive(dishonest)).toThrow(/legacy|approval|finishedAt/i);
+
+    const roundTrip = new KnowledgeEngine({ dataDir: tempDir("ha-v10-writable-roundtrip-") });
+    await roundTrip.restoreSpace(reparsed);
+    expect(roundTrip.listTaskRuns(task.id)[0]?.approval?.status).toBe("legacy");
+    roundTrip.close();
+  });
+
+  test("two v10 spaces bound to one Agent restore in either order without identity drift", async () => {
+    const otherSpace: SpaceId = "team/oc_governance_second";
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-v10-shared-agent-source-") });
+    source.ensureSpace(SPACE);
+    source.ensureSpace(otherSpace);
+    const agent = source.agents.create({
+      name: "Shared legacy Agent",
+      instruction: "same identity and snapshot",
+      provider: "codex",
+    });
+    source.updateSpaceMeta(SPACE, { agentId: agent.id });
+    source.updateSpaceMeta(otherSpace, { agentId: agent.id });
+    const first = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    const second = structuredClone(await source.exportSpace(otherSpace)) as Record<string, any>;
+    source.close();
+    for (const archive of [first, second]) {
+      archive.version = 10;
+      delete archive.agentRevisions;
+      delete archive.agent.publishedRevisionId;
+    }
+
+    const targetDir = tempDir("ha-v10-shared-agent-target-");
+    const target = new KnowledgeEngine({
+      dataDir: targetDir,
+      runProvider: async () => "legacy restored agent ran",
+    });
+    await target.restoreSpace(second);
+    await target.restoreSpace(first);
+    expect(target.registry.get(SPACE)?.agentId).toBe(agent.id);
+    expect(target.registry.get(otherSpace)?.agentId).toBe(agent.id);
+    const restored = target.agents.get(agent.id)!;
+    expect(restored.updatedAt).toBe(agent.updatedAt);
+    const task = target.tasks.create({
+      name: "legacy restored Agent task",
+      space: SPACE,
+      topic: "validate the synthesized revision id",
+      distillOnRun: false,
+    })!;
+    const started = target.startTaskRun(task.id);
+    expect(started.run.executionPlan?.agentRevisionId).toMatch(
+      /^agent_revision_[a-zA-Z0-9-]{1,160}$/,
+    );
+    expect((await started.completion).status).toBe("succeeded");
+    target.close();
+
+    const restarted = new KnowledgeEngine({ dataDir: targetDir });
+    expect(restarted.agentForSpace(SPACE)).toEqual(restored);
+    expect(restarted.agentForSpace(otherSpace)).toEqual(restored);
+    restarted.close();
+  });
+
+  test("a v11 shared Agent restored before its v10 sibling keeps one runnable identity", async () => {
+    const sibling: SpaceId = "team/oc_governance_mixed_v10";
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-mixed-agent-source-") });
+    source.ensureSpace(SPACE);
+    source.ensureSpace(sibling);
+    const agent = source.agents.create({
+      name: "Mixed archive Agent",
+      instruction: "Keep one identity across archive versions.",
+      provider: "claude",
+      permission: "read-only",
+    });
+    source.updateSpaceMeta(SPACE, { agentId: agent.id });
+    source.updateSpaceMeta(sibling, { agentId: agent.id });
+    const v11 = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    const v10 = structuredClone(await source.exportSpace(sibling)) as Record<string, any>;
+    source.close();
+
+    v11.version = 11;
+    delete v11.quality;
+    v11.agentRevisions[0].source = "migration";
+    v10.version = 10;
+    delete v10.agentRevisions;
+    delete v10.agent.publishedRevisionId;
+    delete v10.quality;
+
+    const targetDir = tempDir("ha-mixed-agent-v11-first-");
+    const target = new KnowledgeEngine({
+      dataDir: targetDir,
+      runProvider: async () => "mixed archive Agent ran",
+    });
+    try {
+      await target.restoreSpace(v11);
+      await target.restoreSpace(v10);
+      expect(target.agentForSpace(SPACE)).toEqual(v11.agent);
+      expect(target.agentForSpace(sibling)).toEqual(v11.agent);
+      const task = target.tasks.create({
+        name: "mixed archive identity task",
+        space: sibling,
+        topic: "prove the restored Agent remains runnable",
+        distillOnRun: false,
+      })!;
+      const started = target.startTaskRun(task.id);
+      expect((await started.completion).status).toBe("succeeded");
+      expect(started.run.executionPlan?.agentRevisionId).toBe(v11.agent.publishedRevisionId);
+    } finally {
+      target.close();
+    }
+
+    const restarted = new KnowledgeEngine({ dataDir: targetDir });
+    try {
+      expect(restarted.agentForSpace(SPACE)).toEqual(v11.agent);
+      expect(restarted.agentForSpace(sibling)).toEqual(v11.agent);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  test("a v10 shared Agent restored before its v11 sibling upgrades to one runnable identity", async () => {
+    const sibling: SpaceId = "team/oc_governance_mixed_v11";
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-mixed-agent-reverse-source-") });
+    source.ensureSpace(SPACE);
+    source.ensureSpace(sibling);
+    const agent = source.agents.create({
+      name: "Mixed reverse archive Agent",
+      instruction: "Converge on the v11 identity in either restore order.",
+      provider: "claude",
+      permission: "read-only",
+    });
+    source.updateSpaceMeta(SPACE, { agentId: agent.id });
+    source.updateSpaceMeta(sibling, { agentId: agent.id });
+    const v10 = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    const v11 = structuredClone(await source.exportSpace(sibling)) as Record<string, any>;
+    source.close();
+
+    v10.version = 10;
+    delete v10.agentRevisions;
+    delete v10.agent.publishedRevisionId;
+    delete v10.quality;
+    v11.version = 11;
+    delete v11.quality;
+    v11.agentRevisions[0].source = "migration";
+
+    const targetDir = tempDir("ha-mixed-agent-v10-first-");
+    const target = new KnowledgeEngine({
+      dataDir: targetDir,
+      runProvider: async () => "reverse mixed archive Agent ran",
+    });
+    try {
+      await target.restoreSpace(v10);
+      await target.restoreSpace(v11);
+      expect(target.agentForSpace(SPACE)).toEqual(v11.agent);
+      expect(target.agentForSpace(sibling)).toEqual(v11.agent);
+      expect(target.agents.listRevisions(agent.id)).toEqual(v11.agentRevisions);
+      const task = target.tasks.create({
+        name: "reverse mixed archive identity task",
+        space: sibling,
+        topic: "prove the authoritative v11 Agent remains runnable",
+        distillOnRun: false,
+      })!;
+      const started = target.startTaskRun(task.id);
+      expect((await started.completion).status).toBe("succeeded");
+      expect(started.run.executionPlan?.agentRevisionId).toBe(v11.agent.publishedRevisionId);
+    } finally {
+      target.close();
+    }
+
+    const restarted = new KnowledgeEngine({ dataDir: targetDir });
+    try {
+      expect(restarted.agentForSpace(SPACE)).toEqual(v11.agent);
+      expect(restarted.agentForSpace(sibling)).toEqual(v11.agent);
+      expect(restarted.agents.listRevisions(agent.id)).toEqual(v11.agentRevisions);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  test("two v14 archives with genuinely different Agent histories still conflict", async () => {
+    const sibling: SpaceId = "team/oc_governance_v14_history_conflict";
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-v14-agent-conflict-source-") });
+    source.ensureSpace(SPACE);
+    source.ensureSpace(sibling);
+    const agent = source.agents.create({
+      name: "v14 history conflict Agent",
+      instruction: "Keep published state stable.",
+      provider: "claude",
+    });
+    source.updateSpaceMeta(SPACE, { agentId: agent.id });
+    source.updateSpaceMeta(sibling, { agentId: agent.id });
+    const first = await source.exportSpace(SPACE);
+    source.saveAgentDraft(agent.id, { instruction: "Unpublished draft." });
+    const second = await source.exportSpace(sibling);
+    source.close();
+    expect(second.agent).toEqual(first.agent);
+    expect(second.agentRevisions).not.toEqual(first.agentRevisions);
+
+    const target = new KnowledgeEngine({ dataDir: tempDir("ha-v14-agent-conflict-target-") });
+    try {
+      await target.restoreSpace(first);
+      await expect(target.restoreSpace(second)).rejects.toThrow(/different revision history/i);
+      expect(target.registry.has(SPACE)).toBe(true);
+      expect(target.registry.has(sibling)).toBe(false);
+    } finally {
+      target.close();
+    }
+  });
+
+  test("v11 JSON archive preserves Agent revisions and approved execution audit across restart", async () => {
+    const sourceDir = tempDir("ha-v11-disk-source-");
+    const source = new KnowledgeEngine({
+      dataDir: sourceDir,
+      runProvider: async () => "approved v11 output",
+    });
+    source.ensureSpace(SPACE);
+    const agent = source.agents.create({
+      name: "v11 lifecycle Agent",
+      instruction: "release one",
+      provider: "claude",
+      permission: "write",
+      workdir: sourceDir,
+    });
+    const draft = source.saveAgentDraft(agent.id, { instruction: "release two" })!;
+    source.releaseAgent(agent.id, draft.id);
+    source.updateSpaceMeta(SPACE, { agentId: agent.id });
+    const task = source.tasks.create({
+      name: "v11 approved task",
+      space: SPACE,
+      topic: "preserve approval evidence",
+      distillOnRun: false,
+    })!;
+    const pending = source.startTaskRun(task.id);
+    expect(pending.run.status).toBe("awaiting_approval");
+    expect((await source.approveTaskRun(pending.run.id, "v11-admin").completion).status)
+      .toBe("succeeded");
+    const current = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    const expectedRevisions = structuredClone(current.agentRevisions);
+    const expectedApproval = structuredClone(current.taskRuns[0].approval);
+    source.close();
+
+    current.version = 11;
+    delete current.quality;
+    for (const run of current.taskRuns) {
+      delete run.approval.expiresAt;
+      delete run.approvalNotification;
+      delete run.failure;
+      delete run.retry;
+      delete run.usage;
+    }
+    delete expectedApproval.expiresAt;
+    const parsed = parseSpaceArchive(persistArchiveFixture(sourceDir, 11, current));
+    expect(parsed.agentRevisions).toEqual(expectedRevisions);
+    expect(parsed.taskRuns[0]?.approval).toEqual(expectedApproval);
+
+    const restoredDir = tempDir("ha-v11-disk-restored-");
+    const restored = new KnowledgeEngine({ dataDir: restoredDir });
+    await restored.restoreSpace(parsed);
+    restored.close();
+
+    const restarted = new KnowledgeEngine({ dataDir: restoredDir });
+    expect(restarted.agents.listRevisions(agent.id)).toEqual(expectedRevisions);
+    expect(restarted.listTaskRuns(task.id)[0]?.approval).toEqual(expectedApproval);
+    const upgraded = await restarted.exportSpace(SPACE);
+    expect(upgraded.version).toBe(14);
+    restarted.close();
+
+    const fresh = new KnowledgeEngine({ dataDir: tempDir("ha-v11-disk-fresh-") });
+    await fresh.restoreSpace(parseSpaceArchive(upgraded));
+    expect(fresh.agents.listRevisions(agent.id)).toEqual(expectedRevisions);
+    expect(fresh.listTaskRuns(task.id)[0]?.approval).toEqual(expectedApproval);
+    fresh.close();
+  });
+
+  test("v11 JSON archive fails closed when writable execution lacks approval evidence", async () => {
+    const sourceDir = tempDir("ha-v11-missing-approval-source-");
+    const source = new KnowledgeEngine({
+      dataDir: sourceDir,
+      runProvider: async () => "approved before evidence removal",
+    });
+    source.ensureSpace(SPACE);
+    const agent = source.agents.create({
+      name: "v11 missing approval Agent",
+      provider: "claude",
+      permission: "full",
+      workdir: sourceDir,
+    });
+    source.updateSpaceMeta(SPACE, { agentId: agent.id });
+    const task = source.tasks.create({
+      name: "v11 missing approval task",
+      space: SPACE,
+      topic: "reject unverifiable high privilege history",
+      distillOnRun: false,
+    })!;
+    const pending = source.startTaskRun(task.id);
+    expect((await source.approveTaskRun(pending.run.id, "v11-admin").completion).status)
+      .toBe("succeeded");
+    const legacy = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    source.close();
+
+    legacy.version = 11;
+    delete legacy.quality;
+    delete legacy.taskRuns[0].approval;
+    delete legacy.taskRuns[0].approvalNotification;
+    delete legacy.taskRuns[0].failure;
+    delete legacy.taskRuns[0].retry;
+    delete legacy.taskRuns[0].usage;
+    const untrusted = persistArchiveFixture(sourceDir, 11, legacy);
+
+    expect(() => parseSpaceArchive(untrusted)).toThrow(/approval.*required.*writable/i);
+  });
+
+  test("v12 JSON archive preserves approval expiry and notification audit across restart", async () => {
+    const sourceDir = tempDir("ha-v12-disk-source-");
+    const source = new KnowledgeEngine({ dataDir: sourceDir });
+    source.ensureSpace(SPACE);
+    const agent = source.agents.create({
+      name: "v12 expiring approval Agent",
+      provider: "codex",
+      permission: "write",
+      workdir: sourceDir,
+    });
+    source.updateSpaceMeta(SPACE, { agentId: agent.id });
+    const task = source.tasks.create({
+      name: "v12 expired approval task",
+      space: SPACE,
+      topic: "preserve expiry and notification evidence",
+      distillOnRun: false,
+    })!;
+    const pending = source.startTaskRun(task.id);
+    await source.deliverTaskRunApprovalNotification(
+      pending.run.id,
+      async () => {},
+      { attemptedAt: pending.run.approval!.requestedAt + 1 },
+    );
+    source.expireTaskRunApprovals(pending.run.approval!.expiresAt!);
+    const current = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    const expectedApproval = structuredClone(current.taskRuns[0].approval);
+    const expectedNotification = structuredClone(current.taskRuns[0].approvalNotification);
+    source.close();
+
+    current.version = 12;
+    delete current.quality;
+    for (const run of current.taskRuns) {
+      delete run.failure;
+      delete run.retry;
+      delete run.usage;
+    }
+    const parsed = parseSpaceArchive(persistArchiveFixture(sourceDir, 12, current));
+    expect(parsed.taskRuns[0]).toEqual(expect.objectContaining({
+      status: "cancelled",
+      approval: expectedApproval,
+      approvalNotification: expectedNotification,
+    }));
+
+    const restoredDir = tempDir("ha-v12-disk-restored-");
+    const restored = new KnowledgeEngine({ dataDir: restoredDir });
+    await restored.restoreSpace(parsed);
+    restored.close();
+
+    const restarted = new KnowledgeEngine({ dataDir: restoredDir });
+    expect(restarted.listTaskRuns(task.id)[0]).toEqual(expect.objectContaining({
+      approval: expectedApproval,
+      approvalNotification: expectedNotification,
+    }));
+    const upgraded = await restarted.exportSpace(SPACE);
+    expect(upgraded.version).toBe(14);
+    restarted.close();
+
+    const fresh = new KnowledgeEngine({ dataDir: tempDir("ha-v12-disk-fresh-") });
+    await fresh.restoreSpace(parseSpaceArchive(upgraded));
+    expect(fresh.listTaskRuns(task.id)[0]).toEqual(expect.objectContaining({
+      approval: expectedApproval,
+      approvalNotification: expectedNotification,
+    }));
+    fresh.close();
+  });
+
+  test("v13 JSON archive preserves retry usage and drops pre-v14 quality references", async () => {
+    const sourceDir = tempDir("ha-v13-disk-source-");
+    const source = new KnowledgeEngine({ dataDir: sourceDir });
+    source.ensureSpace(SPACE);
+    const task = source.tasks.create({
+      name: "v13 retry task",
+      space: SPACE,
+      topic: "preserve retry and honest usage",
+      distillOnRun: false,
+    })!;
+    const parent = source.taskRuns.start({
+      task,
+      trigger: "scheduled",
+      provider: "claude",
+      executionPlan: {
+        version: 1,
+        instruction: "Frozen v13 retry plan.",
+        provider: "claude",
+        execution: { permission: "read-only", skills: [] },
+      },
+      distill: false,
+      startedAt: 100,
+    });
+    source.taskRuns.begin(parent.id, 110);
+    source.taskRuns.fail(parent.id, {
+      finishedAt: 120,
+      error: "Error: provider overloaded (503)",
+      failure: { phase: "provider", kind: "overloaded", retryable: true },
+      retry: {
+        attempt: 1,
+        maxAttempts: 2,
+        status: "waiting",
+        nextAttemptAt: 60_120,
+      },
+    });
+    const child = source.taskRuns.claimRetry(parent.id, 60_120)!;
+    source.taskRuns.begin(child.id, 60_121);
+    source.taskRuns.fail(child.id, {
+      finishedAt: 60_122,
+      error: "Error: provider overloaded (503)",
+      failure: { phase: "provider", kind: "overloaded", retryable: true },
+      retry: { attempt: 2, maxAttempts: 2, status: "exhausted" },
+      usage: {
+        calls: 1,
+        knownTokenCalls: 1,
+        unknownTokenCalls: 0,
+        knownCostCalls: 0,
+        unknownCostCalls: 1,
+        inputTokens: 42,
+        costBasis: "unavailable",
+        sources: ["codex-jsonl"],
+      },
+    });
+    const trace = source.quality.recordTrace({
+      spaces: [SPACE],
+      question: "What changed?",
+      outcome: "succeeded",
+      answer: "The retry policy changed.",
+      citations: [],
+      latencyMs: 10,
+      createdAt: 70_000,
+    });
+    const chat = source.chatRuns.start({
+      space: SPACE,
+      input: "What changed?",
+      trigger: "message",
+      executionPlan: {
+        version: 1,
+        instruction: "Frozen v13 chat plan.",
+        provider: "claude",
+      },
+      startedAt: 70_100,
+    });
+    source.chatRuns.begin(chat.id, 70_101);
+    source.chatRuns.succeed(chat.id, {
+      finishedAt: 70_102,
+      output: "The retry policy changed.",
+      traceId: trace.id,
+      usage: {
+        calls: 1,
+        knownTokenCalls: 0,
+        unknownTokenCalls: 1,
+        knownCostCalls: 0,
+        unknownCostCalls: 1,
+        costBasis: "unavailable",
+        sources: ["legacy-text"],
+      },
+    });
+    const current = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    const expectedParentRetry = structuredClone(
+      current.taskRuns.find((run: any) => run.id === parent.id).retry,
+    );
+    const expectedChild = structuredClone(
+      current.taskRuns.find((run: any) => run.id === child.id),
+    );
+    const expectedChatUsage = structuredClone(current.chatRuns[0].usage);
+    source.close();
+
+    current.version = 13;
+    delete current.quality;
+    const parsed = parseSpaceArchive(persistArchiveFixture(sourceDir, 13, current));
+    expect(parsed.taskRuns.find((run) => run.id === parent.id)?.retry)
+      .toEqual(expectedParentRetry);
+    expect(parsed.taskRuns.find((run) => run.id === child.id)).toEqual(expectedChild);
+    expect(parsed.chatRuns[0]?.usage).toEqual(expectedChatUsage);
+    expect(parsed.chatRuns[0]?.traceId).toBeUndefined();
+    expect(parsed.quality).toEqual({ traces: [], reruns: [] });
+
+    const restoredDir = tempDir("ha-v13-disk-restored-");
+    const restored = new KnowledgeEngine({ dataDir: restoredDir });
+    await restored.restoreSpace(parsed);
+    restored.close();
+
+    const restarted = new KnowledgeEngine({ dataDir: restoredDir });
+    expect(restarted.getTaskRun(child.id)).toEqual(expectedChild);
+    expect(restarted.chatRuns.get(chat.id)?.traceId).toBeUndefined();
+    const upgraded = await restarted.exportSpace(SPACE);
+    expect(upgraded.version).toBe(14);
+    expect(upgraded.quality).toEqual({ traces: [], reruns: [] });
+    restarted.close();
+
+    const fresh = new KnowledgeEngine({ dataDir: tempDir("ha-v13-disk-fresh-") });
+    await fresh.restoreSpace(parseSpaceArchive(upgraded));
+    expect(fresh.getTaskRun(child.id)).toEqual(expectedChild);
+    expect(fresh.chatRuns.get(chat.id)?.usage).toEqual(expectedChatUsage);
+    expect(fresh.chatRuns.get(chat.id)?.traceId).toBeUndefined();
+    fresh.close();
+  });
+
   test("exports and parses exact Agent Skill source bindings", async () => {
     const dataDir = tempDir("ha-skill-archive-");
     const skillRoot = join(dataDir, "skills");
@@ -142,6 +1220,37 @@ describe("space data governance", () => {
       distillOnRun: false,
     })!;
     await source.runTask(task.id, { trigger: "scheduled" });
+    const chatRun = source.chatRuns.start({
+      space: SPACE,
+      input: "archive this durable chat",
+      trigger: "message",
+      agentId: agent.id,
+      provider: "codex",
+      model: "gpt-5.6",
+      executionPlan: {
+        version: 1,
+        instruction: "frozen-chat-instruction",
+        provider: "codex",
+        model: "gpt-5.6",
+      },
+      startedAt: 1_700_000_150_000,
+    });
+    source.chatRuns.succeed(chatRun.id, {
+      finishedAt: chatRun.startedAt,
+      output: "durable chat result",
+      usage: {
+        calls: 1,
+        knownTokenCalls: 1,
+        unknownTokenCalls: 0,
+        knownCostCalls: 1,
+        unknownCostCalls: 0,
+        inputTokens: 25,
+        outputTokens: 5,
+        costUsd: 0.003,
+        costBasis: "reported",
+        sources: ["codex-jsonl"],
+      },
+    });
     source.reminders.create({
       title: "提交每日报告",
       space: SPACE,
@@ -186,7 +1295,7 @@ describe("space data governance", () => {
     expect(archive).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 9,
+        version: 14,
         space: expect.objectContaining({
           id: SPACE,
           name: "治理群",
@@ -194,6 +1303,10 @@ describe("space data governance", () => {
           participationLevel: "active",
         }),
         agent: expect.objectContaining({ id: agent.id, name: "治理助手" }),
+        agentRevisions: [expect.objectContaining({
+          id: agent.publishedRevisionId,
+          source: "create",
+        })],
         pages: [expect.objectContaining({ slug: page.slug, title: page.title })],
         raw: expect.arrayContaining([
           expect.objectContaining({
@@ -239,8 +1352,10 @@ describe("space data governance", () => {
     expect(await restored.getPage(SPACE, page.slug)).toEqual(archive.pages[0]!);
     expect(restored.registry.get(SPACE)).toEqual(archive.space);
     expect(restored.agentForSpace(SPACE)).toEqual(archive.agent);
+    expect(restored.agents.listRevisions(agent.id)).toEqual(archive.agentRevisions);
     expect(restored.tasks.list()).toEqual(archive.tasks);
     expect(restored.listTaskRuns(task.id)).toEqual(archive.taskRuns);
+    expect(restored.chatRuns.list(SPACE)).toEqual(archive.chatRuns);
     expect(restored.reminders.list()).toEqual(archive.reminders);
     expect(restored.learning.exportBySpace(SPACE)).toEqual(archive.learning);
     const roundTrip = await restored.exportSpace(SPACE);
@@ -248,6 +1363,7 @@ describe("space data governance", () => {
     expect(roundTrip.retractions).toEqual(archive.retractions);
     expect(roundTrip.reminders).toEqual(archive.reminders);
     expect(roundTrip.taskRuns).toEqual(archive.taskRuns);
+    expect(roundTrip.chatRuns).toEqual(archive.chatRuns);
     expect(roundTrip.learning).toEqual(archive.learning);
     expect(roundTrip.governanceAudit).toEqual(archive.governanceAudit);
     restored.close();
@@ -278,7 +1394,7 @@ describe("space data governance", () => {
     } = archive;
     const parsed = parseSpaceArchive({ ...withoutLearning, version: 1 });
 
-    expect(parsed.version).toBe(9);
+    expect(parsed.version).toBe(14);
     expect(parsed.learning).toEqual({ plans: [], sources: [], sessions: [] });
     expect(parsed.governanceAudit).toEqual([]);
     expect(parsed.taskRuns).toEqual([]);
@@ -310,7 +1426,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(9);
+    expect(parsed.version).toBe(14);
     expect(parsed.learning.plans[0]).toEqual(expect.objectContaining({
       id: plan.id,
       mode: "reading",
@@ -358,7 +1474,7 @@ describe("space data governance", () => {
     expect(target.learning.source(plan.id)?.materials).toEqual([
       expect.objectContaining({ title: "Async Book", rawIds: ["raw_async"] }),
     ]);
-    expect((await target.exportSpace(SPACE)).version).toBe(9);
+    expect((await target.exportSpace(SPACE)).version).toBe(14);
     target.close();
   });
 
@@ -462,7 +1578,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(9);
+    expect(parsed.version).toBe(14);
     expect(parsed.taskRuns).toEqual([]);
   });
 
@@ -490,7 +1606,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(9);
+    expect(parsed.version).toBe(14);
     expect(parsed.tasks[0]?.timeoutMinutes).toBe(12);
     expect(parsed.taskRuns).toEqual([
       expect.objectContaining({
@@ -832,6 +1948,92 @@ describe("space data governance", () => {
     expect(engine.registry.has(SPACE)).toBe(false);
     expect(engine.tasks.get(task.id)?.space).toBe(other);
     engine.close();
+  });
+
+  test("rolls back a quality merge when a later space restore step fails", async () => {
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-quality-rollback-source-") });
+    source.ensureSpace(SPACE);
+    const trace = source.quality.recordTrace({
+      spaces: [SPACE],
+      question: "Who owns the backend?",
+      outcome: "succeeded",
+      answer: "Alice",
+      citations: [],
+      latencyMs: 10,
+      createdAt: 1_000,
+    });
+    const run = source.chatRuns.start({
+      space: SPACE,
+      input: "Who owns the backend?",
+      trigger: "message",
+      executionPlan: {
+        version: 1,
+        instruction: "Use the archived knowledge.",
+        provider: "codex",
+      },
+      startedAt: 1_100,
+    });
+    source.chatRuns.begin(run.id, 1_200);
+    source.chatRuns.succeed(run.id, {
+      finishedAt: 1_300,
+      output: "Alice",
+      traceId: trace.id,
+    });
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+
+    const target = new KnowledgeEngine({ dataDir: tempDir("ha-quality-rollback-target-") });
+    let qualityWasMergedBeforeFailure = false;
+    target.registry.restoreMeta = () => {
+      qualityWasMergedBeforeFailure = target.answerTrace(trace.id) !== undefined;
+      throw new Error("late space restore failure");
+    };
+
+    await expect(target.restoreSpace(archive)).rejects.toThrow("late space restore failure");
+    expect(qualityWasMergedBeforeFailure).toBe(true);
+    expect(target.registry.has(SPACE)).toBe(false);
+    expect(target.chatRuns.get(run.id)).toBeUndefined();
+    expect(target.answerTrace(trace.id)).toBeUndefined();
+    target.close();
+  });
+
+  test("rejects a conflicting quality trace before creating or writing the space", async () => {
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-quality-conflict-source-") });
+    source.ensureSpace(SPACE);
+    const trace = source.quality.recordTrace({
+      spaces: [SPACE],
+      question: "Who owns the backend?",
+      outcome: "succeeded",
+      answer: "Alice",
+      citations: [],
+      latencyMs: 10,
+      createdAt: 1_000,
+    });
+    const run = source.chatRuns.start({
+      space: SPACE,
+      input: "Who owns the backend?",
+      trigger: "message",
+      startedAt: 1_100,
+    });
+    source.chatRuns.begin(run.id, 1_200);
+    source.chatRuns.succeed(run.id, {
+      finishedAt: 1_300,
+      output: "Alice",
+      traceId: trace.id,
+    });
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+
+    const target = new KnowledgeEngine({ dataDir: tempDir("ha-quality-conflict-target-") });
+    const conflicting = structuredClone(archive.quality);
+    conflicting.traces[0]!.answer = "Mallory";
+    target.quality.restoreArchive(conflicting);
+
+    await expect(target.restoreSpace(archive)).rejects.toThrow(/quality trace.*different data/i);
+    expect(target.registry.has(SPACE)).toBe(false);
+    expect(target.chatRuns.get(run.id)).toBeUndefined();
+    expect(target.answerTrace(trace.id)?.answer).toBe("Mallory");
+    target.close();
   });
 
   test("restore preserves a dangling archived agent binding", async () => {

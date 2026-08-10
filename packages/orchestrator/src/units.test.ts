@@ -158,6 +158,22 @@ describe("formatAnswer (Q1)", () => {
     expect(md).toContain("[[entities/alice|Alice]]");
   });
 
+  test("ambiguous citations show a safe scope label without exposing Space ids", () => {
+    const res: AskResult = {
+      answer: "请查看 Alice。",
+      source: "knowledge",
+      citations: [{
+        slug: "entities/alice",
+        title: "Alice",
+        space: "personal/ou_secret_identity",
+      }],
+    };
+
+    const md = formatAnswer(res);
+    expect(md).toContain("[[entities/alice|Alice（个人空间）]]");
+    expect(md).not.toContain("ou_secret_identity");
+  });
+
   test("general answer has no citation footer", () => {
     const res: AskResult = { answer: "通用回答。", source: "general", citations: [] };
     expect(formatAnswer(res)).toBe("通用回答。");

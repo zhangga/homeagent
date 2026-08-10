@@ -25,8 +25,11 @@ jobs:
             echo "Tag version $TAG_VERSION does not match package.json $PACKAGE_VERSION"
             exit 1
           }
+      - run: bun run verify:beta -- --checks-only
       - run: bun test
       - run: bunx tsc -p tsconfig.json --noEmit
+      - run: bun run evaluate:quality
+      - run: bun run verify:crash-recovery
       - name: Require completed binary redistribution review
         env:
           APPROVED: ${{ vars.BINARY_REDISTRIBUTION_APPROVED }}
@@ -142,7 +145,7 @@ jobs:
           path: dist/HomeAgent-*-macos-${{ matrix.target }}.dmg
           if-no-files-found: error
 
-  publish:
+  draft_release:
     needs: build
     runs-on: macos-15
     steps:
@@ -168,6 +171,8 @@ jobs:
             --output dist/release/update-manifest.json
       - uses: softprops/action-gh-release@v2
         with:
+          draft: true
+          prerelease: true
           files: |
             dist/release/*.dmg
             dist/release/update-manifest.json

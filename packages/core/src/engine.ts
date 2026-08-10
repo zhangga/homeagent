@@ -19,12 +19,15 @@ import type {
   SkillWarningView,
   SpaceId,
 } from "@homeagent/shared";
+import { realpathSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { Serializer, canonicalModelId, config, logger } from "@homeagent/shared";
 import {
+  BudgetExceededError,
   isCliProvider,
   isCodexReasoningEffortSupported,
   isProviderTimeoutError,
-  runProvider as runLocalProvider,
+  runProviderDetailed as runLocalProvider,
   type CodexReasoningEffort,
   type ProviderExecution,
   type ProviderId,
@@ -56,13 +59,17 @@ import {
   removeQuarantineRecord,
 } from "./quarantine.ts";
 import { SpaceRegistry } from "./registry.ts";
+import { normalizeSearchLimit } from "./sqlite.ts";
 import { FeishuGroupBindingStore } from "./feishu-bindings.ts";
 import {
   AgentStore,
   agentVisibleInSpace,
+  isMaterializedLegacyAgentRevisionHistory,
   resolveAgentExecution,
+  sameLegacyAgentSnapshot,
   type Agent,
   type AgentInput,
+  type AgentRevision,
 } from "./agents.ts";
 import {
   defaultSkillRoots,
@@ -71,18 +78,30 @@ import {
   type ResolvedAgentSkills,
 } from "./skill-catalog.ts";
 import {
+  isResolvedExecutionPlan,
+  type ResolvedExecutionPlan,
+} from "./execution-plan.ts";
+import {
   DEFAULT_TASK_TIMEOUT_MINUTES,
   TaskStore,
   type Task,
+  type TaskInput,
 } from "./tasks.ts";
 import {
+  AUTOMATIC_TASK_RUN_RETRY_DELAY_MS,
+  MAX_AUTOMATIC_TASK_RUN_ATTEMPTS,
   MAX_TASK_RUN_ERROR_CHARACTERS,
   TaskRunStore,
   type TaskRun,
+  type TaskRunFailure,
   type TaskRunSkillEvidence,
   type TaskRunTrigger,
 } from "./task-runs.ts";
-import { ChatRunStore, type ChatRun } from "./chat-runs.ts";
+import {
+  ChatRunStore,
+  isChatRunDeliveryInFlight,
+  type ChatRun,
+} from "./chat-runs.ts";
 import {
   RunQueueCancelledError,
   RunQueueTimeoutError,
@@ -110,7 +129,11 @@ import {
   type AnswerFeedbackKind,
   type AnswerFeedbackReview,
   type AnswerTrace,
+  type AnswerTraceExecution,
+  type AnswerTraceRetrievalPage,
   type QualityEvaluationCase,
+  type QualityArchiveRestoreReceipt,
+  type QualityRerun,
   type QualityReviewQuery,
   type QualitySnapshot,
 } from "./quality.ts";
@@ -130,6 +153,7 @@ import { refreshDigest } from "./digest.ts";
 import { ask as askImpl } from "./ask.ts";
 import type { LlmClient } from "./llm.ts";
 import { makeCliClient, type RunProviderFn } from "./cli-client.ts";
+import { observeLlmUsage, RunUsageAccumulator } from "./usage.ts";
 import { DEFAULT_PURPOSE, DEFAULT_SCHEMA } from "./space.ts";
 import {
   appendKnowledgeGovernanceAudit,
@@ -230,12 +254,18 @@ export interface RunTaskOptions {
 }
 
 export interface StartedTaskRun {
+  state: "scheduled" | "awaiting_approval";
   run: TaskRun;
   completion: Promise<TaskReport>;
 }
 
 export type TaskRunNotificationDelivery = (
   run: TaskRun,
+) => void | Promise<void>;
+
+export type TaskRunApprovalNotificationDelivery = (
+  run: TaskRun,
+  deliveryKey: string,
 ) => void | Promise<void>;
 
 export interface DeliverTaskRunNotificationOptions {
@@ -285,8 +315,20 @@ export type LearningDelivery = (
   skillWarnings?: SkillWarningView[],
 ) => void | Promise<void>;
 
+export type LearningFollowUpDelivery = (
+  plan: LearningPlan,
+  session: LearningSession,
+) => void | Promise<void>;
+
 /** How long a research task may run before the CLI is killed (much longer than Q&A). */
 const TASK_TIMEOUT_MS = DEFAULT_TASK_TIMEOUT_MINUTES * 60_000;
+/**
+ * CLI providers escalate SIGTERM to SIGKILL after two seconds. Keep admission
+ * occupied slightly longer so an abort cannot release a writable Run while
+ * that old process may still be mutating state, but never trust a custom
+ * provider to settle forever.
+ */
+const PROVIDER_ABORT_JOIN_TIMEOUT_MS = 2_500;
 
 function taskRunAbortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error
@@ -309,16 +351,35 @@ async function awaitTaskRunStep<T>(
 ): Promise<T> {
   throwIfTaskRunAborted(signal);
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(taskRunAbortReason(signal));
+    let abortError: Error | undefined;
+    let joinTimeout: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      signal.removeEventListener("abort", onAbort);
+      if (joinTimeout) clearTimeout(joinTimeout);
+    };
+    const rejectAbort = () => {
+      cleanup();
+      reject(abortError ?? taskRunAbortReason(signal));
+    };
+    const onAbort = () => {
+      abortError = taskRunAbortReason(signal);
+      // The provider promise keeps both handlers below, so a later rejection
+      // is observed even when this bounded join has already elapsed.
+      joinTimeout = setTimeout(rejectAbort, PROVIDER_ABORT_JOIN_TIMEOUT_MS);
+    };
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
       (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
+        const stopped = abortError ?? (signal.aborted ? taskRunAbortReason(signal) : undefined);
+        cleanup();
+        if (stopped) reject(stopped);
+        else resolve(value);
       },
       (err) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(err);
+        const stopped = abortError ?? (signal.aborted ? taskRunAbortReason(signal) : undefined);
+        cleanup();
+        if (stopped) reject(stopped);
+        else reject(err);
       },
     );
   });
@@ -867,6 +928,50 @@ export interface EngineOptions {
   skillCatalog?: SkillCatalog;
 }
 
+function classifyTaskRunFailure(
+  error: unknown,
+  phase: TaskRunFailure["phase"],
+): TaskRunFailure {
+  const message = String(error).toLowerCase();
+  if (error instanceof BudgetExceededError || /\bbudget\b/.test(message)) {
+    return { phase, kind: "budget", retryable: false };
+  }
+  if (/workdir|working directory|not a directory|realpath/.test(message)) {
+    return { phase, kind: "workdir", retryable: false };
+  }
+  if (/\bskill\b/.test(message)) {
+    return { phase, kind: "skill", retryable: false };
+  }
+  if (/\b(?:401|403)\b|unauthori[sz]ed|forbidden|auth(?:entication)?|log[ -]?in|credential|api[ _-]?key/.test(message)) {
+    return { phase, kind: "authentication", retryable: false };
+  }
+  if (/unknown provider|unknown model|model .*not found|unsupported|invalid (?:config|argument)|executable|\benoent\b|not installed|no runnable/.test(message)) {
+    return { phase, kind: "configuration", retryable: false };
+  }
+  if (/timed? out|timeout/.test(message)) {
+    return { phase, kind: "timeout", retryable: false };
+  }
+  if (phase === "capture") {
+    return { phase, kind: "capture", retryable: false };
+  }
+  if (phase === "admission") {
+    return { phase, kind: "admission", retryable: false };
+  }
+  if (/overload|\b503\b/.test(message)) {
+    return { phase, kind: "overloaded", retryable: true };
+  }
+  if (/rate.?limit|too many requests|\b429\b/.test(message)) {
+    return { phase, kind: "rate_limited", retryable: true };
+  }
+  if (/\b502\b|\b504\b|temporar|try again|econnreset|econnrefused|enetunreach|socket hang up|network (?:error|reset|unavailable)/.test(message)) {
+    return { phase, kind: "transient_provider", retryable: true };
+  }
+  if (/empty output/.test(message)) {
+    return { phase, kind: "invalid_output", retryable: false };
+  }
+  return { phase, kind: "provider_error", retryable: false };
+}
+
 /** Durable inbound Chat message shown in an Agent's activity timeline. */
 export interface AgentChatRecord {
   id: string;
@@ -905,7 +1010,7 @@ export interface SpaceAgentCallContext {
   agent?: Agent;
   client: LlmClient;
   skills: ResolvedAgentSkills;
-  execution: ProviderExecution;
+  execution?: ProviderExecution;
 }
 
 export interface AgentRunExecutionSnapshot {
@@ -914,7 +1019,84 @@ export interface AgentRunExecutionSnapshot {
   model?: string;
   reasoningEffort?: CodexReasoningEffort;
   skillEvidence: TaskRunSkillEvidence;
-  execution: ProviderExecution;
+  execution?: ProviderExecution;
+  executionPlan: ResolvedExecutionPlan;
+}
+
+function resolvedSkillsFromEvidence(
+  evidence?: TaskRunSkillEvidence,
+): ResolvedAgentSkills {
+  const requested = evidence?.requested.map((item) => ({ ...item })) ?? [];
+  const resolved = evidence?.resolved.map((item) => ({ ...item })) ?? [];
+  const skipped = evidence?.skipped.map((item) => ({ ...item })) ?? [];
+  return {
+    requested,
+    resolved,
+    skipped,
+    warnings: skipped.map((item) => ({ ...item })),
+  };
+}
+
+function skillsForProviderExecution(
+  resolution: ResolvedAgentSkills,
+  enabled: boolean,
+): ResolvedAgentSkills {
+  if (enabled || resolution.resolved.length === 0) return resolution;
+  const skipped = [
+    ...resolution.skipped.map((item) => ({ ...item })),
+    ...resolution.resolved.map((skill) => ({
+      sourceKey: skill.sourceKey,
+      name: skill.name,
+      code: "no_tools_context" as const,
+      message: "Native Skills are disabled for no-tools provider calls",
+    })),
+  ];
+  return {
+    requested: resolution.requested.map((item) => ({ ...item })),
+    resolved: [],
+    skipped,
+    warnings: skipped.map((item) => ({ ...item })),
+  };
+}
+
+function answerTraceExecution(
+  executionPlan: ResolvedExecutionPlan,
+  skillEvidence?: TaskRunSkillEvidence,
+  agentId?: string,
+): AnswerTraceExecution {
+  return {
+    agentId,
+    agentRevisionId: executionPlan.agentRevisionId,
+    provider: executionPlan.provider,
+    model: executionPlan.model,
+    promptVersion: "ask-v1",
+    instructionHash: createHash("sha256")
+      .update(executionPlan.instruction)
+      .digest("hex"),
+    skills: (skillEvidence?.resolved ?? []).map((skill) => ({
+      sourceKey: skill.sourceKey,
+      skillFileHash: skill.skillFileHash,
+    })),
+  };
+}
+
+function sameResolvedSkillSnapshots(
+  left: ResolvedAgentSkills["resolved"],
+  right: ResolvedAgentSkills["resolved"],
+): boolean {
+  return left.length === right.length && left.every((skill, index) => {
+    const other = right[index];
+    return other !== undefined
+      && skill.sourceKey === other.sourceKey
+      && skill.name === other.name
+      && skill.invocationName === other.invocationName
+      && skill.reference === other.reference
+      && skill.skillFileHash === other.skillFileHash;
+  });
+}
+
+function executionResolutionError(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).slice(0, 20_000);
 }
 
 export interface RunAdmissionContext {
@@ -968,8 +1150,10 @@ export class KnowledgeEngine implements Knowledge {
   private activeTaskRuns = new Map<string, string>();
   private taskRunControllers = new Map<string, AbortController>();
   private deliveringTaskRunNotifications = new Set<string>();
+  private deliveringTaskRunApprovalNotifications = new Set<string>();
   private deliveringReminderCounts = new Map<string, number>();
   private deliveringLearningCounts = new Map<string, number>();
+  private backgroundRunCounts = new Map<SpaceId, number>();
   private readonly runConcurrency: RunConcurrencyConfig;
 
   constructor(opts: EngineOptions = {}) {
@@ -1058,7 +1242,7 @@ export class KnowledgeEngine implements Knowledge {
   private activeTaskRunId(taskId: string): string | undefined {
     return this.activeTaskRuns.get(taskId)
       ?? this.taskRuns.list(taskId).find(
-        (run) => run.status === "queued" || run.status === "running",
+        (run) => ["awaiting_approval", "queued", "running"].includes(run.status),
       )?.id;
   }
 
@@ -1417,21 +1601,83 @@ export class KnowledgeEngine implements Knowledge {
   updateAgent(id: string, input: AgentInput): Agent | undefined {
     const current = this.agents.get(id);
     if (!current) return undefined;
-    if (
-      input.visibility
-      && input.visibility !== current.visibility
-      && (input.visibility === "Team" || input.visibility === "Personal")
-    ) {
-      const candidate: Agent = { ...current, visibility: input.visibility };
-      const incompatible = this.registry.listByAgent(id)
-        .filter((space) => !agentVisibleInSpace(candidate, space.id));
-      if (incompatible.length > 0) {
-        throw new Error(
-          `请先解除不兼容的空间绑定：${incompatible.map((space) => space.name || space.id).join("、")}`,
-        );
-      }
-    }
+    const candidate: Agent = {
+      ...current,
+      ...(input.visibility === "Team" || input.visibility === "Personal"
+        ? { visibility: input.visibility }
+        : {}),
+    };
+    this.assertAgentReleaseCompatible(candidate);
     return this.agents.update(id, input);
+  }
+
+  saveAgentDraft(
+    id: string,
+    input: AgentInput,
+    expectedHeadRevisionId?: string,
+  ): AgentRevision | undefined {
+    return this.agents.saveDraft(id, input, expectedHeadRevisionId);
+  }
+
+  releaseAgent(
+    id: string,
+    draftRevisionId?: string,
+    expectedHeadRevisionId?: string,
+  ): Agent | undefined {
+    const current = this.agents.get(id);
+    if (!current) return undefined;
+    this.assertAgentLifecycleHead(id, expectedHeadRevisionId);
+    const draft = draftRevisionId
+      ? this.agents.listRevisions(id).find((revision) => revision.id === draftRevisionId)
+      : this.agents.getDraft(id);
+    if (!draft || draft.source !== "draft") return undefined;
+    this.assertAgentReleaseCompatible({
+      ...current,
+      ...draft.snapshot,
+      skills: draft.snapshot.skills.map((binding) => ({ ...binding })),
+    });
+    return this.agents.release(id, draft.id, expectedHeadRevisionId);
+  }
+
+  rollbackAgent(
+    id: string,
+    revisionId: string,
+    expectedHeadRevisionId?: string,
+  ): Agent | undefined {
+    const current = this.agents.get(id);
+    if (!current) return undefined;
+    this.assertAgentLifecycleHead(id, expectedHeadRevisionId);
+    const target = this.agents.listRevisions(id)
+      .find((revision) => revision.id === revisionId);
+    if (!target || target.source === "draft") return undefined;
+    this.assertAgentReleaseCompatible({
+      ...current,
+      ...target.snapshot,
+      skills: target.snapshot.skills.map((binding) => ({ ...binding })),
+    });
+    return this.agents.rollback(id, revisionId, expectedHeadRevisionId);
+  }
+
+  private assertAgentLifecycleHead(
+    id: string,
+    expectedHeadRevisionId?: string,
+  ): void {
+    if (
+      expectedHeadRevisionId !== undefined
+      && this.agents.listRevisions(id)[0]?.id !== expectedHeadRevisionId
+    ) {
+      throw new Error("Agent 版本已变化，请刷新后重试");
+    }
+  }
+
+  private assertAgentReleaseCompatible(candidate: Agent): void {
+    const incompatible = this.registry.listByAgent(candidate.id)
+      .filter((space) => !agentVisibleInSpace(candidate, space.id));
+    if (incompatible.length > 0) {
+      throw new Error(
+        `请先解除不兼容的空间绑定：${incompatible.map((space) => space.name || space.id).join("、")}`,
+      );
+    }
   }
 
   agentBindings(id: string): SpaceMeta[] {
@@ -1517,6 +1763,34 @@ export class KnowledgeEngine implements Knowledge {
   removeAgentAndUnbind(id: string): { agent: Agent; bindings: SpaceMeta[] } | undefined {
     const agent = this.agents.get(id);
     if (!agent) return undefined;
+    const attributedTaskRuns = this.taskRuns.list()
+      .filter((run) => run.agentId === id);
+    const pendingApproval = attributedTaskRuns
+      .find((run) => run.status === "awaiting_approval");
+    if (pendingApproval) {
+      throw new Error(
+        `Agent has a Task Run awaiting approval: ${pendingApproval.id}`,
+      );
+    }
+    const waitingRetry = attributedTaskRuns
+      .find((run) => run.retry?.status === "waiting");
+    if (waitingRetry) {
+      throw new Error(`Agent has a Task Run waiting retry: ${waitingRetry.id}`);
+    }
+    const activeTaskRun = attributedTaskRuns
+      .find((run) => run.status === "queued" || run.status === "running");
+    if (activeTaskRun) {
+      throw new Error(`Agent has an active Task Run: ${activeTaskRun.id}`);
+    }
+    const activeChatRun = this.chatRuns.list()
+      .find((run) => run.agentId === id && (
+        run.status === "queued"
+        || run.status === "running"
+        || isChatRunDeliveryInFlight(run)
+      ));
+    if (activeChatRun) {
+      throw new Error(`Agent has an active Chat Run: ${activeChatRun.id}`);
+    }
     const bindings = this.registry.clearAgentBindings(id);
     this.agents.remove(id);
     return { agent, bindings };
@@ -1559,24 +1833,33 @@ export class KnowledgeEngine implements Knowledge {
     const provider: ProviderId = isCliProvider(selectedProvider)
       ? selectedProvider
       : "gateway";
-    const skills = options.resolvedSkills ?? this.skillCatalog.resolveAgentBindings(
-      agent?.skills ?? [],
-      provider,
+    const skills = skillsForProviderExecution(
+      options.resolvedSkills ?? this.skillCatalog.resolveAgentBindings(
+        agent?.skills ?? [],
+        provider,
+      ),
+      options.taskExecution === true,
     );
-    const baseExecution = options.taskExecution
-      ? resolveAgentExecution(agent)
-      : { permission: "read-only" as const, skills: [] };
-    const execution: ProviderExecution = {
-      ...baseExecution,
-      skills: skills.resolved.map((skill) => skill.invocationName),
-      ...(options.webSearch ? { webSearch: true } : {}),
-    };
+    const skillNames = skills.resolved.map((skill) => skill.invocationName);
+    // Only tasks and explicit web research get ProviderExecution. Ask, dream,
+    // and ordinary learning keep it absent; their native Skills are recorded
+    // as skipped so the no-tools boundary and trace evidence stay aligned.
+    const execution: ProviderExecution | undefined = options.taskExecution || options.webSearch
+      ? {
+          ...(options.taskExecution
+            ? resolveAgentExecution(agent)
+            : { permission: "read-only" as const, skills: [] }),
+          skills: skillNames,
+          ...(options.webSearch ? { webSearch: true } : {}),
+        }
+      : undefined;
     const client = this.llm ?? this.makeSpaceCliClient(
       space,
       options.timeoutMs,
       options.signal,
       execution,
       agent,
+      skillNames,
     );
     return { agent, client, skills, execution };
   }
@@ -1607,28 +1890,144 @@ export class KnowledgeEngine implements Knowledge {
       && isCodexReasoningEffortSupported(model, agent.reasoningEffort)
         ? agent.reasoningEffort
         : undefined;
-    const skills = this.skillCatalog.resolveAgentBindings(
-      agent?.skills ?? [],
-      resolutionProvider,
+    const skills = skillsForProviderExecution(
+      this.skillCatalog.resolveAgentBindings(
+        agent?.skills ?? [],
+        resolutionProvider,
+      ),
+      taskExecution,
     );
-    const baseExecution = taskExecution
-      ? resolveAgentExecution(agent)
-      : { permission: "read-only" as const, skills: [] };
+    const skillEvidence: TaskRunSkillEvidence = {
+      requested: skills.requested.map((item) => ({ ...item })),
+      resolved: skills.resolved.map((item) => ({ ...item })),
+      skipped: skills.skipped.map((item) => ({ ...item })),
+    };
+    let execution: ProviderExecution | undefined;
+    let resolutionError: string | undefined;
+    if (taskExecution) {
+      try {
+        execution = {
+          ...resolveAgentExecution(agent),
+          skills: skills.resolved.map((skill) => skill.invocationName),
+        };
+      } catch (error) {
+        resolutionError = executionResolutionError(error);
+      }
+    }
+    const executionPlan: ResolvedExecutionPlan = {
+      version: 1,
+      agentRevisionId: agent?.publishedRevisionId,
+      instruction: agent?.instruction ?? "",
+      provider,
+      model,
+      reasoningEffort,
+      execution,
+      resolutionError,
+    };
     return {
       agent,
       provider,
       model,
       reasoningEffort,
-      skillEvidence: {
-        requested: skills.requested.map((item) => ({ ...item })),
-        resolved: skills.resolved.map((item) => ({ ...item })),
-        skipped: skills.skipped.map((item) => ({ ...item })),
-      },
-      execution: {
-        ...baseExecution,
-        skills: skills.resolved.map((skill) => skill.invocationName),
-      },
+      skillEvidence,
+      execution,
+      executionPlan,
     };
+  }
+
+  private executionPlanCallContext(
+    space: SpaceId,
+    executionPlan: ResolvedExecutionPlan,
+    skillEvidence?: TaskRunSkillEvidence,
+    options: { timeoutMs?: number; signal?: AbortSignal } = {},
+  ): SpaceAgentCallContext {
+    if (!isResolvedExecutionPlan(executionPlan)) {
+      throw new Error("Resolved execution plan is invalid");
+    }
+    if (executionPlan.resolutionError !== undefined) {
+      throw new Error(executionPlan.resolutionError);
+    }
+    const skills = this.validatedSkillsFromEvidence(executionPlan, skillEvidence);
+    const skillNames = skills.resolved.map((skill) => skill.invocationName);
+    let client = this.llm;
+    if (!client) {
+      if (!executionPlan.provider || !isCliProvider(executionPlan.provider)) {
+        throw new NoProviderError(space);
+      }
+      client = makeCliClient(
+        executionPlan.provider,
+        executionPlan.model,
+        this.runProvider,
+        options.timeoutMs,
+        executionPlan.reasoningEffort,
+        options.signal,
+        executionPlan.execution,
+        skillNames,
+        this.dataDir,
+      );
+    }
+    return {
+      client,
+      skills,
+      execution: executionPlan.execution
+        ? {
+            ...executionPlan.execution,
+            skills: [...executionPlan.execution.skills],
+          }
+        : undefined,
+    };
+  }
+
+  private validatedSkillsFromEvidence(
+    executionPlan: ResolvedExecutionPlan,
+    skillEvidence?: TaskRunSkillEvidence,
+  ): ResolvedAgentSkills {
+    const frozen = resolvedSkillsFromEvidence(skillEvidence);
+    const frozenNames = frozen.resolved.map((skill) => skill.invocationName);
+    if (
+      executionPlan.execution
+      && (
+        executionPlan.execution.skills.length !== frozenNames.length
+        || executionPlan.execution.skills.some(
+          (name, index) => name !== frozenNames[index],
+        )
+      )
+    ) {
+      throw new Error("Resolved execution plan Skill names do not match its frozen evidence.");
+    }
+    if (frozen.resolved.length === 0) return frozen;
+    const provider = executionPlan.provider;
+    if (!provider) {
+      throw new Error("Resolved execution plan has frozen Skills but no Provider.");
+    }
+    // Refresh immediately before admission so a changed file, removed exact
+    // source, or new same-name shadow cannot silently change queued behavior.
+    this.skillCatalog.refresh();
+    const current = this.skillCatalog.resolveAgentBindings(
+      frozen.requested,
+      provider,
+    );
+    if (!sameResolvedSkillSnapshots(frozen.resolved, current.resolved)) {
+      throw new Error(
+        "Queued Run Skill snapshot changed after enqueue; refusing to execute mutable Skill content.",
+      );
+    }
+    return frozen;
+  }
+
+  private validateFrozenExecutionWorkdir(execution?: ProviderExecution): void {
+    const workdir = execution?.workdir;
+    if (!workdir) return;
+    try {
+      const current = realpathSync(workdir);
+      if (!statSync(current).isDirectory() || current !== workdir) {
+        throw new Error("changed");
+      }
+    } catch {
+      throw new Error(
+        "Frozen Workdir is missing, no longer a directory, or resolves to a different location.",
+      );
+    }
   }
 
   runConcurrencyLayers(context: RunAdmissionContext): RunConcurrencyLayer[] {
@@ -1657,18 +2056,33 @@ export class KnowledgeEngine implements Knowledge {
     queueTimeoutMs = 60 * 60_000,
   ): Promise<T> {
     const snapshot = this.agentRunExecutionSnapshot(space);
-    return this.runScheduler.schedule({
-      id,
-      priority: "background",
-      queueTimeoutMs,
-      layers: this.runConcurrencyLayers({
-        provider: snapshot.provider,
-        model: snapshot.model,
-        agentId: snapshot.agent?.id,
-        conversationId: space,
-      }),
-      execute,
-    });
+    this.backgroundRunCounts.set(
+      space,
+      (this.backgroundRunCounts.get(space) ?? 0) + 1,
+    );
+    try {
+      return this.runScheduler.schedule({
+        id,
+        priority: "background",
+        queueTimeoutMs,
+        layers: this.runConcurrencyLayers({
+          provider: snapshot.provider,
+          model: snapshot.model,
+          agentId: snapshot.agent?.id,
+          conversationId: space,
+        }),
+        execute,
+      }).finally(() => {
+        const remaining = (this.backgroundRunCounts.get(space) ?? 1) - 1;
+        if (remaining > 0) this.backgroundRunCounts.set(space, remaining);
+        else this.backgroundRunCounts.delete(space);
+      });
+    } catch (error) {
+      const remaining = (this.backgroundRunCounts.get(space) ?? 1) - 1;
+      if (remaining > 0) this.backgroundRunCounts.set(space, remaining);
+      else this.backgroundRunCounts.delete(space);
+      throw error;
+    }
   }
 
   skillWarningsForSpace(space: SpaceId): SkillWarningView[] {
@@ -1688,6 +2102,7 @@ export class KnowledgeEngine implements Knowledge {
     signal?: AbortSignal,
     execution?: ProviderExecution,
     resolvedAgent = this.agentForSpace(space),
+    skillNames: string[] = execution?.skills ?? [],
   ): LlmClient {
     const agent = resolvedAgent;
     const cfg = config();
@@ -1714,6 +2129,8 @@ export class KnowledgeEngine implements Knowledge {
       reasoningEffort,
       signal,
       execution,
+      skillNames,
+      this.dataDir,
     );
   }
 
@@ -2105,6 +2522,36 @@ export class KnowledgeEngine implements Knowledge {
     }
   }
 
+  /** Guard an awaiting-reply follow-up across transport and durable commit. */
+  async deliverLearningFollowUp(
+    planId: string,
+    sessionId: string,
+    followedUpAt: number,
+    deliver: LearningFollowUpDelivery,
+  ): Promise<boolean> {
+    const plan = this.learning.get(planId);
+    const session = this.learning.currentSession(planId);
+    if (
+      !plan
+      || plan.status !== "active"
+      || !session
+      || session.id !== sessionId
+      || session.status !== "awaiting_reply"
+    ) return false;
+    this.deliveringLearningCounts.set(
+      planId,
+      (this.deliveringLearningCounts.get(planId) ?? 0) + 1,
+    );
+    try {
+      await deliver({ ...plan }, { ...session });
+      return Boolean(this.learning.markFollowedUp(sessionId, followedUpAt));
+    } finally {
+      const remaining = (this.deliveringLearningCounts.get(planId) ?? 1) - 1;
+      if (remaining > 0) this.deliveringLearningCounts.set(planId, remaining);
+      else this.deliveringLearningCounts.delete(planId);
+    }
+  }
+
   async answerLearningSession(
     planId: string,
     actorId: string,
@@ -2311,22 +2758,18 @@ export class KnowledgeEngine implements Knowledge {
   private async executeDreamCycle(
     space: SpaceId,
     opts: DreamOptions,
-    fixedContext?: {
-      resolvedAgent?: Agent;
-      resolvedSkills?: ResolvedAgentSkills;
-    },
+    fixedContext?: SpaceAgentCallContext,
   ): Promise<DreamReport> {
+    if (!this.registry.has(space)) throw new Error(`unknown space: ${space}`);
     const health = this.dreamCycles.get(space) ?? { space, running: false };
     health.running = true;
     health.lastStartedAt = Date.now();
     this.dreamCycles.set(space, health);
     try {
       throwIfTaskRunAborted(opts.signal);
-      const store = this.registry.ensure(space);
-      const context = this.agentCallContext(space, {
+      const store = this.registry.store(space);
+      const context = fixedContext ?? this.agentCallContext(space, {
         signal: opts.signal,
-        resolvedAgent: fixedContext?.resolvedAgent,
-        resolvedSkills: fixedContext?.resolvedSkills,
       });
       const baseReport = await distillSpace(store, opts, {
         client: context.client,
@@ -2438,12 +2881,38 @@ export class KnowledgeEngine implements Knowledge {
       const index = store.index();
       const agent = meta.agentId ? this.agents.get(meta.agentId) : undefined;
       const tasks = this.tasks.list().filter((task) => task.space === space);
+      const taskRuns = this.taskRuns.list().filter((run) => run.space === space);
       const chatRuns = this.chatRuns.list(space);
-      if (tasks.some((task) => this.activeTaskRunId(task.id) !== undefined)) {
-        throw new Error(`space has running tasks: ${space}`);
+      const reminders = this.reminders.list().filter((reminder) => reminder.space === space);
+      const learning = this.learning.listBySpace(space);
+      if (taskRuns.some((run) =>
+        ["awaiting_approval", "queued", "running"].includes(run.status)
+        || run.retry?.status === "waiting"
+      )) {
+        throw new Error(`space has active task runs or waiting retries: ${space}`);
       }
       if (chatRuns.some((run) => run.status === "queued" || run.status === "running")) {
         throw new Error(`space has active chat runs: ${space}`);
+      }
+      if (chatRuns.some(isChatRunDeliveryInFlight)) {
+        throw new Error(`space has delivering chat responses: ${space}`);
+      }
+      if (taskRuns.some((run) =>
+        this.deliveringTaskRunNotifications.has(run.id)
+        || this.deliveringTaskRunApprovalNotifications.has(run.id)
+      )) {
+        throw new Error(`space has delivering task run notifications: ${space}`);
+      }
+      if (reminders.some(
+        (reminder) => (this.deliveringReminderCounts.get(reminder.id) ?? 0) > 0,
+      )) {
+        throw new Error(`space has delivering reminders: ${space}`);
+      }
+      if (learning.some((plan) => (this.deliveringLearningCounts.get(plan.id) ?? 0) > 0)) {
+        throw new Error(`space has delivering learning sessions: ${space}`);
+      }
+      if ((this.backgroundRunCounts.get(space) ?? 0) > 0) {
+        throw new Error(`space has queued or running background work: ${space}`);
       }
       const taskIds = new Set(tasks.map((task) => task.id));
       return {
@@ -2457,17 +2926,17 @@ export class KnowledgeEngine implements Knowledge {
               skills: agent.skills.map((binding) => ({ ...binding })),
             }
           : undefined,
+        agentRevisions: agent ? this.agents.listRevisions(agent.id) : [],
         purpose: store.purpose(),
         schema: store.schema(),
         pages: store.listPagesFromDisk(),
         raw: index.listRaw({}),
         retractions: index.listMessageRetractions(),
         tasks,
-        taskRuns: this.taskRuns.list().filter(
-          (run) => run.space === space && taskIds.has(run.taskId),
-        ),
+        taskRuns: taskRuns.filter((run) => taskIds.has(run.taskId)),
         chatRuns,
-        reminders: this.reminders.list().filter((reminder) => reminder.space === space),
+        quality: this.quality.exportArchive(chatRuns),
+        reminders,
         learning: this.learning.exportBySpace(space),
         governanceAudit: listKnowledgeGovernanceAudit(store),
       };
@@ -2500,9 +2969,49 @@ export class KnowledgeEngine implements Knowledge {
         throw new Error(`space already has learning data: ${space}`);
       }
       this.learning.assertCanRestore(archive.learning);
+      this.quality.assertCanRestoreArchive(archive.quality);
       const existingAgent = archive.agent ? this.agents.get(archive.agent.id) : undefined;
-      if (existingAgent && JSON.stringify(existingAgent) !== JSON.stringify(archive.agent)) {
+      const existingAgentRevisions = existingAgent
+        ? this.agents.listRevisions(existingAgent.id)
+        : [];
+      const existingAgentIsMaterializedLegacy = Boolean(
+        existingAgent
+        && isMaterializedLegacyAgentRevisionHistory(
+          existingAgent,
+          existingAgentRevisions,
+        ),
+      );
+      const archiveAgentIsMaterializedLegacy = Boolean(
+        archive.agent
+        && isMaterializedLegacyAgentRevisionHistory(
+          archive.agent,
+          archive.agentRevisions,
+        ),
+      );
+      const legacyCompatible = Boolean(
+        existingAgent
+        && archive.agent
+        && sameLegacyAgentSnapshot(existingAgent, archive.agent)
+        && (existingAgentIsMaterializedLegacy || archiveAgentIsMaterializedLegacy),
+      );
+      const upgradeMaterializedLegacyAgent = Boolean(
+        legacyCompatible
+        && existingAgentIsMaterializedLegacy
+        && !archiveAgentIsMaterializedLegacy,
+      );
+      const existingAgentMatches = existingAgent && archive.agent
+        ? legacyCompatible || JSON.stringify(existingAgent) === JSON.stringify(archive.agent)
+        : true;
+      if (existingAgent && !existingAgentMatches) {
         throw new Error(`agent id already exists with different data: ${archive.agent!.id}`);
+      }
+      if (
+        existingAgent
+        && archive.agentRevisions.length > 0
+        && JSON.stringify(existingAgentRevisions) !== JSON.stringify(archive.agentRevisions)
+        && !legacyCompatible
+      ) {
+        throw new Error(`agent id already exists with different revision history: ${existingAgent.id}`);
       }
       const taskIdsBefore = new Set(this.tasks.list().map((task) => task.id));
       const taskRunIdsBefore = new Set(this.taskRuns.list().map((run) => run.id));
@@ -2510,8 +3019,14 @@ export class KnowledgeEngine implements Knowledge {
       const reminderIdsBefore = new Set(this.reminders.list().map((reminder) => reminder.id));
       const agentWasPresent = Boolean(existingAgent);
       let learningRestored = false;
+      let qualityRestoreReceipt: QualityArchiveRestoreReceipt | undefined;
       try {
-        if (archive.agent) this.agents.restore(archive.agent);
+        if (archive.agent && !existingAgent) {
+          this.agents.restore(
+            archive.agent,
+            archive.agentRevisions.length > 0 ? archive.agentRevisions : undefined,
+          );
+        }
         const store = this.registry.ensure(space, { chatId: archive.space.chatId });
         store.setPurpose(archive.purpose);
         store.setSchema(archive.schema);
@@ -2525,11 +3040,18 @@ export class KnowledgeEngine implements Knowledge {
         this.reminders.restore(archive.reminders);
         this.learning.restore(archive.learning);
         learningRestored = archive.learning.plans.length > 0;
+        qualityRestoreReceipt = this.quality.restoreArchive(archive.quality);
         restoreKnowledgeGovernanceAudit(store, archive.governanceAudit);
         this.registry.restoreMeta({
           ...archive.space,
           agentId: archive.space.agentId,
         });
+        if (upgradeMaterializedLegacyAgent) {
+          this.agents.upgradeMaterializedLegacyRestore(
+            archive.agent!,
+            archive.agentRevisions,
+          );
+        }
       } catch (err) {
         for (const run of this.taskRuns.list()) {
           if (run.space === space && !taskRunIdsBefore.has(run.id)) this.taskRuns.remove(run.id);
@@ -2553,6 +3075,16 @@ export class KnowledgeEngine implements Knowledge {
           && !this.registry.list().some((meta) => meta.agentId === archive.agent!.id)
         ) {
           this.agents.remove(archive.agent.id);
+        }
+        if (qualityRestoreReceipt) {
+          try {
+            this.quality.rollbackArchiveRestore(qualityRestoreReceipt);
+          } catch (rollbackError) {
+            throw new Error(
+              `space restore failed and quality rollback also failed: ${String(rollbackError)}`,
+              { cause: err },
+            );
+          }
         }
         throw err;
       }
@@ -2578,11 +3110,23 @@ export class KnowledgeEngine implements Knowledge {
       const chatRuns = this.chatRuns.list(space);
       const reminders = this.reminders.list().filter((reminder) => reminder.space === space);
       const learning = this.learning.listBySpace(space);
-      if (tasks.some((task) => this.activeTaskRunId(task.id) !== undefined)) {
-        throw new Error(`space has running tasks: ${space}`);
+      if (taskRuns.some((run) =>
+        ["awaiting_approval", "queued", "running"].includes(run.status)
+        || run.retry?.status === "waiting"
+      )) {
+        throw new Error(`space has active task runs or waiting retries: ${space}`);
       }
       if (chatRuns.some((run) => run.status === "queued" || run.status === "running")) {
         throw new Error(`space has active chat runs: ${space}`);
+      }
+      if (chatRuns.some(isChatRunDeliveryInFlight)) {
+        throw new Error(`space has delivering chat responses: ${space}`);
+      }
+      if (taskRuns.some((run) =>
+        this.deliveringTaskRunNotifications.has(run.id)
+        || this.deliveringTaskRunApprovalNotifications.has(run.id)
+      )) {
+        throw new Error(`space has delivering task run notifications: ${space}`);
       }
       if (reminders.some(
         (reminder) => (this.deliveringReminderCounts.get(reminder.id) ?? 0) > 0,
@@ -2591,6 +3135,9 @@ export class KnowledgeEngine implements Knowledge {
       }
       if (learning.some((plan) => (this.deliveringLearningCounts.get(plan.id) ?? 0) > 0)) {
         throw new Error(`space has delivering learning sessions: ${space}`);
+      }
+      if ((this.backgroundRunCounts.get(space) ?? 0) > 0) {
+        throw new Error(`space has queued or running background work: ${space}`);
       }
       if (this.dreamCycles.get(space)?.running) {
         throw new Error(`space has a running dream cycle: ${space}`);
@@ -2721,8 +3268,59 @@ export class KnowledgeEngine implements Knowledge {
     return this.taskRuns.list(taskId);
   }
 
+  expireTaskRunApprovals(now = Date.now()): TaskRun[] {
+    const expired = this.taskRuns.expireApprovals(now);
+    for (const run of expired) {
+      this.tasks.setLastRun(run.taskId, {
+        at: run.finishedAt!,
+        status: "error",
+        error: run.error,
+      });
+    }
+    return expired;
+  }
+
   listTaskRunsNeedingNotification(now = Date.now()): TaskRun[] {
     return this.taskRuns.listNeedingNotification(now);
+  }
+
+  listTaskRunApprovalsNeedingNotification(now = Date.now()): TaskRun[] {
+    return this.taskRuns.listNeedingApprovalNotification(now);
+  }
+
+  async deliverTaskRunApprovalNotification(
+    runId: string,
+    deliver: TaskRunApprovalNotificationDelivery,
+    opts: DeliverTaskRunNotificationOptions = {},
+  ): Promise<TaskRun> {
+    const current = this.taskRuns.get(runId);
+    if (!current) throw new Error(`unknown task run: ${runId}`);
+    if (!current.approvalNotification) {
+      throw new Error(`task run has no pending approval notification: ${runId}`);
+    }
+    if (current.approvalNotification.status === "sent") return current;
+    if (this.deliveringTaskRunApprovalNotifications.has(runId)) {
+      throw new Error(`task run approval notification is already being delivered: ${runId}`);
+    }
+    const attemptedAt = opts.attemptedAt !== undefined
+      && Number.isFinite(opts.attemptedAt)
+      && opts.attemptedAt >= 0
+      ? Math.trunc(opts.attemptedAt)
+      : Date.now();
+    const attempting = this.taskRuns.startApprovalNotificationAttempt(runId, attemptedAt);
+    if (!attempting) {
+      throw new Error(`task run has no pending approval notification: ${runId}`);
+    }
+    this.deliveringTaskRunApprovalNotifications.add(runId);
+    try {
+      await deliver(attempting, `ha-appr-${runId}`);
+      return this.taskRuns.approvalNotificationSent(runId, attemptedAt) ?? attempting;
+    } catch (error) {
+      this.taskRuns.approvalNotificationFailed(runId, String(error));
+      throw error;
+    } finally {
+      this.deliveringTaskRunApprovalNotifications.delete(runId);
+    }
   }
 
   async deliverTaskRunNotification(
@@ -2766,6 +3364,29 @@ export class KnowledgeEngine implements Knowledge {
     return removed;
   }
 
+  updateTask(taskId: string, input: TaskInput): Task | undefined {
+    const current = this.tasks.get(taskId);
+    if (!current) return undefined;
+    const requestedSpace = input.space?.trim();
+    if (requestedSpace && requestedSpace !== current.space) {
+      if (!this.registry.has(requestedSpace as SpaceId)) {
+        throw new Error(`unknown space: ${requestedSpace}`);
+      }
+      if (this.taskRuns.list(taskId).length > 0) {
+        throw new Error(
+          "已有运行历史的任务不能更换空间；请在目标空间新建任务",
+        );
+      }
+    }
+    const updated = this.tasks.update(taskId, input);
+    if (updated && input.enabled === false) {
+      for (const run of this.taskRuns.list(taskId)) {
+        if (run.retry?.status === "waiting") this.taskRuns.exhaustRetry(run.id);
+      }
+    }
+    return updated;
+  }
+
   startTaskRun(taskId: string, opts: RunTaskOptions = {}): StartedTaskRun {
     const task = this.tasks.get(taskId);
     if (!task) throw new Error(`unknown task: ${taskId}`);
@@ -2781,11 +3402,28 @@ export class KnowledgeEngine implements Knowledge {
 
   cancelTaskRun(runId: string): boolean {
     const run = this.taskRuns.get(runId);
-    if (!run || !["queued", "running"].includes(run.status)) return false;
+    if (run?.status === "failed" && run.retry?.status === "waiting") {
+      return this.taskRuns.exhaustRetry(runId) !== undefined;
+    }
+    if (!run || !["awaiting_approval", "queued", "running"].includes(run.status)) return false;
+    if (run.status === "awaiting_approval") {
+      const cancelled = this.taskRuns.cancel(runId, {
+        finishedAt: Math.max(Date.now(), run.startedAt),
+        error: new TaskRunCancelledError().message,
+      });
+      if (cancelled?.finishedAt) {
+        this.tasks.setLastRun(cancelled.taskId, {
+          at: cancelled.finishedAt,
+          status: "error",
+          error: cancelled.error,
+        });
+      }
+      return cancelled?.status === "cancelled";
+    }
     if (run.status === "queued") {
       if (!this.runScheduler.cancel(runId)) return false;
       this.taskRuns.cancel(runId, {
-        finishedAt: Date.now(),
+        finishedAt: Math.max(Date.now(), run.startedAt),
         error: new TaskRunCancelledError().message,
       });
       return true;
@@ -2794,6 +3432,76 @@ export class KnowledgeEngine implements Knowledge {
     if (!controller) return false;
     controller.abort(new TaskRunCancelledError());
     return true;
+  }
+
+  approveTaskRun(runId: string, decidedBy: string): StartedTaskRun {
+    const pending = this.taskRuns.get(runId);
+    if (!pending) throw new Error(`unknown task run: ${runId}`);
+    if (pending.status !== "awaiting_approval") {
+      throw new Error(`task run is not awaiting approval: ${runId}`);
+    }
+    if (!pending.executionPlan) {
+      throw new Error(`task run has no immutable execution plan: ${runId}`);
+    }
+    const storedTask = this.tasks.get(pending.taskId);
+    if (!storedTask) throw new Error(`unknown task: ${pending.taskId}`);
+    const approved = this.taskRuns.approve(runId, {
+      decidedAt: Math.max(Date.now(), pending.approval?.requestedAt ?? pending.startedAt),
+      decidedBy,
+    });
+    if (!approved) {
+      const current = this.taskRuns.get(runId);
+      if (
+        current?.approval?.status === "expired"
+        && current.finishedAt !== undefined
+      ) {
+        this.tasks.setLastRun(current.taskId, {
+          at: current.finishedAt,
+          status: "error",
+          error: current.error,
+        });
+        throw new Error(`task run approval expired: ${runId}`);
+      }
+      throw new Error(`task run is not awaiting approval: ${runId}`);
+    }
+    const task: Task = {
+      ...storedTask,
+      name: approved.taskName,
+      space: approved.space,
+      topic: approved.topic,
+      notify: approved.notify ?? storedTask.notify,
+    };
+    return this.scheduleApprovedTaskRun(task, approved);
+  }
+
+  rejectTaskRun(runId: string, decidedBy: string, reason?: string): TaskRun {
+    const pending = this.taskRuns.get(runId);
+    if (!pending) throw new Error(`unknown task run: ${runId}`);
+    const rejected = this.taskRuns.reject(runId, {
+      decidedAt: Math.max(Date.now(), pending.approval?.requestedAt ?? pending.startedAt),
+      decidedBy,
+      reason,
+    });
+    if (!rejected) {
+      const current = this.taskRuns.get(runId);
+      if (current?.approval?.status === "expired" && current.finishedAt !== undefined) {
+        this.tasks.setLastRun(current.taskId, {
+          at: current.finishedAt,
+          status: "error",
+          error: current.error,
+        });
+        throw new Error(`task run approval expired: ${runId}`);
+      }
+      throw new Error(`task run is not awaiting approval: ${runId}`);
+    }
+    if (rejected.finishedAt) {
+      this.tasks.setLastRun(rejected.taskId, {
+        at: rejected.finishedAt,
+        status: "error",
+        error: rejected.error,
+      });
+    }
+    return rejected;
   }
 
   retryTaskRun(runId: string): StartedTaskRun {
@@ -2813,6 +3521,33 @@ export class KnowledgeEngine implements Knowledge {
     }, "retry", previous.distill, previous.id, task.timeoutMinutes * 60_000);
   }
 
+  /**
+   * Admit durable automatic retries whose backoff has elapsed. Each child is a
+   * fresh execution of the parent's frozen plan; no provider checkpoint exists.
+   */
+  retryDueTaskRuns(now = Date.now()): StartedTaskRun[] {
+    const scheduled: StartedTaskRun[] = [];
+    for (const parent of this.taskRuns.listDueRetries(now)) {
+      if (this.activeTaskRunId(parent.taskId)) continue;
+      const storedTask = this.tasks.get(parent.taskId);
+      if (!storedTask?.enabled) {
+        this.taskRuns.exhaustRetry(parent.id);
+        continue;
+      }
+      const child = this.taskRuns.claimRetry(parent.id, now);
+      if (!child) continue;
+      const task: Task = {
+        ...storedTask,
+        name: child.taskName,
+        space: child.space,
+        topic: child.topic,
+        notify: child.notify ?? storedTask.notify,
+      };
+      scheduled.push(this.scheduleApprovedTaskRun(task, child));
+    }
+    return scheduled;
+  }
+
   private launchTaskRun(
     task: Task,
     trigger: TaskRunTrigger,
@@ -2825,72 +3560,91 @@ export class KnowledgeEngine implements Knowledge {
     if (activeRunId) {
       throw new TaskAlreadyRunningError(taskId, activeRunId);
     }
-    let executionAgent: Agent | undefined;
-    let provider: ProviderId | undefined;
-    let model: string | undefined;
-    let client: LlmClient | undefined;
-    let resolvedSkills: ResolvedAgentSkills | undefined;
-    let skillEvidence: TaskRunSkillEvidence = {
-      requested: [],
-      resolved: [],
-      skipped: [],
-    };
-    let setupError: unknown;
-    const controller = new AbortController();
+    let snapshot: AgentRunExecutionSnapshot;
     try {
-      const configuredAgent = this.agentForSpace(task.space);
-      const cfg = config();
-      const selectedProvider = configuredAgent?.provider || cfg.defaultProvider;
-      const inheritedModel = !configuredAgent || configuredAgent.provider === cfg.defaultProvider
-        ? cfg.defaultModel
-        : "";
-      const selectedModel = configuredAgent?.model || inheritedModel || undefined;
-      model = selectedProvider === "codex" && selectedModel
-        ? canonicalModelId(selectedModel)
-        : selectedModel;
-      provider = isCliProvider(selectedProvider) ? selectedProvider : undefined;
-      executionAgent = configuredAgent
-        ? { ...configuredAgent, model: model ?? "" }
-        : undefined;
-      const context = this.agentCallContext(task.space, {
-        timeoutMs,
-        signal: controller.signal,
-        taskExecution: true,
-        resolvedAgent: executionAgent,
-      });
-      client = context.client;
-      resolvedSkills = context.skills;
-      skillEvidence = {
-        requested: context.skills.requested.map((item) => ({ ...item })),
-        resolved: context.skills.resolved.map((item) => ({ ...item })),
-        skipped: context.skills.skipped.map((item) => ({ ...item })),
-      };
+      snapshot = this.agentRunExecutionSnapshot(task.space, true);
     } catch (error) {
-      setupError = error;
+      const resolutionError = executionResolutionError(error);
+      snapshot = {
+        skillEvidence: { requested: [], resolved: [], skipped: [] },
+        executionPlan: {
+          version: 1,
+          instruction: "",
+          resolutionError,
+        },
+      };
     }
+    const approvalRequired = snapshot.executionPlan.execution !== undefined
+      && snapshot.executionPlan.execution.permission !== "read-only";
     const run = this.taskRuns.start({
       task,
       trigger,
-      agentId: executionAgent?.id,
-      provider,
-      model,
-      skillEvidence,
+      agentId: snapshot.agent?.id,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      executionPlan: snapshot.executionPlan,
+      skillEvidence: snapshot.skillEvidence,
       retryOf,
       distill,
       timeoutMs,
+      approvalRequired,
     });
+    if (run.status === "awaiting_approval") {
+      const completion = Promise.resolve<TaskReport>({
+        runId: run.id,
+        taskId: run.taskId,
+        space: run.space,
+        ok: false,
+        status: run.status,
+        error: "Task Run is awaiting human approval",
+        startedAt: run.startedAt,
+        // Compatibility: callers historically receive a completion Promise.
+        // `state` distinguishes this admission result from a terminal report.
+        finishedAt: run.startedAt,
+      });
+      return {
+        state: "awaiting_approval",
+        run,
+        completion,
+      };
+    }
+    const scheduled = this.scheduleApprovedTaskRun(task, run);
+    return scheduled;
+  }
+
+  private scheduleApprovedTaskRun(task: Task, run: TaskRun): StartedTaskRun {
+    if (!run.executionPlan) {
+      throw new Error(`task run has no immutable execution plan: ${run.id}`);
+    }
+    const timeoutMs = run.timeoutMs ?? task.timeoutMinutes * 60_000;
+    const controller = new AbortController();
+    let callContext: SpaceAgentCallContext | undefined;
+    let setupError: unknown;
+    try {
+      callContext = this.executionPlanCallContext(
+        task.space,
+        run.executionPlan,
+        run.skillEvidence,
+        {
+          timeoutMs,
+          signal: controller.signal,
+        },
+      );
+    } catch (error) {
+      setupError = error;
+    }
     const completion = this.scheduleTaskRun({
       task,
       run,
-      distill,
+      distill: run.distill,
       timeoutMs,
       controller,
-      executionAgent,
-      client,
-      resolvedSkills,
+      executionPlan: run.executionPlan,
+      callContext,
       setupError,
     });
     return {
+      state: "scheduled",
       run: this.taskRuns.get(run.id) ?? run,
       completion,
     };
@@ -2902,9 +3656,8 @@ export class KnowledgeEngine implements Knowledge {
     distill: boolean;
     timeoutMs: number;
     controller: AbortController;
-    executionAgent?: Agent;
-    client?: LlmClient;
-    resolvedSkills?: ResolvedAgentSkills;
+    executionPlan: ResolvedExecutionPlan;
+    callContext?: SpaceAgentCallContext;
     setupError?: unknown;
   }): Promise<TaskReport> {
     const {
@@ -2913,9 +3666,8 @@ export class KnowledgeEngine implements Knowledge {
       distill,
       timeoutMs,
       controller,
-      executionAgent,
-      client,
-      resolvedSkills,
+      executionPlan,
+      callContext,
       setupError,
     } = input;
     const taskId = task.id;
@@ -2943,9 +3695,8 @@ export class KnowledgeEngine implements Knowledge {
             running,
             distill,
             controller,
-            executionAgent,
-            client,
-            resolvedSkills,
+            executionPlan,
+            callContext,
             setupError,
           );
         } finally {
@@ -2973,6 +3724,16 @@ export class KnowledgeEngine implements Knowledge {
           });
         }
       }
+      if (
+        current?.finishedAt
+        && ["failed", "cancelled", "timed_out"].includes(current.status)
+      ) {
+        this.tasks.setLastRun(current.taskId, {
+          at: current.finishedAt,
+          status: "error",
+          error: current.error,
+        });
+      }
       const settled = current ?? this.taskRuns.get(run.id)!;
       return {
         runId: settled.id,
@@ -2992,6 +3753,27 @@ export class KnowledgeEngine implements Knowledge {
     });
   }
 
+  private finishQueuedTaskRun(
+    run: TaskRun,
+    rawError: string,
+    status: "failed" | "cancelled" | "timed_out" = "failed",
+  ): TaskRun | undefined {
+    const error = rawError.slice(0, MAX_TASK_RUN_ERROR_CHARACTERS);
+    const finishedAt = Math.max(Date.now(), run.startedAt);
+    const result = { finishedAt, error };
+    const finished = status === "timed_out"
+      ? this.taskRuns.timeout(run.id, result)
+      : status === "cancelled"
+        ? this.taskRuns.cancel(run.id, result)
+        : this.taskRuns.fail(run.id, result);
+    this.tasks.setLastRun(run.taskId, {
+      at: finishedAt,
+      status: "error",
+      error,
+    });
+    return finished;
+  }
+
   /** Re-enqueue durable Task Runs that had not started when the service stopped. */
   resumeQueuedTaskRuns(): StartedTaskRun[] {
     const resumed: StartedTaskRun[] = [];
@@ -2999,12 +3781,34 @@ export class KnowledgeEngine implements Knowledge {
       .filter((run) => run.status === "queued")
       .sort((a, b) => a.queuedAt - b.queuedAt || a.id.localeCompare(b.id));
     for (const run of queued) {
+      if (!run.executionPlan) {
+        this.finishQueuedTaskRun(
+          run,
+          "Queued Task Run has no immutable execution plan; refusing to use live Agent state.",
+        );
+        continue;
+      }
+      if (!run.executionPlan.execution && !run.executionPlan.resolutionError) {
+        this.finishQueuedTaskRun(
+          run,
+          "Queued Task Run execution plan has no task execution grant.",
+        );
+        continue;
+      }
+      if (
+        run.executionPlan.execution?.permission !== undefined
+        && run.executionPlan.execution.permission !== "read-only"
+        && run.approval?.status !== "approved"
+      ) {
+        this.finishQueuedTaskRun(
+          run,
+          "Queued writable Task Run has no durable approval; refusing to execute.",
+        );
+        continue;
+      }
       const storedTask = this.tasks.get(run.taskId);
       if (!storedTask) {
-        this.taskRuns.fail(run.id, {
-          finishedAt: Date.now(),
-          error: `Queued task no longer exists: ${run.taskId}`,
-        });
+        this.finishQueuedTaskRun(run, `Queued task no longer exists: ${run.taskId}`);
         continue;
       }
       const task: Task = {
@@ -3016,30 +3820,15 @@ export class KnowledgeEngine implements Knowledge {
       };
       const timeoutMs = run.timeoutMs ?? storedTask.timeoutMinutes * 60_000;
       const controller = new AbortController();
-      let executionAgent: Agent | undefined;
-      let client: LlmClient | undefined;
-      let resolvedSkills: ResolvedAgentSkills | undefined;
+      let callContext: SpaceAgentCallContext | undefined;
       let setupError: unknown;
       try {
-        const storedAgent = run.agentId ? this.agents.get(run.agentId) : undefined;
-        if (run.agentId && !storedAgent) {
-          throw new Error(`Queued run Agent no longer exists: ${run.agentId}`);
-        }
-        executionAgent = storedAgent
-          ? {
-              ...storedAgent,
-              provider: run.provider ?? storedAgent.provider,
-              model: run.model ?? storedAgent.model,
-            }
-          : undefined;
-        const context = this.agentCallContext(task.space, {
-          timeoutMs,
-          signal: controller.signal,
-          taskExecution: true,
-          resolvedAgent: executionAgent,
-        });
-        client = context.client;
-        resolvedSkills = context.skills;
+        callContext = this.executionPlanCallContext(
+          task.space,
+          run.executionPlan,
+          run.skillEvidence,
+          { timeoutMs, signal: controller.signal },
+        );
       } catch (error) {
         setupError = error;
       }
@@ -3049,12 +3838,12 @@ export class KnowledgeEngine implements Knowledge {
         distill: run.distill,
         timeoutMs,
         controller,
-        executionAgent,
-        client,
-        resolvedSkills,
+        executionPlan: run.executionPlan,
+        callContext,
         setupError,
       });
       resumed.push({
+        state: "scheduled",
         run: this.taskRuns.get(run.id) ?? run,
         completion,
       });
@@ -3076,27 +3865,38 @@ export class KnowledgeEngine implements Knowledge {
     run: TaskRun,
     distill: boolean,
     controller: AbortController,
-    resolvedAgent?: Agent,
-    resolvedClient?: LlmClient,
-    resolvedSkills?: ResolvedAgentSkills,
+    executionPlan: ResolvedExecutionPlan,
+    callContext?: SpaceAgentCallContext,
     setupError?: unknown,
   ): Promise<TaskReport> {
     const startedAt = run.startedAt;
+    const usage = new RunUsageAccumulator();
+    const observedCallContext = callContext
+      ? {
+          ...callContext,
+          client: observeLlmUsage(callContext.client, (item) => usage.record(item)),
+        }
+      : undefined;
     let output: string | undefined;
     let rawId: string | undefined;
+    let failurePhase: TaskRunFailure["phase"] = "admission";
     try {
       if (setupError) throw setupError;
       this.registry.ensure(task.space);
-      const agent = resolvedAgent;
       // The LLM call runs OUTSIDE the per-space serializer — research is
       // long-running and must not block captures/distillation. Only the write
       // (remember) is serialized, and it acquires the lock itself.
-      if (!resolvedClient) throw new Error("task Agent context is unavailable");
+      if (!observedCallContext) throw new Error("task execution plan context is unavailable");
+      this.validatedSkillsFromEvidence(executionPlan, run.skillEvidence);
+      // Re-resolve last, immediately before the provider call, so an approval
+      // cannot be replayed against a replaced symlink/junction or file.
+      this.validateFrozenExecutionWorkdir(executionPlan.execution);
+      failurePhase = "provider";
       const res = await awaitTaskRunStep(
-        resolvedClient.complete({
-          system: agent?.instruction || undefined,
+        observedCallContext.client.complete({
+          system: executionPlan.instruction || undefined,
           prompt: researchPrompt(task.topic),
-          model: agent?.model || undefined,
+          model: executionPlan.model,
           purpose: "distill",
           space: task.space,
         }),
@@ -3106,6 +3906,7 @@ export class KnowledgeEngine implements Knowledge {
       const text = res.text.trim();
       if (!text) throw new Error("task produced empty output");
       output = text;
+      failurePhase = "capture";
       throwIfTaskRunAborted(controller.signal);
       rawId = await this.remember({
         space: task.space,
@@ -3125,10 +3926,7 @@ export class KnowledgeEngine implements Knowledge {
             async () => this.executeDreamCycle(
               task.space,
               { signal: controller.signal },
-              {
-                resolvedAgent: agent,
-                resolvedSkills,
-              },
+              observedCallContext,
             ),
           );
           throwIfTaskRunAborted(controller.signal);
@@ -3147,6 +3945,7 @@ export class KnowledgeEngine implements Knowledge {
         summary,
         rawId,
         pagesWritten,
+        usage: usage.snapshot(),
       });
       log.info("task run ok", { runId: run.id, taskId: task.id, space: task.space, rawId, pagesWritten });
       return {
@@ -3168,13 +3967,53 @@ export class KnowledgeEngine implements Knowledge {
       const error = (timedOut || cancelled ? abortReason.message : String(err))
         .slice(0, MAX_TASK_RUN_ERROR_CHARACTERS);
       const finishedAt = Math.max(Date.now(), startedAt);
+      const failure: TaskRunFailure = timedOut
+        ? { phase: failurePhase, kind: "timeout", retryable: false }
+        : cancelled
+          ? { phase: failurePhase, kind: "cancelled", retryable: false }
+          : classifyTaskRunFailure(err, failurePhase);
+      const attempt = run.retry?.attempt ?? 1;
+      const retry = !timedOut
+        && !cancelled
+        && run.executionPlan?.execution?.permission === "read-only"
+        && (run.trigger === "scheduled" || run.retry !== undefined)
+        && failure.phase === "provider"
+        && failure.retryable
+        && output === undefined
+        && rawId === undefined
+        && attempt < MAX_AUTOMATIC_TASK_RUN_ATTEMPTS
+        ? {
+            attempt,
+            maxAttempts: MAX_AUTOMATIC_TASK_RUN_ATTEMPTS,
+            status: "waiting" as const,
+            nextAttemptAt: finishedAt + AUTOMATIC_TASK_RUN_RETRY_DELAY_MS,
+          }
+        : !timedOut
+          && !cancelled
+          && run.retry
+          && attempt >= MAX_AUTOMATIC_TASK_RUN_ATTEMPTS
+          ? {
+              attempt,
+              maxAttempts: MAX_AUTOMATIC_TASK_RUN_ATTEMPTS,
+              status: "exhausted" as const,
+            }
+          : undefined;
+      const terminal = {
+        finishedAt,
+        error,
+        output,
+        rawId,
+        failure,
+        retry,
+        usage: usage.snapshot(),
+      };
       this.tasks.setLastRun(task.id, { at: finishedAt, status: "error", error });
       if (timedOut) {
-        this.taskRuns.timeout(run.id, { finishedAt, error, output, rawId });
+        this.taskRuns.timeout(run.id, terminal);
       } else if (cancelled) {
-        this.taskRuns.cancel(run.id, { finishedAt, error, output, rawId });
+        this.taskRuns.cancel(run.id, terminal);
       } else {
-        this.taskRuns.fail(run.id, { finishedAt, error, output, rawId });
+        this.taskRuns.fail(run.id, terminal);
       }
       log.error("task run failed", { runId: run.id, taskId: task.id, space: task.space, err: error });
       return {
@@ -3203,11 +4042,79 @@ export class KnowledgeEngine implements Knowledge {
     const context = primary
       ? this.agentCallContext(primary, { signal: opts.signal })
       : this.agentCallContext(spaces[0]!, { signal: opts.signal });
-    const client = context.client;
+    const snapshot = primary ? this.agentRunExecutionSnapshot(primary) : undefined;
+    return this.executeAsk(
+      stores,
+      spaces,
+      question,
+      opts,
+      context,
+      snapshot
+        ? answerTraceExecution(
+            snapshot.executionPlan,
+            snapshot.skillEvidence,
+            snapshot.agent?.id,
+          )
+        : undefined,
+    );
+  }
+
+  /** Execute a durable Chat Run using only the configuration captured at enqueue time. */
+  async askWithExecutionPlan(
+    spaces: SpaceId[],
+    question: string,
+    executionPlan: ResolvedExecutionPlan,
+    skillEvidence?: TaskRunSkillEvidence,
+    opts: AskOptions = {},
+    traceAgentId?: string,
+  ): Promise<AskResult> {
+    if (executionPlan.execution !== undefined) {
+      throw new Error("Chat execution plan must not grant ProviderExecution");
+    }
+    const stores = spaces.filter((space) => this.registry.has(space))
+      .map((space) => this.registry.store(space));
+    const primary = spaces[0] ?? stores[0]?.space;
+    if (!primary) throw new Error("Chat Run requires at least one space");
+    const context = this.executionPlanCallContext(
+      primary,
+      executionPlan,
+      skillEvidence,
+      { signal: opts.signal },
+    );
+    return this.executeAsk(
+      stores,
+      spaces,
+      question,
+      {
+        ...opts,
+        model: executionPlan.model,
+        instruction: executionPlan.instruction || undefined,
+      },
+      context,
+      answerTraceExecution(executionPlan, skillEvidence, traceAgentId),
+    );
+  }
+
+  private async executeAsk(
+    stores: Parameters<typeof askImpl>[0],
+    spaces: SpaceId[],
+    question: string,
+    opts: AskOptions,
+    context: SpaceAgentCallContext,
+    traceExecution?: AnswerTraceExecution,
+  ): Promise<AskResult> {
+    const usage = new RunUsageAccumulator();
+    const client = observeLlmUsage(context.client, (item) => usage.record(item));
     const skillWarnings = skillWarningViews(context.skills);
     const startedAt = Date.now();
+    let retrievalPages: AnswerTraceRetrievalPage[] = [];
     try {
-      const asking = askImpl(stores, question, opts, { client });
+      const asking = askImpl(stores, question, opts, {
+        client,
+        onRetrieval: (evidence) => {
+          retrievalPages = evidence.pages.map((page) => ({ ...page }));
+        },
+      });
       const result = opts.signal
         ? await awaitTaskRunStep(asking, opts.signal)
         : await asking;
@@ -3219,6 +4126,9 @@ export class KnowledgeEngine implements Knowledge {
           source: result.source,
           answer: result.answer,
           citations: result.citations,
+          execution: traceExecution,
+          retrievalPages,
+          usage: usage.snapshot(),
           latencyMs: Date.now() - startedAt,
           createdAt: startedAt,
         });
@@ -3237,14 +4147,21 @@ export class KnowledgeEngine implements Knowledge {
     } catch (err) {
       try {
         const message = String(err);
-        this.quality.recordTrace({
+        const trace = this.quality.recordTrace({
           spaces,
           question,
           outcome: isProviderTimeoutError(err) ? "timed_out" : "failed",
           citations: [],
+          execution: traceExecution,
+          retrievalPages,
+          usage: usage.snapshot(),
           latencyMs: Date.now() - startedAt,
           error: message,
           createdAt: startedAt,
+        });
+        opts.onFailureTrace?.({
+          traceId: trace.id,
+          usage: trace.usage,
         });
       } catch (traceError) {
         log.warn("failed answer quality trace persistence failed", { err: String(traceError) });
@@ -3290,8 +4207,62 @@ export class KnowledgeEngine implements Knowledge {
     return this.quality.evaluationCases();
   }
 
+  /**
+   * Re-evaluate a completed Chat Run with its immutable Agent execution plan.
+   * This deliberately creates only a candidate quality trace: it does not
+   * create or deliver a Chat Run and does not capture another raw message.
+   */
+  async rerunChatRunForEvaluation(chatRunId: string): Promise<QualityRerun> {
+    const sourceRun = this.chatRuns.get(chatRunId);
+    if (!sourceRun) throw new Error(`unknown chat run: ${chatRunId}`);
+    if (
+      sourceRun.status !== "succeeded"
+      || !sourceRun.traceId
+      || !sourceRun.executionPlan
+    ) {
+      throw new Error(`chat run is not eligible for evaluation rerun: ${chatRunId}`);
+    }
+    const sourceTrace = this.quality.trace(sourceRun.traceId);
+    if (!sourceTrace) {
+      throw new Error(`chat run source trace is unavailable: ${sourceRun.traceId}`);
+    }
+    const audit = this.quality.startRerun({
+      sourceChatRunId: sourceRun.id,
+      sourceTraceId: sourceRun.traceId,
+    });
+    if (!audit) throw new Error(`could not start evaluation rerun: ${chatRunId}`);
+    try {
+      const missingSourceSpaces = sourceTrace.spaces.filter(
+        (space) => !this.registry.has(space),
+      );
+      if (missingSourceSpaces.length > 0) {
+        throw new Error(
+          `evaluation source trace spaces are unavailable (${missingSourceSpaces.length})`,
+        );
+      }
+      const candidate = await this.askWithExecutionPlan(
+        sourceTrace.spaces,
+        sourceTrace.question,
+        sourceRun.executionPlan,
+        sourceRun.skillEvidence,
+        {},
+        sourceRun.agentId,
+      );
+      if (!candidate.traceId) {
+        throw new Error("evaluation rerun did not produce a durable candidate trace");
+      }
+      const completed = this.quality.completeRerun(audit.id, candidate.traceId);
+      if (!completed) throw new Error("evaluation rerun audit could not be completed");
+      return completed;
+    } catch (error) {
+      this.quality.failRerun(audit.id, String(error));
+      throw error;
+    }
+  }
+
   async search(spaces: SpaceId[], keyword: string, opts: SearchOptions = {}): Promise<Hit[]> {
-    const limit = opts.limit ?? 10;
+    const limit = normalizeSearchLimit(opts.limit ?? 10);
+    if (limit === 0) return [];
     const hits: Hit[] = [];
     for (const space of spaces) {
       if (!this.registry.has(space)) continue;

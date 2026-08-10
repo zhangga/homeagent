@@ -10,6 +10,7 @@ import type { OrchestratorHealth } from "@homeagent/orchestrator";
 import {
   detectProviders as detectLocalProviders,
   isCliProvider,
+  providerSupportsNoToolsCompletion,
   type DetectedProvider,
 } from "@homeagent/llm";
 import type { RuntimeLoopHealth } from "./scheduler.ts";
@@ -27,6 +28,8 @@ export interface SystemHealthSources {
   serviceHealth?: () => RuntimeServiceStatus;
   detectProviders?: () => Promise<DetectedProvider[]>;
   requiredProviderIds?: () => string[];
+  ordinaryProviderId?: () => string;
+  ordinaryProviderIds?: () => string[];
   now?: () => number;
   providerProbeTtlMs?: number;
 }
@@ -228,15 +231,40 @@ export function createSystemHealthReporter(
       providerErrors.push(`CLI 探测：${String(err)}`);
     }
     let required: string[] = [];
+    let ordinaryProvider: string | undefined;
+    const ordinaryProviders = new Set<string>();
     try {
       required = [...new Set(requiredProviderIds())].sort();
     } catch (err) {
       providerErrors.push(`必需 CLI 配置：${String(err)}`);
     }
+    if (sources.ordinaryProviderId) {
+      try {
+        ordinaryProvider = sources.ordinaryProviderId();
+        ordinaryProviders.add(ordinaryProvider);
+        required = [...new Set([...required, ordinaryProvider])].sort();
+      } catch (err) {
+        providerErrors.push(`普通对话 CLI 配置：${String(err)}`);
+      }
+    }
+    if (sources.ordinaryProviderIds) {
+      try {
+        for (const provider of sources.ordinaryProviderIds()) {
+          if (provider) ordinaryProviders.add(provider);
+        }
+        required = [...new Set([...required, ...ordinaryProviders])].sort();
+      } catch (err) {
+        providerErrors.push(`空间普通对话 CLI 配置：${String(err)}`);
+      }
+    }
     const detectedById = new Map<string, DetectedProvider>(
       detected.map((provider) => [provider.id, provider]),
     );
     const unavailable = required.filter((id) => !detectedById.get(id)?.available);
+    const ordinaryProviderList = [...ordinaryProviders].sort();
+    const noToolsUnsupported = ordinaryProviderList.filter(
+      (provider) => !providerSupportsNoToolsCompletion(provider),
+    );
     const providerRuns =
       (core.details?.providerRuns as Array<Record<string, unknown>> | undefined) ?? [];
     const latestRuntimeFailures = providerRuns.filter(
@@ -246,7 +274,11 @@ export function createSystemHealthReporter(
       (run) => required.includes(String(run.provider)) && run.lastStatus === "timeout",
     );
     const providerReady =
-      providerErrors.length === 0 && required.length > 0 && unavailable.length === 0 && latestRuntimeFailures.length === 0;
+      providerErrors.length === 0
+      && required.length > 0
+      && unavailable.length === 0
+      && noToolsUnsupported.length === 0
+      && latestRuntimeFailures.length === 0;
     components.providers = {
       status: providerReady ? latestRuntimeTimeouts.length > 0 ? "degraded" : "ok" : "down",
       summary: providerReady
@@ -257,11 +289,17 @@ export function createSystemHealthReporter(
           ? "CLI 状态检查失败"
           : unavailable.length > 0
             ? `CLI 不可用：${unavailable.join("、")}`
-            : latestRuntimeFailures.length > 0
-              ? `CLI 最近执行失败：${latestRuntimeFailures.map((run) => run.provider).join("、")}`
-              : "未配置可用 CLI",
+            : noToolsUnsupported.length > 0
+              ? `普通对话 CLI 不支持 no-tools：${noToolsUnsupported.join("、")}`
+              : latestRuntimeFailures.length > 0
+                ? `CLI 最近执行失败：${latestRuntimeFailures.map((run) => run.provider).join("、")}`
+                : "未配置可用 CLI",
       details: {
         required,
+        ...(ordinaryProvider ? { ordinaryProvider } : {}),
+        ordinaryProviders: ordinaryProviderList,
+        unavailable,
+        noToolsUnsupported,
         detected,
         providerRuns,
         ...(providerErrors.length > 0 ? { errors: providerErrors } : {}),

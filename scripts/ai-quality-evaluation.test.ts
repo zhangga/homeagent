@@ -28,10 +28,14 @@ describe("AI quality evaluation", () => {
       "proactive",
       "learning",
     ]);
-    expect(report.recommendation.decision).toBe("improve_fts_retrieval");
-    expect(report.recommendation.reasons.join(" ")).toContain("aliases/tags");
-    expect(report.recommendation.reasons.join(" ")).toContain("查询改写");
-    expect(report.recommendation.reasons.join(" ")).not.toMatch(/embedding|hybrid/iu);
+    expect(
+      report.categories
+        .find((item) => item.category === "retrieval")
+        ?.cases.find((item) => item.id === "incident-contact-alias")
+        ?.checks.ftsCovered,
+    ).toBe(true);
+    expect(report.retrieval.ftsCoverage).toBe(1);
+    expect(report.recommendation.decision).toBe("keep_fts");
   });
 
   test("recommends FTS-native improvements only when FTS coverage is the bottleneck", () => {
@@ -42,6 +46,9 @@ describe("AI quality evaluation", () => {
       ftsCoverage: 0.75,
     });
     expect(retrievalGap.decision).toBe("improve_fts_retrieval");
+    expect(retrievalGap.reasons.join(" ")).toContain("aliases/tags");
+    expect(retrievalGap.reasons.join(" ")).toContain("大目录有界路由");
+    expect(retrievalGap.reasons.join(" ")).not.toContain("查询改写");
     expect(retrievalGap.reasons.join(" ")).not.toMatch(/embedding|hybrid/iu);
     expect(recommendRetrieval({
       caseCount: 8,
@@ -77,5 +84,24 @@ describe("AI quality evaluation", () => {
       rate: 0.75,
     });
     expect(report.generatedAt).toBe(1000);
+  });
+
+  test("fails the release gate when FTS coverage is below the fixed threshold", () => {
+    const categories = [
+      passingCategory("retrieval"),
+      passingCategory("routing"),
+      passingCategory("proactive"),
+      passingCategory("learning"),
+    ];
+
+    const report = buildQualityEvaluationReport(categories, {
+      caseCount: 4,
+      pipelineAccuracy: 1,
+      citationAccuracy: 1,
+      ftsCoverage: 0.75,
+    }, 1000);
+
+    expect(report.overall.passed).toBe(false);
+    expect(report.recommendation.decision).toBe("improve_fts_retrieval");
   });
 });

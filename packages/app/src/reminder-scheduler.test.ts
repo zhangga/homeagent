@@ -85,6 +85,63 @@ describe("ReminderScheduler", () => {
     }));
   });
 
+  test("retries a post-send commit with the same occurrence idempotency key", async () => {
+    const reminder = engine.reminders.create({
+      title: "提交失败重试",
+      space: SPACE,
+      chatId: "oc_reminder_scheduler",
+      creatorId: "ou_me",
+      triggerAt: NOW,
+    }, NOW)!;
+    const persistNotified = engine.reminders.markNotified.bind(engine.reminders);
+    let commitAttempts = 0;
+    engine.reminders.markNotified = (...args) => {
+      commitAttempts += 1;
+      return commitAttempts === 1 ? undefined : persistNotified(...args);
+    };
+    const attemptedKeys: string[] = [];
+    const acceptedKeys = new Set<string>();
+    let physicalDeliveries = 0;
+    const scheduler = new ReminderScheduler(engine, {
+      notify: async (_item, _message, deliveryKey: string) => {
+        attemptedKeys.push(deliveryKey);
+        if (acceptedKeys.has(deliveryKey)) return;
+        acceptedKeys.add(deliveryKey);
+        physicalDeliveries += 1;
+      },
+    });
+
+    expect(await scheduler.tick("post-send-commit-empty", new Date(NOW))).toEqual([]);
+    expect(await scheduler.tick("retry", new Date(NOW + 1))).toEqual([reminder.id]);
+    expect(attemptedKeys).toEqual([expect.any(String), attemptedKeys[0]]);
+    expect(attemptedKeys[0]).toMatch(/^ha-reminder-/);
+    expect(physicalDeliveries).toBe(1);
+  });
+
+  test("uses a distinct reminder idempotency key for each repeating occurrence", async () => {
+    engine.reminders.create({
+      title: "重复提醒键",
+      space: SPACE,
+      chatId: "oc_reminder_scheduler",
+      creatorId: "ou_me",
+      triggerAt: NOW,
+      repeatEveryMs: 60_000,
+      untilConfirmed: true,
+    }, NOW);
+    const keys: string[] = [];
+    const scheduler = new ReminderScheduler(engine, {
+      notify: async (_item, _message, deliveryKey: string) => {
+        keys.push(deliveryKey);
+      },
+    });
+
+    await scheduler.tick("first occurrence", new Date(NOW));
+    await scheduler.tick("second occurrence", new Date(NOW + 60_000));
+
+    expect(keys).toEqual([expect.any(String), expect.any(String)]);
+    expect(keys[0]).not.toBe(keys[1]);
+  });
+
   test("prevents deleting a space while one of its reminders is being delivered", async () => {
     engine.reminders.create({
       title: "并发投递",
@@ -106,6 +163,7 @@ describe("ReminderScheduler", () => {
 
     const tick = scheduler.tick("test", new Date(NOW));
     await started;
+    await expect(engine.exportSpace(SPACE)).rejects.toThrow("space has delivering reminders");
     await expect(engine.deleteSpace(SPACE)).rejects.toThrow("space has delivering reminders");
     releaseDelivery();
     await tick;

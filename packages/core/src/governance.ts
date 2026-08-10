@@ -13,13 +13,17 @@ import {
   isCodexReasoningEffortSupported,
   normalizeProviderSkills,
 } from "@homeagent/llm";
-import type { Agent, AgentSkillBinding } from "./agents.ts";
+import type { Agent, AgentRevision, AgentSkillBinding } from "./agents.ts";
 import {
   AGENT_PERMISSIONS,
   AGENT_VISIBILITIES,
+  MAX_AGENT_REVISION_HISTORY,
   agentVisibleInSpace,
+  assertAgentRevisionHistory,
   isAgentSkillName,
   isAgentSkillSourceKey,
+  isAgentRevision,
+  materializeLegacyAgentRevisionHistory,
 } from "./agents.ts";
 import {
   DEFAULT_TASK_TIMEOUT_MINUTES,
@@ -32,15 +36,32 @@ import {
   MAX_TASK_RUN_ERROR_CHARACTERS,
   MAX_TASK_RUN_HISTORY_PER_TASK,
   MAX_TASK_RUN_OUTPUT_CHARACTERS,
+  MAX_TASK_RUN_APPROVER_CHARACTERS,
+  LEGACY_TASK_RUN_APPROVAL_ACTOR,
+  LEGACY_TASK_RUN_APPROVAL_REASON,
+  TASK_RUN_APPROVAL_EXPIRY_ACTOR,
+  TASK_RUN_APPROVAL_EXPIRY_REASON,
+  isTaskRunFailure,
+  isTaskRunRetry,
   isTaskRunSkillEvidence,
   type TaskRun,
+  type TaskRunApproval,
   type TaskRunNotification,
 } from "./task-runs.ts";
+import {
+  cloneAggregatedRunUsage,
+  isAggregatedRunUsage,
+} from "./usage.ts";
 import {
   MAX_CHAT_RUN_HISTORY_PER_AGENT,
   isChatRun,
   type ChatRun,
 } from "./chat-runs.ts";
+import {
+  cloneResolvedExecutionPlan,
+  isResolvedExecutionPlan,
+  type ResolvedExecutionPlan,
+} from "./execution-plan.ts";
 import type { Reminder } from "./reminders.ts";
 import type {
   LearningArchive,
@@ -60,6 +81,10 @@ import {
   parseKnowledgeGovernanceAuditRecord,
   type KnowledgeGovernanceAuditRecord,
 } from "./knowledge-governance.ts";
+import {
+  parseQualityArchive,
+  type QualityArchive,
+} from "./quality.ts";
 
 export const SPACE_ARCHIVE_FORMAT = "homeagent.space" as const;
 export const LEGACY_SPACE_ARCHIVE_FORMAT = "homebrain.space" as const;
@@ -72,7 +97,12 @@ export const TASK_EXECUTION_SPACE_ARCHIVE_VERSION = 6 as const;
 export const AGENT_SKILL_BINDINGS_SPACE_ARCHIVE_VERSION = 7 as const;
 export const CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION = 8 as const;
 export const RUN_QUEUE_SPACE_ARCHIVE_VERSION = 9 as const;
-export const SPACE_ARCHIVE_VERSION = RUN_QUEUE_SPACE_ARCHIVE_VERSION;
+export const RUN_EXECUTION_PLAN_SPACE_ARCHIVE_VERSION = 10 as const;
+export const AGENT_LIFECYCLE_APPROVAL_SPACE_ARCHIVE_VERSION = 11 as const;
+export const TASK_APPROVAL_EXPIRY_SPACE_ARCHIVE_VERSION = 12 as const;
+export const TASK_RUN_RESILIENCE_SPACE_ARCHIVE_VERSION = 13 as const;
+export const CHAT_QUALITY_TRACE_SPACE_ARCHIVE_VERSION = 14 as const;
+export const SPACE_ARCHIVE_VERSION = CHAT_QUALITY_TRACE_SPACE_ARCHIVE_VERSION;
 
 export interface MessageRetractionRecord {
   chatId: string;
@@ -134,8 +164,30 @@ export interface SpaceArchiveV9 extends Omit<SpaceArchiveV8, "version"> {
   version: typeof RUN_QUEUE_SPACE_ARCHIVE_VERSION;
 }
 
+export interface SpaceArchiveV10 extends Omit<SpaceArchiveV9, "version"> {
+  version: typeof RUN_EXECUTION_PLAN_SPACE_ARCHIVE_VERSION;
+}
+
+export interface SpaceArchiveV11 extends Omit<SpaceArchiveV10, "version"> {
+  version: typeof AGENT_LIFECYCLE_APPROVAL_SPACE_ARCHIVE_VERSION;
+  agentRevisions: AgentRevision[];
+}
+
+export interface SpaceArchiveV12 extends Omit<SpaceArchiveV11, "version"> {
+  version: typeof TASK_APPROVAL_EXPIRY_SPACE_ARCHIVE_VERSION;
+}
+
+export interface SpaceArchiveV13 extends Omit<SpaceArchiveV12, "version"> {
+  version: typeof TASK_RUN_RESILIENCE_SPACE_ARCHIVE_VERSION;
+}
+
+export interface SpaceArchiveV14 extends Omit<SpaceArchiveV13, "version"> {
+  version: typeof CHAT_QUALITY_TRACE_SPACE_ARCHIVE_VERSION;
+  quality: QualityArchive;
+}
+
 /** Current normalized archive shape returned by export and parsing. */
-export type SpaceArchive = SpaceArchiveV9;
+export type SpaceArchive = SpaceArchiveV14;
 
 export interface SpaceDeleteResult {
   status: "deleted" | "not_found";
@@ -333,6 +385,10 @@ function parseAgent(
     workdir: optionalText(item.workdir, "agent.workdir"),
     permission,
     skills: parseAgentSkills(item.skills, version),
+    publishedRevisionId: optionalText(
+      item.publishedRevisionId,
+      "agent.publishedRevisionId",
+    ),
     createdAt: finiteNumber(item.createdAt, "agent.createdAt"),
     updatedAt: finiteNumber(item.updatedAt, "agent.updatedAt"),
   };
@@ -369,6 +425,39 @@ function parseAgentSkills(value: unknown, version: number): AgentSkillBinding[] 
     "agent Skill binding",
   );
   return bindings;
+}
+
+function parseAgentRevisions(
+  value: unknown,
+  agent: Agent | undefined,
+  version: number,
+): AgentRevision[] {
+  if (version < AGENT_LIFECYCLE_APPROVAL_SPACE_ARCHIVE_VERSION) return [];
+  if (!Array.isArray(value)) throw new Error("agentRevisions must be an array");
+  if (value.length > MAX_AGENT_REVISION_HISTORY) {
+    throw new Error(`agentRevisions exceeds ${MAX_AGENT_REVISION_HISTORY} revisions`);
+  }
+  if (!agent) {
+    if (value.length > 0) throw new Error("agentRevisions requires agent");
+    return [];
+  }
+  if (!agent.publishedRevisionId || value.length === 0) {
+    throw new Error("agent published revision history is missing");
+  }
+  const history = value.map((entry, index): AgentRevision => {
+    if (!isAgentRevision(entry, agent)) {
+      throw new Error(`agentRevisions[${index}] is invalid`);
+    }
+    return {
+      ...entry,
+      snapshot: {
+        ...entry.snapshot,
+        skills: entry.snapshot.skills.map((binding) => ({ ...binding })),
+      },
+    };
+  });
+  assertAgentRevisionHistory(agent, history, "agentRevisions");
+  return history;
 }
 
 function parseTask(value: unknown, index: number, space: SpaceId, version: number): Task {
@@ -418,22 +507,24 @@ function parseTask(value: unknown, index: number, space: SpaceId, version: numbe
 function parseTaskRunNotification(
   value: unknown,
   index: number,
+  field: "notification" | "approvalNotification" = "notification",
 ): TaskRunNotification | undefined {
   if (value === undefined) return undefined;
-  const item = record(value, `taskRuns[${index}].notification`);
+  const label = `taskRuns[${index}].${field}`;
+  const item = record(value, label);
   const status = text(
     item.status,
-    `taskRuns[${index}].notification.status`,
+    `${label}.status`,
   ) as TaskRunNotification["status"];
   if (!["pending", "sent", "failed"].includes(status)) {
-    throw new Error(`taskRuns[${index}].notification.status is invalid`);
+    throw new Error(`${label}.status is invalid`);
   }
   const attempts = finiteNumber(
     item.attempts,
-    `taskRuns[${index}].notification.attempts`,
+    `${label}.attempts`,
   );
   if (!Number.isInteger(attempts) || attempts < 0) {
-    throw new Error(`taskRuns[${index}].notification.attempts is invalid`);
+    throw new Error(`${label}.attempts is invalid`);
   }
   const notification: TaskRunNotification = {
     status,
@@ -441,37 +532,141 @@ function parseTaskRunNotification(
     ...(item.lastAttemptAt === undefined ? {} : {
       lastAttemptAt: finiteNumber(
         item.lastAttemptAt,
-        `taskRuns[${index}].notification.lastAttemptAt`,
+        `${label}.lastAttemptAt`,
       ),
     }),
     ...(item.nextAttemptAt === undefined ? {} : {
       nextAttemptAt: finiteNumber(
         item.nextAttemptAt,
-        `taskRuns[${index}].notification.nextAttemptAt`,
+        `${label}.nextAttemptAt`,
       ),
     }),
     ...(item.sentAt === undefined ? {} : {
-      sentAt: finiteNumber(item.sentAt, `taskRuns[${index}].notification.sentAt`),
+      sentAt: finiteNumber(item.sentAt, `${label}.sentAt`),
     }),
     ...(item.error === undefined ? {} : {
-      error: text(item.error, `taskRuns[${index}].notification.error`),
+      error: text(item.error, `${label}.error`),
     }),
   };
   if (status === "sent" && notification.sentAt === undefined) {
-    throw new Error(`taskRuns[${index}].notification.sentAt is required`);
+    throw new Error(`${label}.sentAt is required`);
   }
   if (status === "failed" && !notification.error) {
-    throw new Error(`taskRuns[${index}].notification.error is required`);
+    throw new Error(`${label}.error is required`);
   }
   if (
     notification.error
     && notification.error.length > MAX_TASK_RUN_ERROR_CHARACTERS
   ) {
     throw new Error(
-      `taskRuns[${index}].notification.error exceeds ${MAX_TASK_RUN_ERROR_CHARACTERS} characters`,
+      `${label}.error exceeds ${MAX_TASK_RUN_ERROR_CHARACTERS} characters`,
     );
   }
   return notification;
+}
+
+function parseTaskRunApproval(
+  value: unknown,
+  index: number,
+  version: number,
+): TaskRunApproval | undefined {
+  if (
+    version < AGENT_LIFECYCLE_APPROVAL_SPACE_ARCHIVE_VERSION
+    || value === undefined
+  ) {
+    return undefined;
+  }
+  const item = record(value, `taskRuns[${index}].approval`);
+  const status = text(
+    item.status,
+    `taskRuns[${index}].approval.status`,
+  ) as TaskRunApproval["status"];
+  if (
+    status !== "approved"
+    && status !== "rejected"
+    && status !== "legacy"
+    && !(
+      version >= TASK_APPROVAL_EXPIRY_SPACE_ARCHIVE_VERSION
+      && status === "expired"
+    )
+  ) {
+    throw new Error(`taskRuns[${index}].approval.status is invalid`);
+  }
+  const requestedAt = finiteNumber(
+    item.requestedAt,
+    `taskRuns[${index}].approval.requestedAt`,
+  );
+  if (requestedAt < 0) {
+    throw new Error(`taskRuns[${index}].approval.requestedAt is invalid`);
+  }
+  const expiresAt = item.expiresAt === undefined
+    ? undefined
+    : finiteNumber(item.expiresAt, `taskRuns[${index}].approval.expiresAt`);
+  if (expiresAt !== undefined && expiresAt <= requestedAt) {
+    throw new Error(`taskRuns[${index}].approval.expiresAt is invalid`);
+  }
+  const decidedAt = finiteNumber(
+    item.decidedAt,
+    `taskRuns[${index}].approval.decidedAt`,
+  );
+  if (decidedAt < requestedAt) {
+    throw new Error(`taskRuns[${index}].approval timestamps are invalid`);
+  }
+  if (status === "approved" && expiresAt !== undefined && decidedAt >= expiresAt) {
+    throw new Error(`taskRuns[${index}].approval was decided after expiry`);
+  }
+  const decidedBy = optionalText(
+    item.decidedBy,
+    `taskRuns[${index}].approval.decidedBy`,
+  );
+  if (
+    decidedBy !== undefined
+    && (decidedBy.length === 0 || decidedBy.length > MAX_TASK_RUN_APPROVER_CHARACTERS)
+  ) {
+    throw new Error(`taskRuns[${index}].approval.decidedBy is too long`);
+  }
+  const reason = optionalText(item.reason, `taskRuns[${index}].approval.reason`);
+  if (reason && reason.length > MAX_TASK_RUN_ERROR_CHARACTERS) {
+    throw new Error(`taskRuns[${index}].approval.reason is too long`);
+  }
+  if (
+    status === "legacy"
+    && (
+      decidedBy !== LEGACY_TASK_RUN_APPROVAL_ACTOR
+      || reason !== LEGACY_TASK_RUN_APPROVAL_REASON
+    )
+  ) {
+    throw new Error(`taskRuns[${index}].legacy approval audit is invalid`);
+  }
+  if (
+    status === "expired"
+    && (
+      expiresAt === undefined
+      || decidedAt !== expiresAt
+      || decidedBy !== TASK_RUN_APPROVAL_EXPIRY_ACTOR
+      || reason !== TASK_RUN_APPROVAL_EXPIRY_REASON
+    )
+  ) {
+    throw new Error(`taskRuns[${index}].expired approval audit is invalid`);
+  }
+  return { status, requestedAt, expiresAt, decidedAt, decidedBy, reason };
+}
+
+function parseRunExecutionPlan(
+  value: unknown,
+  label: string,
+  version: number,
+): ResolvedExecutionPlan | undefined {
+  if (
+    version < RUN_EXECUTION_PLAN_SPACE_ARCHIVE_VERSION
+    || value === undefined
+  ) {
+    return undefined;
+  }
+  if (!isResolvedExecutionPlan(value)) {
+    throw new Error(`${label} is invalid`);
+  }
+  return cloneResolvedExecutionPlan(value);
 }
 
 function parseTaskRun(
@@ -567,6 +762,10 @@ function parseTaskRun(
   if (notification && notify === false) {
     throw new Error(`taskRuns[${index}].notification conflicts with notify=false`);
   }
+  const rawId = optionalText(item.rawId, `taskRuns[${index}].rawId`);
+  const approvalNotification = version < TASK_APPROVAL_EXPIRY_SPACE_ARCHIVE_VERSION
+    ? undefined
+    : parseTaskRunNotification(item.approvalNotification, index, "approvalNotification");
   const provider = optionalText(item.provider, `taskRuns[${index}].provider`);
   if (provider !== undefined && !isCliProvider(provider)) {
     throw new Error(`taskRuns[${index}].provider is invalid`);
@@ -584,6 +783,128 @@ function parseTaskRun(
           skipped: item.skillEvidence.skipped.map((entry) => ({ ...entry })),
         };
       })();
+  const executionPlan = parseRunExecutionPlan(
+    item.executionPlan,
+    `taskRuns[${index}].executionPlan`,
+    version,
+  );
+  if (
+    executionPlan !== undefined
+    && executionPlan.execution === undefined
+    && executionPlan.resolutionError === undefined
+  ) {
+    throw new Error(`taskRuns[${index}].executionPlan is invalid`);
+  }
+  const parsedApproval = parseTaskRunApproval(item.approval, index, version);
+  const writableExecution = executionPlan?.execution?.permission !== undefined
+    && executionPlan.execution.permission !== "read-only";
+  const approval = parsedApproval ?? (
+    version < AGENT_LIFECYCLE_APPROVAL_SPACE_ARCHIVE_VERSION
+    && writableExecution
+      ? {
+          status: "legacy" as const,
+          requestedAt: startedAt,
+          decidedAt: finishedAt,
+          decidedBy: LEGACY_TASK_RUN_APPROVAL_ACTOR,
+          reason: LEGACY_TASK_RUN_APPROVAL_REASON,
+        }
+      : undefined
+  );
+  if (approval?.status === "rejected" && status !== "cancelled") {
+    throw new Error(`taskRuns[${index}].rejected approval requires cancelled status`);
+  }
+  if (approval?.status === "expired" && status !== "cancelled") {
+    throw new Error(`taskRuns[${index}].expired approval requires cancelled status`);
+  }
+  if (approval?.status === "expired" && approval.decidedAt !== finishedAt) {
+    throw new Error(`taskRuns[${index}].expired approval must match finishedAt`);
+  }
+  if (approvalNotification && approval === undefined) {
+    throw new Error(`taskRuns[${index}].approvalNotification requires approval`);
+  }
+  if (
+    approval?.status === "approved"
+    && runStartedAt !== undefined
+    && approval.decidedAt! > runStartedAt
+  ) {
+    throw new Error(`taskRuns[${index}] started before approval`);
+  }
+  if (
+    approval?.status === "approved"
+    && approval.decidedAt! > finishedAt
+  ) {
+    throw new Error(`taskRuns[${index}] finished before approval`);
+  }
+  if (
+    approval?.status === "legacy"
+    && approval.decidedAt !== finishedAt
+  ) {
+    throw new Error(`taskRuns[${index}].legacy approval must match finishedAt`);
+  }
+  if (
+    version >= AGENT_LIFECYCLE_APPROVAL_SPACE_ARCHIVE_VERSION
+    && writableExecution
+    && approval === undefined
+  ) {
+    throw new Error(`taskRuns[${index}].approval is required for writable execution`);
+  }
+  const failure = version < TASK_RUN_RESILIENCE_SPACE_ARCHIVE_VERSION
+    || item.failure === undefined
+    ? undefined
+    : (() => {
+        if (!isTaskRunFailure(item.failure)) {
+          throw new Error(`taskRuns[${index}].failure is invalid`);
+        }
+        return { ...item.failure };
+      })();
+  const retry = version < TASK_RUN_RESILIENCE_SPACE_ARCHIVE_VERSION
+    || item.retry === undefined
+    ? undefined
+    : (() => {
+        if (!isTaskRunRetry(item.retry)) {
+          throw new Error(`taskRuns[${index}].retry is invalid`);
+        }
+        if (item.retry.status === "waiting") {
+          throw new Error(`taskRuns[${index}].retry cannot restore waiting execution`);
+        }
+        return { ...item.retry };
+      })();
+  const usage = version < TASK_RUN_RESILIENCE_SPACE_ARCHIVE_VERSION
+    || item.usage === undefined
+    ? undefined
+    : (() => {
+        if (!isAggregatedRunUsage(item.usage)) {
+          throw new Error(`taskRuns[${index}].usage is invalid`);
+        }
+        return cloneAggregatedRunUsage(item.usage);
+      })();
+  if (failure !== undefined && status === "succeeded") {
+    throw new Error(`taskRuns[${index}].failure conflicts with succeeded status`);
+  }
+  if (retry?.status === "exhausted" && status !== "failed") {
+    throw new Error(`taskRuns[${index}].retry exhausted requires failed status`);
+  }
+  if (
+    retry !== undefined
+    && (
+      executionPlan?.execution?.permission !== "read-only"
+      || (trigger !== "scheduled" && trigger !== "retry")
+    )
+  ) {
+    throw new Error(`taskRuns[${index}].retry is not eligible for automatic execution`);
+  }
+  if (
+    retry?.claimedByRunId !== undefined
+    && (
+      status !== "failed"
+      || failure?.phase !== "provider"
+      || !failure.retryable
+      || output !== undefined
+      || rawId !== undefined
+    )
+  ) {
+    throw new Error(`taskRuns[${index}].retry claim audit is invalid`);
+  }
   return {
     id: nonemptyText(item.id, `taskRuns[${index}].id`),
     taskId,
@@ -594,6 +915,7 @@ function parseTaskRun(
     agentId: optionalText(item.agentId, `taskRuns[${index}].agentId`),
     provider,
     model: optionalText(item.model, `taskRuns[${index}].model`),
+    executionPlan,
     skillEvidence,
     retryOf: optionalText(item.retryOf, `taskRuns[${index}].retryOf`),
     distill: boolean(item.distill, `taskRuns[${index}].distill`),
@@ -601,6 +923,8 @@ function parseTaskRun(
     timeoutMs,
     priority,
     status,
+    approval,
+    approvalNotification,
     queuedAt,
     startedAt,
     runStartedAt,
@@ -609,7 +933,10 @@ function parseTaskRun(
     outputTruncated,
     summary: optionalText(item.summary, `taskRuns[${index}].summary`),
     error,
-    rawId: optionalText(item.rawId, `taskRuns[${index}].rawId`),
+    failure,
+    retry,
+    usage,
+    rawId,
     pagesWritten,
     notification,
   };
@@ -622,14 +949,24 @@ function parseChatRun(
   version: number,
 ): ChatRun {
   const legacy = record(value, `chatRuns[${index}]`);
-  const normalized = version < RUN_QUEUE_SPACE_ARCHIVE_VERSION
-    ? {
-        ...legacy,
-        priority: "interactive",
-        queuedAt: legacy.startedAt,
-        runStartedAt: legacy.startedAt,
-      }
-    : legacy;
+  const normalized = {
+    ...legacy,
+    ...(version < RUN_QUEUE_SPACE_ARCHIVE_VERSION
+      ? {
+          priority: "interactive",
+          queuedAt: legacy.startedAt,
+          runStartedAt: legacy.startedAt,
+        }
+      : {}),
+    executionPlan: parseRunExecutionPlan(
+      legacy.executionPlan,
+      `chatRuns[${index}].executionPlan`,
+      version,
+    ),
+    usage: version < TASK_RUN_RESILIENCE_SPACE_ARCHIVE_VERSION
+      ? undefined
+      : legacy.usage,
+  };
   if (!isChatRun(normalized)) throw new Error(`chatRuns[${index}] is invalid`);
   if (normalized.space !== space) {
     throw new Error(`chatRuns[${index}].space does not match archive space`);
@@ -651,6 +988,9 @@ function parseChatRun(
     provider: normalized.provider,
     model: normalized.model,
     reasoningEffort: normalized.reasoningEffort,
+    executionPlan: normalized.executionPlan
+      ? cloneResolvedExecutionPlan(normalized.executionPlan)
+      : undefined,
     skillEvidence: normalized.skillEvidence
       ? {
           requested: normalized.skillEvidence.requested.map((item) => ({ ...item })),
@@ -671,7 +1011,12 @@ function parseChatRun(
     finishedAt: normalized.finishedAt,
     output: normalized.output,
     outputTruncated: normalized.outputTruncated,
-    traceId: normalized.traceId,
+    traceId: version < CHAT_QUALITY_TRACE_SPACE_ARCHIVE_VERSION
+      ? undefined
+      : normalized.traceId,
+    usage: normalized.usage
+      ? cloneAggregatedRunUsage(normalized.usage)
+      : undefined,
     error: normalized.error ? { ...normalized.error } : undefined,
   };
 }
@@ -1229,6 +1574,11 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       && version !== AGENT_SKILL_BINDINGS_SPACE_ARCHIVE_VERSION
       && version !== CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION
       && version !== RUN_QUEUE_SPACE_ARCHIVE_VERSION
+      && version !== RUN_EXECUTION_PLAN_SPACE_ARCHIVE_VERSION
+      && version !== AGENT_LIFECYCLE_APPROVAL_SPACE_ARCHIVE_VERSION
+      && version !== TASK_APPROVAL_EXPIRY_SPACE_ARCHIVE_VERSION
+      && version !== TASK_RUN_RESILIENCE_SPACE_ARCHIVE_VERSION
+      && version !== CHAT_QUALITY_TRACE_SPACE_ARCHIVE_VERSION
     )
   ) {
     throw new Error("unsupported space archive format or version");
@@ -1272,19 +1622,30 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       version >= CHAT_RUN_HISTORY_SPACE_ARCHIVE_VERSION
       && !Array.isArray(root.chatRuns)
     )
+    || (
+      version >= AGENT_LIFECYCLE_APPROVAL_SPACE_ARCHIVE_VERSION
+      && !Array.isArray(root.agentRevisions)
+    )
   ) {
     throw new Error("archive collections must be arrays");
   }
   const defaultVisibility = space.id.startsWith("personal/") ? "Personal" : "Team";
-  const agent = root.agent === undefined
+  const parsedAgent = root.agent === undefined
     ? undefined
     : parseAgent(root.agent, defaultVisibility, version);
-  if (agent && agent.id !== space.agentId) {
+  if (parsedAgent && parsedAgent.id !== space.agentId) {
     throw new Error("agent.id does not match space.agentId");
   }
-  if (agent && !agentVisibleInSpace(agent, space.id)) {
+  if (parsedAgent && !agentVisibleInSpace(parsedAgent, space.id)) {
     throw new Error("agent.visibility does not match archive space");
   }
+  const legacyAgentHistory = parsedAgent
+    && version < AGENT_LIFECYCLE_APPROVAL_SPACE_ARCHIVE_VERSION
+    ? materializeLegacyAgentRevisionHistory(parsedAgent)
+    : undefined;
+  const agent = legacyAgentHistory?.agent ?? parsedAgent;
+  const agentRevisions = legacyAgentHistory?.revisions
+    ?? parseAgentRevisions(root.agentRevisions, agent, version);
   const pages = root.pages.map(parsePage);
   const raw = root.raw.map((item, index) => parseRaw(item, index, id));
   const retractions = root.retractions.map((value, index) => {
@@ -1349,6 +1710,36 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
   assertUnique(taskRuns, (run) => run.id, "task run id");
   assertUnique(chatRuns, (run) => run.id, "chat run id");
   assertUnique(reminders, (reminder) => reminder.id, "reminder id");
+  const quality = version < CHAT_QUALITY_TRACE_SPACE_ARCHIVE_VERSION
+    ? { traces: [], reruns: [] }
+    : parseQualityArchive(root.quality);
+  const traceById = new Map(quality.traces.map((trace) => [trace.id, trace]));
+  const directTraceIds = new Set<string>();
+  const chatRunById = new Map(chatRuns.map((run) => [run.id, run]));
+  for (const run of chatRuns) {
+    if (!run.traceId) continue;
+    const trace = traceById.get(run.traceId);
+    if (!trace) {
+      throw new Error(`chat run trace is missing from quality archive: ${run.id}`);
+    }
+    if (!trace.spaces.includes(run.space)) {
+      throw new Error(`chat run trace does not include its archive space: ${run.id}`);
+    }
+    directTraceIds.add(run.traceId);
+  }
+  const candidateTraceIds = new Set<string>();
+  for (const rerun of quality.reruns) {
+    const sourceRun = chatRunById.get(rerun.sourceChatRunId);
+    if (!sourceRun || sourceRun.traceId !== rerun.sourceTraceId) {
+      throw new Error(`quality rerun does not match an archived chat run: ${rerun.id}`);
+    }
+    if (rerun.candidateTraceId) candidateTraceIds.add(rerun.candidateTraceId);
+  }
+  for (const trace of quality.traces) {
+    if (!directTraceIds.has(trace.id) && !candidateTraceIds.has(trace.id)) {
+      throw new Error(`quality archive contains an unrelated trace: ${trace.id}`);
+    }
+  }
   const learning = parseLearningArchive(root.learning, version, id);
   const governanceAudit = version < KNOWLEDGE_GOVERNANCE_SPACE_ARCHIVE_VERSION
     ? []
@@ -1362,6 +1753,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
     exportedAt: finiteNumber(root.exportedAt, "exportedAt"),
     space,
     agent,
+    agentRevisions,
     purpose: text(root.purpose, "purpose"),
     schema: text(root.schema, "schema"),
     pages,
@@ -1370,6 +1762,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
     tasks,
     taskRuns,
     chatRuns,
+    quality,
     reminders,
     learning,
     governanceAudit,

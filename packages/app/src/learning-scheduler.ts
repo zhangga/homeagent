@@ -1,10 +1,11 @@
 /** Daily guided-learning delivery with startup catch-up and retry-safe state. */
+import { createHash } from "node:crypto";
 import { logger, type SkillWarningView } from "@homeagent/shared";
 import type {
   KnowledgeEngine,
-  LearningDelivery,
   LearningPlan,
   LearningSession,
+  LearningSource,
 } from "@homeagent/core";
 import { formatSkillWarnings } from "@homeagent/orchestrator";
 import { dayKey, localHour, type RuntimeLoopHealth } from "./scheduler.ts";
@@ -19,12 +20,37 @@ export const DEFAULT_LEARNING_SCHEDULE: LearningScheduleConfig = {
   tickMs: 15 * 60 * 1000,
 };
 
-export type LearningNotify = LearningDelivery;
+export type LearningNotify = (
+  plan: LearningPlan,
+  source: LearningSource,
+  session: LearningSession,
+  skillWarnings: SkillWarningView[] | undefined,
+  idempotencyKey: string,
+) => void | Promise<void>;
 export type LearningFollowUpNotify = (
   plan: LearningPlan,
   session: LearningSession,
   message: string,
+  idempotencyKey: string,
 ) => void | Promise<void>;
+
+function learningDeliveryKey(prefix: "lesson" | "follow", identity: string): string {
+  const digest = createHash("sha256").update(identity).digest("hex").slice(0, 32);
+  return `ha-${prefix}-${digest}`;
+}
+
+export function learningLessonIdempotencyKey(session: LearningSession): string {
+  return learningDeliveryKey("lesson", session.id);
+}
+
+export function learningFollowUpIdempotencyKey(
+  session: LearningSession,
+): string {
+  return learningDeliveryKey(
+    "follow",
+    `${session.id}\0${(session.followUpCount ?? 0) + 1}`,
+  );
+}
 
 export function shouldRunLearningPlan(
   plan: LearningPlan,
@@ -163,13 +189,18 @@ export class LearningScheduler {
         if (shouldFollowUpLearningPlan(plan, current, now)) {
           try {
             if (!this.followUp) throw new Error("learning follow-up transport is unavailable");
-            await this.followUp(
-              plan,
-              current!,
-              learningFollowUpNotification(plan, current!),
+            const advanced = await this.engine.deliverLearningFollowUp(
+              plan.id,
+              current!.id,
+              now.getTime(),
+              async (currentPlan, currentSession) => this.followUp!(
+                currentPlan,
+                currentSession,
+                learningFollowUpNotification(currentPlan, currentSession),
+                learningFollowUpIdempotencyKey(currentSession),
+              ),
             );
-            this.engine.learning.markFollowedUp(current!.id, now.getTime());
-            delivered.push(`follow-up:${plan.id}`);
+            if (advanced) delivered.push(`follow-up:${plan.id}`);
           } catch (error) {
             errors.push(`follow-up ${plan.id}: ${String(error)}`);
             log.error("scheduled learning follow-up failed", {
@@ -187,11 +218,17 @@ export class LearningScheduler {
             () => this.engine.deliverLearningSession(
               plan.id,
               now.getTime(),
-              async (currentPlan, source, session) => {
+              async (currentPlan, source, session, skillWarnings) => {
                 if (!this.notify) {
                   throw new Error("learning notification transport is unavailable");
                 }
-                await this.notify(currentPlan, source, session);
+                await this.notify(
+                  currentPlan,
+                  source,
+                  session,
+                  skillWarnings,
+                  learningLessonIdempotencyKey(session),
+                );
               },
             ),
           );

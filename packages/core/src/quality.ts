@@ -14,8 +14,14 @@ import {
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import type { ProviderId } from "@homeagent/llm";
 import { isSpaceId, type Citation, type SpaceId } from "@homeagent/shared";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
+import {
+  cloneAggregatedRunUsage,
+  isAggregatedRunUsage,
+  type AggregatedRunUsage,
+} from "./usage.ts";
 
 export type AnswerOutcome = "succeeded" | "failed" | "timed_out";
 export const ANSWER_FEEDBACK_KINDS = [
@@ -30,6 +36,27 @@ export const NEGATIVE_ANSWER_FEEDBACK_KINDS = [
 ] as const;
 export type NegativeAnswerFeedbackKind = (typeof NEGATIVE_ANSWER_FEEDBACK_KINDS)[number];
 
+export interface AnswerTraceSkill {
+  sourceKey: string;
+  skillFileHash: string;
+}
+
+export interface AnswerTraceExecution {
+  agentId?: string;
+  agentRevisionId?: string;
+  provider?: ProviderId;
+  model?: string;
+  promptVersion: "ask-v1";
+  instructionHash: string;
+  skills: AnswerTraceSkill[];
+}
+
+export interface AnswerTraceRetrievalPage {
+  space: SpaceId;
+  slug: string;
+  contentHash: string;
+}
+
 export interface AnswerTrace {
   id: string;
   spaces: SpaceId[];
@@ -38,6 +65,9 @@ export interface AnswerTrace {
   source?: "knowledge" | "general";
   answer?: string;
   citations: Citation[];
+  execution?: AnswerTraceExecution;
+  retrievalPages?: AnswerTraceRetrievalPage[];
+  usage?: AggregatedRunUsage;
   latencyMs: number;
   error?: string;
   createdAt: number;
@@ -50,6 +80,9 @@ export interface AnswerTraceInput {
   source?: "knowledge" | "general";
   answer?: string;
   citations: Citation[];
+  execution?: AnswerTraceExecution;
+  retrievalPages?: AnswerTraceRetrievalPage[];
+  usage?: AggregatedRunUsage;
   latencyMs: number;
   error?: string;
   createdAt?: number;
@@ -80,6 +113,46 @@ export interface QualityEvaluationCase {
   feedbackNote?: string;
   curatorNote: string;
   createdAt: number;
+}
+
+export type QualityRerunStatus = "running" | "completed" | "failed";
+
+/**
+ * Audit record for re-evaluating a durable Chat Run. This is intentionally a
+ * rerun, not a deterministic replay: the frozen Agent plan is reused while the
+ * knowledge base, provider service, and local environment may have changed.
+ */
+export interface QualityRerun {
+  id: string;
+  sourceChatRunId: string;
+  sourceTraceId: string;
+  candidateTraceId?: string;
+  status: QualityRerunStatus;
+  createdAt: number;
+  completedAt?: number;
+  error?: string;
+}
+
+/** Bounded quality evidence embedded in a portable space archive. */
+export interface QualityArchive {
+  traces: AnswerTrace[];
+  reruns: QualityRerun[];
+}
+
+export interface QualityArchiveChatRun {
+  id: string;
+  traceId?: string;
+}
+
+export interface QualityArchiveRestoreReceipt {
+  traceIds: string[];
+  rerunIds: string[];
+}
+
+export interface StartQualityRerunInput {
+  sourceChatRunId: string;
+  sourceTraceId: string;
+  createdAt?: number;
 }
 
 export interface AnswerFeedbackReview {
@@ -116,18 +189,25 @@ export interface QualitySnapshot {
 }
 
 interface QualityFile {
+  version: 1;
   traces: AnswerTrace[];
   feedback: AnswerFeedback[];
   evaluationCases: QualityEvaluationCase[];
+  reruns: QualityRerun[];
 }
 
 const MAX_TRACES = 1000;
 const MAX_FEEDBACK = 2000;
 const MAX_EVALUATION_CASES = 1000;
+const MAX_RERUNS = 1000;
 const MAX_QUESTION_LENGTH = 4000;
 const MAX_ANSWER_LENGTH = 12_000;
 const MAX_ERROR_LENGTH = 1000;
 const MAX_NOTE_LENGTH = 1000;
+const MAX_ARCHIVE_SPACES = 50;
+const MAX_ARCHIVE_CITATIONS = 100;
+const MAX_ARCHIVE_TEXT_LENGTH = 500;
+const MAX_ARCHIVE_SPACE_ID_LENGTH = 600;
 const FEEDBACK_KINDS = new Set<AnswerFeedbackKind>(ANSWER_FEEDBACK_KINDS);
 const NEGATIVE_FEEDBACK_KINDS = new Set<AnswerFeedbackKind>(NEGATIVE_ANSWER_FEEDBACK_KINDS);
 
@@ -154,7 +234,56 @@ function validCitation(value: unknown): value is Citation {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const citation = value as Partial<Citation>;
   return typeof citation.slug === "string" && citation.slug.length > 0
-    && typeof citation.title === "string" && citation.title.length > 0;
+    && typeof citation.title === "string" && citation.title.length > 0
+    && (citation.space === undefined || (
+      typeof citation.space === "string" && isSpaceId(citation.space)
+    ));
+}
+
+function validTraceExecution(value: unknown): value is AnswerTraceExecution {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Partial<AnswerTraceExecution>;
+  return (item.agentId === undefined || (
+    typeof item.agentId === "string" && item.agentId.length > 0 && item.agentId.length <= 200
+  ))
+    && (item.agentRevisionId === undefined || (
+      typeof item.agentRevisionId === "string"
+      && item.agentRevisionId.length > 0
+      && item.agentRevisionId.length <= 200
+    ))
+    && (item.provider === undefined
+      || ["gateway", "claude", "codex", "trae-cli"].includes(item.provider))
+    && (item.model === undefined || (
+      typeof item.model === "string" && item.model.length > 0 && item.model.length <= 200
+    ))
+    && item.promptVersion === "ask-v1"
+    && typeof item.instructionHash === "string"
+    && /^[0-9a-f]{64}$/u.test(item.instructionHash)
+    && Array.isArray(item.skills)
+    && item.skills.length <= 50
+    && item.skills.every((skill) => (
+      !!skill
+      && typeof skill === "object"
+      && !Array.isArray(skill)
+      && typeof skill.sourceKey === "string"
+      && skill.sourceKey.length > 0
+      && skill.sourceKey.length <= 600
+      && typeof skill.skillFileHash === "string"
+      && /^[0-9a-f]{64}$/u.test(skill.skillFileHash)
+    ));
+}
+
+function validTraceRetrievalPage(value: unknown): value is AnswerTraceRetrievalPage {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Partial<AnswerTraceRetrievalPage>;
+  return typeof item.space === "string"
+    && isSpaceId(item.space)
+    && typeof item.slug === "string"
+    && item.slug.length > 0
+    && item.slug.length <= 500
+    && typeof item.contentHash === "string"
+    && item.contentHash.length > 0
+    && item.contentHash.length <= 200;
 }
 
 function validTrace(value: unknown): value is AnswerTrace {
@@ -170,6 +299,16 @@ function validTrace(value: unknown): value is AnswerTrace {
     && (trace.answer === undefined || typeof trace.answer === "string")
     && Array.isArray(trace.citations)
     && trace.citations.every(validCitation)
+    && trace.citations.every((citation) => (
+      citation.space === undefined || trace.spaces?.includes(citation.space) === true
+    ))
+    && (trace.execution === undefined || validTraceExecution(trace.execution))
+    && (trace.retrievalPages === undefined || (
+      Array.isArray(trace.retrievalPages)
+      && trace.retrievalPages.length <= 50
+      && trace.retrievalPages.every(validTraceRetrievalPage)
+    ))
+    && (trace.usage === undefined || isAggregatedRunUsage(trace.usage))
     && finiteNonNegative(trace.latencyMs)
     && (trace.error === undefined || typeof trace.error === "string")
     && finiteNonNegative(trace.createdAt);
@@ -218,11 +357,113 @@ function validEvaluationCase(value: unknown): value is QualityEvaluationCase {
     && finiteNonNegative(item.createdAt);
 }
 
+function validRerun(value: unknown): value is QualityRerun {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Partial<QualityRerun>;
+  const terminal = item.status === "completed" || item.status === "failed";
+  return typeof item.id === "string" && item.id.length > 0 && item.id.length <= 200
+    && typeof item.sourceChatRunId === "string"
+    && item.sourceChatRunId.length > 0
+    && item.sourceChatRunId.length <= 200
+    && typeof item.sourceTraceId === "string"
+    && item.sourceTraceId.length > 0
+    && item.sourceTraceId.length <= 200
+    && (item.candidateTraceId === undefined || (
+      typeof item.candidateTraceId === "string"
+      && item.candidateTraceId.length > 0
+      && item.candidateTraceId.length <= 200
+    ))
+    && ["running", "completed", "failed"].includes(String(item.status))
+    && finiteNonNegative(item.createdAt)
+    && (item.completedAt === undefined || (
+      finiteNonNegative(item.completedAt)
+      && item.completedAt >= item.createdAt
+    ))
+    && (item.error === undefined || (
+      typeof item.error === "string"
+      && item.error.length > 0
+      && item.error.length <= MAX_ERROR_LENGTH
+    ))
+    && (terminal ? item.completedAt !== undefined : item.completedAt === undefined)
+    && (item.status === "completed"
+      ? item.candidateTraceId !== undefined && item.error === undefined
+      : item.candidateTraceId === undefined)
+    && (item.status === "failed" ? item.error !== undefined : item.error === undefined);
+}
+
+function validArchiveTrace(value: unknown): value is AnswerTrace {
+  if (!validTrace(value)) return false;
+  return value.id.length <= 200
+    && value.spaces.length <= MAX_ARCHIVE_SPACES
+    && new Set(value.spaces).size === value.spaces.length
+    && value.spaces.every((space) => space.length <= MAX_ARCHIVE_SPACE_ID_LENGTH)
+    && value.question.length <= MAX_QUESTION_LENGTH
+    && (value.answer === undefined || value.answer.length <= MAX_ANSWER_LENGTH)
+    && value.citations.length <= MAX_ARCHIVE_CITATIONS
+    && value.citations.every((citation) => (
+      citation.slug.length <= MAX_ARCHIVE_TEXT_LENGTH
+      && citation.title.length <= MAX_ARCHIVE_TEXT_LENGTH
+      && (citation.space === undefined || citation.space.length <= MAX_ARCHIVE_SPACE_ID_LENGTH)
+    ))
+    && (value.error === undefined || value.error.length <= MAX_ERROR_LENGTH);
+}
+
+/** Strictly validate untrusted quality evidence before any durable restore write. */
+export function parseQualityArchive(value: unknown): QualityArchive {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("quality archive must be an object");
+  }
+  const root = value as Partial<QualityArchive>;
+  if (!Array.isArray(root.traces) || !Array.isArray(root.reruns)) {
+    throw new Error("quality archive collections must be arrays");
+  }
+  if (root.traces.length > MAX_TRACES) {
+    throw new Error(`quality archive exceeds ${MAX_TRACES} traces`);
+  }
+  if (root.reruns.length > MAX_RERUNS) {
+    throw new Error(`quality archive exceeds ${MAX_RERUNS} reruns`);
+  }
+  if (root.traces.some((trace) => !validArchiveTrace(trace))) {
+    throw new Error("quality archive contains an invalid answer trace");
+  }
+  if (root.reruns.some((rerun) => !validRerun(rerun) || rerun.status === "running")) {
+    throw new Error("quality archive contains an invalid or active rerun audit");
+  }
+  const traceIds = new Set<string>();
+  for (const trace of root.traces) {
+    if (traceIds.has(trace.id)) throw new Error(`duplicate quality trace id: ${trace.id}`);
+    traceIds.add(trace.id);
+  }
+  const rerunIds = new Set<string>();
+  for (const rerun of root.reruns) {
+    if (rerunIds.has(rerun.id)) throw new Error(`duplicate quality rerun id: ${rerun.id}`);
+    rerunIds.add(rerun.id);
+    if (
+      !traceIds.has(rerun.sourceTraceId)
+      || (rerun.candidateTraceId !== undefined && !traceIds.has(rerun.candidateTraceId))
+    ) {
+      throw new Error(`quality rerun trace is missing from archive: ${rerun.id}`);
+    }
+  }
+  return {
+    traces: root.traces.map(cloneTrace),
+    reruns: root.reruns.map(cloneRerun),
+  };
+}
+
 function cloneTrace(trace: AnswerTrace): AnswerTrace {
   return {
     ...trace,
     spaces: [...trace.spaces],
     citations: trace.citations.map((citation) => ({ ...citation })),
+    execution: trace.execution
+      ? {
+          ...trace.execution,
+          skills: trace.execution.skills.map((skill) => ({ ...skill })),
+        }
+      : undefined,
+    retrievalPages: trace.retrievalPages?.map((page) => ({ ...page })),
+    usage: trace.usage ? cloneAggregatedRunUsage(trace.usage) : undefined,
   };
 }
 
@@ -234,11 +475,39 @@ function cloneEvaluationCase(item: QualityEvaluationCase): QualityEvaluationCase
   };
 }
 
+function cloneRerun(item: QualityRerun): QualityRerun {
+  return { ...item };
+}
+
+function canonicalJson(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (!item || typeof item !== "object") return item;
+    const normalized: Record<string, unknown> = {};
+    const record = item as Record<string, unknown>;
+    for (const key of Object.keys(record).sort()) {
+      if (record[key] !== undefined) normalized[key] = normalize(record[key]);
+    }
+    return normalized;
+  };
+  return JSON.stringify(normalize(value));
+}
+
+function sameTrace(left: AnswerTrace, right: AnswerTrace): boolean {
+  return canonicalJson(cloneTrace(left)) === canonicalJson(cloneTrace(right));
+}
+
+function sameRerun(left: QualityRerun, right: QualityRerun): boolean {
+  return canonicalJson(cloneRerun(left)) === canonicalJson(cloneRerun(right));
+}
+
 export class QualityStore {
   private readonly configPath: string;
+  private readonly archiveRestoreReceipts = new WeakSet<QualityArchiveRestoreReceipt>();
   private traces: AnswerTrace[];
   private feedbackRecords: AnswerFeedback[];
   private evaluationCaseRecords: QualityEvaluationCase[];
+  private rerunRecords: QualityRerun[];
 
   constructor(dataDir: string) {
     this.configPath = join(dataDir, "quality", "quality.json");
@@ -246,10 +515,29 @@ export class QualityStore {
     this.traces = loaded.traces;
     this.feedbackRecords = loaded.feedback;
     this.evaluationCaseRecords = loaded.evaluationCases;
+    this.rerunRecords = loaded.reruns;
+    this.recoverInterruptedReruns();
+  }
+
+  private recoverInterruptedReruns(): void {
+    if (!this.rerunRecords.some((item) => item.status === "running")) return;
+    const now = Date.now();
+    const reruns = this.rerunRecords.map((item): QualityRerun => item.status === "running"
+      ? {
+          ...item,
+          status: "failed",
+          completedAt: Math.max(now, item.createdAt),
+          error: "The application stopped before the evaluation rerun completed.",
+        }
+      : item);
+    this.persist(this.traces, this.feedbackRecords, this.evaluationCaseRecords, reruns);
+    this.rerunRecords = reruns;
   }
 
   private load(): QualityFile {
-    if (!existsSync(this.configPath)) return { traces: [], feedback: [], evaluationCases: [] };
+    if (!existsSync(this.configPath)) {
+      return { version: 1, traces: [], feedback: [], evaluationCases: [], reruns: [] };
+    }
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<QualityFile>;
       const traces = Array.isArray(parsed.traces)
@@ -269,9 +557,19 @@ export class QualityStore {
           .slice(-MAX_EVALUATION_CASES)
           .map(cloneEvaluationCase)
         : [];
-      return { traces, feedback, evaluationCases };
+      const reruns = Array.isArray(parsed.reruns)
+        ? parsed.reruns
+          .filter(validRerun)
+          .filter((item) => (
+            traceIds.has(item.sourceTraceId)
+            && (item.candidateTraceId === undefined || traceIds.has(item.candidateTraceId))
+          ))
+          .slice(-MAX_RERUNS)
+          .map(cloneRerun)
+        : [];
+      return { version: 1, traces, feedback, evaluationCases, reruns };
     } catch {
-      return { traces: [], feedback: [], evaluationCases: [] };
+      return { version: 1, traces: [], feedback: [], evaluationCases: [], reruns: [] };
     }
   }
 
@@ -279,6 +577,7 @@ export class QualityStore {
     traces = this.traces,
     feedback = this.feedbackRecords,
     evaluationCases = this.evaluationCaseRecords,
+    reruns = this.rerunRecords,
   ): void {
     const directory = dirname(this.configPath);
     mkdirSync(directory, { recursive: true });
@@ -286,10 +585,16 @@ export class QualityStore {
     try {
       writeFileSync(
         temporaryPath,
-        JSON.stringify({ traces, feedback, evaluationCases } satisfies QualityFile, null, 2),
+        JSON.stringify({
+          version: 1,
+          traces,
+          feedback,
+          evaluationCases,
+          reruns,
+        } satisfies QualityFile, null, 2),
         { encoding: "utf8", mode: 0o600 },
       );
-      const fileDescriptor = openSync(temporaryPath, "r");
+      const fileDescriptor = openSync(temporaryPath, "r+");
       try {
         durableFsyncSync(fileDescriptor);
       } finally {
@@ -298,7 +603,9 @@ export class QualityStore {
       durableRenameSync(temporaryPath, this.configPath);
       const directoryDescriptor = openSync(directory, "r");
       try {
-        durableFsyncSync(directoryDescriptor);
+        durableFsyncSync(directoryDescriptor, {
+          allowUnsupportedDirectoryOnWindows: true,
+        });
       } finally {
         closeSync(directoryDescriptor);
       }
@@ -313,6 +620,25 @@ export class QualityStore {
   }
 
   recordTrace(input: AnswerTraceInput): AnswerTrace {
+    const execution = input.execution
+      ? {
+          ...input.execution,
+          skills: input.execution.skills.slice(0, 50).map((skill) => ({ ...skill })),
+        }
+      : undefined;
+    const retrievalPages = input.retrievalPages
+      ?.slice(0, 50)
+      .map((page) => ({ ...page }));
+    if (execution !== undefined && !validTraceExecution(execution)) {
+      throw new Error("answer trace execution evidence is invalid");
+    }
+    if (retrievalPages?.some((page) => !validTraceRetrievalPage(page))) {
+      throw new Error("answer trace retrieval evidence is invalid");
+    }
+    const usage = input.usage ? cloneAggregatedRunUsage(input.usage) : undefined;
+    if (usage !== undefined && !isAggregatedRunUsage(usage)) {
+      throw new Error("answer trace usage evidence is invalid");
+    }
     const trace: AnswerTrace = {
       id: `answer_${randomUUID()}`,
       spaces: [...new Set(input.spaces.filter(isSpaceId))],
@@ -321,6 +647,9 @@ export class QualityStore {
       source: input.source,
       answer: bounded(input.answer, MAX_ANSWER_LENGTH),
       citations: input.citations.map((citation) => ({ ...citation })),
+      execution,
+      retrievalPages,
+      usage,
       latencyMs: Math.max(0, Math.round(input.latencyMs)),
       error: bounded(input.error, MAX_ERROR_LENGTH),
       createdAt: input.createdAt ?? Date.now(),
@@ -330,10 +659,112 @@ export class QualityStore {
     const feedback = this.feedbackRecords
       .filter((record) => traceIds.has(record.traceId))
       .slice(-MAX_FEEDBACK);
-    this.persist(traces, feedback);
+    const reruns = this.rerunRecords.filter((item) => (
+      traceIds.has(item.sourceTraceId)
+      && (item.candidateTraceId === undefined || traceIds.has(item.candidateTraceId))
+    ));
+    this.persist(traces, feedback, this.evaluationCaseRecords, reruns);
     this.traces = traces;
     this.feedbackRecords = feedback;
+    this.rerunRecords = reruns;
     return cloneTrace(trace);
+  }
+
+  exportArchive(chatRuns: readonly QualityArchiveChatRun[]): QualityArchive {
+    const traces: AnswerTrace[] = [];
+    const included = new Set<string>();
+    const sourceTraceByChatRun = new Map<string, string>();
+    for (const run of chatRuns) {
+      if (run.traceId) sourceTraceByChatRun.set(run.id, run.traceId);
+      if (!run.traceId || included.has(run.traceId)) continue;
+      const trace = this.traces.find((item) => item.id === run.traceId);
+      if (!trace) throw new Error(`chat run source trace is unavailable: ${run.traceId}`);
+      traces.push(cloneTrace(trace));
+      included.add(trace.id);
+    }
+    const reruns = this.rerunRecords
+      .filter((rerun) => (
+        rerun.status !== "running"
+        && sourceTraceByChatRun.get(rerun.sourceChatRunId) === rerun.sourceTraceId
+      ))
+      .map(cloneRerun);
+    for (const rerun of reruns) {
+      if (!rerun.candidateTraceId || included.has(rerun.candidateTraceId)) continue;
+      const trace = this.traces.find((item) => item.id === rerun.candidateTraceId);
+      if (!trace) throw new Error(`quality rerun candidate trace is unavailable: ${rerun.id}`);
+      traces.push(cloneTrace(trace));
+      included.add(trace.id);
+    }
+    return parseQualityArchive({ traces, reruns });
+  }
+
+  assertCanRestoreArchive(value: unknown): QualityArchive {
+    const archive = parseQualityArchive(value);
+    const traceById = new Map(this.traces.map((trace) => [trace.id, trace]));
+    const rerunById = new Map(this.rerunRecords.map((rerun) => [rerun.id, rerun]));
+    for (const trace of archive.traces) {
+      const existing = traceById.get(trace.id);
+      if (existing && !sameTrace(existing, trace)) {
+        throw new Error(`quality trace id already exists with different data: ${trace.id}`);
+      }
+    }
+    for (const rerun of archive.reruns) {
+      const existing = rerunById.get(rerun.id);
+      if (existing && !sameRerun(existing, rerun)) {
+        throw new Error(`quality rerun id already exists with different data: ${rerun.id}`);
+      }
+    }
+    const addedTraceCount = archive.traces.filter((trace) => !traceById.has(trace.id)).length;
+    const addedRerunCount = archive.reruns.filter((rerun) => !rerunById.has(rerun.id)).length;
+    if (this.traces.length + addedTraceCount > MAX_TRACES) {
+      throw new Error(`quality store exceeds ${MAX_TRACES} traces`);
+    }
+    if (this.rerunRecords.length + addedRerunCount > MAX_RERUNS) {
+      throw new Error(`quality store exceeds ${MAX_RERUNS} reruns`);
+    }
+    return archive;
+  }
+
+  restoreArchive(value: unknown): QualityArchiveRestoreReceipt {
+    const archive = this.assertCanRestoreArchive(value);
+    const traceById = new Map(this.traces.map((trace) => [trace.id, trace]));
+    const rerunById = new Map(this.rerunRecords.map((rerun) => [rerun.id, rerun]));
+    const addedTraces = archive.traces.filter((trace) => !traceById.has(trace.id));
+    const addedReruns = archive.reruns.filter((rerun) => !rerunById.has(rerun.id));
+    const traces = [...this.traces, ...addedTraces];
+    const reruns = [...this.rerunRecords, ...addedReruns];
+    if (addedTraces.length === 0 && addedReruns.length === 0) {
+      const receipt = { traceIds: [], rerunIds: [] };
+      this.archiveRestoreReceipts.add(receipt);
+      return receipt;
+    }
+    this.persist(traces, this.feedbackRecords, this.evaluationCaseRecords, reruns);
+    this.traces = traces;
+    this.rerunRecords = reruns;
+    const receipt = {
+      traceIds: addedTraces.map((trace) => trace.id),
+      rerunIds: addedReruns.map((rerun) => rerun.id),
+    };
+    this.archiveRestoreReceipts.add(receipt);
+    return receipt;
+  }
+
+  rollbackArchiveRestore(receipt: QualityArchiveRestoreReceipt): void {
+    if (!this.archiveRestoreReceipts.has(receipt)) {
+      throw new Error("quality archive restore receipt is invalid or already rolled back");
+    }
+    if (receipt.traceIds.length === 0 && receipt.rerunIds.length === 0) {
+      this.archiveRestoreReceipts.delete(receipt);
+      return;
+    }
+    const traceIds = new Set(receipt.traceIds);
+    const rerunIds = new Set(receipt.rerunIds);
+    const traces = this.traces.filter((trace) => !traceIds.has(trace.id));
+    const reruns = this.rerunRecords.filter((rerun) => !rerunIds.has(rerun.id));
+    this.persist(traces, this.feedbackRecords, this.evaluationCaseRecords, reruns);
+    this.traces = traces;
+    this.rerunRecords = reruns;
+    this.archiveRestoreReceipts.delete(receipt);
   }
 
   trace(id: string): AnswerTrace | undefined {
@@ -469,6 +900,89 @@ export class QualityStore {
 
   evaluationCases(): QualityEvaluationCase[] {
     return this.evaluationCaseRecords.map(cloneEvaluationCase);
+  }
+
+  startRerun(input: StartQualityRerunInput): QualityRerun | undefined {
+    if (!this.traces.some((trace) => trace.id === input.sourceTraceId)) return undefined;
+    const sourceChatRunId = input.sourceChatRunId.trim();
+    if (!sourceChatRunId || sourceChatRunId.length > 200) return undefined;
+    const createdAt = input.createdAt ?? Date.now();
+    if (!finiteNonNegative(createdAt)) return undefined;
+    const item: QualityRerun = {
+      id: `rerun_${randomUUID()}`,
+      sourceChatRunId,
+      sourceTraceId: input.sourceTraceId,
+      status: "running",
+      createdAt,
+    };
+    const reruns = [...this.rerunRecords, item].slice(-MAX_RERUNS);
+    this.persist(this.traces, this.feedbackRecords, this.evaluationCaseRecords, reruns);
+    this.rerunRecords = reruns;
+    return cloneRerun(item);
+  }
+
+  completeRerun(
+    id: string,
+    candidateTraceId: string,
+    completedAt = Date.now(),
+  ): QualityRerun | undefined {
+    const index = this.rerunRecords.findIndex((item) => item.id === id);
+    const current = this.rerunRecords[index];
+    if (
+      !current
+      || current.status !== "running"
+      || !this.traces.some((trace) => trace.id === candidateTraceId)
+      || !finiteNonNegative(completedAt)
+      || completedAt < current.createdAt
+    ) {
+      return undefined;
+    }
+    const updated: QualityRerun = {
+      ...current,
+      status: "completed",
+      candidateTraceId,
+      completedAt,
+    };
+    const reruns = this.rerunRecords.map((item, itemIndex) =>
+      itemIndex === index ? updated : item
+    );
+    this.persist(this.traces, this.feedbackRecords, this.evaluationCaseRecords, reruns);
+    this.rerunRecords = reruns;
+    return cloneRerun(updated);
+  }
+
+  failRerun(id: string, error: string, completedAt = Date.now()): QualityRerun | undefined {
+    const index = this.rerunRecords.findIndex((item) => item.id === id);
+    const current = this.rerunRecords[index];
+    const normalizedError = bounded(error, MAX_ERROR_LENGTH);
+    if (
+      !current
+      || current.status !== "running"
+      || !normalizedError
+      || !finiteNonNegative(completedAt)
+      || completedAt < current.createdAt
+    ) {
+      return undefined;
+    }
+    const updated: QualityRerun = {
+      ...current,
+      status: "failed",
+      completedAt,
+      error: normalizedError,
+    };
+    const reruns = this.rerunRecords.map((item, itemIndex) =>
+      itemIndex === index ? updated : item
+    );
+    this.persist(this.traces, this.feedbackRecords, this.evaluationCaseRecords, reruns);
+    this.rerunRecords = reruns;
+    return cloneRerun(updated);
+  }
+
+  rerunsForChatRun(sourceChatRunId: string): QualityRerun[] {
+    return this.rerunRecords
+      .filter((item) => item.sourceChatRunId === sourceChatRunId)
+      .sort((left, right) => right.createdAt - left.createdAt || left.id.localeCompare(right.id))
+      .map(cloneRerun);
   }
 
   snapshot(): QualitySnapshot {

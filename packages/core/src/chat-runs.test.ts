@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpaceId } from "@homeagent/shared";
+import type { ResolvedExecutionPlan } from "./execution-plan.ts";
 import {
   ChatRunStore,
   MAX_CHAT_RUN_HISTORY_PER_AGENT,
@@ -114,6 +115,88 @@ describe("ChatRunStore", () => {
     });
   });
 
+  test("persists a resolved Chat execution plan without a ProviderExecution", () => {
+    const store = new ChatRunStore(dir);
+    const executionPlan: ResolvedExecutionPlan = {
+      version: 1,
+      instruction: "Use the original chat persona.",
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "high",
+    };
+
+    const run = store.start({
+      space: SPACE,
+      input: "queued chat",
+      trigger: "message",
+      executionPlan,
+      startedAt: 100,
+    });
+
+    expect(new ChatRunStore(dir).get(run.id)?.executionPlan).toEqual(executionPlan);
+    expect(JSON.parse(readFileSync(join(dir, "config", "chat-runs.json"), "utf8")).version)
+      .toBe(4);
+  });
+
+  test("rejects an invalid resolved execution plan before persisting a run", () => {
+    const store = new ChatRunStore(dir);
+
+    expect(() => store.start({
+      space: SPACE,
+      input: "queued chat",
+      trigger: "message",
+      executionPlan: {
+        version: 1,
+        instruction: "Use a chat Skill.",
+        execution: {
+          permission: "read-only",
+          skills: ["not a valid skill"],
+        },
+      },
+    })).toThrow("Resolved execution plan");
+    expect(store.list()).toEqual([]);
+  });
+
+  test("rejects a Chat execution plan that grants provider execution", () => {
+    const store = new ChatRunStore(dir);
+
+    expect(() => store.start({
+      space: SPACE,
+      input: "ordinary chat",
+      trigger: "message",
+      executionPlan: {
+        version: 1,
+        instruction: "Answer only.",
+        provider: "claude",
+        execution: {
+          permission: "read-only",
+          skills: [],
+        },
+      },
+    })).toThrow("must not grant provider execution");
+    expect(store.list()).toEqual([]);
+  });
+
+  test("continues to load version 2 history without an execution plan", () => {
+    const store = new ChatRunStore(dir);
+    const run = store.start({
+      space: SPACE,
+      input: "legacy chat",
+      trigger: "message",
+      startedAt: 100,
+    });
+    const path = join(dir, "config", "chat-runs.json");
+    const legacy = JSON.parse(readFileSync(path, "utf8")) as {
+      version: number;
+      runs: Record<string, Record<string, unknown>>;
+    };
+    legacy.version = 2;
+    delete legacy.runs[run.id]!.executionPlan;
+    writeFileSync(path, JSON.stringify(legacy), "utf8");
+
+    expect(new ChatRunStore(dir).get(run.id)).toBeDefined();
+  });
+
   test("recovers an interrupted running record as a typed durable failure", () => {
     const store = new ChatRunStore(dir);
     const run = store.start({
@@ -153,6 +236,18 @@ describe("ChatRunStore", () => {
       finishedAt: 120,
       output: "这是模型输出",
       traceId: "trace_1",
+      usage: {
+        calls: 2,
+        knownTokenCalls: 1,
+        unknownTokenCalls: 1,
+        knownCostCalls: 1,
+        unknownCostCalls: 1,
+        inputTokens: 80,
+        outputTokens: 20,
+        costUsd: 0.004,
+        costBasis: "reported",
+        sources: ["claude-json", "trae-text"],
+      },
     });
     store.startDeliveryAttempt(run.id, 130);
     store.deliveryFailed(run.id, "Feishu unavailable");
@@ -162,6 +257,18 @@ describe("ChatRunStore", () => {
       finishedAt: 120,
       output: "这是模型输出",
       traceId: "trace_1",
+      usage: {
+        calls: 2,
+        knownTokenCalls: 1,
+        unknownTokenCalls: 1,
+        knownCostCalls: 1,
+        unknownCostCalls: 1,
+        inputTokens: 80,
+        outputTokens: 20,
+        costUsd: 0.004,
+        costBasis: "reported",
+        sources: ["claude-json", "trae-text"],
+      },
       error: undefined,
       delivery: {
         status: "failed",
@@ -170,6 +277,37 @@ describe("ChatRunStore", () => {
         error: "Feishu unavailable",
       },
     }));
+  });
+
+  test("raw cleanup removes active generation but preserves an in-flight delivery audit", () => {
+    const store = new ChatRunStore(dir);
+    const generating = store.start({
+      space: SPACE,
+      rawId: "raw_generating",
+      input: "still generating",
+      trigger: "message",
+      startedAt: 100,
+    });
+    store.begin(generating.id, 101);
+    const delivering = store.start({
+      space: SPACE,
+      rawId: "raw_delivering",
+      input: "already generated",
+      trigger: "message",
+      startedAt: 110,
+    });
+    store.succeed(delivering.id, { finishedAt: 120, output: "reply" });
+    store.startDeliveryAttempt(delivering.id, 121);
+
+    expect(store.removeByRawIds(new Set(["raw_generating", "raw_delivering"]))).toBe(1);
+    expect(store.get(generating.id)).toBeUndefined();
+    expect(store.get(delivering.id)).toEqual(expect.objectContaining({
+      delivery: expect.objectContaining({ status: "pending", attempts: 1 }),
+    }));
+
+    store.deliverySent(delivering.id, 130);
+    expect(store.removeByRawIds(new Set(["raw_delivering"]))).toBe(1);
+    expect(store.get(delivering.id)).toBeUndefined();
   });
 
   test("persists a typed provider failure for diagnosis and retry", () => {
@@ -197,6 +335,86 @@ describe("ChatRunStore", () => {
         kind: "authentication",
         message: "Provider authentication expired",
       },
+    }));
+  });
+
+  test("terminal transitions cannot rewrite an existing terminal outcome", () => {
+    const store = new ChatRunStore(dir);
+    const cancelled = store.start({
+      space: SPACE,
+      input: "cancel this answer",
+      trigger: "message",
+      startedAt: 100,
+    });
+    store.cancel(cancelled.id, {
+      finishedAt: 110,
+      error: { kind: "cancelled", message: "cancelled by user" },
+    });
+    const cancelledSnapshot = store.get(cancelled.id);
+
+    expect(store.succeed(cancelled.id, {
+      finishedAt: 120,
+      output: "late provider output",
+    })).toBeUndefined();
+    expect(store.get(cancelled.id)).toEqual(cancelledSnapshot);
+
+    const succeeded = store.start({
+      space: SPACE,
+      input: "finish once",
+      trigger: "message",
+      startedAt: 200,
+    });
+    store.succeed(succeeded.id, {
+      finishedAt: 210,
+      output: "durable answer",
+    });
+    const succeededSnapshot = store.get(succeeded.id);
+
+    expect(store.fail(succeeded.id, {
+      finishedAt: 220,
+      error: { kind: "process_exit", message: "late failure" },
+    })).toBeUndefined();
+    expect(store.get(succeeded.id)).toEqual(succeededSnapshot);
+  });
+
+  test("persists quality trace evidence with a provider failure", () => {
+    const store = new ChatRunStore(dir);
+    const run = store.start({
+      space: SPACE,
+      input: "diagnose the provider failure",
+      trigger: "message",
+      startedAt: 100,
+    });
+    store.begin(run.id, 101);
+
+    store.fail(run.id, {
+      finishedAt: 120,
+      error: { kind: "process_exit", message: "provider exited 1" },
+      traceId: "answer_failed_1",
+      usage: {
+        calls: 1,
+        knownTokenCalls: 1,
+        unknownTokenCalls: 0,
+        knownCostCalls: 1,
+        unknownCostCalls: 0,
+        inputTokens: 60,
+        outputTokens: 7,
+        costUsd: 0.006,
+        costBasis: "reported",
+        sources: ["claude-json"],
+      },
+    });
+
+    expect(new ChatRunStore(dir).get(run.id)).toEqual(expect.objectContaining({
+      status: "failed",
+      traceId: "answer_failed_1",
+      usage: expect.objectContaining({
+        calls: 1,
+        inputTokens: 60,
+        outputTokens: 7,
+        costUsd: 0.006,
+        sources: ["claude-json"],
+      }),
     }));
   });
 

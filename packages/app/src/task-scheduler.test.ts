@@ -3,8 +3,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type SpaceId } from "@homeagent/shared";
-import { KnowledgeEngine, type Task, type TaskRun } from "@homeagent/core";
 import {
+  DEFAULT_TASK_RUN_APPROVAL_TTL_MS,
+  KnowledgeEngine,
+  type Task,
+  type TaskRun,
+} from "@homeagent/core";
+import {
+  formatTaskApprovalNotification,
   formatTaskRunNotification,
   shouldRunTask,
   TaskScheduler,
@@ -38,6 +44,42 @@ function task(over: Partial<Task>): Task {
 }
 
 describe("shouldRunTask", () => {
+  test("approval notification contains a safe review summary", () => {
+    const run = {
+      id: "run_approval_notice",
+      taskId: "task_1",
+      taskName: "Repository maintenance",
+      space: SPACE,
+      topic: "sensitive topic that must stay in the Web review",
+      trigger: "scheduled",
+      distill: false,
+      priority: "scheduled",
+      status: "awaiting_approval",
+      queuedAt: 1,
+      startedAt: 1,
+      approval: {
+        status: "pending",
+        requestedAt: 1,
+        expiresAt: 86_400_001,
+      },
+      approvalNotification: { status: "pending", attempts: 0 },
+      executionPlan: {
+        version: 1,
+        instruction: "secret instruction",
+        provider: "codex",
+        execution: { permission: "write", workdir: "C:\\secret", skills: [] },
+      },
+    } satisfies TaskRun;
+
+    const message = formatTaskApprovalNotification(run);
+    expect(message).toContain("Repository maintenance");
+    expect(message).toContain("write");
+    expect(message).toContain("审批截止");
+    expect(message).toContain(run.id);
+    expect(message).not.toContain("secret instruction");
+    expect(message).not.toContain("C:\\secret");
+  });
+
   test("task notification includes persisted skipped-Skill warnings", () => {
     const run = {
       id: "run_skill_warning",
@@ -131,6 +173,66 @@ describe("TaskScheduler.tick", () => {
     }));
   });
 
+  test("admits and waits for a due durable Task Run retry", async () => {
+    engine.close();
+    let providerCalls = 0;
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "retry recovered";
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const t = engine.tasks.create({
+      name: "due retry",
+      space: SPACE,
+      topic: "retry from scheduler",
+      distillOnRun: false,
+    })!;
+    const failed = engine.taskRuns.start({
+      task: t,
+      trigger: "scheduled",
+      provider: "claude",
+      executionPlan: {
+        version: 1,
+        instruction: "Frozen scheduler retry.",
+        provider: "claude",
+        execution: { permission: "read-only", skills: [] },
+      },
+      distill: false,
+      startedAt: T10.getTime() - 70_000,
+    });
+    engine.taskRuns.begin(failed.id, T10.getTime() - 69_000);
+    engine.taskRuns.fail(failed.id, {
+      finishedAt: T10.getTime() - 60_000,
+      error: "Error: provider overloaded (503)",
+      failure: { phase: "provider", kind: "overloaded", retryable: true },
+      retry: {
+        attempt: 1,
+        maxAttempts: 2,
+        status: "waiting",
+        nextAttemptAt: T10.getTime(),
+      },
+    });
+    engine.tasks.setLastRun(t.id, {
+      at: T10.getTime() - 60_000,
+      status: "error",
+      error: "Error: provider overloaded (503)",
+    });
+
+    const sched = new TaskScheduler(engine);
+    expect(await sched.tick("due-retry", T10)).toEqual([]);
+    expect(providerCalls).toBe(1);
+    const runs = engine.listTaskRuns(t.id);
+    expect(runs).toHaveLength(2);
+    expect(runs[0]).toEqual(expect.objectContaining({
+      status: "succeeded",
+      trigger: "retry",
+      retryOf: failed.id,
+    }));
+  });
+
   test("persists a notification failure and retries it on a later tick", async () => {
     const t = engine.tasks.create({
       name: "通知恢复",
@@ -171,6 +273,110 @@ describe("TaskScheduler.tick", () => {
       lastStatus: "ok",
       lastError: undefined,
     }));
+  });
+
+  test("expires approvals before attempting to deliver their notifications", async () => {
+    const t = engine.tasks.create({
+      name: "expired approval",
+      space: SPACE,
+      topic: "do not notify stale approval requests",
+      distillOnRun: false,
+    })!;
+    const run = engine.taskRuns.start({
+      task: t,
+      trigger: "scheduled",
+      distill: false,
+      startedAt: T10.getTime() - DEFAULT_TASK_RUN_APPROVAL_TTL_MS,
+      approvalRequired: true,
+      executionPlan: {
+        version: 1,
+        instruction: "Expired write request.",
+        provider: "codex",
+        execution: {
+          permission: "write",
+          workdir: dir,
+          skills: [],
+        },
+      },
+    });
+    const notified: string[] = [];
+    const sched = new TaskScheduler(engine, {
+      notifyApproval: async (_task, approvalRun) => {
+        notified.push(approvalRun.id);
+      },
+    });
+
+    expect(await sched.tick("approval-expiry", T10)).toEqual([]);
+    expect(notified).toEqual([]);
+    expect(engine.getTaskRun(run.id)).toEqual(expect.objectContaining({
+      status: "cancelled",
+      approval: expect.objectContaining({ status: "expired" }),
+    }));
+  });
+
+  test("delivers one logical approval notification after restart", async () => {
+    const agent = engine.agents.create({
+      name: "scheduled writer",
+      provider: "codex",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.updateSpaceMeta(SPACE, { agentId: agent.id });
+    const t = engine.tasks.create({
+      name: "durable approval notice",
+      space: SPACE,
+      topic: "notify after restart",
+      distillOnRun: false,
+    })!;
+    const pending = engine.startTaskRun(t.id, { trigger: "scheduled" }).run;
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "must not run" });
+
+    const deliveryKeys: string[] = [];
+    const sched = new TaskScheduler(engine, {
+      notifyApproval: async (_task, run, deliveryKey) => {
+        expect(run.id).toBe(pending.id);
+        deliveryKeys.push(deliveryKey);
+      },
+    });
+    const firstTick = new Date(pending.startedAt + 1);
+    expect(await sched.tick("approval-notification", firstTick)).toEqual([]);
+    expect(engine.getTaskRun(pending.id)?.approvalNotification).toEqual(
+      expect.objectContaining({ status: "sent", attempts: 1 }),
+    );
+
+    expect(await sched.tick("approval-notification-again", new Date(firstTick.getTime() + 1))).toEqual([]);
+    expect(deliveryKeys).toEqual([`ha-appr-${pending.id}`]);
+  });
+
+  test("notifies a newly-created scheduled approval in the same tick", async () => {
+    const agent = engine.agents.create({
+      name: "same-tick writer",
+      provider: "codex",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.updateSpaceMeta(SPACE, { agentId: agent.id });
+    const t = engine.tasks.create({
+      name: "same-tick approval",
+      space: SPACE,
+      topic: "notify without waiting for another cadence",
+      distillOnRun: false,
+    })!;
+    const notified: string[] = [];
+    const sched = new TaskScheduler(engine, {
+      notifyApproval: async (_task, run) => {
+        notified.push(run.id);
+      },
+    });
+
+    expect(await sched.tick("new-approval", T10)).toEqual([t.id]);
+    const run = engine.listTaskRuns(t.id)[0]!;
+    expect(run.status).toBe("awaiting_approval");
+    expect(notified).toEqual([run.id]);
+    expect(engine.getTaskRun(run.id)?.approvalNotification).toEqual(
+      expect.objectContaining({ status: "sent", attempts: 1 }),
+    );
   });
 
   test("skips a disabled task and does not notify", async () => {

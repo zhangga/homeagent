@@ -3,6 +3,7 @@ import type {
   AgentActivityRun,
   AgentChatRecord,
   AgentInput,
+  AgentRevision,
   AgentSkillBinding,
   SkillCatalogSnapshot,
   SkillRootKind,
@@ -110,6 +111,19 @@ export interface AgentInspectorView {
   hasMoreRuns: boolean;
 }
 
+export interface AgentRevisionView {
+  id: string;
+  number: number;
+  source: AgentRevision["source"];
+  basedOnRevisionId?: string;
+  createdAt: number;
+  provider: string;
+  model: string;
+  permission: string;
+  published: boolean;
+  draft: boolean;
+}
+
 export interface AgentWorkbenchView {
   mode: AgentWorkbenchMode;
   list: AgentWorkbenchListItem[];
@@ -122,6 +136,12 @@ export interface AgentWorkbenchView {
   models: Record<string, string[]>;
   defaults: { provider: string; model: string };
   inspector: AgentInspectorView | null;
+  revision: {
+    headRevisionId?: string;
+    publishedRevisionId?: string;
+    draftRevisionId?: string;
+    history: AgentRevisionView[];
+  } | null;
   skillCatalog: AgentSkillCatalogView;
   flash?: string;
   formError?: string;
@@ -184,6 +204,10 @@ export interface BuildAgentWorkbenchInput {
   flash?: string;
   formError?: string;
   catalog?: SkillCatalogSnapshot;
+  revisions?: AgentRevision[];
+  draft?: AgentRevision;
+  /** Preserve a stale CAS token on conflict pages until the user explicitly reloads. */
+  expectedHeadRevisionId?: string;
 }
 
 export interface AgentValidationContext {
@@ -608,8 +632,15 @@ export function agentInputForEditor(
 export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkbenchView {
   const generatedNames = generatedAgentNames(input.agents);
   const automaticName = input.mode === "create" && input.values === undefined;
+  const editorAgent = input.selected && input.draft
+    ? {
+        ...input.selected,
+        ...input.draft.snapshot,
+        skills: input.draft.snapshot.skills.map((binding) => ({ ...binding })),
+      }
+    : input.selected;
   const editor = input.values
-    ?? editorValuesFor(input.selected, input.providers, input.defaults);
+    ?? editorValuesFor(editorAgent, input.providers, input.defaults);
   if (
     automaticName
     && isGeneratedAgentProvider(editor.provider)
@@ -789,6 +820,27 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
     models: input.models,
     defaults: input.defaults,
     inspector,
+    revision: input.selected
+      ? {
+          headRevisionId: input.expectedHeadRevisionId
+            ?? input.revisions?.[0]?.id
+            ?? input.selected.publishedRevisionId,
+          publishedRevisionId: input.selected.publishedRevisionId,
+          draftRevisionId: input.draft?.id,
+          history: (input.revisions ?? []).slice(0, 20).map((revision) => ({
+            id: revision.id,
+            number: revision.number,
+            source: revision.source,
+            basedOnRevisionId: revision.basedOnRevisionId,
+            createdAt: revision.createdAt,
+            provider: revision.snapshot.provider,
+            model: revision.snapshot.model || "CLI 默认模型",
+            permission: revision.snapshot.permission,
+            published: revision.id === input.selected?.publishedRevisionId,
+            draft: revision.source === "draft" && revision.id === input.draft?.id,
+          })),
+        }
+      : null,
     skillCatalog: buildSkillCatalogView(
       input.catalog,
       editor.provider,

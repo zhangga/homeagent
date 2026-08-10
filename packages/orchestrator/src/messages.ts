@@ -22,13 +22,24 @@ export const PROVIDER_TIMEOUT_NOTICE = [
 
 export const UNSUPPORTED_IMAGE_NOTICE = [
   "⚠️ 当前 Agent 不支持图片输入，因此我没有分析这张图。",
-  "请在管理后台把当前空间的 Agent 切换到 Codex 后重试；文字问答仍可继续使用当前 Agent。",
+  "普通对话目前不会为了图片绕过 no-tools 隔离；请改用文字描述，或等待接入受限的视觉 completion 通道。",
 ].join("\n");
+
+export const NO_TOOLS_MODE_NOTICE = [
+  "⚠️ 当前 Provider 无法为普通对话提供可验证的 no-tools 隔离，因此这次调用已被安全拒绝。",
+  "请把空间 Agent 切换到 Claude；Codex / TRAE 当前只用于显式任务执行。",
+].join("\n");
+
+export const GROUP_REMINDER_AUTOMATION_DENIAL =
+  "只有群主或群管理员可以管理本群提醒；私聊提醒仍由本人直接管理。";
 
 export function providerNotice(error: unknown): string {
   const message = String(error);
   if (/does not support image inputs|不支持图片输入/i.test(message)) {
     return UNSUPPORTED_IMAGE_NOTICE;
+  }
+  if (/cannot provide a no-tools execution mode/i.test(message)) {
+    return NO_TOOLS_MODE_NOTICE;
   }
   return isProviderTimeoutError(error) ? PROVIDER_TIMEOUT_NOTICE : NO_PROVIDER_NOTICE;
 }

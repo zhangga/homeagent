@@ -394,6 +394,155 @@ describe("system health reporter", () => {
     engine.close();
   });
 
+  test("is not ready when the ordinary provider only supports explicit tasks", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-ordinary-provider-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" },
+      ],
+      requiredProviderIds: () => ["codex"],
+      ordinaryProviderId: () => "codex",
+    });
+
+    const snapshot = await reportHealth();
+    engine.close();
+    expect(snapshot.ready).toBe(false);
+    expect(snapshot.components.providers).toEqual(expect.objectContaining({
+      status: "down",
+      details: expect.objectContaining({
+        ordinaryProvider: "codex",
+        unavailable: [],
+        noToolsUnsupported: ["codex"],
+      }),
+    }));
+  });
+
+  test("reports an unavailable no-tools ordinary provider separately", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-ordinary-unavailable-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "claude", name: "Claude", bin: "claude", available: false, detail: "missing" },
+      ],
+      requiredProviderIds: () => [],
+      ordinaryProviderId: () => "claude",
+    });
+
+    const snapshot = await reportHealth();
+    engine.close();
+    expect(snapshot.ready).toBe(false);
+    expect(snapshot.components.providers).toEqual(expect.objectContaining({
+      status: "down",
+      details: expect.objectContaining({
+        ordinaryProvider: "claude",
+        unavailable: ["claude"],
+        noToolsUnsupported: [],
+      }),
+    }));
+  });
+
+  test("is ready when the ordinary provider is available and supports no-tools", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-ordinary-ready-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "claude", name: "Claude", bin: "claude", available: true, detail: "2.0" },
+      ],
+      requiredProviderIds: () => [],
+      ordinaryProviderId: () => "claude",
+    });
+
+    const snapshot = await reportHealth();
+    expect(snapshot.ready).toBe(true);
+    expect(snapshot.components.providers).toEqual(expect.objectContaining({
+      status: "ok",
+      details: expect.objectContaining({
+        ordinaryProvider: "claude",
+        unavailable: [],
+        noToolsUnsupported: [],
+      }),
+    }));
+    engine.close();
+  });
+
+  test("is not ready when a bound space Agent cannot run ordinary no-tools calls", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-space-ordinary-provider-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    const space = "team/oc_health" as const;
+    engine.ensureSpace(space, { chatId: "oc_health" });
+    const agent = engine.agents.create({ name: "Task-only Agent", provider: "codex" });
+    engine.updateSpaceMeta(space, { agentId: agent.id });
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "claude", name: "Claude", bin: "claude", available: true, detail: "2.0" },
+        { id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" },
+      ],
+      requiredProviderIds: () => ["claude", "codex"],
+      ordinaryProviderId: () => "claude",
+      ordinaryProviderIds: () => ["claude", "codex"],
+    });
+
+    const snapshot = await reportHealth();
+    engine.close();
+    expect(snapshot.ready).toBe(false);
+    expect(snapshot.components.providers).toEqual(expect.objectContaining({
+      status: "down",
+      details: expect.objectContaining({
+        ordinaryProviders: ["claude", "codex"],
+        noToolsUnsupported: ["codex"],
+      }),
+    }));
+  });
+
   test("a caller-controlled task timeout degrades the task without taking provider readiness down", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hb-health-task-timeout-"));
     dirs.push(dir);

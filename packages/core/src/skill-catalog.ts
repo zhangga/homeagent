@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { providerSkillReference, type ProviderId } from "@homeagent/llm";
 import type { SkillWarningView } from "@homeagent/shared";
 
@@ -73,7 +73,8 @@ export type SkillSkipCode =
   | "provider_incompatible"
   | "ambiguous_legacy_name"
   | "shadowed_source"
-  | "invalid_invocation_name";
+  | "invalid_invocation_name"
+  | "no_tools_context";
 
 export interface ResolvedSkillSnapshot {
   sourceKey: string;
@@ -104,6 +105,7 @@ const warningMessages: Record<SkillSkipCode, string> = {
   ambiguous_legacy_name: "旧 Skill 名称未绑定到唯一来源，已跳过",
   shadowed_source: "Skill 来源被更高优先级版本遮蔽，已跳过",
   invalid_invocation_name: "Skill 名称无法安全调用，已跳过",
+  no_tools_context: "普通 no-tools 调用不会加载本机 Skill，已跳过",
 };
 
 export function skillWarningViews(
@@ -305,6 +307,90 @@ function skillDirectories(root: string, maxDepth: number, maxEntries: number): s
     }
   }
   return found.sort();
+}
+
+interface SkillBundleFile {
+  path: string;
+  mode: number;
+  content: Buffer;
+}
+
+/**
+ * Hash every regular file a native Skill can load. A single-file Skill keeps
+ * its historical SKILL.md digest for compatibility; once resources exist the
+ * manifest binds path, mode and bytes. Symlinks/junctions and oversized trees
+ * fail closed instead of following content outside the selected Skill.
+ */
+function hashSkillBundle(
+  skillFile: string,
+  maxEntries: number,
+  maxTotalBytes: number,
+): string {
+  const root = dirname(skillFile);
+  const canonicalRoot = realpathSync(root);
+  if (lstatSync(root).isSymbolicLink()) {
+    throw new Error("Skill bundle root cannot be a symbolic link");
+  }
+  const files: SkillBundleFile[] = [];
+  const pending = [{ directory: root, relativeDir: "", depth: 0 }];
+  let entries = 0;
+  let totalBytes = 0;
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (current.depth > 32) throw new Error("Skill bundle is too deeply nested");
+    const children = readdirSync(current.directory, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const child of children) {
+      entries += 1;
+      if (entries > maxEntries) throw new Error("Skill bundle has too many entries");
+      const fullPath = join(current.directory, child.name);
+      const metadata = lstatSync(fullPath);
+      if (metadata.isSymbolicLink()) {
+        throw new Error("Skill bundle cannot contain symbolic links");
+      }
+      const canonicalPath = realpathSync(fullPath);
+      const fromRoot = relative(canonicalRoot, canonicalPath);
+      if (
+        fromRoot === ".."
+        || fromRoot.startsWith(`..${sep}`)
+        || isAbsolute(fromRoot)
+      ) {
+        throw new Error("Skill bundle entry escapes its root");
+      }
+      const relativePath = join(current.relativeDir, child.name).split(sep).join("/");
+      if (metadata.isDirectory()) {
+        pending.push({
+          directory: fullPath,
+          relativeDir: relativePath,
+          depth: current.depth + 1,
+        });
+        continue;
+      }
+      if (!metadata.isFile()) throw new Error("Skill bundle contains a non-regular file");
+      totalBytes += metadata.size;
+      if (totalBytes > maxTotalBytes) throw new Error("Skill bundle is too large");
+      const content = readFileSync(fullPath);
+      const after = lstatSync(fullPath);
+      if (
+        after.isSymbolicLink()
+        || after.size !== metadata.size
+        || after.mtimeMs !== metadata.mtimeMs
+      ) {
+        throw new Error("Skill bundle changed while it was being hashed");
+      }
+      files.push({ path: relativePath, mode: metadata.mode & 0o777, content });
+    }
+  }
+  files.sort((left, right) => left.path.localeCompare(right.path));
+  if (files.length === 1 && files[0]!.path === "SKILL.md") {
+    return createHash("sha256").update(files[0]!.content).digest("hex");
+  }
+  const hash = createHash("sha256").update("homeagent-skill-bundle-v1\0");
+  for (const file of files) {
+    hash.update(`${Buffer.byteLength(file.path)}:${file.path}\0${file.mode}\0${file.content.length}\0`);
+    hash.update(file.content);
+  }
+  return hash.digest("hex");
 }
 
 export class SkillCatalog {
@@ -599,12 +685,27 @@ export class SkillCatalog {
         });
         continue;
       }
+      let bundleHash: string;
+      try {
+        bundleHash = hashSkillBundle(
+          resolvedSource.skillFile,
+          this.maxEntries,
+          this.maxTotalBytes,
+        );
+      } catch {
+        skipped.push({
+          ...binding,
+          code: "invalid_skill",
+          message: "Skill bundle is invalid or changed",
+        });
+        continue;
+      }
       resolved.push({
         sourceKey: resolvedSource.sourceKey,
         name: resolvedSource.name,
         invocationName: resolvedSource.name,
         reference,
-        skillFileHash: createHash("sha256").update(currentContent).digest("hex"),
+        skillFileHash: bundleHash,
       });
     }
     return {

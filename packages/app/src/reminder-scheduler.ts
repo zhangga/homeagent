@@ -1,4 +1,5 @@
 /** Proactive delivery loop for durable user reminders. */
+import { createHash } from "node:crypto";
 import { logger } from "@homeagent/shared";
 import type { KnowledgeEngine, Reminder } from "@homeagent/core";
 import type { RuntimeLoopHealth } from "./scheduler.ts";
@@ -17,7 +18,16 @@ export const DEFAULT_REMINDER_SCHEDULE: ReminderScheduleConfig = {
 export type ReminderNotify = (
   reminder: Reminder,
   message: string,
+  idempotencyKey: string,
 ) => void | Promise<void>;
+
+export function reminderIdempotencyKey(reminder: Reminder): string {
+  const digest = createHash("sha256")
+    .update(`${reminder.id}\0${reminder.nextTriggerAt}`)
+    .digest("hex")
+    .slice(0, 32);
+  return `ha-reminder-${digest}`;
+}
 
 export function reminderNotification(reminder: Reminder): string {
   const lines = [`⏰ 提醒：${reminder.title}`];
@@ -104,7 +114,11 @@ export class ReminderScheduler {
               if (!this.notify) {
                 throw new Error("reminder notification transport is unavailable");
               }
-              await this.notify(current, reminderNotification(current));
+              await this.notify(
+                current,
+                reminderNotification(current),
+                reminderIdempotencyKey(current),
+              );
             },
           );
           if (advanced) delivered.push(reminder.id);

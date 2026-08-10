@@ -184,6 +184,34 @@ describe("LearningScheduler", () => {
     }));
   });
 
+  test("retries a post-send lesson commit with one stable transport idempotency key", async () => {
+    const created = seedPlan(engine);
+    llm.queueText("## 今日目标\n理解第一章");
+    const persistDelivered = engine.learning.markDelivered.bind(engine.learning);
+    let commitAttempts = 0;
+    engine.learning.markDelivered = (...args) => {
+      commitAttempts += 1;
+      return commitAttempts === 1 ? undefined : persistDelivered(...args);
+    };
+    const attemptedKeys: string[] = [];
+    const acceptedKeys = new Set<string>();
+    let physicalDeliveries = 0;
+    const scheduler = new LearningScheduler(engine, {
+      notify: async (_plan, _source, _session, _warnings, deliveryKey: string) => {
+        attemptedKeys.push(deliveryKey);
+        if (acceptedKeys.has(deliveryKey)) return;
+        acceptedKeys.add(deliveryKey);
+        physicalDeliveries += 1;
+      },
+    });
+
+    expect(await scheduler.tick("post-send-commit-failed", NOW)).toEqual([]);
+    expect(await scheduler.tick("retry", NOW)).toEqual([created.id]);
+    expect(attemptedKeys).toEqual([expect.any(String), attemptedKeys[0]]);
+    expect(attemptedKeys[0]).toMatch(/^ha-lesson-/);
+    expect(physicalDeliveries).toBe(1);
+  });
+
   test("persists a friendly follow-up only after successful delivery", async () => {
     const created = seedPlan(engine);
     llm.queueText("## 今日目标\n理解第一章");
@@ -222,6 +250,72 @@ describe("LearningScheduler", () => {
     expect(scheduler.health().lastError).toContain("network unavailable");
   });
 
+  test("does not report an empty follow-up commit and retries with one stable idempotency key", async () => {
+    const created = seedPlan(engine);
+    llm.queueText("## 今日目标\n理解第一章");
+    const persistFollowUp = engine.learning.markFollowedUp.bind(engine.learning);
+    let commitAttempts = 0;
+    const attemptedKeys: string[] = [];
+    const acceptedKeys = new Set<string>();
+    let physicalDeliveries = 0;
+    const scheduler = new LearningScheduler(engine, {
+      notify: async () => {},
+      followUp: async (_plan, _session, _message, deliveryKey: string) => {
+        attemptedKeys.push(deliveryKey);
+        if (acceptedKeys.has(deliveryKey)) return;
+        acceptedKeys.add(deliveryKey);
+        physicalDeliveries += 1;
+      },
+    });
+    await scheduler.tick("deliver", NOW);
+    engine.learning.markFollowedUp = (...args) => {
+      commitAttempts += 1;
+      return commitAttempts === 1 ? undefined : persistFollowUp(...args);
+    };
+    const later = new Date(NOW.getTime() + 25 * 60 * 60 * 1000);
+    const nextDayRetry = new Date(later.getTime() + 24 * 60 * 60 * 1000);
+
+    expect(await scheduler.tick("post-send-commit-empty", later)).toEqual([]);
+    expect(await scheduler.tick("retry-next-day", nextDayRetry))
+      .toEqual([`follow-up:${created.id}`]);
+    expect(attemptedKeys).toEqual([expect.any(String), attemptedKeys[0]]);
+    expect(attemptedKeys[0]).toMatch(/^ha-follow-/);
+    expect(physicalDeliveries).toBe(1);
+  });
+
+  test("prevents export or deletion while an awaiting-reply follow-up is being delivered", async () => {
+    engine.ensureSpace("personal/ou_me", { chatId: "oc_p2p" });
+    const created = seedPlan(engine);
+    llm.queueText("## 今日目标\n理解第一章");
+    let deliveryStarted!: () => void;
+    let releaseDelivery!: () => void;
+    const started = new Promise<void>((resolve) => { deliveryStarted = resolve; });
+    const released = new Promise<void>((resolve) => { releaseDelivery = resolve; });
+    const scheduler = new LearningScheduler(engine, {
+      notify: async () => {},
+      followUp: async () => {
+        deliveryStarted();
+        await released;
+      },
+    });
+    await scheduler.tick("deliver", NOW);
+    const later = new Date(NOW.getTime() + 25 * 60 * 60 * 1000);
+
+    const tick = scheduler.tick("follow-up", later);
+    await started;
+    try {
+      await expect(engine.exportSpace("personal/ou_me"))
+        .rejects.toThrow("space has delivering learning sessions");
+      await expect(engine.deleteSpace("personal/ou_me"))
+        .rejects.toThrow("space has delivering learning sessions");
+    } finally {
+      releaseDelivery();
+      await tick;
+    }
+    expect(engine.learning.currentSession(created.id)?.followUpCount).toBe(1);
+    expect((await engine.deleteSpace("personal/ou_me")).status).toBe("deleted");
+  });
+
   test("prevents deleting a space while a lesson is being delivered", async () => {
     engine.ensureSpace("personal/ou_me", { chatId: "oc_p2p" });
     seedPlan(engine);
@@ -239,6 +333,8 @@ describe("LearningScheduler", () => {
 
     const tick = scheduler.tick("test", NOW);
     await started;
+    await expect(engine.exportSpace("personal/ou_me"))
+      .rejects.toThrow("space has delivering learning sessions");
     await expect(engine.deleteSpace("personal/ou_me"))
       .rejects.toThrow("space has delivering learning sessions");
     releaseDelivery();

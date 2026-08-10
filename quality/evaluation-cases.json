@@ -61,24 +61,25 @@
       "expectedCitations": ["concepts/release-retry-policy"]
     },
     {
-      "id": "semantic-backend-paraphrase",
+      "id": "incident-contact-alias",
       "question": "线上故障该找哪位？",
       "pages": [
         {
-          "slug": "entities/alice-semantic",
+          "slug": "entities/alice-incident",
           "type": "entity",
           "title": "Alice",
-          "summary": "Alice 负责后端服务",
-          "aliases": [],
-          "content": "Alice 负责后端服务，并主导服务端架构。"
+          "summary": "Alice 是生产事故响应负责人",
+          "aliases": ["线上故障联系人"],
+          "tags": ["生产事故", "应急响应"],
+          "content": "Alice 负责生产事故响应，并主导服务端应急处置。"
         }
       ],
-      "routeSlugs": ["entities/alice-semantic"],
+      "routeSlugs": ["entities/alice-incident"],
       "relevant": true,
-      "answer": "Alice 在负责后端服务。",
-      "usedSlugs": ["entities/alice-semantic"],
+      "answer": "线上故障应联系 Alice。",
+      "usedSlugs": ["entities/alice-incident"],
       "expectedSource": "knowledge",
-      "expectedCitations": ["entities/alice-semantic"]
+      "expectedCitations": ["entities/alice-incident"]
     }
   ],
   "routing": [

@@ -121,6 +121,8 @@ export interface Hit {
 export interface Citation {
   slug: string;
   title: string;
+  /** Exact source only when the same slug exists in more than one queried space. */
+  space?: SpaceId;
 }
 
 export type SkillWarningCode =
@@ -129,7 +131,8 @@ export type SkillWarningCode =
   | "provider_incompatible"
   | "ambiguous_legacy_name"
   | "shadowed_source"
-  | "invalid_invocation_name";
+  | "invalid_invocation_name"
+  | "no_tools_context";
 
 /** Presentation-safe warning for an Agent Skill that could not be loaded. */
 export interface SkillWarningView {

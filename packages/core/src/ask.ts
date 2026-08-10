@@ -29,9 +29,15 @@ const log = logger.child("ask");
 const SINGLETON = new Set(["index", "overview", "log", "glossary"]);
 const DEFAULT_MAX_PAGES = 8;
 const CATALOG_CAP = 60;
+const CATALOG_FALLBACK_MAX_BATCHES = 4;
 
 export interface AskDeps {
   client?: LlmClient;
+  onRetrieval?: (evidence: AskRetrievalEvidence) => void;
+}
+
+export interface AskRetrievalEvidence {
+  pages: Array<{ space: SpaceId; slug: string; contentHash: string }>;
 }
 
 /** A page plus the store it lives in — slugs are only unique within a space. */
@@ -39,6 +45,18 @@ export interface LocatedPage {
   space: SpaceId;
   store: SpaceStore;
   ref: PageRef;
+}
+
+function locatedPageIdentity(page: Pick<LocatedPage, "space" | "ref">): string {
+  return `${page.space}::${page.ref.slug}`;
+}
+
+function pageKey(space: SpaceId, slug: string): string {
+  return `${space}::${slug}`;
+}
+
+function routeCandidateKey(index: number): string {
+  return `page-${index + 1}`;
 }
 
 // ---- step 1: catalog -------------------------------------------------------
@@ -82,6 +100,39 @@ export function buildCatalog(
   return out.slice(0, cap * Math.max(1, stores.length));
 }
 
+function buildCatalogFallbackBatches(stores: SpaceStore[]): LocatedPage[][] {
+  const queues = stores.map((store) => ({
+    store,
+    refs: store.index().listPages().filter((ref) => !SINGLETON.has(ref.slug)),
+    offset: 0,
+  }));
+  const batches: LocatedPage[][] = [];
+  while (batches.length < CATALOG_FALLBACK_MAX_BATCHES) {
+    const batch: LocatedPage[] = [];
+    while (batch.length < CATALOG_CAP) {
+      let progressed = false;
+      for (const queue of queues) {
+        if (batch.length >= CATALOG_CAP) break;
+        const ref = queue.refs[queue.offset];
+        if (!ref) continue;
+        queue.offset += 1;
+        progressed = true;
+        batch.push({ space: queue.store.space, store: queue.store, ref });
+      }
+      if (!progressed) break;
+    }
+    if (batch.length === 0) break;
+    batches.push(batch);
+  }
+  return batches;
+}
+
+function hasLargeCatalog(stores: SpaceStore[]): boolean {
+  return stores.some((store) =>
+    store.index().listPages().filter((ref) => !SINGLETON.has(ref.slug)).length > CATALOG_CAP
+  );
+}
+
 // ---- step 2: routing -------------------------------------------------------
 
 const ROUTE_SCHEMA = {
@@ -90,7 +141,7 @@ const ROUTE_SCHEMA = {
     slugs: {
       type: "array",
       items: { type: "string" },
-      description: "slugs of catalog pages relevant to the question (may be empty)",
+      description: "opaque candidate keys relevant to the question (may be empty)",
     },
     relevant: {
       type: "boolean",
@@ -112,10 +163,35 @@ function validateRoute(raw: unknown): RouteResult {
   return { slugs, relevant };
 }
 
+function normalizeRouteSelections(catalog: LocatedPage[], selections: string[]): string[] {
+  const identityByCandidateKey = new Map(
+    catalog.map((candidate, index) => [routeCandidateKey(index), locatedPageIdentity(candidate)]),
+  );
+  const keysBySlug = new Map<string, string[]>();
+  for (const candidate of catalog) {
+    const keys = keysBySlug.get(candidate.ref.slug) ?? [];
+    keys.push(locatedPageIdentity(candidate));
+    keysBySlug.set(candidate.ref.slug, keys);
+  }
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const selection of selections) {
+    const key = identityByCandidateKey.has(selection)
+      ? identityByCandidateKey.get(selection)
+      : keysBySlug.get(selection)?.length === 1
+      ? keysBySlug.get(selection)?.[0]
+      : undefined;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(key);
+  }
+  return normalized;
+}
+
 function routePrompt(catalog: LocatedPage[], question: string): string {
-  const lines = catalog.map((c) => {
+  const lines = catalog.map((c, index) => {
     const aliases = c.ref.aliases.length ? `（别名：${c.ref.aliases.join("、")}）` : "";
-    return `- ${c.ref.slug}${aliases}：${c.ref.title}｜${c.ref.summary}`;
+    return `- ${routeCandidateKey(index)}（slug: ${c.ref.slug}）${aliases}：${c.ref.title}｜${c.ref.summary}`;
   });
   return [
     "下面是知识库中可用页面的目录。请判断哪些页面与用户消息相关。",
@@ -127,7 +203,7 @@ function routePrompt(catalog: LocatedPage[], question: string): string {
     question,
     "",
     "任务：",
-    "- 选出与消息直接相关的页面 slug（可多选；无相关页面则返回空数组）。",
+    "- 选出与消息直接相关的完整候选 key（可多选；无相关页面则返回空数组），不要只返回裸 slug。",
     "- relevant 表示知识库是否可能帮助回应该消息。",
   ].join("\n");
 }
@@ -148,7 +224,31 @@ async function route(
     space,
     model: config().modelFast,
   });
-  return value;
+  return { ...value, slugs: normalizeRouteSelections(catalog, value.slugs) };
+}
+
+async function routeCatalogFallback(
+  client: LlmClient,
+  stores: SpaceStore[],
+  question: string,
+  primarySpace: SpaceId | undefined,
+): Promise<{ catalog: LocatedPage[]; routed: RouteResult } | undefined> {
+  for (const batch of buildCatalogFallbackBatches(stores)) {
+    try {
+      const candidate = await route(client, batch, question, primarySpace);
+      const batchKeys = new Set(batch.map(locatedPageIdentity));
+      const validSlugs = candidate.slugs.filter((key) => batchKeys.has(key));
+      if (!candidate.relevant || validSlugs.length === 0) continue;
+      return {
+        catalog: batch,
+        routed: { ...candidate, slugs: validSlugs },
+      };
+    } catch (err) {
+      log.warn("bounded catalog fallback routing failed", { err: String(err) });
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 // ---- step 3: graph expansion ----------------------------------------------
@@ -335,17 +435,32 @@ async function generalFallback(
 /** Resolve used slugs to citations (title lookup), preserving order & de-duping. */
 export function resolveCitations(
   usedSlugs: string[],
-  loaded: { slug: string; page: Page }[],
+  loaded: {
+    slug: string;
+    page: Page;
+    key?: string;
+    space?: SpaceId;
+    includeSpace?: boolean;
+  }[],
 ): Citation[] {
-  const bySlug = new Map(loaded.map((l) => [l.slug, l.page]));
+  const slugCounts = new Map<string, number>();
+  for (const item of loaded) slugCounts.set(item.slug, (slugCounts.get(item.slug) ?? 0) + 1);
+  const byIdentifier = new Map<string, (typeof loaded)[number]>();
+  for (const item of loaded) {
+    if (item.key) byIdentifier.set(item.key, item);
+    if (slugCounts.get(item.slug) === 1) byIdentifier.set(item.slug, item);
+  }
   const seen = new Set<string>();
   const out: Citation[] = [];
-  for (const slug of usedSlugs) {
-    if (seen.has(slug)) continue;
-    const page = bySlug.get(slug);
-    if (!page) continue;
-    seen.add(slug);
-    out.push({ slug, title: page.title });
+  for (const identifier of usedSlugs) {
+    const item = byIdentifier.get(identifier);
+    if (!item || seen.has(identifier)) continue;
+    seen.add(identifier);
+    out.push({
+      slug: item.slug,
+      title: item.page.title,
+      ...(item.includeSpace && item.space ? { space: item.space } : {}),
+    });
   }
   return out;
 }
@@ -366,7 +481,15 @@ export async function ask(
   const primarySpace = stores[0]?.space;
 
   // Empty knowledge base across all spaces -> general fallback (Q1/Q3).
-  const catalog = buildCatalog(stores, question);
+  let catalog = buildCatalog(stores, question);
+  let routed: RouteResult | undefined;
+  if (catalog.length === 0) {
+    const fallback = await routeCatalogFallback(client, stores, question, primarySpace);
+    if (fallback) {
+      catalog = fallback.catalog;
+      routed = fallback.routed;
+    }
+  }
   if (catalog.length === 0) {
     if (opts.knowledgeOnly) {
       return { answer: "", source: "general", citations: [], gaps: ["知识库为空"] };
@@ -382,20 +505,42 @@ export async function ask(
   }
 
   // Route: which pages are relevant?
-  let routed: RouteResult;
-  try {
-    routed = await route(client, catalog, question, primarySpace);
-  } catch (err) {
-    log.warn("routing failed, falling back to FTS", { err: String(err) });
-    routed = { slugs: [], relevant: false };
+  let routingFailed = false;
+  if (!routed) {
+    try {
+      routed = await route(client, catalog, question, primarySpace);
+    } catch (err) {
+      log.warn("routing failed, falling back to FTS", { err: String(err) });
+      routed = { slugs: [], relevant: false };
+      routingFailed = true;
+    }
   }
 
   // If routing found nothing, try FTS as a safety net before giving up.
-  let selected = routed.slugs.filter((s) => catalog.some((c) => c.ref.slug === s));
+  let selected = routed.slugs.filter((key) =>
+    catalog.some((candidate) => locatedPageIdentity(candidate) === key)
+  );
   if (selected.length === 0) {
-    const ftsSlugs = new Set<string>();
-    for (const store of stores) for (const h of store.index().search(question, 5)) ftsSlugs.add(h.slug);
-    selected = catalog.filter((c) => ftsSlugs.has(c.ref.slug)).map((c) => c.ref.slug);
+    const ftsKeys = new Set<string>();
+    for (const store of stores) {
+      for (const hit of store.index().search(question, 5)) {
+        ftsKeys.add(pageKey(store.space, hit.slug));
+      }
+    }
+    selected = catalog.filter((c) => ftsKeys.has(locatedPageIdentity(c))).map(locatedPageIdentity);
+  }
+
+  if (
+    !routingFailed
+    && (selected.length === 0 || !routed.relevant)
+    && hasLargeCatalog(stores)
+  ) {
+    const fallback = await routeCatalogFallback(client, stores, question, primarySpace);
+    if (fallback) {
+      catalog = fallback.catalog;
+      routed = fallback.routed;
+      selected = fallback.routed.slugs;
+    }
   }
 
   if (selected.length === 0 || !routed.relevant) {
@@ -413,10 +558,10 @@ export async function ask(
   }
 
   // Expand + load whole pages per store.
-  const loaded: { slug: string; page: Page }[] = [];
+  const loaded: { space: SpaceId; slug: string; key: string; page: Page }[] = [];
   const bySpaceSelected = new Map<SpaceStore, string[]>();
   for (const c of catalog) {
-    if (!selected.includes(c.ref.slug)) continue;
+    if (!selected.includes(locatedPageIdentity(c))) continue;
     const list = bySpaceSelected.get(c.store) ?? [];
     list.push(c.ref.slug);
     bySpaceSelected.set(c.store, list);
@@ -427,7 +572,7 @@ export async function ask(
     for (const slug of expanded) {
       if (loaded.length >= maxPages) break;
       const page = store.index().getPage(slug);
-      if (page) loaded.push({ slug, page });
+      if (page) loaded.push({ space: store.space, slug, key: pageKey(store.space, slug), page });
     }
   }
 
@@ -445,10 +590,27 @@ export async function ask(
     );
   }
 
+  deps.onRetrieval?.({
+    pages: loaded.map(({ space, slug, page }) => ({
+      space,
+      slug,
+      contentHash: page.contentHash,
+    })),
+  });
+
   // Synthesize a grounded answer.
+  const duplicateSlugs = new Set(
+    loaded
+      .filter((item, index, all) => all.findIndex((other) => other.slug === item.slug) !== index)
+      .map((item) => item.slug),
+  );
+  const synthesisPages = loaded.map((item, index) => ({
+    slug: duplicateSlugs.has(item.slug) ? `source-${index + 1}` : item.slug,
+    page: item.page,
+  }));
   const synth = await synthesize(
     client,
-    loaded,
+    synthesisPages,
     question,
     primarySpace,
     model,
@@ -468,8 +630,12 @@ export async function ask(
   }
 
   const citations = resolveCitations(
-    synth.usedSlugs.length ? synth.usedSlugs : loaded.map((l) => l.slug),
-    loaded,
+    synth.usedSlugs.length ? synth.usedSlugs : synthesisPages.map((item) => item.slug),
+    loaded.map((item, index) => ({
+      ...item,
+      key: synthesisPages[index]!.slug,
+      includeSpace: stores.filter((store) => store.index().getPage(item.slug) !== null).length > 1,
+    })),
   );
   return {
     answer: synth.answer.trim(),

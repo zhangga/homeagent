@@ -164,10 +164,26 @@ async function analyze(
 interface GeneratedPage {
   title: string;
   summary: string;
-  aliases: string[];
-  tags: string[];
+  aliases?: string[];
+  tags?: string[];
   links: string[];
   content: string;
+}
+
+const MAX_SEARCH_METADATA_ITEMS = 64;
+const MAX_SEARCH_METADATA_VALUE_CHARACTERS = 200;
+
+function normalizeSearchMetadata(values: unknown[]): string[] {
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const item = String(value).trim().slice(0, MAX_SEARCH_METADATA_VALUE_CHARACTERS);
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    normalized.push(item);
+    if (normalized.length >= MAX_SEARCH_METADATA_ITEMS) break;
+  }
+  return normalized;
 }
 
 const GENERATE_SCHEMA = {
@@ -196,11 +212,15 @@ function validateGenerate(raw: unknown): GeneratedPage {
   return {
     title: o.title,
     summary: typeof o.summary === "string" ? o.summary : "",
-    aliases: Array.isArray(o.aliases) ? (o.aliases as unknown[]).map(String) : [],
-    tags: Array.isArray(o.tags) ? (o.tags as unknown[]).map(String) : [],
+    aliases: Array.isArray(o.aliases) ? normalizeSearchMetadata(o.aliases) : undefined,
+    tags: Array.isArray(o.tags) ? normalizeSearchMetadata(o.tags) : undefined,
     links: Array.isArray(o.links) ? (o.links as unknown[]).map(String) : [],
     content: o.content,
   };
+}
+
+function resolveSearchMetadata(existing: string[] | undefined, generated: string[] | undefined): string[] {
+  return generated === undefined ? normalizeSearchMetadata(existing ?? []) : generated;
 }
 
 function generatePrompt(
@@ -225,6 +245,10 @@ function generatePrompt(
       "## 该页现有内容（请在此基础上合并更新，不要丢失既有信息）",
       existing.content.trim(),
       "",
+      "## 现有检索元数据",
+      `aliases: ${JSON.stringify(existing.aliases)}`,
+      `tags: ${JSON.stringify(existing.tags)}`,
+      "",
     );
   }
   if (sources.some((source) => source.source === "manual")) {
@@ -242,6 +266,10 @@ function generatePrompt(
     "- content 为完整 markdown 正文（整页，不要分片）。",
     "- 用 [[slug]] 形式链接到相关页面（若知道其 slug）。",
     "- summary 用一句话概括。",
+    "- aliases 只填写来源或既有页面明确支持的别名、简称与常见用户问法，用于检索本页。",
+    "- tags 只填写来源或既有页面明确支持的主题、场景与职责。",
+    "- aliases 与 tags 要输出更新后的完整集合；已不再受当前来源支持的旧项应删除，无内容时输出空数组。",
+    "- 不要为了提高检索召回而臆造同义词、职责或场景。",
     "- 只根据来源与既有内容写，不要臆造。",
   );
   return parts.join("\n");
@@ -339,8 +367,8 @@ export async function regeneratePageFromSources(
       type: op.type,
       title: generated.title,
       summary: generated.summary,
-      aliases: generated.aliases,
-      tags: generated.tags,
+      aliases: resolveSearchMetadata(existing.aliases, generated.aliases),
+      tags: resolveSearchMetadata(existing.tags, generated.tags),
       sources: rawIds,
       links: generated.links,
       content: `${generated.content.trimEnd()}\n`,
@@ -481,8 +509,8 @@ export async function runDreamCycle(
         type: op.type,
         title: gen.title,
         summary: gen.summary,
-        aliases: gen.aliases,
-        tags: gen.tags,
+        aliases: resolveSearchMetadata(existing?.aliases, gen.aliases),
+        tags: resolveSearchMetadata(existing?.tags, gen.tags),
         sources: mergedSources,
         links: gen.links,
         content: gen.content.trimEnd() + "\n",

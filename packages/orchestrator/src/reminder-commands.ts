@@ -289,6 +289,15 @@ function snoozeDuration(text: string): number | undefined {
   return durationMs(parsed?.[1], parsed?.[2]);
 }
 
+/** Pure preflight used to authorize group reminder governance before any mutation/model call. */
+export function isReminderAutomationMessage(text: string): boolean {
+  return isReminderListQuery(text)
+    || snoozeDuration(text) !== undefined
+    || isReminderCancellation(text)
+    || isReminderCompletion(text)
+    || needsReminderInference(text);
+}
+
 /** Return null when the message is not a reminder control message. */
 export function handleReminderMessage(
   engine: KnowledgeEngine,

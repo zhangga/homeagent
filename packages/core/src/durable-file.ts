@@ -3,18 +3,21 @@ import { fsyncSync, renameSync } from "node:fs";
 /**
  * Flush a file or directory when the runtime supports it.
  *
- * Bun on Windows may return EPERM/EINVAL for fsync even on a valid writable
- * file descriptor. The same-directory temporary file + atomic rename remains
- * the integrity boundary there; all other platforms and error codes stay
- * strict so genuine storage failures are never hidden.
+ * Bun on Windows does not support fsync for directory descriptors. Callers
+ * must opt into that narrow exception; regular-file failures always propagate
+ * so an atomic writer cannot silently skip flushing its data.
  */
-export function durableFsyncSync(fileDescriptor: number): void {
+export function durableFsyncSync(
+  fileDescriptor: number,
+  options: { allowUnsupportedDirectoryOnWindows?: boolean } = {},
+): void {
   try {
     fsyncSync(fileDescriptor);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (
       process.platform === "win32"
+      && options.allowUnsupportedDirectoryOnWindows === true
       && (code === "EPERM" || code === "EINVAL")
     ) {
       return;

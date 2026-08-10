@@ -18,11 +18,21 @@ import {
 import { isSpaceId, type SpaceId } from "@homeagent/shared";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 import {
+  cloneResolvedExecutionPlan,
+  isResolvedExecutionPlan,
+  type ResolvedExecutionPlan,
+} from "./execution-plan.ts";
+import {
   MAX_TASK_RUN_SKILLS,
   isTaskRunSkillEvidence,
   type TaskRunSkillEvidence,
 } from "./task-runs.ts";
 import type { RunPriority } from "./run-scheduler.ts";
+import {
+  cloneAggregatedRunUsage,
+  isAggregatedRunUsage,
+  type AggregatedRunUsage,
+} from "./usage.ts";
 
 export type ChatRunTrigger = "message" | "retry";
 export type ChatRunStatus =
@@ -71,6 +81,7 @@ export interface ChatRun {
   reasoningEffort?: CodexReasoningEffort;
   skillEvidence?: TaskRunSkillEvidence;
   execution?: ProviderExecution;
+  executionPlan?: ResolvedExecutionPlan;
   retryOf?: string;
   priority: RunPriority;
   status: ChatRunStatus;
@@ -82,7 +93,17 @@ export interface ChatRun {
   output?: string;
   outputTruncated?: boolean;
   traceId?: string;
+  usage?: AggregatedRunUsage;
   error?: ChatRunError;
+}
+
+/** A reply has crossed the durable delivery boundary but has not settled yet. */
+export function isChatRunDeliveryInFlight(
+  run: Pick<ChatRun, "status" | "delivery">,
+): boolean {
+  return run.status === "succeeded"
+    && run.delivery.status === "pending"
+    && run.delivery.attempts > 0;
 }
 
 export interface StartChatRunInput {
@@ -99,6 +120,7 @@ export interface StartChatRunInput {
   reasoningEffort?: CodexReasoningEffort;
   skillEvidence?: TaskRunSkillEvidence;
   execution?: ProviderExecution;
+  executionPlan?: ResolvedExecutionPlan;
   retryOf?: string;
   priority?: RunPriority;
   startedAt?: number;
@@ -112,15 +134,18 @@ export interface FinishChatRunSuccessInput {
   finishedAt: number;
   output: string;
   traceId?: string;
+  usage?: AggregatedRunUsage;
 }
 
 export interface FinishChatRunFailureInput {
   finishedAt: number;
   error: ChatRunError;
+  traceId?: string;
+  usage?: AggregatedRunUsage;
 }
 
 interface ChatRunsFile {
-  version: 1 | 2;
+  version: 1 | 2 | 3 | 4;
   runs: Record<string, ChatRun>;
 }
 
@@ -142,7 +167,11 @@ function clone(run: ChatRun): ChatRun {
     execution: run.execution
       ? { ...run.execution, skills: [...run.execution.skills] }
       : undefined,
+    executionPlan: run.executionPlan
+      ? cloneResolvedExecutionPlan(run.executionPlan)
+      : undefined,
     delivery: { ...run.delivery },
+    usage: run.usage ? cloneAggregatedRunUsage(run.usage) : undefined,
     error: run.error ? { ...run.error } : undefined,
   };
 }
@@ -210,6 +239,11 @@ export function isChatRun(value: unknown): value is ChatRun {
       || CODEX_REASONING_EFFORTS.includes(run.reasoningEffort))
     && (run.skillEvidence === undefined || isTaskRunSkillEvidence(run.skillEvidence))
     && (run.execution === undefined || isExecution(run.execution))
+    && (run.executionPlan === undefined || (
+      isResolvedExecutionPlan(run.executionPlan)
+      && run.executionPlan.execution === undefined
+    ))
+    && (run.usage === undefined || isAggregatedRunUsage(run.usage))
     && (run.error === undefined || (
       typeof run.error === "object"
       && !Array.isArray(run.error)
@@ -272,7 +306,7 @@ export class ChatRunStore {
     if (!existsSync(this.configPath)) return runs;
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<ChatRunsFile>;
-      if (parsed.version !== 1 && parsed.version !== 2) return runs;
+      if (![1, 2, 3, 4].includes(Number(parsed.version))) return runs;
       for (const [id, value] of Object.entries(parsed.runs ?? {})) {
         const legacy = value as Partial<ChatRun>;
         const normalized = parsed.version === 1
@@ -296,13 +330,13 @@ export class ChatRunStore {
     const configDir = dirname(this.configPath);
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const tempPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
-    const file: ChatRunsFile = { version: 2, runs: Object.fromEntries(runs) };
+    const file: ChatRunsFile = { version: 4, runs: Object.fromEntries(runs) };
     try {
       writeFileSync(tempPath, JSON.stringify(file, null, 2), {
         encoding: "utf8",
         mode: 0o600,
       });
-      const fileDescriptor = openSync(tempPath, "r");
+      const fileDescriptor = openSync(tempPath, "r+");
       try {
         durableFsyncSync(fileDescriptor);
       } finally {
@@ -311,7 +345,9 @@ export class ChatRunStore {
       durableRenameSync(tempPath, this.configPath);
       const directoryDescriptor = openSync(configDir, "r");
       try {
-        durableFsyncSync(directoryDescriptor);
+        durableFsyncSync(directoryDescriptor, {
+          allowUnsupportedDirectoryOnWindows: true,
+        });
       } finally {
         closeSync(directoryDescriptor);
       }
@@ -354,7 +390,11 @@ export class ChatRunStore {
   private pruneCompletedRuns(runs = this.runs): void {
     const completedByOwner = new Map<string, ChatRun[]>();
     for (const run of runs.values()) {
-      if (run.status === "queued" || run.status === "running") continue;
+      if (
+        run.status === "queued"
+        || run.status === "running"
+        || isChatRunDeliveryInFlight(run)
+      ) continue;
       const owner = run.agentId ? `agent:${run.agentId}` : `space:${run.space}`;
       const completed = completedByOwner.get(owner) ?? [];
       completed.push(run);
@@ -370,6 +410,12 @@ export class ChatRunStore {
   }
 
   start(input: StartChatRunInput): ChatRun {
+    if (input.executionPlan !== undefined && !isResolvedExecutionPlan(input.executionPlan)) {
+      throw new Error("Resolved execution plan is invalid");
+    }
+    if (input.executionPlan?.execution !== undefined) {
+      throw new Error("Chat execution plan must not grant provider execution");
+    }
     if (input.skillEvidence !== undefined && !isTaskRunSkillEvidence(input.skillEvidence)) {
       throw new Error("Skill evidence is invalid or exceeds persistence limits");
     }
@@ -396,6 +442,9 @@ export class ChatRunStore {
         execution: input.execution
           ? { ...input.execution, skills: [...input.execution.skills] }
           : undefined,
+        executionPlan: input.executionPlan
+          ? cloneResolvedExecutionPlan(input.executionPlan)
+          : undefined,
         priority: input.priority ?? "interactive",
         status: "queued",
         delivery: { status: "pending", attempts: 0 },
@@ -418,9 +467,12 @@ export class ChatRunStore {
   }
 
   succeed(id: string, result: FinishChatRunSuccessInput): ChatRun | undefined {
-    if (!this.runs.has(id)) return undefined;
+    if (!["queued", "running"].includes(this.runs.get(id)?.status ?? "")) {
+      return undefined;
+    }
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
+      if (!["queued", "running"].includes(run.status)) return undefined;
       run.runStartedAt ??= run.startedAt;
       run.status = "succeeded";
       run.finishedAt = Math.max(result.finishedAt, run.startedAt);
@@ -428,6 +480,7 @@ export class ChatRunStore {
       run.outputTruncated =
         result.output.length > MAX_CHAT_RUN_OUTPUT_CHARACTERS || undefined;
       run.traceId = result.traceId;
+      run.usage = result.usage ? cloneAggregatedRunUsage(result.usage) : undefined;
       run.error = undefined;
       this.pruneCompletedRuns(candidate);
       return clone(run);
@@ -451,9 +504,12 @@ export class ChatRunStore {
     status: "failed" | "cancelled" | "timed_out",
     result: FinishChatRunFailureInput,
   ): ChatRun | undefined {
-    if (!this.runs.has(id)) return undefined;
+    if (!["queued", "running"].includes(this.runs.get(id)?.status ?? "")) {
+      return undefined;
+    }
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
+      if (!["queued", "running"].includes(run.status)) return undefined;
       if (run.status !== "queued") run.runStartedAt ??= run.startedAt;
       run.status = status;
       run.finishedAt = Math.max(result.finishedAt, run.runStartedAt ?? run.startedAt);
@@ -461,6 +517,8 @@ export class ChatRunStore {
         kind: result.error.kind,
         message: result.error.message.slice(0, MAX_CHAT_RUN_ERROR_CHARACTERS),
       };
+      run.traceId = result.traceId;
+      run.usage = result.usage ? cloneAggregatedRunUsage(result.usage) : undefined;
       this.pruneCompletedRuns(candidate);
       return clone(run);
     });
@@ -576,12 +634,16 @@ export class ChatRunStore {
   removeByRawIds(rawIds: ReadonlySet<string>): number {
     if (rawIds.size === 0) return 0;
     const removed = [...this.runs.values()].filter(
-      (run) => run.rawId && rawIds.has(run.rawId),
+      (run) => run.rawId && rawIds.has(run.rawId) && !isChatRunDeliveryInFlight(run),
     ).length;
     if (removed === 0) return 0;
     return this.commit((candidate) => {
       for (const [id, run] of candidate) {
-        if (run.rawId && rawIds.has(run.rawId)) candidate.delete(id);
+        if (
+          run.rawId
+          && rawIds.has(run.rawId)
+          && !isChatRunDeliveryInFlight(run)
+        ) candidate.delete(id);
       }
       return removed;
     });

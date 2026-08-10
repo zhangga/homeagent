@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { JSONOptions } from "@homeagent/llm";
+import { ProviderRunError, type JSONOptions } from "@homeagent/llm";
 import { resetConfig, saveSettings, type SpaceId } from "@homeagent/shared";
 import { KnowledgeEngine, FakeLlm, type AgentInput, type LlmClient } from "@homeagent/core";
 import { CliConnector, type Connector } from "@homeagent/connectors";
@@ -18,6 +18,10 @@ const cliOnlyRuntimes: Array<{
   connector: CliConnector;
   orchestrator: Orchestrator;
 }> = [];
+
+function grantGroupAdministrator(): void {
+  (connector as CliConnector & Connector).isChatAdministrator = async () => true;
+}
 
 /**
  * One fake serves participation, routing, and synthesis by inspecting each
@@ -222,10 +226,10 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
         contentHash: "health",
       },
     );
-    const originalAsk = engine.ask.bind(engine);
-    engine.ask = async (spaces, question, opts) => {
+    const originalAsk = engine.askWithExecutionPlan.bind(engine);
+    engine.askWithExecutionPlan = async (spaces, question, plan, evidence, opts) => {
       await Bun.sleep(5);
-      return originalAsk(spaces, question, opts);
+      return originalAsk(spaces, question, plan, evidence, opts);
     };
     await orch.start();
     await connector.sendGroup("@agent 谁负责后端服务？", true);
@@ -311,6 +315,56 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
         }),
       }),
     ]);
+  });
+
+  test("a provider failure links its quality trace and usage to the durable Chat Run", async () => {
+    const failing = new FakeLlm();
+    const providerFailure = () => {
+      throw new ProviderRunError("claude", "provider claude exited 1", {
+        inputTokens: 60,
+        outputTokens: 7,
+        costUsd: 0.006,
+        costBasis: "reported",
+        source: "claude-json",
+      });
+    };
+    failing.onJSON(providerFailure);
+    failing.onText(providerFailure);
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: failing });
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Failure usage Agent",
+      provider: "claude",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    orch = new Orchestrator({ engine, connector, llm: failing });
+    await orch.start();
+
+    await connector.sendGroup("@agent diagnose the provider failure", true);
+
+    const run = engine.chatRuns.listByAgent(agent.id, 10)[0]!;
+    expect(run).toEqual(expect.objectContaining({
+      status: "failed",
+      traceId: expect.any(String),
+      usage: {
+        calls: 1,
+        knownTokenCalls: 1,
+        unknownTokenCalls: 0,
+        knownCostCalls: 1,
+        unknownCostCalls: 0,
+        inputTokens: 60,
+        outputTokens: 7,
+        costUsd: 0.006,
+        costBasis: "reported",
+        sources: ["claude-json"],
+      },
+    }));
+    expect(engine.answerTrace(run.traceId!)).toEqual(expect.objectContaining({
+      outcome: "failed",
+      usage: run.usage,
+    }));
   });
 
   test("bot-added events do not reopen a locally disconnected group", async () => {
@@ -442,14 +496,14 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
     await orch.start();
 
-    await connector.sendGroup("@agent hello", true);
+    await connector.sendGroup("@agent what is the release process?", true);
 
     const chats = engine.listAgentChatRecords(agent.id, 10);
     expect(chats).toEqual([
       expect.objectContaining({
         agentId: agent.id,
         space: "team/oc_team",
-        content: "@agent hello",
+        content: "@agent what is the release process?",
       }),
     ]);
     const detail = await engine.getRawGovernanceDetail("team/oc_team", chats[0]!.id);
@@ -464,6 +518,15 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
         provider: "claude",
         status: "succeeded",
         output: connector.sent[0]!.markdown,
+        usage: {
+          calls: 1,
+          knownTokenCalls: 0,
+          unknownTokenCalls: 1,
+          knownCostCalls: 0,
+          unknownCostCalls: 1,
+          costBasis: "unavailable",
+          sources: [],
+        },
         delivery: expect.objectContaining({
           status: "sent",
           attempts: 1,
@@ -530,6 +593,53 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(connector.sent).toHaveLength(1);
   });
 
+  test("an in-flight reply keeps its Chat Run audit and blocks space export or deletion", async () => {
+    let markReplyStarted!: () => void;
+    let releaseReply!: () => void;
+    const replyStarted = new Promise<void>((resolve) => {
+      markReplyStarted = resolve;
+    });
+    const replyGate = new Promise<void>((resolve) => {
+      releaseReply = resolve;
+    });
+    const originalReply = connector.reply.bind(connector);
+    connector.reply = async (out) => {
+      markReplyStarted();
+      await replyGate;
+      await originalReply(out);
+    };
+    await orch.start();
+
+    const handling = connector.sendGroup("hello", true);
+    await replyStarted;
+    const run = engine.chatRuns.list("team/oc_team")[0]!;
+    expect(run).toEqual(expect.objectContaining({
+      status: "succeeded",
+      delivery: expect.objectContaining({ status: "pending", attempts: 1 }),
+    }));
+
+    try {
+      expect(await engine.retractMessage("team/oc_team", {
+        chatId: "oc_team",
+        messageId: "om_cli-1",
+        requestedBy: "ou_me",
+      })).toEqual(expect.objectContaining({ status: "retracted" }));
+      expect(engine.chatRuns.get(run.id)).toEqual(expect.objectContaining({
+        delivery: expect.objectContaining({ status: "pending", attempts: 1 }),
+      }));
+      await expect(engine.exportSpace("team/oc_team"))
+        .rejects.toThrow("delivering chat responses");
+      await expect(engine.deleteSpace("team/oc_team"))
+        .rejects.toThrow("delivering chat responses");
+    } finally {
+      releaseReply();
+      await handling;
+    }
+
+    expect(engine.chatRuns.get(run.id)?.delivery.status).toBe("sent");
+    expect((await engine.exportSpace("team/oc_team")).chatRuns).toHaveLength(1);
+  });
+
   test("retrying a failed text Chat creates a linked Run with the current execution", async () => {
     engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
     const agent = engine.agents.create({
@@ -573,17 +683,60 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(engine.chatRuns.get(previous.id)?.status).toBe("failed");
   });
 
-  test("a queued Chat Run resumes with the same durable id after restart", async () => {
+  test("a queued Chat Run resumes with its immutable execution plan after Agent edits", async () => {
     engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Queued Chat Agent",
+      instruction: "Use the original queued Chat persona.",
+      provider: "claude",
+      model: "claude-original",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
     const queued = engine.chatRuns.start({
       space: "team/oc_team",
       chatId: "oc_team",
       messageId: "om_queued_restart",
       author: "ou_me",
-      input: "@agent 请继续分析",
+      input: "@agent explain the queued snapshot?",
       trigger: "message",
+      agentId: agent.id,
+      provider: "claude",
+      model: "claude-original",
+      executionPlan: {
+        version: 1,
+        instruction: "Use the original queued Chat persona.",
+        provider: "claude",
+        model: "claude-original",
+      },
     });
+    engine.agents.update(agent.id, {
+      instruction: "Use the changed live Chat persona.",
+      provider: "codex",
+      model: "gpt-changed",
+    });
+    engine.close();
 
+    let providerCall: {
+      provider: string;
+      system?: string;
+      model?: string;
+      execution?: unknown;
+    } | undefined;
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async (provider, input) => {
+        providerCall = {
+          provider,
+          system: input.system,
+          model: input.model,
+          execution: input.execution,
+        };
+        return "snapshot answer";
+      },
+    });
+    connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
+    orch = new Orchestrator({ engine, connector });
     await orch.start();
     await orch.stop();
 
@@ -592,6 +745,55 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       status: "succeeded",
       runStartedAt: expect.any(Number),
       delivery: expect.objectContaining({ status: "sent" }),
+    }));
+    expect(providerCall).toEqual(expect.objectContaining({
+      provider: "claude",
+      system: expect.stringContaining("Use the original queued Chat persona."),
+      model: "claude-original",
+      execution: undefined,
+    }));
+    expect(providerCall?.system).not.toContain("Use the changed live Chat persona.");
+  });
+
+  test("a legacy queued Chat Run without an execution plan fails closed on recovery", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Legacy Queued Chat Agent",
+      provider: "claude",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const queued = engine.chatRuns.start({
+      space: "team/oc_team",
+      chatId: "oc_team",
+      messageId: "om_legacy_queued_restart",
+      author: "ou_me",
+      input: "@agent this legacy run must fail closed?",
+      trigger: "message",
+      agentId: agent.id,
+      provider: "claude",
+    });
+    engine.close();
+
+    let providerCalls = 0;
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "must not execute";
+      },
+    });
+    connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
+    orch = new Orchestrator({ engine, connector });
+    await orch.start();
+    await orch.stop();
+
+    expect(providerCalls).toBe(0);
+    expect(engine.chatRuns.get(queued.id)).toEqual(expect.objectContaining({
+      status: "failed",
+      error: expect.objectContaining({
+        message: expect.stringMatching(/execution plan/i),
+      }),
     }));
   });
 
@@ -831,7 +1033,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("group participation level progressively answers more optional discussion", async () => {
-    engine.ask = async (_spaces, text) => ({
+    engine.askWithExecutionPlan = async (_spaces, text) => ({
       answer: `参与：${text}`,
       source: "general",
       citations: [],
@@ -889,7 +1091,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
 
   test("a question addressed to another group member stays silent even if the model says respond", async () => {
     let asked = 0;
-    engine.ask = async () => {
+    engine.askWithExecutionPlan = async () => {
       asked += 1;
       return { answer: "不应发送", source: "general", citations: [] };
     };
@@ -915,7 +1117,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
 
   test("an obvious unmentioned question is answered when participation classification fails", async () => {
     let asked = 0;
-    engine.ask = async () => {
+    engine.askWithExecutionPlan = async () => {
       asked += 1;
       return {
         answer: "小贝儿是张洺汐。",
@@ -982,7 +1184,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     const answerGate = new Promise<void>((resolve) => {
       releaseAnswer = resolve;
     });
-    engine.ask = async () => {
+    engine.askWithExecutionPlan = async () => {
       markAsked();
       await answerGate;
       return {
@@ -1002,9 +1204,47 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(connector.sent).toEqual([]);
   });
 
+  test("retracting an active Chat generation prevents its late provider result from being sent", async () => {
+    let markAsked!: () => void;
+    let releaseAnswer!: () => void;
+    const asked = new Promise<void>((resolve) => {
+      markAsked = resolve;
+    });
+    const answerGate = new Promise<void>((resolve) => {
+      releaseAnswer = resolve;
+    });
+    engine.askWithExecutionPlan = async () => {
+      markAsked();
+      await answerGate;
+      return {
+        answer: "This retracted answer must never be delivered.",
+        source: "general",
+        citations: [],
+      };
+    };
+    await orch.start();
+
+    const handling = connector.sendGroup("answer this", true);
+    await asked;
+    const active = engine.chatRuns.list("team/oc_team").find(
+      (run) => run.status === "running",
+    )!;
+    expect(await engine.retractMessage("team/oc_team", {
+      chatId: "oc_team",
+      messageId: "om_cli-1",
+      requestedBy: "ou_me",
+    })).toEqual(expect.objectContaining({ status: "retracted" }));
+    expect(engine.chatRuns.get(active.id)).toBeUndefined();
+
+    releaseAnswer();
+    await handling;
+
+    expect(connector.sent).toEqual([]);
+  });
+
   test("a natural-language analysis request reaches conversation without intent classification", async () => {
     let asked = 0;
-    engine.ask = async () => {
+    engine.askWithExecutionPlan = async () => {
       asked += 1;
       return {
         answer: "这顿晚餐准备得很用心。",
@@ -1040,7 +1280,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       messageType: "text",
     });
     let userMessage = "";
-    engine.ask = async (_spaces, question) => {
+    engine.askWithExecutionPlan = async (_spaces, question) => {
       userMessage = question;
       return {
         answer: "从菜品数量和偏好照顾来看，准备得比较用心。",
@@ -1092,7 +1332,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       messageType: "file",
     });
     let question = "";
-    engine.ask = async (_spaces, input) => {
+    engine.askWithExecutionPlan = async (_spaces, input) => {
       question = input;
       return {
         answer: "编号 HA-SOAK-20260717-A，负责人小林，复核时间周日 16:30。",
@@ -1153,7 +1393,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     });
     orch = new Orchestrator({ engine, connector, llm: proactive });
     let question = "";
-    engine.ask = async (_spaces, input) => {
+    engine.askWithExecutionPlan = async (_spaces, input) => {
       question = input;
       return {
         answer: "负责人是小林。",
@@ -1198,7 +1438,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
         }];
       },
     });
-    engine.ask = async (_spaces, _question, options) => {
+    engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, options) => {
       images = (options as { images?: unknown }).images;
       return {
         answer: "从摆盘和菜品搭配看，这顿晚餐准备得很用心。",
@@ -1236,7 +1476,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
         },
       }],
     });
-    engine.ask = async () => {
+    engine.askWithExecutionPlan = async () => {
       throw new Error("provider claude does not support image inputs");
     };
 
@@ -1244,7 +1484,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     await connector.sendGroup("@agent 分析下这个晚餐", true);
 
     expect(connector.sent[0]!.markdown).toContain("当前 Agent 不支持图片输入");
-    expect(connector.sent[0]!.markdown).toContain("Codex");
+    expect(connector.sent[0]!.markdown).toContain("不会为了图片绕过 no-tools 隔离");
     expect(cleaned).toBe(true);
   });
 
@@ -1262,7 +1502,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       connector,
       attachmentDownloader: async () => [],
     });
-    engine.ask = async (_spaces, input, options) => {
+    engine.askWithExecutionPlan = async (_spaces, input, _plan, _evidence, options) => {
       question = input;
       images = (options as { images?: unknown }).images;
       return {
@@ -1282,7 +1522,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
 
   test("a mentioned Chinese question without punctuation reaches ask directly", async () => {
     let asked = 0;
-    engine.ask = async (spaces, question) => {
+    engine.askWithExecutionPlan = async (spaces, question) => {
       asked += 1;
       expect(spaces).toEqual(["team/oc_team", "personal/ou_me"]);
       expect(question).toBe("小贝儿是谁");
@@ -1310,6 +1550,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("an addressed natural-language reminder creates a durable reminder", async () => {
+    grantGroupAdministrator();
     const before = Date.now();
     await orch.start();
     await connector.sendGroup("@agent 1小时后提醒我喝水", true);
@@ -1330,7 +1571,103 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(engine.registry.store("team/oc_team").index().countRaw()).toBe(0);
   });
 
+  test("ordinary group members cannot create direct, repeating, or inferred reminders", async () => {
+    const reactive = connector as CliConnector & Connector;
+    reactive.isChatAdministrator = async () => false;
+    let providerCalls = 0;
+    const countingLlm: LlmClient = {
+      complete: (options) => fake.complete(options),
+      completeJSON: (options) => {
+        providerCalls += 1;
+        return fake.completeJSON(options);
+      },
+    };
+    orch = new Orchestrator({ engine, connector, llm: countingLlm });
+    await orch.start();
+
+    await connector.sendGroup("@agent 1小时后提醒我喝水", true);
+    await connector.sendGroup(
+      "@agent 1小时后提醒我喝水，每隔1小时重复，直到我回复确认",
+      true,
+    );
+    await connector.sendGroup(
+      "7.22日上午七点半提醒我购买8.5日北京去苏州的火车票",
+      false,
+    );
+
+    expect(providerCalls).toBe(0);
+    expect(engine.reminders.list()).toEqual([]);
+    expect(connector.sent).toHaveLength(3);
+    expect(connector.sent.every((item) => item.markdown.includes("只有群主或群管理员")))
+      .toBe(true);
+  });
+
+  test("an inferred reminder candidate rechecks group administration before confirmation", async () => {
+    const reactive = connector as CliConnector & Connector;
+    let administrator = true;
+    reactive.isChatAdministrator = async () => administrator;
+    let providerCalls = 0;
+    const countingLlm: LlmClient = {
+      complete: (options) => fake.complete(options),
+      completeJSON: (options) => {
+        providerCalls += 1;
+        return fake.completeJSON(options);
+      },
+    };
+    orch = new Orchestrator({ engine, connector, llm: countingLlm });
+    await orch.start();
+
+    await connector.sendGroup(
+      "@agent 7.22日上午七点半提醒我购买8.5日北京去苏州的火车票",
+      true,
+    );
+    expect(providerCalls).toBe(1);
+    expect(engine.reminders.list()).toEqual([]);
+
+    administrator = false;
+    await connector.sendGroup("确认", false);
+
+    expect(providerCalls).toBe(1);
+    expect(engine.reminders.list()).toEqual([]);
+    expect(connector.sent.at(-1)?.markdown).toContain("只有群主或群管理员");
+  });
+
+  test("ordinary group members cannot mutate an existing reminder", async () => {
+    const reactive = connector as CliConnector & Connector;
+    reactive.isChatAdministrator = async () => false;
+    const now = Date.now();
+    const reminder = engine.reminders.create({
+      title: "去茶饼斋",
+      space: "team/oc_team",
+      chatId: "oc_team",
+      creatorId: "ou_me",
+      triggerAt: now + 3600_000,
+    }, now)!;
+    await orch.start();
+
+    await connector.sendGroup("@agent 取消去茶饼斋的提醒", true);
+
+    expect(engine.reminders.get(reminder.id)?.status).toBe("scheduled");
+    expect(connector.sent.at(-1)?.markdown).toContain("只有群主或群管理员");
+  });
+
+  test("p2p reminder creation keeps its existing owner authorization behavior", async () => {
+    await orch.start();
+
+    await connector.sendP2P("1小时后提醒我喝水");
+
+    expect(engine.reminders.list()).toEqual([
+      expect.objectContaining({
+        space: "personal/ou_me",
+        creatorId: "ou_me",
+        title: "喝水",
+        status: "scheduled",
+      }),
+    ]);
+  });
+
   test("asking for the coming week lists scheduled reminders instead of searching the wiki", async () => {
+    grantGroupAdministrator();
     const now = Date.now();
     engine.reminders.create({
       title: "去茶饼斋",
@@ -1356,6 +1693,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("the creator can confirm a repeating reminder in natural language", async () => {
+    grantGroupAdministrator();
     const now = Date.now();
     const reminder = engine.reminders.create({
       title: "确认去大同",
@@ -1375,6 +1713,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("confirmation prefers the exact reminder title over an ambiguous partial match", async () => {
+    grantGroupAdministrator();
     const now = Date.now();
     const shorter = engine.reminders.create({
       title: "去大同",
@@ -1400,6 +1739,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("the creator can cancel a scheduled reminder in natural language", async () => {
+    grantGroupAdministrator();
     const now = Date.now();
     const reminder = engine.reminders.create({
       title: "去茶饼斋",
@@ -1416,6 +1756,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("the creator can snooze a scheduled reminder by a duration", async () => {
+    grantGroupAdministrator();
     const before = Date.now();
     const reminder = engine.reminders.create({
       title: "去茶饼斋",
@@ -1434,6 +1775,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("a reminder without a time asks for one instead of pretending it was saved", async () => {
+    grantGroupAdministrator();
     await orch.start();
     await connector.sendGroup("@agent 提醒我喝水", true);
 
@@ -1443,6 +1785,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("asks for confirmation before creating an LLM-inferred reminder", async () => {
+    grantGroupAdministrator();
     await orch.start();
     await connector.sendGroup(
       "@agent 7.22日上午七点半提醒我购买8.5日北京去苏州的火车票",
@@ -1481,6 +1824,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("cancels an inferred reminder candidate without creating it", async () => {
+    grantGroupAdministrator();
     await orch.start();
     await connector.sendGroup(
       "@agent 7.22日上午七点半提醒我购买8.5日北京去苏州的火车票",
@@ -1493,6 +1837,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("a new unresolved reminder request supersedes an older inferred candidate", async () => {
+    grantGroupAdministrator();
     await orch.start();
     await connector.sendGroup(
       "@agent 7.22日上午七点半提醒我购买8.5日北京去苏州的火车票",
@@ -1532,6 +1877,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   test("retraction without a reply target gives actionable guidance", async () => {
     const reactive = connector as CliConnector & Connector;
     reactive.resolveReplyTarget = async () => undefined;
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
 
     await orch.start();
     await connector.sendGroup("别记这条", true);
@@ -2338,6 +2684,8 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("/task new is handled as a control command: creates a task, not captured, replies", async () => {
+    const reactive = connector as CliConnector & Connector;
+    reactive.isChatAdministrator = async () => true;
     await orch.start();
     // group message WITHOUT @-mention — control commands still respond + are not stored
     await connector.sendGroup("/task new 大模型 Agent 进展", false);
@@ -2351,7 +2699,53 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(engine.registry.store("team/oc_team").index().countRaw()).toBe(0);
   });
 
+  test("ordinary group members cannot create or run filesystem-capable tasks", async () => {
+    const reactive = connector as CliConnector & Connector;
+    reactive.isChatAdministrator = async () => false;
+    await orch.start();
+
+    await connector.sendGroup("/task new 读取本机密钥并汇总", false);
+
+    expect(connector.sent).toHaveLength(1);
+    expect(connector.sent[0]!.markdown).toContain("只有群主或群管理员");
+    expect(engine.tasks.list()).toHaveLength(0);
+
+    const task = engine.tasks.create({
+      name: "existing sensitive task",
+      space: "team/oc_team",
+      topic: "read local credentials",
+      distillOnRun: false,
+    })!;
+    await connector.sendGroup(`/task run ${task.name}`, true);
+
+    expect(connector.sent).toHaveLength(2);
+    expect(connector.sent[1]!.markdown).toContain("只有群主或群管理员");
+    expect(engine.listTaskRuns(task.id)).toHaveLength(0);
+  });
+
+  test("ordinary group members cannot create learning automations or redistill a space", async () => {
+    const reactive = connector as CliConnector & Connector;
+    reactive.isChatAdministrator = async () => false;
+    let dreamCalls = 0;
+    engine.runDreamCycle = async () => {
+      dreamCalls += 1;
+      throw new Error("must not run");
+    };
+    await orch.start();
+
+    await connector.sendGroup("/learn topic 读取网页并持续学习", false);
+    await connector.sendGroup("帮我重新提炼一下知识", true);
+
+    expect(connector.sent).toHaveLength(2);
+    expect(connector.sent[0]!.markdown).toContain("只有群主或群管理员");
+    expect(connector.sent[1]!.markdown).toContain("只有群主或群管理员");
+    expect(engine.learning.list()).toHaveLength(0);
+    expect(dreamCalls).toBe(0);
+  });
+
   test("an addressed /task command is handled before capture and conversation", async () => {
+    const reactive = connector as CliConnector & Connector;
+    reactive.isChatAdministrator = async () => true;
     await orch.start();
 
     await connector.sendGroup("@agent /task new 浸泡测试研究-20260717", true);
@@ -2386,6 +2780,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       content: "# 附件：principles.md\n\n# 第一章\n\n这是书籍正文。",
     });
     const reactive = connector as CliConnector & Connector;
+    reactive.isChatAdministrator = async () => true;
     reactive.resolveReplyTarget = async () => ({ messageId: "om_book", senderId: "ou_me" });
 
     await orch.start();
@@ -2472,6 +2867,8 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       preparedAt: 2,
     })!;
     engine.learning.markDelivered(session.id, 3);
+    const reactive = connector as CliConnector & Connector;
+    reactive.isChatAdministrator = async () => true;
     await orch.start();
 
     await connector.inject({

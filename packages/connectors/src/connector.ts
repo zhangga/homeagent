@@ -93,6 +93,11 @@ export interface ConnectorHealth {
   consumers: ConsumerHealth[];
 }
 
+export interface NoticeOptions {
+  /** Stable key used by transports to collapse retries into one logical message. */
+  idempotencyKey?: string;
+}
+
 /**
  * The connector surface the orchestrator consumes. `start` streams normalized
  * events to `onEvent` until `stop` is called. `reply`/`notice` send outbound.
@@ -103,7 +108,7 @@ export interface Connector {
   stop(): Promise<void>;
   reply(out: OutboundReply): Promise<void>;
   /** send a standalone message to a chat (e.g. group-added notice) */
-  notice(chatId: string, markdown: string): Promise<void>;
+  notice(chatId: string, markdown: string, opts?: NoticeOptions): Promise<void>;
   /** add a platform-native reaction while a response is being prepared */
   addReaction?(messageId: string, emojiType: string): Promise<string | undefined>;
   /** remove a previously-added platform-native reaction */
