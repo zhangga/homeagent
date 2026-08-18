@@ -4,11 +4,11 @@
  * research tasks in a space.
  *
  * Active fields: name, instruction (persona), provider (local CLI), model,
- * Codex reasoning effort, visibility, and task-only execution controls.
- * Workdir and task permission are consumed only by explicit research tasks.
- * Ordinary calls receive no ProviderExecution grant; Claude can enforce true
- * no-tools mode, while Codex/TRAE remain constrained by their native read-only
- * CLI fallback.
+ * Codex reasoning effort, visibility, and task execution controls.
+ * Task permission is consumed only by explicit research tasks; Workdir also
+ * anchors ordinary Codex calls as read-only context. Ordinary calls receive no
+ * ProviderExecution grant. Claude disables tools; Codex stays ephemeral and
+ * read-only; TRAE remains task-only.
  *
  * Agents are persisted to data/config/agents.json using the same whole-file
  * JSON pattern as the space registry (registry.ts). The markdown/DB knowledge is
@@ -597,10 +597,15 @@ function resolveWorkdir(raw: string): string {
   return resolved;
 }
 
+/** Resolve an Agent's configured directory for ordinary read-only context. */
+export function resolveAgentWorkdir(agent?: Agent): string | undefined {
+  return agent?.workdir ? resolveWorkdir(agent.workdir) : undefined;
+}
+
 /** Resolve the task-only execution contract before a provider process starts. */
 export function resolveAgentExecution(agent?: Agent): AgentExecution {
   const permission = agent?.permission ?? "read-only";
-  const workdir = agent?.workdir ? resolveWorkdir(agent.workdir) : undefined;
+  const workdir = resolveAgentWorkdir(agent);
   if (permission !== "read-only" && !workdir) {
     throw new Error(`Agent 的 ${permission} 权限必须配置 Workdir`);
   }

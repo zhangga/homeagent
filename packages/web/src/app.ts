@@ -37,7 +37,7 @@ import {
 } from "@homeagent/shared";
 import {
   detectProviders,
-  providerSupportsNoToolsCompletion,
+  providerSupportsOrdinaryCompletion,
   providerModels,
   type CodexLoginSession,
   type DetectedProvider,
@@ -523,9 +523,8 @@ export function createWebApp(opts: WebOptions): Hono {
   };
   const persistReadyCodex = (session: CodexLoginSession): void => {
     if (session.state !== "ready") return;
-    // Codex remains available for explicit Agent tasks, but it cannot enforce
-    // HomeAgent's ordinary no-tools contract and must not become the default
-    // Chat/dream/learning provider during first-run setup.
+    // Refresh provider discovery so first-run setup can offer the newly logged-in
+    // Codex for ordinary conversations and explicit Agent tasks.
     providerCache = null;
   };
   const startCodexLogin = (): void => {
@@ -910,7 +909,7 @@ export function createWebApp(opts: WebOptions): Hono {
     if (!available) {
       return c.redirect(`/setup?ok=${encodeURIComponent("所选 AI 尚未安装或无法运行")}`);
     }
-    if (!providerSupportsNoToolsCompletion(provider)) {
+    if (!providerSupportsOrdinaryCompletion(provider)) {
       return c.redirect(`/setup?ok=${encodeURIComponent("所选 AI 无法安全关闭工具，只能用于显式任务")}`);
     }
     const model = str(body, "model");
@@ -2562,7 +2561,7 @@ export function createWebApp(opts: WebOptions): Hono {
       if (!selectedProvider?.available) {
         parsed.errors.defaultProvider = "默认 Provider 尚未安装或无法运行";
         parsed.patch = undefined;
-      } else if (!providerSupportsNoToolsCompletion(selectedProvider.id)) {
+      } else if (!providerSupportsOrdinaryCompletion(selectedProvider.id)) {
         parsed.errors.defaultProvider = "默认 Provider 必须支持安全的普通对话；该 CLI 仅用于显式任务";
         parsed.patch = undefined;
       }

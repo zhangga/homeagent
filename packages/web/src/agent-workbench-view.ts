@@ -1273,8 +1273,8 @@ export function agentWorkbenchView(
         <details class="agent-task-execution" ${taskExecutionOpen ? "open" : ""}>
           <summary>
             <span class="agent-task-summary-copy">
-              任务执行
-              <small>仅影响研究任务</small>
+              执行上下文
+              <small>Permission 仅影响任务；Codex 普通会话只读使用 Workdir</small>
             </span>
           </summary>
           <div class="agent-task-fields">
@@ -1300,7 +1300,7 @@ export function agentWorkbenchView(
             <div class="agent-field agent-create-field">
               <label class="agent-field-label" for="agent-workdir">
                 Workdir
-                <small>可写与完全访问权限必填</small>
+                <small>Codex 普通会话只读使用；可写与完全访问权限必填</small>
               </label>
               <div class="agent-field-control">
                 <input

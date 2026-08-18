@@ -179,6 +179,18 @@ describe("formatAnswer (Q1)", () => {
     expect(formatAnswer(res)).toBe("通用回答。");
   });
 
+  test("Agent-workdir answers do not claim that their workspace evidence is missing", () => {
+    const res: AskResult = {
+      answer: "后端由 Alice 负责。",
+      source: "general",
+      context: "agent-workdir",
+      citations: [],
+      gaps: ["知识库中暂无相关记录"],
+    };
+
+    expect(formatAnswer(res)).toBe("后端由 Alice 负责。");
+  });
+
   test("gaps are surfaced", () => {
     const res: AskResult = {
       answer: "部分回答。",

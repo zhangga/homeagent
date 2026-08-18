@@ -83,7 +83,7 @@ describe("runDoctor", () => {
     expect(JSON.stringify(report)).not.toContain(paths.larkBin);
   });
 
-  test("requires an available no-tools provider for ordinary conversations", async () => {
+  test("accepts an available Codex provider for restricted ordinary conversations", async () => {
     const ordinaryProbes = probes();
     delete (ordinaryProbes as Partial<DoctorProbeSet>).aiProvider;
     const report = await runDoctor({
@@ -96,10 +96,10 @@ describe("runDoctor", () => {
       ],
     });
 
-    expect(report.checks.find((check) => check.id === "ai-provider")?.status).toBe("action");
+    expect(report.checks.find((check) => check.id === "ai-provider")?.status).toBe("pass");
     expect(report.checks.find((check) => check.id === "ai-provider")?.message)
       .toContain("安全普通对话");
-    expect(report.status).toBe("action");
+    expect(report.status).toBe("pass");
   });
 
   test("accepts an available Claude provider for ordinary conversations", async () => {

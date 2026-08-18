@@ -1341,6 +1341,7 @@ describe("Knowledge seam contract", () => {
     expect(providerInput).toEqual(expect.objectContaining({
       execution: undefined,
       skills: [],
+      workdir: realpathSync(workdir),
     }));
     expect(context.skills.resolved).toEqual([]);
     expect(context.skills.skipped).toEqual([expect.objectContaining({
@@ -1400,6 +1401,8 @@ describe("Knowledge seam contract", () => {
 
   test("durable no-tools Chat records native Skills as skipped instead of claiming execution", async () => {
     const chatDir = join(dir, "chat-plan-skill-change");
+    const workdir = join(chatDir, "agent-workspace");
+    mkdirSync(workdir, { recursive: true });
     const skillRoot = join(chatDir, "skills");
     const skillDir = join(skillRoot, "review");
     const skillFile = join(skillDir, "SKILL.md");
@@ -1410,32 +1413,36 @@ describe("Knowledge seam contract", () => {
       "utf8",
     );
     let providerCalls = 0;
+    let providerInput: unknown;
     const chatEngine = new KnowledgeEngine({
       dataDir: chatDir,
       skillCatalog: new SkillCatalog({
-        roots: [{ kind: "claude-user", path: skillRoot, providerIds: ["claude"] }],
+        roots: [{ kind: "codex-user", path: skillRoot, providerIds: ["codex"] }],
         cacheTtlMs: 60_000,
       }),
-      runProvider: async () => {
+      runProvider: async (_id, input) => {
         providerCalls += 1;
+        providerInput = input;
         return "base answer";
       },
     });
     chatEngine.ensureSpace(SPACE);
     const agent = chatEngine.agents.create({
       name: "durable Chat Skill",
-      provider: "claude",
+      provider: "codex",
+      workdir,
       skills: [{
         kind: "source",
-        sourceKey: "claude-user:review",
+        sourceKey: "codex-user:review",
         name: "review",
       }],
     });
     chatEngine.registry.updateMeta(SPACE, { agentId: agent.id });
     const snapshot = chatEngine.agentRunExecutionSnapshot(SPACE);
+    expect(snapshot.executionPlan.workdir).toBe(realpathSync(workdir));
     expect(snapshot.skillEvidence.resolved).toEqual([]);
     expect(snapshot.skillEvidence.skipped).toEqual([expect.objectContaining({
-      sourceKey: "claude-user:review",
+      sourceKey: "codex-user:review",
       code: "no_tools_context",
     })]);
     writeFileSync(
@@ -1451,7 +1458,12 @@ describe("Knowledge seam contract", () => {
       snapshot.skillEvidence,
     );
     expect(result.answer).toBe("base answer");
+    expect(result.context).toBe("agent-workdir");
     expect(providerCalls).toBe(1);
+    expect(providerInput).toEqual(expect.objectContaining({
+      execution: undefined,
+      workdir: realpathSync(workdir),
+    }));
     chatEngine.close();
   });
 

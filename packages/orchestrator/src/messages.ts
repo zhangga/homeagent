@@ -27,7 +27,7 @@ export const UNSUPPORTED_IMAGE_NOTICE = [
 
 export const NO_TOOLS_MODE_NOTICE = [
   "⚠️ 当前 Provider 无法为普通对话提供可验证的 no-tools 隔离，因此这次调用已被安全拒绝。",
-  "请把空间 Agent 切换到 Claude；Codex / TRAE 当前只用于显式任务执行。",
+  "请把空间 Agent 切换到 Claude 或 Codex；TRAE 当前只用于显式任务执行。",
 ].join("\n");
 
 export const GROUP_REMINDER_AUTOMATION_DENIAL =

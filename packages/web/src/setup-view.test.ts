@@ -54,13 +54,12 @@ function render(current: SetupStep, overrides: Partial<Parameters<typeof setupVi
 }
 
 describe("guided setup view", () => {
-  test("keeps task-only providers out of the ordinary AI choice", () => {
+  test("offers Codex for ordinary conversations with its restricted-mode boundary", () => {
     const body = render("ai");
 
-    expect(body).toContain("普通问答需要 Claude Code");
-    expect(body).toContain("claude auth login");
-    expect(body).toContain("Codex 只能用于显式任务");
-    expect(body).not.toContain('<option value="codex"');
+    expect(body).toContain('<option value="codex"');
+    expect(body).toContain("Codex 普通会话使用临时只读模式");
+    expect(body).not.toContain("Codex 只能用于显式任务");
   });
 
   test("AI step offers one detected-provider choice and one primary submit", () => {
@@ -80,7 +79,7 @@ describe("guided setup view", () => {
     expect((body.match(/class="primary-action"/g) ?? []).length).toBe(1);
   });
 
-  test("managed Codex stays an optional task executor during ordinary AI setup", () => {
+  test("managed Codex can become the ordinary AI after installation and login", () => {
     const install = render("ai", {
       providers: [],
       codex: {
@@ -91,11 +90,10 @@ describe("guided setup view", () => {
         login: { state: "idle", message: "尚未连接" },
       },
     });
-    expect(install).toContain("普通问答需要 Claude Code");
-    expect(install).toContain("安装 Codex 任务执行器");
-    expect(install).toContain("Codex 只能用于显式任务");
+    expect(install).toContain("先连接 Claude Code 或 Codex");
+    expect(install).toContain("安装 Codex");
+    expect(install).toContain("普通问答和显式任务");
     expect(install).toContain('name="consent"');
-    expect(install).not.toContain("安装并连接 ChatGPT");
 
     const waiting = render("ai", {
       providers: [],
@@ -115,8 +113,8 @@ describe("guided setup view", () => {
     expect(waiting).toContain("https://auth.openai.com/device");
     expect(waiting).toContain("SAFE-CODE");
     expect(waiting).toContain("/setup/ai/codex/session");
-    expect(waiting).toContain("可选的 Codex 任务执行器");
-    expect(waiting).toContain("普通问答仍需要 Claude Code");
+    expect(waiting).toContain("正在准备 Codex");
+    expect(waiting).toContain("登录后可用于普通问答和显式任务");
 
     const repair = render("ai", {
       providers: [],

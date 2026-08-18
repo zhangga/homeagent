@@ -86,8 +86,8 @@ Homebrew 或 lark-cli。
 2. 验证 Gatekeeper 未提示“开发者无法验证”或已损坏。
 3. 将 `HomeAgent.app` 拖入 `/Applications`，双击启动。
 4. 确认应用自动安装并启动 LaunchAgent，然后自动打开 `/setup`。
-5. 验证普通调用 Provider。当前 `/setup` 托管的 Codex / ChatGPT 登录只满足显式任务，不能用于普通问答；Claude CLI 才能执行
-   strict no-tools 普通调用，但其安装与登录目前仍需单独完成。若全新用户必须打开终端才能补齐 Claude，本轮“无终端安装”应记为失败；
+5. 验证普通调用 Provider。Claude CLI 必须使用 strict no-tools 模式；Codex / ChatGPT 登录可直接用于普通问答，
+   但必须记录 `ephemeral`、忽略用户配置/规则、`approval_policy=never` 与 `read-only` sandbox 证据。若所选 Provider 仍要求用户打开终端补齐安装或登录，本轮“无终端安装”应记为失败；
    内部 Soak 可预装 Claude 继续硬化，但不得拿它代替新用户门禁。
 6. 创建或连接飞书机器人，确认两个事件消费者就绪。
 7. 加入测试群，确认机器人只登记待确认并发送一次提示；由群主或管理员发送“@HomeAgent 启用群聊”，
@@ -146,9 +146,10 @@ KeepAlive 应自动启动新 PID。随后检查 `/readyz`，并使用第 3 节�
    Agent revision、Provider、Model、Permission、Workdir 和完整 Skill 证据。
 3. 从发布历史选择 v1 回滚，确认系统不是原地改写 v1，而是创建并发布一个内容等同 v1 的新版本；回滚前已创建的 Run 仍引用 v2，
    回滚后新建的 Run 引用新的线上版本。
-4. 在飞书发起一次普通 @ 问答，确认 Claude 使用 safe mode、空工具集且不保存 Provider 会话，没有 Workdir；绑定的 native Skills 记录为
-   `no_tools_context` 跳过且未被声明为已执行。普通问答、提炼、学习和质量重新评测都不得加载本机 Skill。
-5. 把 Agent 切换为 Codex 或 TRAE 后再做普通 @ 问答，确认系统明确安全拒绝且不产生工具副作用；再运行一条显式研究任务，
+4. 在飞书发起一次普通 @ 问答。Claude 必须使用 safe mode、空工具集且不保存 Provider 会话；Codex 必须使用临时只读模式、
+   忽略用户配置/规则、禁止审批且不加载 Pinned Skills。Codex 应以冻结的 Agent Workdir（如已配置）作为只读当前目录，Claude 不使用
+   Workdir 工具；绑定的 native Skills 记录为 `no_tools_context` 跳过且未被声明为已执行。普通问答、提炼、学习和质量重新评测都不得加载本机 Skill。
+5. 把 Agent 切换为 Codex 后确认普通 @ 问答正常；切换为 TRAE 后确认系统明确安全拒绝且不产生工具副作用。再运行一条显式研究任务，
    确认只有该任务按冻结计划使用 Permission / Workdir / Pinned Skills。
 6. 临时修改 Pinned Skill 目录中的一个非 `SKILL.md` 资源文件，再运行先前已排队的显式任务；必须因完整目录树摘要变化而
    fail-closed，不能只校验入口文件或静默使用新内容。恢复目录并重新创建 Run 后才允许执行。
@@ -270,23 +271,22 @@ bun run soak:feishu -- \
 智能参与、普通群消息收录以及“响应所有消息”的验收。
 
 可先加 `--dry-run` 检查场景和路径而不发送消息。必须显式传入本轮需要自动执行的 `--scenarios`；普通问答类场景使用
-Claude strict no-tools 路径。`network_recovery` 不接受自动伪造的接口失败，必须在明确获准中断测试机网络后受控执行，
+Claude strict no-tools 或 Codex 临时只读路径。`network_recovery` 不接受自动伪造的接口失败，必须在明确获准中断测试机网络后受控执行，
 并继续使用 `--record-evidence` 记录恢复后的真实消息或发布记录编号。
 
 必须覆盖以下场景；失败的尝试使用 `--failed` 记录，修复后再记录新的成功证据：
 
 - `group_binding_lifecycle`：入群待确认、管理员启用、断开隐私、原空间重连和状态恢复；
 - `message_capture`：群消息静默收录；
-- `mention_answer`：Claude strict no-tools 的 @ 问答；绑定的 native Skills 必须显示为跳过；
+- `mention_answer`：Claude strict no-tools 或 Codex 临时只读的 @ 问答；绑定的 native Skills 必须显示为跳过；
 - `proactive_participation`：一次主动参与；
-- `image_analysis`：普通图片输入的负向边界验收；机器人必须明确说明当前不能在 no-tools 普通对话中分析图片，
-  不得猜测图片内容或切换到 Codex 绕过隔离。当前自动驱动仍按旧的正向识别断言实现，因此不要把它放进自动场景列表；
-  人工确认安全拒绝后，用拒绝消息 ID 执行 `--record-evidence image_analysis`。在驱动改为负向断言前，不得宣称该项已自动化；
+- `image_analysis`：绑定 Codex 时验证临时只读普通会话的原生图片输入；绑定不支持图片的 Provider 时必须明确拒绝，
+  不得猜测图片内容。自动驱动的正向识别断言只允许在本轮空间已绑定 Codex 时运行；
 - `attachment_extraction`：文本或 PDF 附件提取；
 - `research_notification`：研究任务及飞书通知；
 - `reminder_delivery`：提醒创建与送达；
 - `learning_interaction`：学习课程推送与回答；
-- `distill_citation`：Claude no-tools 手动提炼和引用问答；
+- `distill_citation`：Claude no-tools 或 Codex 临时只读的手动提炼和引用问答；
 - `network_recovery`：网络短暂中断后恢复。
 
 Soak 默认要求 `/healthz` 和 `/readyz` 同时成功，并记录延迟、失败、连续失败和进程替换次数。
@@ -385,7 +385,7 @@ metadata，不得包含消息正文、Instruction、Prompt、凭据或完整模�
 - 自动与真实崩溃恢复均通过；
 - v10、v11、v12、v13 四份真实归档均完成独立迁移、v14 再导出、重启和二次恢复，比对记录已归档；
 - Agent 草稿/发布/回滚、`write/full` 审批与过期、定时只读自动重试三个真实飞书灰度场景全部通过；
-- 普通调用的 Claude strict no-tools、native Skill `no_tools_context` 跳过、Codex / TRAE 安全拒绝和图片输入负向边界均有真实消息证据；
+- 普通调用的 Claude strict no-tools 或 Codex 临时只读、native Skill `no_tools_context` 跳过、TRAE 安全拒绝和图片输入边界均有真实消息证据；
 - 用量页面没有把未知成本显示为 0，质量重新评测没有外发副作用且被标记为 re-evaluation 而非 deterministic replay；
 - 24 小时 soak 达标；公开 Beta 前完成 48 小时 soak；
 - 已记录仍由飞书管理员完成的权限、发布和外部共享步骤。

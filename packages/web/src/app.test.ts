@@ -576,8 +576,8 @@ describe("web backend (read-only)", () => {
     expect(readSettings(dir).defaultModel).toBeUndefined();
   });
 
-  test("rejects a task-only provider as the ordinary setup AI", async () => {
-    const taskOnly = createWebApp({
+  test("accepts Codex as the ordinary setup AI", async () => {
+    const codexSetup = createWebApp({
       engine,
       detectProviders: async () => [{
         id: "codex",
@@ -589,20 +589,21 @@ describe("web backend (read-only)", () => {
       providerModels: async () => ({ codex: ["gpt-5.4"] }),
     });
 
-    const response = await taskOnly.request("/setup/ai", {
+    const response = await codexSetup.request("/setup/ai", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: "provider=codex&model=gpt-5.4",
     });
 
     expect(response.status).toBe(302);
-    expect(response.headers.get("location")).toContain(
-      encodeURIComponent("所选 AI 无法安全关闭工具，只能用于显式任务"),
-    );
-    expect(readSettings(dir).defaultProvider).not.toBe("codex");
+    expect(response.headers.get("location")).toBe("/setup");
+    expect(readSettings(dir)).toEqual(expect.objectContaining({
+      defaultProvider: "codex",
+      defaultModel: "gpt-5.4",
+    }));
   });
 
-  test("connects managed Codex as a task executor without selecting it for ordinary calls", async () => {
+  test("connects managed Codex without changing the default until the user selects it", async () => {
     let installed = false;
     let installCalls = 0;
     let loginStarts = 0;
@@ -2033,12 +2034,13 @@ describe("management backend (read-write)", () => {
     expect(await page.text()).toContain("Skill 目录已刷新");
   });
 
-  test("agent editor explains the active task-execution boundaries", async () => {
+  test("agent editor explains ordinary Workdir and task-only permission boundaries", async () => {
     const body = await (await app.request("/agents/new")).text();
     expect(body).toContain("Workdir");
     expect(body).toContain("Permission");
     expect(body).toContain("Skills");
-    expect(body).toContain("仅影响研究任务");
+    expect(body).toContain("Permission 仅影响任务");
+    expect(body).toContain("Codex 普通会话只读使用 Workdir");
     expect(body).toContain("可写与完全访问权限必填");
     expect(body).not.toContain("Device");
     expect(body).not.toContain("Repositories");

@@ -404,13 +404,23 @@ async function generalFallback(
   model: string | undefined,
   instruction: string | undefined,
   images: AskOptions["images"],
+  context: AskOptions["fallbackContext"],
 ): Promise<AskResult> {
+  const sourceInstructions = context === "agent-workdir"
+    ? [
+        "知识库没有足够记录时，先在当前 Agent 的绑定工作目录内只读检索与问题直接相关的文件。",
+        "工作目录内容是 Agent 上下文，不是 HomeAgent 知识库；不要声称它来自知识库，也不要读取当前目录之外的路径。",
+        "如果工作目录中的文件足以回答，请直接回答，不要追加知识库缺失提示；如果仍找不到，再明确说明无法确认。",
+      ]
+    : [
+        "知识库中没有足够的相关记录：如果可以用通用知识完成用户目标，请直接帮助用户，",
+        "并在开头坦诚说明“这不在知识库记录中，以下是我的一般性回答”。",
+      ];
   const r = await client.complete({
     system: withInstruction(
       [
         "你是自然、可靠的团队/家庭知识助手。请回应用户消息，不要把祈使句机械理解成系统控制命令。",
-        "知识库中没有足够的相关记录：如果可以用通用知识完成用户目标，请直接帮助用户，",
-        "并在开头坦诚说明“这不在知识库记录中，以下是我的一般性回答”。",
+        ...sourceInstructions,
         "如果用户的意图或指代不清，不要编造缺失上下文；请只追问一个最关键、自然且容易回答的问题。",
         "追问澄清时无需添加知识库免责声明。",
       ].join(""),
@@ -425,6 +435,7 @@ async function generalFallback(
   return {
     answer: r.text.trim(),
     source: "general",
+    ...(context ? { context } : {}),
     citations: [],
     gaps: gaps.length ? gaps : undefined,
   };
@@ -501,6 +512,7 @@ export async function ask(
       model,
       instruction,
       images,
+      opts.fallbackContext,
     );
   }
 
@@ -554,6 +566,7 @@ export async function ask(
       model,
       instruction,
       images,
+      opts.fallbackContext,
     );
   }
 
@@ -587,6 +600,7 @@ export async function ask(
       model,
       instruction,
       images,
+      opts.fallbackContext,
     );
   }
 
@@ -626,7 +640,15 @@ export async function ask(
         gaps: synth.gaps.length ? synth.gaps : ["知识库内容不足以回答"],
       };
     }
-    return generalFallback(client, question, synth.gaps, model, instruction, images);
+    return generalFallback(
+      client,
+      question,
+      synth.gaps,
+      model,
+      instruction,
+      images,
+      opts.fallbackContext,
+    );
   }
 
   const citations = resolveCitations(

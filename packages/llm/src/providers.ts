@@ -135,6 +135,8 @@ export interface RunInput {
   images?: ImageInput[];
   /** Safe pinned-Skill identifiers supplied independently of ProviderExecution. */
   skills?: string[];
+  /** Canonical Agent working directory used as read-only context for ordinary calls. */
+  workdir?: string;
   /** Present only for an explicit task or web-research grant, never ordinary Q&A/distillation. */
   execution?: ProviderExecution;
 }
@@ -286,17 +288,22 @@ const KNOWN: CliSpec[] = [
     buildRun: ({ model, reasoningEffort, images, execution }) => {
       // Only explicit task execution reaches this adapter. Ephemeral mode and
       // ignored ambient config/rules isolate each one-shot from global state.
-      const args: string[] = [
+      const args: string[] = ["-c", 'approval_policy="never"'];
+      if (reasoningEffort) args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
+      if (execution?.webSearch) args.push("--search");
+      const sandbox = sandboxForPermission(execution?.permission);
+      // Codex 0.147+ scopes these isolation flags to the `exec` subcommand.
+      // Keeping them before `exec` makes the CLI exit during argument parsing.
+      args.push(
+        "exec",
         "--ephemeral",
         "--ignore-user-config",
         "--ignore-rules",
-      ];
-      if (reasoningEffort) args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
-      if (execution) args.push("-c", 'approval_policy="never"');
-      if (execution?.webSearch) args.push("--search");
-      const sandbox = sandboxForPermission(execution?.permission);
-      args.push("exec", "--json", "--sandbox", sandbox);
-      if (execution) args.push("--skip-git-repo-check");
+        "--json",
+        "--sandbox",
+        sandbox,
+      );
+      args.push("--skip-git-repo-check");
       if (model) args.push("-m", model);
       for (const image of images ?? []) args.push("--image", image.path);
       // Codex's --image accepts multiple values. Terminate option parsing
@@ -530,9 +537,9 @@ export function isCliProvider(id: string): id is ProviderId {
   return specById.has(id as ProviderId);
 }
 
-/** True only when ordinary Chat/dream/learning can run with provider tools disabled. */
-export function providerSupportsNoToolsCompletion(id: string): id is "claude" {
-  return id === "claude";
+/** True when ordinary Chat/dream/learning can run in the provider's restricted mode. */
+export function providerSupportsOrdinaryCompletion(id: string): id is "claude" | "codex" {
+  return id === "claude" || id === "codex";
 }
 
 /**
@@ -632,7 +639,7 @@ export async function runProviderDetailed(
     throw new UnsupportedImageInputError(id);
   }
   const prepared = injectProviderSkills(id, input);
-  if (!prepared.execution && (id === "codex" || id === "trae-cli")) {
+  if (!prepared.execution && id === "trae-cli") {
     throw new Error(`provider ${id} cannot provide a no-tools execution mode`);
   }
   if (prepared.execution?.webSearch && prepared.execution.permission !== "read-only") {
@@ -657,7 +664,7 @@ export async function runProviderDetailed(
     args,
     timeoutMs,
     signal,
-    prepared.execution?.workdir,
+    prepared.execution?.workdir ?? prepared.workdir,
     id === "codex" ? prepared.prompt : undefined,
   );
   if (aborted) throw signal?.reason ?? new Error(`provider ${id} cancelled`);

@@ -49,7 +49,7 @@ import {
 } from "@homeagent/core";
 import {
   codexReasoningEffortsForModel,
-  providerSupportsNoToolsCompletion,
+  providerSupportsOrdinaryCompletion,
   type DetectedProvider,
 } from "@homeagent/llm";
 import type { FeishuRuntimeStatus } from "./integrations.ts";
@@ -910,11 +910,11 @@ export function agentsView(
               </select>
             </div>
           </div>
-          <h2 style="font-size:14px;margin:18px 0 4px">任务执行 <span class="hint" style="font-weight:400">（仅影响任务运行；普通问答、提炼与学习始终使用无工具模式）</span></h2>
+          <h2 style="font-size:14px;margin:18px 0 4px">执行上下文 <span class="hint" style="font-weight:400">（Permission / Skills 仅影响任务；普通 Codex 只读使用 Workdir）</span></h2>
           <p class="muted">只读模式禁止写入；可写模式以 Workdir 为工作根目录并启用 Provider 的工作区写入沙箱；完全访问会绕过 Provider 沙箱，必须谨慎使用。可写和完全访问都要求配置有效 Workdir。</p>
           <div class="grid2">
             <div class="field">
-              <label>Workdir <span class="hint">CLI 执行任务的工作目录</span></label>
+              <label>Workdir <span class="hint">普通 Codex 的只读上下文，也是任务工作目录</span></label>
               <input type="text" name="workdir" value="${workdirVal}" placeholder="~/work/项目目录" />
             </div>
             <div class="field">
@@ -2657,7 +2657,7 @@ export function settingsView(
   // The global default handles ordinary conversation, so task-only CLIs stay visible but disabled.
   const providerOptions = providers.map((p) => {
     const sel = p.id === values.defaultProvider ? "selected" : "";
-    const supportsOrdinaryConversation = providerSupportsNoToolsCompletion(p.id);
+    const supportsOrdinaryConversation = providerSupportsOrdinaryCompletion(p.id);
     const disabled = p.available && supportsOrdinaryConversation ? "" : "disabled";
     const suffix = !p.available
       ? `（不可用：${p.detail}）`

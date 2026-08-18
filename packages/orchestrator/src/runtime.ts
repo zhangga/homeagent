@@ -1186,7 +1186,11 @@ export class Orchestrator {
       // Cold-start honesty (Q3): if general and the KB is essentially empty, add a
       // gentle nudge to feed knowledge.
       let text = formatAnswer(res);
-      if (res.source === "general" && (await this.isColdStart(readSpaces))) {
+      if (
+        res.source === "general"
+        && res.context !== "agent-workdir"
+        && (await this.isColdStart(readSpaces))
+      ) {
         text = `${text}\n\n${coldStartNote()}`;
       }
       const succeeded = this.engine.chatRuns.succeed(runId, {

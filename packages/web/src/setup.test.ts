@@ -18,14 +18,14 @@ const codexProvider = {
 };
 
 describe("buildSetupSnapshot", () => {
-  test("does not treat a task-only Codex CLI as ready for ordinary HomeAgent conversations", () => {
+  test("treats an available Codex CLI as ready for ordinary HomeAgent conversations", () => {
     expect(buildSetupSnapshot({
       defaultProvider: "codex",
       providers: [codexProvider],
       lark: { state: "unconfigured", verified: false, message: "missing" },
       runtime: { ready: false, consumers: [] },
       restartRequired: false,
-    }).current).toBe("ai");
+    }).current).toBe("feishu");
   });
 
   test("moves directly from verified Bot identity to activation", () => {

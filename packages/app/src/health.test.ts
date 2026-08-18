@@ -394,7 +394,7 @@ describe("system health reporter", () => {
     engine.close();
   });
 
-  test("is not ready when the ordinary provider only supports explicit tasks", async () => {
+  test("is ready when Codex is the ordinary provider", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hb-health-ordinary-provider-"));
     dirs.push(dir);
     const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
@@ -419,13 +419,13 @@ describe("system health reporter", () => {
 
     const snapshot = await reportHealth();
     engine.close();
-    expect(snapshot.ready).toBe(false);
+    expect(snapshot.ready).toBe(true);
     expect(snapshot.components.providers).toEqual(expect.objectContaining({
-      status: "down",
+      status: "ok",
       details: expect.objectContaining({
         ordinaryProvider: "codex",
         unavailable: [],
-        noToolsUnsupported: ["codex"],
+        noToolsUnsupported: [],
       }),
     }));
   });
@@ -502,13 +502,13 @@ describe("system health reporter", () => {
     engine.close();
   });
 
-  test("is not ready when a bound space Agent cannot run ordinary no-tools calls", async () => {
+  test("is not ready when a bound TRAE Agent cannot run restricted ordinary calls", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hb-health-space-ordinary-provider-"));
     dirs.push(dir);
     const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
     const space = "team/oc_health" as const;
     engine.ensureSpace(space, { chatId: "oc_health" });
-    const agent = engine.agents.create({ name: "Task-only Agent", provider: "codex" });
+    const agent = engine.agents.create({ name: "Task-only Agent", provider: "trae-cli" });
     engine.updateSpaceMeta(space, { agentId: agent.id });
     const reportHealth = createSystemHealthReporter({
       engine,
@@ -524,11 +524,11 @@ describe("system health reporter", () => {
       taskSchedulerHealth: () => loopHealth,
       detectProviders: async () => [
         { id: "claude", name: "Claude", bin: "claude", available: true, detail: "2.0" },
-        { id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" },
+        { id: "trae-cli", name: "TRAE", bin: "trae-cli", available: true, detail: "1.0" },
       ],
-      requiredProviderIds: () => ["claude", "codex"],
+      requiredProviderIds: () => ["claude", "trae-cli"],
       ordinaryProviderId: () => "claude",
-      ordinaryProviderIds: () => ["claude", "codex"],
+      ordinaryProviderIds: () => ["claude", "trae-cli"],
     });
 
     const snapshot = await reportHealth();
@@ -537,8 +537,8 @@ describe("system health reporter", () => {
     expect(snapshot.components.providers).toEqual(expect.objectContaining({
       status: "down",
       details: expect.objectContaining({
-        ordinaryProviders: ["claude", "codex"],
-        noToolsUnsupported: ["codex"],
+        ordinaryProviders: ["claude", "trae-cli"],
+        noToolsUnsupported: ["trae-cli"],
       }),
     }));
   });

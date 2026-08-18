@@ -35,6 +35,8 @@ export interface AskOptions {
   maxPages?: number;
   /** when true, never fall back to general knowledge (knowledge-only) */
   knowledgeOnly?: boolean;
+  /** Ordinary Codex may use the bound Agent directory as read-only fallback context. */
+  fallbackContext?: "agent-workdir";
   /** cancel the active provider call when the owning Run is cancelled. */
   signal?: AbortSignal;
   /** Observe the durable quality trace recorded before a failed ask is rethrown. */

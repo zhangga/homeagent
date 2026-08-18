@@ -66,6 +66,7 @@ import {
   agentVisibleInSpace,
   isMaterializedLegacyAgentRevisionHistory,
   resolveAgentExecution,
+  resolveAgentWorkdir,
   sameLegacyAgentSnapshot,
   type Agent,
   type AgentInput,
@@ -1903,16 +1904,18 @@ export class KnowledgeEngine implements Knowledge {
       skipped: skills.skipped.map((item) => ({ ...item })),
     };
     let execution: ProviderExecution | undefined;
+    let workdir: string | undefined;
     let resolutionError: string | undefined;
-    if (taskExecution) {
-      try {
+    try {
+      workdir = resolveAgentWorkdir(agent);
+      if (taskExecution) {
         execution = {
           ...resolveAgentExecution(agent),
           skills: skills.resolved.map((skill) => skill.invocationName),
         };
-      } catch (error) {
-        resolutionError = executionResolutionError(error);
       }
+    } catch (error) {
+      resolutionError = executionResolutionError(error);
     }
     const executionPlan: ResolvedExecutionPlan = {
       version: 1,
@@ -1921,6 +1924,7 @@ export class KnowledgeEngine implements Knowledge {
       provider,
       model,
       reasoningEffort,
+      workdir,
       execution,
       resolutionError,
     };
@@ -1947,6 +1951,7 @@ export class KnowledgeEngine implements Knowledge {
     if (executionPlan.resolutionError !== undefined) {
       throw new Error(executionPlan.resolutionError);
     }
+    this.validateFrozenWorkdir(executionPlan.workdir);
     const skills = this.validatedSkillsFromEvidence(executionPlan, skillEvidence);
     const skillNames = skills.resolved.map((skill) => skill.invocationName);
     let client = this.llm;
@@ -1964,6 +1969,7 @@ export class KnowledgeEngine implements Knowledge {
         executionPlan.execution,
         skillNames,
         this.dataDir,
+        executionPlan.workdir,
       );
     }
     return {
@@ -2015,8 +2021,7 @@ export class KnowledgeEngine implements Knowledge {
     return frozen;
   }
 
-  private validateFrozenExecutionWorkdir(execution?: ProviderExecution): void {
-    const workdir = execution?.workdir;
+  private validateFrozenWorkdir(workdir?: string): void {
     if (!workdir) return;
     try {
       const current = realpathSync(workdir);
@@ -2028,6 +2033,10 @@ export class KnowledgeEngine implements Knowledge {
         "Frozen Workdir is missing, no longer a directory, or resolves to a different location.",
       );
     }
+  }
+
+  private validateFrozenExecutionWorkdir(execution?: ProviderExecution): void {
+    this.validateFrozenWorkdir(execution?.workdir);
   }
 
   runConcurrencyLayers(context: RunAdmissionContext): RunConcurrencyLayer[] {
@@ -2131,6 +2140,7 @@ export class KnowledgeEngine implements Knowledge {
       execution,
       skillNames,
       this.dataDir,
+      resolveAgentWorkdir(agent),
     );
   }
 
@@ -4047,7 +4057,13 @@ export class KnowledgeEngine implements Knowledge {
       stores,
       spaces,
       question,
-      opts,
+      {
+        ...opts,
+        fallbackContext: snapshot?.executionPlan.provider === "codex"
+            && snapshot.executionPlan.workdir
+          ? "agent-workdir"
+          : undefined,
+      },
       context,
       snapshot
         ? answerTraceExecution(
@@ -4089,6 +4105,9 @@ export class KnowledgeEngine implements Knowledge {
         ...opts,
         model: executionPlan.model,
         instruction: executionPlan.instruction || undefined,
+        fallbackContext: executionPlan.provider === "codex" && executionPlan.workdir
+          ? "agent-workdir"
+          : undefined,
       },
       context,
       answerTraceExecution(executionPlan, skillEvidence, traceAgentId),

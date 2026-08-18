@@ -10,7 +10,7 @@ import type { OrchestratorHealth } from "@homeagent/orchestrator";
 import {
   detectProviders as detectLocalProviders,
   isCliProvider,
-  providerSupportsNoToolsCompletion,
+  providerSupportsOrdinaryCompletion,
   type DetectedProvider,
 } from "@homeagent/llm";
 import type { RuntimeLoopHealth } from "./scheduler.ts";
@@ -263,7 +263,7 @@ export function createSystemHealthReporter(
     const unavailable = required.filter((id) => !detectedById.get(id)?.available);
     const ordinaryProviderList = [...ordinaryProviders].sort();
     const noToolsUnsupported = ordinaryProviderList.filter(
-      (provider) => !providerSupportsNoToolsCompletion(provider),
+      (provider) => !providerSupportsOrdinaryCompletion(provider),
     );
     const providerRuns =
       (core.details?.providerRuns as Array<Record<string, unknown>> | undefined) ?? [];

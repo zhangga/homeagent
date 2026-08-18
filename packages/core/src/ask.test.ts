@@ -532,6 +532,29 @@ describe("ask pipeline", () => {
     expect(String(call?.opts.prompt)).toContain("帮我处理一下这个");
   });
 
+  test("general fallback preserves that the bound Agent workdir was available", async () => {
+    const fake = scriptedLlm({
+      routeSlugs: [],
+      relevant: false,
+      answer: "",
+      grounded: false,
+      generalText: "后端由 Alice 负责。",
+    });
+
+    const res = await ask(
+      [store],
+      "谁负责后端？",
+      { fallbackContext: "agent-workdir" },
+      { client: fake },
+    );
+
+    expect(res.context).toBe("agent-workdir");
+    expect(res.answer).toBe("后端由 Alice 负责。");
+    const call = fake.calls.find((candidate) => candidate.kind === "complete");
+    expect(String(call?.opts.system)).toContain("绑定工作目录");
+    expect(String(call?.opts.system)).not.toContain("以下是我的一般性回答");
+  });
+
   test("knowledgeOnly never falls back to general", async () => {
     const fake = scriptedLlm({ routeSlugs: [], relevant: false, answer: "", grounded: false });
     const res = await ask([store], "x", { knowledgeOnly: true }, { client: fake });

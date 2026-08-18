@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { createConnection } from "node:net";
 import {
   detectProviders as detectLocalProviders,
-  providerSupportsNoToolsCompletion,
+  providerSupportsOrdinaryCompletion,
   type DetectedProvider,
 } from "@homeagent/llm";
 import { brandedEnv, readSettings } from "@homeagent/shared";
@@ -237,7 +237,7 @@ function defaultProbes(input: {
       const perProviderMs = Math.max(100, Math.floor(input.timeoutMs / 4));
       const detected = await input.detectProviders(perProviderMs);
       return detected.some(
-        (provider) => provider.available && providerSupportsNoToolsCompletion(provider.id),
+        (provider) => provider.available && providerSupportsOrdinaryCompletion(provider.id),
       )
         ? "pass"
         : "action";

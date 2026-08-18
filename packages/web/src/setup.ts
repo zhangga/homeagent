@@ -1,5 +1,5 @@
 import {
-  providerSupportsNoToolsCompletion,
+  providerSupportsOrdinaryCompletion,
   type DetectedProvider,
 } from "@homeagent/llm";
 import type { LarkSetupStatus } from "@homeagent/shared";
@@ -27,7 +27,7 @@ export function buildSetupSnapshot(input: SetupSnapshotInput): SetupSnapshot {
   const selectedProviderReady = input.providers.some(
     (provider) => provider.id === input.defaultProvider
       && provider.available
-      && providerSupportsNoToolsCompletion(provider.id),
+      && providerSupportsOrdinaryCompletion(provider.id),
   );
   const larkReady = input.lark.state === "ready" && input.lark.verified;
   const runtimeReady = larkReady && !input.restartRequired && input.runtime.ready;

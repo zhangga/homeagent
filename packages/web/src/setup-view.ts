@@ -3,7 +3,7 @@ import type { HtmlEscapedString } from "hono/utils/html";
 import type { LarkProvisioningSession, LarkSetupStatus } from "@homeagent/shared";
 import type { SpaceMeta } from "@homeagent/core";
 import {
-  providerSupportsNoToolsCompletion,
+  providerSupportsOrdinaryCompletion,
   type CodexLoginSession,
   type DetectedProvider,
 } from "@homeagent/llm";
@@ -192,13 +192,13 @@ function optionalCodexTaskSetup(
         <button class="secondary-action">重新安装 Codex</button>
       </form></div>`
     : "";
-  return html`<details><summary>可选：安装 Codex 任务执行器</summary>
-    <p class="muted">Codex 只能用于显式任务，不能替代普通问答所需的 Claude Code。</p>
+  return html`<details><summary>安装 Codex</summary>
+    <p class="muted">安装并登录后，Codex 可用于普通问答和显式任务；普通会话使用临时只读模式，并从绑定 Agent 的 Workdir 读取上下文。</p>
     ${error ? html`<div class="flash">${error}</div>` : ""}
     <form method="post" action="${needsInstall ? "/setup/ai/codex/install" : "/setup/ai/codex/login"}">
       ${needsInstall ? html`<label class="consent"><input type="checkbox" name="consent" value="on" required />
         <span>允许 HomeAgent 下载并校验 OpenAI 官方 Codex，将它安装在本机 HomeAgent 专用目录。不会修改系统级软件。</span></label>` : ""}
-      <div class="actions"><button class="secondary-action">${needsInstall ? "安装 Codex 任务执行器" : "连接 Codex 任务执行器"}</button></div>
+      <div class="actions"><button class="secondary-action">${needsInstall ? "安装 Codex" : "连接 Codex"}</button></div>
     </form>
     ${repair}
   </details>`;
@@ -206,10 +206,10 @@ function optionalCodexTaskSetup(
 
 function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
   const available = input.providers.filter(
-    (provider) => provider.available && providerSupportsNoToolsCompletion(provider.id),
+    (provider) => provider.available && providerSupportsOrdinaryCompletion(provider.id),
   );
   const taskOnlyAvailable = input.providers.filter(
-    (provider) => provider.available && !providerSupportsNoToolsCompletion(provider.id),
+    (provider) => provider.available && !providerSupportsOrdinaryCompletion(provider.id),
   );
   const codexUrl = safeCodexVerificationUrl(input.codex.login.verificationUrl);
   const codexWaiting = input.codex.installing
@@ -220,8 +220,8 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
       : input.codex.login.state === "verifying"
         ? "正在确认 ChatGPT 登录…"
         : "请在浏览器中确认登录";
-    return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">正在准备可选的 Codex 任务执行器</h1>
-      <p class="lede">登录授权由 OpenAI 页面处理，HomeAgent 不会接触你的密码。Codex 只能用于显式任务；普通问答仍需要 Claude Code。</p>
+    return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">正在准备 Codex</h1>
+      <p class="lede">登录授权由 OpenAI 页面处理，HomeAgent 不会接触你的密码。登录后可用于普通问答和显式任务。</p>
       <div class="waiting"><strong>${title}</strong>
         <span class="muted">${input.codex.installing ? "正在下载并校验 OpenAI 官方 Codex" : input.codex.login.message}</span>
         ${input.codex.login.userCode ? html`<div class="command">${input.codex.login.userCode}</div>` : ""}
@@ -229,15 +229,18 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
       </div>${codexPollScript()}`;
   }
   if (available.length === 0) {
-    return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">先连接 Claude Code</h1>
-      <p class="lede">普通问答需要 Claude Code 来可靠关闭本机工具。安装并登录后回来重新检测；Codex 和 TRAE 只能用于显式任务，不能完成首次对话设置。</p>
+    return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">先连接 Claude Code 或 Codex</h1>
+      <p class="lede">安装并登录任一可用 AI 后回来重新检测。Claude 使用严格 no-tools 模式；Codex 普通会话使用临时只读模式。</p>
       <div class="choice-grid"><div class="choice"><strong>Claude Code</strong><small>普通问答、提炼和学习使用严格 no-tools 模式</small><div class="command">npm install -g @anthropic-ai/claude-code && claude auth login</div></div></div>
-      ${taskOnlyAvailable.length > 0 ? html`<p class="muted">已检测到 ${taskOnlyAvailable.map((provider) => provider.name).join("、")}；Codex 只能用于显式任务，HomeAgent 不会把它设为普通对话 AI。</p>` : ""}
+      ${taskOnlyAvailable.length > 0 ? html`<p class="muted">已检测到 ${taskOnlyAvailable.map((provider) => provider.name).join("、")}，但它目前只能用于显式任务。</p>` : ""}
       <form method="post" action="/setup/providers/refresh" class="actions"><button class="primary-action">重新检测</button></form>
       ${optionalCodexTaskSetup(input)}`;
   }
   return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">先连接一个 AI</h1>
     <p class="lede">检测到本机已有可用的 AI。它负责理解消息、整理知识和回答问题，账号仍由你自己掌控。</p>
+    ${available.some((provider) => provider.id === "codex")
+      ? html`<p class="muted">Codex 普通会话使用临时只读模式，以绑定 Agent 的 Workdir 作为上下文目录，不加载本机 Skills、用户配置或规则。</p>`
+      : ""}
     ${providerChoice(input, available)}`;
 }
 

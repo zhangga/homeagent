@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -544,7 +545,9 @@ describe("provider detection", () => {
       );
 
       expect(output).toEqual({
-        text: expect.stringContaining("exec --json --sandbox read-only"),
+        text: expect.stringContaining(
+          "exec --ephemeral --ignore-user-config --ignore-rules --json --sandbox read-only",
+        ),
         usage: {
           costBasis: "unavailable",
           source: "legacy-text",
@@ -635,25 +638,40 @@ describe("provider detection", () => {
     }
   });
 
-  test("Codex refuses ordinary calls because read-only does not isolate host reads", async () => {
+  test("Codex ordinary calls run as ephemeral read-only completions without native Skills", async () => {
     const previous = process.env.HOMEAGENT_CODEX_BIN;
     const directory = mkdtempSync(join(tmpdir(), "ha-codex-no-tools-"));
     const bin = join(directory, process.platform === "win32" ? "codex.cmd" : "codex");
+    const workdir = join(directory, "agent-workdir");
     try {
+      mkdirSync(workdir);
+      writeFileSync(join(workdir, "AGENT_CONTEXT.md"), "agent context", "utf8");
       writeFileSync(
         bin,
         process.platform === "win32"
-          ? '@echo off\r\necho %*\r\nnode -e "let s=\'\';process.stdin.setEncoding(\'utf8\');process.stdin.on(\'data\',d=>s+=d);process.stdin.on(\'end\',()=>process.stdout.write(s))"\r\n'
-          : '#!/bin/sh\nprintf "%s\\n" "$*"\ncat\n',
+          ? '@echo off\r\nnode -e "console.log(require(\'fs\').existsSync(\'AGENT_CONTEXT.md\')?\'AGENT_WORKDIR_VISIBLE\':\'AGENT_WORKDIR_MISSING\')"\r\necho %*\r\nnode -e "let s=\'\';process.stdin.setEncoding(\'utf8\');process.stdin.on(\'data\',d=>s+=d);process.stdin.on(\'end\',()=>process.stdout.write(s))"\r\n'
+          : '#!/bin/sh\nnode -e "console.log(require(\'fs\').existsSync(\'AGENT_CONTEXT.md\')?\'AGENT_WORKDIR_VISIBLE\':\'AGENT_WORKDIR_MISSING\')"\nprintf "%s\\n" "$*"\ncat\n',
         "utf8",
       );
       if (process.platform !== "win32") chmodSync(bin, 0o755);
       process.env.HOMEAGENT_CODEX_BIN = bin;
 
-      await expect(runProvider("codex", {
+      const output = await runProvider("codex", {
         prompt: "answer the question",
         skills: ["review"],
-      }, 500)).rejects.toThrow("cannot provide a no-tools execution mode");
+        workdir,
+      }, 500);
+
+      expect(output).toContain("exec --ephemeral --ignore-user-config --ignore-rules");
+      expect(output).toContain("approval_policy");
+      expect(output).toContain("never");
+      expect(output).toContain(
+        "--json --sandbox read-only --skip-git-repo-check -- -",
+      );
+      expect(output).toContain("answer the question");
+      expect(output).toContain("AGENT_WORKDIR_VISIBLE");
+      expect(output).not.toContain("AGENT_WORKDIR_MISSING");
+      expect(output).not.toContain("/review");
     } finally {
       if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
       else process.env.HOMEAGENT_CODEX_BIN = previous;
@@ -697,7 +715,9 @@ describe("provider detection", () => {
         500,
       );
       expect(output).toContain("cli_auth_credentials_store");
-      expect(output).toContain("exec --json --sandbox read-only");
+      expect(output).toContain(
+        "exec --ephemeral --ignore-user-config --ignore-rules --json --sandbox read-only",
+      );
       expect(output).toContain("--image /tmp/dinner.png -- -");
     } finally {
       if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
@@ -791,7 +811,7 @@ describe("provider detection", () => {
       );
       expect(defaultRun).toContain("cli_auth_credentials_store");
       expect(defaultRun).toContain(
-        "exec --json --sandbox read-only --skip-git-repo-check -- -",
+        "exec --ephemeral --ignore-user-config --ignore-rules --json --sandbox read-only --skip-git-repo-check -- -",
       );
 
       const configuredRun = await runProvider(
@@ -807,7 +827,7 @@ describe("provider detection", () => {
       expect(configuredRun).toContain("model_reasoning_effort");
       expect(configuredRun).toContain("high");
       expect(configuredRun).toContain(
-        "exec --json --sandbox read-only --skip-git-repo-check -m gpt-5.6-sol -- -",
+        "exec --ephemeral --ignore-user-config --ignore-rules --json --sandbox read-only --skip-git-repo-check -m gpt-5.6-sol -- -",
       );
     } finally {
       for (const key of keys) {
@@ -1090,7 +1110,7 @@ describe("provider detection", () => {
         "--ephemeral --ignore-user-config --ignore-rules",
       );
       expect(codexWrite).toContain(
-        "exec --json --sandbox workspace-write --skip-git-repo-check -- -",
+        "exec --ephemeral --ignore-user-config --ignore-rules --json --sandbox workspace-write --skip-git-repo-check -- -",
       );
 
       await expect(runProvider("codex", {

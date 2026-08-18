@@ -2179,6 +2179,23 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(connector.sent[0]!.markdown).toContain("知识库还是空的");
   });
 
+  test("cold-start Agent-workdir answer is not mislabeled as missing knowledge", async () => {
+    engine.askWithExecutionPlan = async () => ({
+      answer: "后端由 Alice 负责。",
+      source: "general",
+      context: "agent-workdir",
+      citations: [],
+      gaps: ["知识库中暂无相关记录"],
+    });
+    await orch.start();
+
+    await connector.sendP2P("谁负责后端？");
+
+    expect(connector.sent[0]!.markdown).toBe("后端由 Alice 负责。");
+    expect(connector.sent[0]!.markdown).not.toContain("尚缺");
+    expect(connector.sent[0]!.markdown).not.toContain("知识库还是空的");
+  });
+
   test("command '重新提炼' triggers a dream cycle", async () => {
     // seed one raw so the dream cycle has something (and won't call LLM on empty)
     await engine.remember({ space: "personal/ou_me", source: "message", content: "x" });

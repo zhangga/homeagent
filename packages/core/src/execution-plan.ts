@@ -21,6 +21,8 @@ export interface ResolvedExecutionPlan {
   provider?: ProviderId;
   model?: string;
   reasoningEffort?: CodexReasoningEffort;
+  /** Canonical Agent directory available as read-only context to ordinary calls. */
+  workdir?: string;
   execution?: ProviderExecution;
   resolutionError?: string;
 }
@@ -71,6 +73,11 @@ export function isResolvedExecutionPlan(value: unknown): value is ResolvedExecut
     ))
     && (plan.reasoningEffort === undefined
       || CODEX_REASONING_EFFORTS.includes(plan.reasoningEffort))
+    && (plan.workdir === undefined || (
+      typeof plan.workdir === "string"
+      && plan.workdir.length > 0
+      && plan.workdir.length <= MAX_EXECUTION_PLAN_WORKDIR_CHARACTERS
+    ))
     && (plan.execution === undefined || isExecution(plan.execution))
     && (plan.resolutionError === undefined || (
       typeof plan.resolutionError === "string"
@@ -93,6 +100,7 @@ export function cloneResolvedExecutionPlan(
     ...(plan.reasoningEffort === undefined
       ? {}
       : { reasoningEffort: plan.reasoningEffort }),
+    ...(plan.workdir === undefined ? {} : { workdir: plan.workdir }),
     ...(plan.execution === undefined
       ? {}
       : {

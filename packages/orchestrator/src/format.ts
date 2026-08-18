@@ -53,7 +53,7 @@ export function formatAnswer(res: AskResult): string {
     parts.push("", `— 依据：${list}`);
   }
 
-  if (res.gaps && res.gaps.length > 0) {
+  if (res.context !== "agent-workdir" && res.gaps && res.gaps.length > 0) {
     parts.push("", `（尚缺：${res.gaps.join("；")}）`);
   }
 

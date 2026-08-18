@@ -59,6 +59,7 @@ export type RunProviderFn = (
     reasoningEffort?: CodexReasoningEffort;
     images?: CompleteOptions["images"];
     skills?: string[];
+    workdir?: string;
     execution?: ProviderExecution;
   },
   timeoutMs?: number,
@@ -166,6 +167,7 @@ export function makeCliClient(
   execution?: ProviderExecution,
   skills: string[] = execution?.skills ?? [],
   accountingDataDir?: string,
+  workdir?: string,
 ): LlmClient {
   // The model is fixed at construction (the engine already resolved it from the
   // space's agent / global default). We deliberately IGNORE per-call opts.model:
@@ -200,6 +202,7 @@ export function makeCliClient(
             reasoningEffort,
             images: opts.images,
             skills: [...skills],
+            workdir,
             execution,
           },
           timeoutMs,
@@ -246,6 +249,7 @@ export function makeCliClient(
             reasoningEffort,
             images: opts.images,
             skills: [...skills],
+            workdir,
             execution,
           },
           timeoutMs,
