@@ -115,6 +115,32 @@ describe("shouldRunTask", () => {
     expect(message).not.toContain("Legacy Skill name is not bound");
   });
 
+  test("work action notification distinguishes execution from acceptance", () => {
+    const run = {
+      id: "run_1",
+      taskId: "action_1",
+      taskName: "继续：灰度发布",
+      workItemId: "work_1",
+      workActionId: "action_1",
+      space: SPACE,
+      topic: "x",
+      trigger: "scheduled",
+      distill: false,
+      priority: "scheduled",
+      status: "succeeded",
+      queuedAt: 1,
+      startedAt: 1,
+      runStartedAt: 1,
+      finishedAt: 2,
+      summary: "命令执行完成",
+    } satisfies TaskRun;
+
+    const message = formatTaskRunNotification(run);
+
+    expect(message).toContain("执行已完成，结果已进入验收流程");
+    expect(message).not.toContain("任务「继续：灰度发布」已完成");
+  });
+
   test("disabled never runs", () => {
     expect(shouldRunTask(task({ enabled: false }), T10)).toBe(false);
   });

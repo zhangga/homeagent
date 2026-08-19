@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { SpaceId } from "@homeagent/shared";
 import { resetConfig } from "@homeagent/shared";
 import { SpaceStore } from "./space.ts";
-import { runDreamCycle, isCacheHit } from "./dream.ts";
+import { regeneratePageFromSources, runDreamCycle, isCacheHit } from "./dream.ts";
 import { FakeLlm } from "./testing.ts";
 import type { Page } from "@homeagent/shared";
 
@@ -33,6 +33,41 @@ function seedRaw(content: string): string {
 }
 
 describe("runDreamCycle", () => {
+  test("manual page regeneration rejects a held WorkAction Raw before calling the LLM", async () => {
+    const readyRawId = seedRaw("Alice 负责发布流程。");
+    const heldRawId = store.index().insertRaw({
+      space: SPACE,
+      source: "task",
+      content: "尚未验收的发布结果",
+      admission: "held",
+      workActionId: "action-held",
+    });
+    store.writePage({
+      slug: "entities/alice",
+      type: "entity",
+      title: "Alice",
+      summary: "负责发布流程。",
+      aliases: [],
+      tags: [],
+      sources: [readyRawId],
+      links: [],
+      content: "# Alice\n\nAlice 负责发布流程。\n",
+      updatedAt: 1,
+      contentHash: "existing",
+    });
+    const fake = new FakeLlm();
+
+    await expect(regeneratePageFromSources(
+      store,
+      "entities/alice",
+      [heldRawId],
+      {},
+      { client: fake },
+    )).rejects.toThrow("尚未通过动作验收");
+    expect(fake.calls).toEqual([]);
+    expect(store.index().getPage("entities/alice")?.sources).toEqual([readyRawId]);
+  });
+
   test("distills a worthwhile entry into a page with provenance", async () => {
     const id = seedRaw("Alice 是我们的后端负责人，主导服务端架构设计。");
     const fake = new FakeLlm();

@@ -516,7 +516,7 @@ describe("TaskRunStore", () => {
       }),
       approvalNotification: { status: "pending", attempts: 0 },
     }));
-    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(9);
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(11);
   });
 
   test("rejects pending approval as a durable cancelled run", () => {
@@ -627,7 +627,7 @@ describe("TaskRunStore", () => {
       finishedAt: expect.any(Number),
       error: expect.stringMatching(/approval/i),
     }));
-    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(9);
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(11);
   });
 
   test("preserves an unapproved legacy running write run as a durable failure", () => {
@@ -669,7 +669,7 @@ describe("TaskRunStore", () => {
         error: expect.stringMatching(/approval/i),
       }));
       expect(new TaskRunStore(dir).get(run.id)?.finishedAt).toBe(460);
-      expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(9);
+      expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(11);
     } finally {
       clock.mockRestore();
     }
@@ -712,7 +712,7 @@ describe("TaskRunStore", () => {
       decidedBy: "homeagent.archive-v10",
       reason: expect.stringMatching(/not recorded/i),
     });
-    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(9);
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(11);
 
     const dishonest = JSON.parse(readFileSync(path, "utf8"));
     dishonest.runs[run.id].approval.decidedAt = 551;
@@ -1194,7 +1194,7 @@ describe("TaskRunStore", () => {
       },
     });
     expect(JSON.parse(readFileSync(join(dir, "config", "task-runs.json"), "utf8")).version)
-      .toBe(9);
+      .toBe(11);
   });
 
   test("rejects an invalid resolved execution plan before persisting a run", () => {
@@ -1272,7 +1272,7 @@ describe("TaskRunStore", () => {
       }],
       skipped: [],
     });
-    expect(JSON.parse(readFileSync(join(dir, "config", "task-runs.json"), "utf8")).version).toBe(9);
+    expect(JSON.parse(readFileSync(join(dir, "config", "task-runs.json"), "utf8")).version).toBe(11);
   });
 
   test("rejects unbounded Skill evidence before persisting a run", () => {

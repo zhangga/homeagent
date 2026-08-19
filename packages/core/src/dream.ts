@@ -341,6 +341,12 @@ export async function regeneratePageFromSources(
   const rawIds = [...new Set([...existing.sources, ...extraRawIds])];
   if (rawIds.length === 0) throw new Error("知识页没有可用于重新生成的原始来源");
   const sources = store.index().listRawByIds(rawIds, { onlyPending: false });
+  const nonAdmitted = sources.find((source) => source.admission !== "ready");
+  if (nonAdmitted) {
+    throw new Error(nonAdmitted.admission === "held"
+      ? "知识页原始来源尚未通过动作验收，不能用于重新生成"
+      : "知识页原始来源已被动作验收排除，不能用于重新生成");
+  }
   const availableRawIds = new Set(sources.map((source) => source.id));
   if (extraRawIds.some((rawId) => !availableRawIds.has(rawId))) {
     throw new Error("新增的人工来源不存在，无法安全重新生成");
@@ -443,10 +449,14 @@ export async function runDreamCycle(
     opts.rawIds === undefined
       ? idx.listRaw({
           onlyPending: !force,
+          onlyAdmitted: true,
           limit: opts.maxEntries ?? DEFAULT_MAX_ENTRIES,
         })
       : idx.listRawByIds(opts.rawIds, {
           onlyPending: !force,
+          // `force` may replay an already-ingested Raw, but it must never
+          // bypass the independent WorkAction knowledge-admission decision.
+          onlyAdmitted: true,
           limit: opts.maxEntries,
         });
 

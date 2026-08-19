@@ -153,6 +153,20 @@ afterEach(async () => {
 });
 
 describe("orchestrator trunk (cli connector, no feishu)", () => {
+  test("a new Chat Run is attached to the current work item", async () => {
+    const workItem = engine.workItems.create({
+      space: "team/oc_team",
+      title: "跟进群聊结论",
+    });
+    await orch.start();
+
+    await connector.sendGroup("hello", true);
+
+    const run = engine.chatRuns.list("team/oc_team")[0]!;
+    expect(run.workItemId).toBe(workItem.id);
+    expect(engine.workItems.get(workItem.id)?.chatRunIds).toContain(run.id);
+  });
+
   test("an unbound group event has no capture, model, or reply side effects", async () => {
     engine.feishuBindings.disconnect("team/oc_team");
     let downloads = 0;

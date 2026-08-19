@@ -15,6 +15,7 @@ import type {
   HealthReport,
   Page,
   PageRef,
+  RawAdmission,
   RawEntry,
   SkillWarningView,
   SpaceId,
@@ -110,6 +111,16 @@ import {
   type RunConcurrencyLayer,
 } from "./run-scheduler.ts";
 import { ReminderStore, type Reminder } from "./reminders.ts";
+import { WorkItemStore, type WorkItem } from "./work-items.ts";
+import {
+  MAX_WORK_ACTION_RUNS,
+  parseWorkActionProviderReport,
+  WorkContinuationStore,
+  type WorkAction,
+  type WorkActionAcceptance,
+  type WorkActionPermission,
+  type WorkActionProviderReport,
+} from "./work-continuation.ts";
 import {
   LearningPlanStore,
   type AdaptiveTopicUpdateInput,
@@ -259,6 +270,9 @@ export interface StartedTaskRun {
   run: TaskRun;
   completion: Promise<TaskReport>;
 }
+
+const WORK_ACTION_BOUNDARY_CHANGED_ERROR =
+  "work action boundary changed: current WorkItem next action no longer matches the frozen action";
 
 export type TaskRunNotificationDelivery = (
   run: TaskRun,
@@ -1138,6 +1152,8 @@ export class KnowledgeEngine implements Knowledge {
   readonly taskRuns: TaskRunStore;
   readonly chatRuns: ChatRunStore;
   readonly reminders: ReminderStore;
+  readonly workItems: WorkItemStore;
+  readonly workContinuations: WorkContinuationStore;
   readonly learning: LearningPlanStore;
   readonly quality: QualityStore;
   readonly serializer: Serializer;
@@ -1160,6 +1176,8 @@ export class KnowledgeEngine implements Knowledge {
   constructor(opts: EngineOptions = {}) {
     this.dataDir = opts.dataDir ?? config().dataDir;
     this.registry = new SpaceRegistry(this.dataDir);
+    this.workItems = new WorkItemStore(this.dataDir);
+    this.workContinuations = new WorkContinuationStore(this.dataDir);
     this.feishuBindings = new FeishuGroupBindingStore(this.dataDir);
     this.skillCatalog = opts.skillCatalog ?? new SkillCatalog({
       roots: defaultSkillRoots(),
@@ -1180,6 +1198,7 @@ export class KnowledgeEngine implements Knowledge {
       recoverInterrupted: opts.recoverInterruptedChatRuns,
     });
     this.reconcileTaskRunHealth();
+    this.reconcileWorkContinuationState();
     this.reminders = new ReminderStore(this.dataDir);
     this.learning = new LearningPlanStore(this.dataDir);
     this.quality = new QualityStore(this.dataDir);
@@ -1245,6 +1264,743 @@ export class KnowledgeEngine implements Knowledge {
       ?? this.taskRuns.list(taskId).find(
         (run) => ["awaiting_approval", "queued", "running"].includes(run.status),
       )?.id;
+  }
+
+  private reconcileWorkContinuationState(): void {
+    this.reconcileTaskRunWorkActionRawEvidence();
+    for (const run of this.taskRuns.list().filter((candidate) => candidate.workActionId)) {
+      const action = this.workContinuations.get(run.workActionId!);
+      const item = run.workItemId ? this.workItems.get(run.workItemId) : undefined;
+      if (
+        !action
+        || !item
+        || action.workItemId !== item.id
+        || action.space !== run.space
+        || item.space !== run.space
+      ) continue;
+      if (
+        !action.taskRunIds.includes(run.id)
+        && ["queued", "awaiting_approval", "running"].includes(action.status)
+      ) {
+        this.workContinuations.attachRun(
+          action.id,
+          run.id,
+          run.status === "awaiting_approval" ? "awaiting_approval" : "queued",
+          Math.max(action.updatedAt, run.startedAt),
+        );
+      }
+      if (!item.taskRunIds.includes(run.id)) {
+        this.workItems.attachTaskRun(item.id, run.id, Math.max(item.updatedAt, run.startedAt));
+      }
+    }
+    for (const action of this.workContinuations.list()) {
+      this.reconcileWorkActionRawAdmissions(action);
+      if (action.status === "blocked" && action.error) {
+        const latestRunId = action.taskRunIds.at(-1);
+        this.excludeWorkActionRaws(
+          action,
+          latestRunId ? this.taskRuns.get(latestRunId)?.rawId : undefined,
+        );
+        this.workItems.applyActionBlocker(
+          action.workItemId,
+          action.id,
+          action.instruction,
+          action.error,
+          action.updatedAt,
+        );
+        continue;
+      }
+      const item = this.workItems.get(action.workItemId);
+      if (item?.actionBlockers?.[action.id]) {
+        this.workItems.clearActionBlocker(action.workItemId, action.id, action.updatedAt);
+      }
+      const runId = action.taskRunIds.at(-1);
+      if (!runId || !this.taskRuns.get(runId)) {
+        if (["queued", "awaiting_approval", "running", "awaiting_acceptance"]
+          .includes(action.status)) {
+          const error = "工作动作恢复失败：没有关联的 Task Run，已阻止自动重放";
+          const blocked = this.workContinuations.failClosed(action.id, error);
+          this.workItems.applyActionBlocker(
+            blocked.workItemId,
+            blocked.id,
+            blocked.instruction,
+            error,
+            blocked.updatedAt,
+          );
+        }
+        continue;
+      }
+      if (
+        ["queued", "awaiting_approval", "running", "awaiting_acceptance"]
+          .includes(action.status)
+        && action.taskRunIds.length < action.attempt
+      ) {
+        const error = "工作动作恢复失败：重试意图已保存，但缺少本次尝试的新 Task Run，已阻止自动重放";
+        const blocked = this.workContinuations.failClosed(action.id, error);
+        this.workItems.applyActionBlocker(
+          blocked.workItemId,
+          blocked.id,
+          blocked.instruction,
+          error,
+          blocked.updatedAt,
+        );
+        continue;
+      }
+      this.settleWorkActionFromTaskRun(runId);
+    }
+    this.reconcileAllWorkActionRawAdmissions();
+    this.removeNonAdmittedKnowledgePages();
+  }
+
+  private reconcileTaskRunWorkActionRawEvidence(): void {
+    const runs = this.taskRuns.list().filter((candidate) => candidate.workActionId);
+    const referencedRawIds = new Set(
+      runs.flatMap((run) => run.rawId ? [run.rawId] : []),
+    );
+    for (const run of runs) {
+      if (!this.registry.has(run.space)) continue;
+      const item = run.workItemId ? this.workItems.get(run.workItemId) : undefined;
+      if (!item || item.space !== run.space) {
+        throw new Error(`work action Task Run WorkItem evidence is inconsistent: ${run.id}`);
+      }
+      const index = this.registry.store(run.space).index();
+      const action = this.workContinuations.get(run.workActionId!);
+      let evidenceRawId = run.rawId;
+      let raw = evidenceRawId ? index.getRaw(evidenceRawId) : null;
+      if (!evidenceRawId) {
+        const prefix = `# 任务研究：${run.taskName}\n主题：${run.topic}\n\n`;
+        const nextRun = runs
+          .filter((candidate) => (
+            candidate.workActionId === run.workActionId
+            && candidate.startedAt > run.startedAt
+          ))
+          .sort((left, right) => left.startedAt - right.startedAt)[0];
+        const upperBound = run.finishedAt ?? nextRun?.startedAt ?? Date.now();
+        const candidates = index.listRaw({}).filter((candidate) =>
+          candidate.source === "task"
+          && candidate.workItemId === run.workItemId
+          && !referencedRawIds.has(candidate.id)
+          && candidate.createdAt >= run.startedAt
+          && candidate.createdAt <= upperBound
+          && (nextRun === undefined || candidate.createdAt < nextRun.startedAt)
+          && candidate.content.startsWith(prefix)
+        );
+        const conflictingOwner = candidates.find((candidate) => (
+          candidate.workActionId !== undefined
+          && candidate.workActionId !== run.workActionId
+        ));
+        if (conflictingOwner) {
+          throw new Error(`work action Raw belongs to another action: ${conflictingOwner.id}`);
+        }
+        if (candidates.length > 1) {
+          throw new Error(`work action Raw evidence is ambiguous: ${run.id}`);
+        }
+        const recovered = candidates[0];
+        if (recovered) {
+          const repairedRun = this.taskRuns.reconcileRawEvidence(run.id, recovered.id);
+          if (!repairedRun) {
+            throw new Error(`work action Task Run evidence cannot be reconciled: ${run.id}`);
+          }
+          evidenceRawId = recovered.id;
+          raw = recovered;
+          referencedRawIds.add(recovered.id);
+        }
+      }
+      if (!raw) {
+        if (
+          action
+          && evidenceRawId
+          && this.desiredWorkActionRawAdmission(action, evidenceRawId, run.status) === "ready"
+        ) {
+          throw new Error(`accepted WorkAction Raw evidence is missing: ${evidenceRawId}`);
+        }
+        continue;
+      }
+      if (
+        raw.space !== run.space
+        || raw.source !== "task"
+        || raw.workItemId !== item.id
+      ) {
+        throw new Error(`work action Task Run Raw evidence is inconsistent: ${run.id}`);
+      }
+      if (raw.workActionId !== undefined && raw.workActionId !== run.workActionId) {
+        throw new Error(`work action Raw belongs to another action: ${raw.id}`);
+      }
+      if (action && (
+        action.space !== run.space
+        || action.workItemId !== item.id
+        || (
+          !action.taskRunIds.includes(run.id)
+          && !["queued", "awaiting_approval", "running"].includes(action.status)
+        )
+      )) {
+        throw new Error(`work action Task Run evidence is inconsistent: ${run.id}`);
+      }
+      const admission = action
+        ? this.desiredWorkActionRawAdmission(action, raw.id, run.status)
+        : "excluded";
+      if (raw.workActionId !== run.workActionId || raw.admission !== admission) {
+        const reconciled = index.reconcileWorkActionRawAdmission(
+          raw.id,
+          run.workActionId!,
+          admission,
+        );
+        if (!reconciled) {
+          throw new Error(`work action Raw admission cannot be reconciled: ${raw.id}`);
+        }
+      }
+      if (admission !== "ready" && raw.ingested) index.markPending([raw.id]);
+      this.workItems.attachRaw(
+        item.id,
+        raw.id,
+        Math.max(
+          item.updatedAt,
+          raw.createdAt,
+          run.finishedAt ?? run.runStartedAt ?? run.startedAt,
+        ),
+      );
+    }
+  }
+
+  private desiredWorkActionRawAdmission(
+    action: WorkAction,
+    rawId: string,
+    inferredRunStatus?: TaskRun["status"],
+  ): RawAdmission {
+    const acceptance = action.acceptances?.find((candidate) => candidate.rawId === rawId);
+    if (acceptance?.status === "accepted") return "ready";
+    if (acceptance?.status === "rejected") return "excluded";
+    if (acceptance?.status === "pending") return "held";
+    if (action.checkpoint?.rawId === rawId) return "ready";
+    const run = action.taskRunIds
+      .map((runId) => this.taskRuns.get(runId))
+      .find((candidate) => candidate?.rawId === rawId);
+    const runStatus = run?.status ?? inferredRunStatus;
+    if (runStatus && ["failed", "timed_out", "cancelled"].includes(runStatus)) {
+      return "excluded";
+    }
+    if (action.status === "blocked" || action.status === "cancelled") return "excluded";
+    if (action.status === "succeeded") return "excluded";
+    return "held";
+  }
+
+  private reconcileWorkActionRawAdmissions(action: WorkAction): void {
+    if (!this.registry.has(action.space)) return;
+    const index = this.registry.store(action.space).index();
+    const raws = new Map(index.listRawsByWorkAction(action.id).map((raw) => [raw.id, raw]));
+    const inferredRunStatuses = new Map<string, TaskRun["status"]>();
+    const addRaw = (rawId: string | undefined): void => {
+      if (!rawId || raws.has(rawId)) return;
+      const raw = index.getRaw(rawId);
+      if (raw) raws.set(raw.id, raw);
+    };
+    addRaw(action.checkpoint?.rawId);
+    if (action.checkpoint?.rawId && !index.getRaw(action.checkpoint.rawId)) {
+      throw new Error(`accepted WorkAction Raw evidence is missing: ${action.checkpoint.rawId}`);
+    }
+    for (const acceptance of action.acceptances ?? []) {
+      addRaw(acceptance.rawId);
+      if (acceptance.status === "accepted" && acceptance.rawId && !index.getRaw(acceptance.rawId)) {
+        throw new Error(`accepted WorkAction Raw evidence is missing: ${acceptance.rawId}`);
+      }
+    }
+    const referencedRawIds = new Set(
+      this.taskRuns.list().flatMap((run) => run.rawId ? [run.rawId] : []),
+    );
+    for (const [runIndex, runId] of action.taskRunIds.entries()) {
+      const run = this.taskRuns.get(runId);
+      if (!run) continue;
+      if (run.rawId) {
+        addRaw(run.rawId);
+        continue;
+      }
+      const prefix = `# 任务研究：${run.taskName}\n主题：${run.topic}\n\n`;
+      const nextRun = this.taskRuns.get(action.taskRunIds[runIndex + 1] ?? "");
+      const legacyCandidates = index.listRaw({}).filter((raw) =>
+        raw.source === "task"
+        && (raw.workActionId === undefined || raw.workActionId === action.id)
+        && raw.workItemId === action.workItemId
+        && !referencedRawIds.has(raw.id)
+        && raw.createdAt >= run.startedAt
+        && (run.finishedAt === undefined || raw.createdAt <= run.finishedAt)
+        && (nextRun === undefined || raw.createdAt < nextRun.startedAt)
+        && raw.content.startsWith(prefix)
+      );
+      if (legacyCandidates.length > 1) {
+        throw new Error(`work action Raw evidence is ambiguous: ${run.id}`);
+      }
+      const recovered = legacyCandidates[0];
+      if (recovered) {
+        const repairedRun = this.taskRuns.reconcileRawEvidence(run.id, recovered.id);
+        if (!repairedRun) {
+          throw new Error(`work action Task Run evidence cannot be reconciled: ${run.id}`);
+        }
+        referencedRawIds.add(recovered.id);
+        raws.set(recovered.id, recovered);
+        inferredRunStatuses.set(recovered.id, run.status);
+      }
+    }
+    if (action.taskRunIds.some((runId) => !this.taskRuns.get(runId))) {
+      const item = this.workItems.get(action.workItemId);
+      if (!item || item.space !== action.space) {
+        throw new Error(`work action WorkItem evidence is inconsistent: ${action.id}`);
+      }
+      const survivingPrefixes = action.taskRunIds.flatMap((runId) => {
+        const run = this.taskRuns.get(runId);
+        return run ? [`# 任务研究：${run.taskName}\n主题：${run.topic}\n\n`] : [];
+      });
+      const prefixes = survivingPrefixes.length > 0
+        ? [...new Set(survivingPrefixes)]
+        : (() => {
+            const task = this.workActionTask(item, action);
+            return [`# 任务研究：${task.name}\n主题：${task.topic}\n\n`];
+          })();
+      const legacyHeader = [
+        `# 任务研究：继续：${item.title}`,
+        "主题：你正在继续一个已持久化的 HomeAgent 工作项。只执行本次动作，不要擅自展开后续动作。",
+        `# 工作项\n${item.title}`,
+      ].join("\n");
+      const actionMarker = `\n## 本次动作\n${action.instruction}\n`;
+      const legacyCandidates = index.listRaw({}).filter((raw) =>
+        raw.source === "task"
+        && raw.workItemId === action.workItemId
+        && !raws.has(raw.id)
+        && !referencedRawIds.has(raw.id)
+        && raw.createdAt >= action.createdAt
+        && raw.createdAt <= action.updatedAt
+        && (
+          prefixes.some((prefix) => raw.content.startsWith(prefix))
+          || (raw.content.startsWith(legacyHeader) && raw.content.includes(actionMarker))
+        )
+      );
+      const conflictingOwner = legacyCandidates.find(
+        (raw) => raw.workActionId !== undefined && raw.workActionId !== action.id,
+      );
+      if (conflictingOwner) {
+        throw new Error(`work action Raw belongs to another action: ${conflictingOwner.id}`);
+      }
+      if (legacyCandidates.length > 1) {
+        throw new Error(`work action Raw evidence is ambiguous: ${action.id}`);
+      }
+      const recovered = legacyCandidates[0];
+      if (recovered) raws.set(recovered.id, recovered);
+    }
+    for (const raw of raws.values()) {
+      const item = this.workItems.get(action.workItemId);
+      if (raw.source !== "task") {
+        throw new Error(`work action Raw is not task evidence: ${raw.id}`);
+      }
+      if (!item || item.space !== action.space || raw.workItemId !== item.id) {
+        throw new Error(`work action Raw WorkItem evidence is inconsistent: ${raw.id}`);
+      }
+      if (raw.workActionId !== undefined && raw.workActionId !== action.id) {
+        throw new Error(`work action Raw belongs to another action: ${raw.id}`);
+      }
+      const admission = this.desiredWorkActionRawAdmission(
+        action,
+        raw.id,
+        inferredRunStatuses.get(raw.id),
+      );
+      if (raw.workActionId !== action.id || raw.admission !== admission) {
+        const reconciled = index.reconcileWorkActionRawAdmission(raw.id, action.id, admission);
+        if (!reconciled) {
+          throw new Error(`work action Raw admission cannot be reconciled: ${raw.id}`);
+        }
+      }
+      if (admission !== "ready" && raw.ingested) index.markPending([raw.id]);
+      this.workItems.attachRaw(
+        item.id,
+        raw.id,
+        Math.max(item.updatedAt, raw.createdAt, action.updatedAt),
+      );
+    }
+  }
+
+  private reconcileAllWorkActionRawAdmissions(): void {
+    const actions = this.workContinuations.list();
+    const actionIds = new Set(actions.map((action) => action.id));
+    for (const action of actions) this.reconcileWorkActionRawAdmissions(action);
+    for (const space of this.registry.list()) {
+      const index = this.registry.store(space.id).index();
+      for (const raw of index.listRaw({})) {
+        if (!raw.workActionId || actionIds.has(raw.workActionId)) continue;
+        if (!index.reconcileWorkActionRawAdmission(raw.id, raw.workActionId, "excluded")) {
+          throw new Error(`orphan WorkAction Raw cannot be excluded: ${raw.id}`);
+        }
+        if (raw.ingested) index.markPending([raw.id]);
+      }
+    }
+  }
+
+  private deniedWorkActionRawIds(space: SpaceId): Set<string> {
+    const denied = new Set<string>();
+    for (const run of this.taskRuns.list().filter(
+      (candidate) => candidate.space === space && candidate.workActionId && candidate.rawId,
+    )) {
+      const action = this.workContinuations.get(run.workActionId!);
+      if (
+        !action
+        || this.desiredWorkActionRawAdmission(action, run.rawId!, run.status) !== "ready"
+      ) denied.add(run.rawId!);
+    }
+    for (const action of this.workContinuations.list().filter(
+      (candidate) => candidate.space === space,
+    )) {
+      for (const acceptance of action.acceptances ?? []) {
+        if (acceptance.rawId && acceptance.status !== "accepted") denied.add(acceptance.rawId);
+      }
+    }
+    return denied;
+  }
+
+  private removeNonAdmittedKnowledgePages(): void {
+    for (const space of this.registry.list()) {
+      const store = this.registry.store(space.id);
+      const index = store.index();
+      const deniedRawIds = this.deniedWorkActionRawIds(space.id);
+      const pages = index.allPages();
+      for (const slug of store.listPageFiles()) {
+        try {
+          const diskPage = store.readPageFile(slug);
+          if (diskPage) pages.push(diskPage);
+        } catch {
+          // Keep corrupt Markdown on the existing rebuild/quarantine path. It
+          // is never treated as admitted evidence by this reconciliation.
+        }
+      }
+      const affected = pages.filter((page) => page.sources.some((sourceId) => {
+        const raw = index.getRaw(sourceId);
+        return deniedRawIds.has(sourceId) || (raw !== null && raw.admission !== "ready");
+      }));
+      if (affected.length === 0) continue;
+      const readySources = new Set<string>();
+      const affectedSlugs = new Set(affected.map((page) => page.slug));
+      for (const page of affected) {
+        for (const sourceId of page.sources) {
+          if (index.getRaw(sourceId)?.admission === "ready") readySources.add(sourceId);
+        }
+      }
+      for (const slug of affectedSlugs) store.deletePage(slug);
+      for (const slug of ["index", "glossary", "overview"]) store.deletePage(slug);
+      index.markPending([...readySources]);
+      refreshDigest(store);
+      this.syncWorkItemPages(space.id);
+    }
+  }
+
+  private workActionPermission(run: TaskRun): WorkActionPermission {
+    const permission = run.executionPlan?.execution?.permission;
+    return permission === "read-only" || permission === "write" || permission === "full"
+      ? permission
+      : "unknown";
+  }
+
+  private canAutomaticallyAcceptWorkAction(
+    run: TaskRun,
+    action: WorkAction,
+    acceptance: WorkActionAcceptance,
+  ): boolean {
+    return acceptance.permission === "read-only"
+      && run.status === "succeeded"
+      && run.rawId !== undefined
+      && Boolean(run.summary?.trim())
+      && run.outputTruncated !== true
+      && acceptance.report.outcome === "completed"
+      && acceptance.report.checks.every((check) => check.status === "passed")
+      && this.workActionAcceptanceRawError(action, acceptance) === undefined;
+  }
+
+  private workActionAcceptanceRawError(
+    action: WorkAction,
+    acceptance: WorkActionAcceptance,
+  ): string | undefined {
+    if (!acceptance.rawId || !this.registry.has(action.space)) {
+      return `work action acceptance Raw is missing: ${acceptance.rawId ?? "unknown"}`;
+    }
+    const raw = this.registry.store(action.space).index().getRaw(acceptance.rawId);
+    if (!raw) return `work action acceptance Raw is missing: ${acceptance.rawId}`;
+    if (
+      raw.source !== "task"
+      || raw.workActionId !== action.id
+      || raw.admission !== "held"
+    ) {
+      return `work action acceptance Raw is not the held candidate: ${acceptance.rawId}`;
+    }
+    return undefined;
+  }
+
+  private assertWorkActionAcceptanceRaw(
+    action: WorkAction,
+    acceptance: WorkActionAcceptance | undefined,
+  ): asserts acceptance is WorkActionAcceptance {
+    if (!acceptance) throw new Error("work action acceptance candidate is missing");
+    const error = this.workActionAcceptanceRawError(action, acceptance);
+    if (error) throw new Error(error);
+  }
+
+  private projectAcceptedWorkAction(action: WorkAction): void {
+    if (!action.checkpoint) return;
+    if (action.checkpoint.rawId) {
+      if (!this.registry.has(action.space)) {
+        throw new Error(`work action Raw space is unavailable: ${action.space}`);
+      }
+      const index = this.registry.store(action.space).index();
+      const raw = index.getRaw(action.checkpoint.rawId);
+      if (!raw) {
+        throw new Error(`work action acceptance Raw is missing: ${action.checkpoint.rawId}`);
+      }
+      const promoted = raw.workActionId === undefined
+        ? index.reconcileWorkActionRawAdmission(raw.id, action.id, "ready")
+        : index.promoteRawAdmission(raw.id, action.id);
+      if (!promoted) {
+        throw new Error(`work action acceptance Raw cannot be promoted: ${raw.id}`);
+      }
+    }
+    this.workItems.applyActionCheckpoint(
+      action.workItemId,
+      action.id,
+      action.instruction,
+      action.checkpoint.summary,
+      action.checkpoint.completedAt,
+    );
+  }
+
+  private excludeWorkActionRaws(action: WorkAction, rawId?: string): void {
+    if (!this.registry.has(action.space)) return;
+    const index = this.registry.store(action.space).index();
+    const raws = index.listRawsByWorkAction(action.id);
+    if (rawId && !raws.some((raw) => raw.id === rawId)) {
+      const legacy = index.getRaw(rawId);
+      if (legacy) raws.push(legacy);
+    }
+    for (const raw of raws) {
+      if (raw.admission === "excluded") continue;
+      const excluded = raw.workActionId === undefined
+        ? index.reconcileWorkActionRawAdmission(raw.id, action.id, "excluded")
+        : index.excludeRawAdmission(raw.id, action.id);
+      if (!excluded) {
+        throw new Error(`work action Raw cannot be excluded: ${raw.id}`);
+      }
+    }
+  }
+
+  private isCurrentWorkActionBoundary(action: WorkAction): boolean {
+    const item = this.workItems.get(action.workItemId);
+    return item?.space === action.space && item.nextActions[0] === action.instruction;
+  }
+
+  private workActionExecutionBoundaryError(run: TaskRun): string | undefined {
+    if (!run.workActionId) return undefined;
+    const action = this.workContinuations.get(run.workActionId);
+    const item = run.workItemId ? this.workItems.get(run.workItemId) : undefined;
+    if (
+      !action
+      || !item
+      || action.workItemId !== item.id
+      || action.space !== run.space
+      || item.space !== run.space
+    ) {
+      return "work action execution boundary is invalid: Run, WorkAction, and WorkItem no longer agree";
+    }
+    if (action.taskRunIds.at(-1) !== run.id) {
+      return "work action execution boundary is stale: Run is not the current action attempt";
+    }
+    if (!["queued", "awaiting_approval", "running"].includes(action.status)) {
+      return "work action execution boundary is closed: action is no longer executable";
+    }
+    if (!item.active || item.phase !== "active" || item.blockers.length > 0) {
+      return "work action execution boundary is no longer admissible: WorkItem is inactive or blocked";
+    }
+    if (!this.isCurrentWorkActionBoundary(action)) {
+      return WORK_ACTION_BOUNDARY_CHANGED_ERROR;
+    }
+    return undefined;
+  }
+
+  private failClosedWorkActionRun(
+    run: TaskRun,
+    error: string,
+    now = Date.now(),
+  ): void {
+    if (!run.workActionId) return;
+    const action = this.workContinuations.get(run.workActionId);
+    if (
+      !action
+      || action.taskRunIds.at(-1) !== run.id
+      || !["queued", "awaiting_approval", "running", "awaiting_acceptance"]
+        .includes(action.status)
+    ) return;
+    const blocked = this.workContinuations.failClosed(action.id, error, now);
+    this.excludeWorkActionRaws(blocked, run.rawId);
+    this.workItems.applyActionBlocker(
+      blocked.workItemId,
+      blocked.id,
+      blocked.instruction,
+      error,
+      blocked.updatedAt,
+    );
+  }
+
+  private rejectReportedWorkActionBlocker(
+    action: WorkAction,
+    acceptance: WorkActionAcceptance,
+  ): boolean {
+    if (acceptance.status !== "pending" || acceptance.report.outcome !== "blocked") {
+      return false;
+    }
+    const reason = acceptance.report.blockers.join("；").slice(0, 20_000);
+    const rejected = this.workContinuations.reject(action.id, {
+      runId: acceptance.taskRunId,
+      decidedAt: Math.max(Date.now(), acceptance.requestedAt),
+      decidedBy: "homeagent.execution-report",
+      mode: "automatic",
+      reason,
+    });
+    this.excludeWorkActionRaws(rejected, acceptance.rawId);
+    this.workItems.applyActionBlocker(
+      rejected.workItemId,
+      rejected.id,
+      rejected.instruction,
+      reason,
+      rejected.updatedAt,
+    );
+    return true;
+  }
+
+  private settleWorkActionFromTaskRun(runId: string): void {
+    const run = this.taskRuns.get(runId);
+    if (!run?.workActionId || !run.workItemId || run.finishedAt === undefined) return;
+    const action = this.workContinuations.get(run.workActionId);
+    if (
+      !action
+      || action.workItemId !== run.workItemId
+      || !action.taskRunIds.includes(run.id)
+      || action.taskRunIds.at(-1) !== run.id
+    ) return;
+    // Cancellation is the durable user decision for this action attempt. A
+    // provider that ignores abort (or a restart that recovers its Run as
+    // failed) must not turn a cancelled action back into acceptance or block.
+    if (action.status === "cancelled") {
+      this.excludeWorkActionRaws(action, run.rawId);
+      return;
+    }
+    const latestAcceptance = action.acceptances?.at(-1);
+    if (action.status === "succeeded") {
+      this.projectAcceptedWorkAction(action);
+      return;
+    }
+    if (action.status === "blocked" && action.error) {
+      this.workItems.applyActionBlocker(
+        action.workItemId,
+        action.id,
+        action.instruction,
+        action.error,
+        latestAcceptance?.decidedAt ?? action.updatedAt,
+      );
+      return;
+    }
+    if (action.status === "awaiting_acceptance") {
+      if (
+        latestAcceptance?.taskRunId === run.id
+        && this.rejectReportedWorkActionBlocker(action, latestAcceptance)
+      ) return;
+      if (
+        latestAcceptance?.status === "pending"
+        && latestAcceptance.taskRunId === run.id
+        && this.canAutomaticallyAcceptWorkAction(run, action, latestAcceptance)
+        && this.isCurrentWorkActionBoundary(action)
+      ) {
+        const accepted = this.workContinuations.accept(action.id, {
+          runId: run.id,
+          decidedAt: Math.max(Date.now(), latestAcceptance.requestedAt),
+          decidedBy: "homeagent.auto-accept",
+          mode: "automatic",
+        });
+        this.projectAcceptedWorkAction(accepted);
+      }
+      return;
+    }
+    if (run.status === "succeeded") {
+      const parsedReport = parseWorkActionProviderReport(run.output ?? "");
+      const report: WorkActionProviderReport | undefined = parsedReport && run.summary
+        ? { ...parsedReport, result: run.summary }
+        : undefined;
+      const pending = this.workContinuations.submitForAcceptance(action.id, {
+        runId: run.id,
+        permission: this.workActionPermission(run),
+        summary: run.summary ?? "",
+        rawId: run.rawId,
+        finishedAt: run.finishedAt,
+        outputTruncated: run.outputTruncated,
+        report,
+      });
+      const acceptance = pending.acceptances?.at(-1);
+      if (acceptance && this.rejectReportedWorkActionBlocker(pending, acceptance)) return;
+      if (
+        acceptance
+        && this.canAutomaticallyAcceptWorkAction(run, pending, acceptance)
+        && this.isCurrentWorkActionBoundary(pending)
+      ) {
+        const accepted = this.workContinuations.accept(action.id, {
+          runId: run.id,
+          decidedAt: Math.max(Date.now(), acceptance.requestedAt),
+          decidedBy: "homeagent.auto-accept",
+          mode: "automatic",
+        });
+        this.projectAcceptedWorkAction(accepted);
+      }
+      return;
+    }
+    if (["failed", "timed_out"].includes(run.status) && run.error) {
+      if (run.retry?.status === "waiting") {
+        if (action.status !== "queued") {
+          this.workContinuations.waitForRetry(action.id, run.error, {
+            runId: run.id,
+            rawId: run.rawId,
+            finishedAt: run.finishedAt,
+          });
+        }
+        return;
+      }
+      const blocked = action.status === "blocked"
+        ? action
+        : this.workContinuations.block(action.id, run.error, {
+            runId: run.id,
+            rawId: run.rawId,
+            finishedAt: run.finishedAt,
+          });
+      this.excludeWorkActionRaws(blocked, run.rawId);
+      this.workItems.applyActionBlocker(
+        blocked.workItemId,
+        blocked.id,
+        blocked.instruction,
+        run.error,
+        run.finishedAt,
+      );
+      return;
+    }
+    if (run.status === "cancelled") {
+      if (run.approval?.status === "expired" && run.error) {
+        const blocked = action.status === "blocked"
+          ? action
+          : this.workContinuations.block(action.id, run.error, {
+              runId: run.id,
+              rawId: run.rawId,
+              finishedAt: run.finishedAt,
+            });
+        this.excludeWorkActionRaws(blocked, run.rawId);
+        this.workItems.applyActionBlocker(
+          blocked.workItemId,
+          blocked.id,
+          blocked.instruction,
+          run.error,
+          run.finishedAt,
+        );
+      } else {
+        const cancelled = this.workContinuations.cancel(action.id, run.finishedAt);
+        if (cancelled) this.excludeWorkActionRaws(cancelled, run.rawId);
+      }
+    }
   }
 
   /** Ensure a space exists (used by connectors when a group is joined). */
@@ -1371,7 +2127,13 @@ export class KnowledgeEngine implements Knowledge {
     const normalizedActor = normalizeGovernanceActor(actor);
     return this.serializer.run(space, async () => {
       const store = this.registry.store(space);
-      if (!store.index().getRaw(rawId)) throw new Error(`unknown raw record: ${rawId}`);
+      const raw = store.index().getRaw(rawId);
+      if (!raw) throw new Error(`unknown raw record: ${rawId}`);
+      if (raw.admission !== "ready") {
+        throw new Error(raw.admission === "held"
+          ? "原始记录尚未通过动作验收，不能进入知识提炼"
+          : "原始记录已被动作验收排除，不能进入知识提炼");
+      }
       try {
         const report = await this.executeDreamCycle(space, {
           rawIds: [rawId],
@@ -1424,6 +2186,7 @@ export class KnowledgeEngine implements Knowledge {
       store.deletePage(safeSlug);
       try {
         refreshDigest(store);
+        this.syncWorkItemPages(space);
         appendKnowledgeGovernanceAudit(store, {
           action: "page_deleted",
           actor: normalizedActor,
@@ -2157,6 +2920,12 @@ export class KnowledgeEngine implements Knowledge {
   async remember(entry: RawEntry): Promise<string> {
     // Capture is a write; serialize per space so it never races distillation.
     return this.serializer.run(entry.space, async () => {
+      const requestedWorkItem = entry.workItemId
+        ? this.workItems.get(entry.workItemId)
+        : this.workItems.activeForSpace(entry.space);
+      if (entry.workItemId && (!requestedWorkItem || requestedWorkItem.space !== entry.space)) {
+        throw new Error(`work item does not belong to space: ${entry.workItemId}`);
+      }
       const store = this.registry.ensure(entry.space, { chatId: entry.chatId });
       const index = store.index();
       if (
@@ -2171,7 +2940,11 @@ export class KnowledgeEngine implements Knowledge {
         });
         return `retracted:${entry.messageId}`;
       }
-      const id = index.insertRaw(entry);
+      const normalizedEntry: RawEntry = requestedWorkItem
+        ? { ...entry, workItemId: requestedWorkItem.id }
+        : entry;
+      const id = index.insertRaw(normalizedEntry);
+      if (requestedWorkItem) this.workItems.attachRaw(requestedWorkItem.id, id);
       log.debug("remembered raw entry", { space: entry.space, source: entry.source, id });
       return id;
     });
@@ -2744,6 +3517,7 @@ export class KnowledgeEngine implements Knowledge {
       for (const rawRecord of matchingRawRecords) index.deleteRaw(rawRecord.id);
       index.markPending([...survivingSourceIds]);
       if (affectedPages.length > 0) refreshDigest(store);
+      this.syncWorkItemPages(space);
       log.info("retracted raw message", {
         space,
         messageId: request.messageId,
@@ -2789,6 +3563,7 @@ export class KnowledgeEngine implements Knowledge {
         ...baseReport,
         ...(skillWarnings.length > 0 ? { skillWarnings } : {}),
       };
+      this.syncWorkItemPages(space);
       throwIfTaskRunAborted(opts.signal);
       this.registry.setLastDream(space, report.finishedAt);
       health.lastExamined = report.examined;
@@ -2813,6 +3588,15 @@ export class KnowledgeEngine implements Knowledge {
     }
   }
 
+  private syncWorkItemPages(space: SpaceId): void {
+    if (!this.registry.has(space)) return;
+    const pages = this.registry.store(space).index().allPages().map((page) => ({
+      slug: page.slug,
+      sources: page.sources,
+    }));
+    this.workItems.syncPageLinks(space, pages);
+  }
+
   async listQuarantines(space: SpaceId): Promise<QuarantineRecord[]> {
     if (!this.registry.has(space)) return [];
     return listQuarantineRecords(this.registry.store(space));
@@ -2831,9 +3615,16 @@ export class KnowledgeEngine implements Knowledge {
       if (record.rawIds.length === 0) {
         return { status: "failed", id, reason: "隔离记录没有可重试的原始来源" };
       }
-      const available = store.index().listRawByIds(record.rawIds, { onlyPending: false });
+      const available = store.index().listRawByIds(record.rawIds, {
+        onlyPending: false,
+        onlyAdmitted: true,
+      });
       if (available.length !== record.rawIds.length) {
-        return { status: "failed", id, reason: "部分原始来源已不存在，无法安全重试" };
+        return {
+          status: "failed",
+          id,
+          reason: "部分原始来源尚未通过动作验收、已被排除或不存在，无法安全重试",
+        };
       }
       let report: DreamReport;
       try {
@@ -2893,6 +3684,8 @@ export class KnowledgeEngine implements Knowledge {
       const tasks = this.tasks.list().filter((task) => task.space === space);
       const taskRuns = this.taskRuns.list().filter((run) => run.space === space);
       const chatRuns = this.chatRuns.list(space);
+      const workItems = this.workItems.list(space);
+      const workContinuation = this.workContinuations.exportBySpace(space);
       const reminders = this.reminders.list().filter((reminder) => reminder.space === space);
       const learning = this.learning.listBySpace(space);
       if (taskRuns.some((run) =>
@@ -2900,6 +3693,12 @@ export class KnowledgeEngine implements Knowledge {
         || run.retry?.status === "waiting"
       )) {
         throw new Error(`space has active task runs or waiting retries: ${space}`);
+      }
+      if (workContinuation.actions.some((action) =>
+        ["queued", "awaiting_approval", "running", "awaiting_acceptance"]
+          .includes(action.status)
+      )) {
+        throw new Error(`space has active work actions: ${space}`);
       }
       if (chatRuns.some((run) => run.status === "queued" || run.status === "running")) {
         throw new Error(`space has active chat runs: ${space}`);
@@ -2925,6 +3724,7 @@ export class KnowledgeEngine implements Knowledge {
         throw new Error(`space has queued or running background work: ${space}`);
       }
       const taskIds = new Set(tasks.map((task) => task.id));
+      const workActionIds = new Set(workContinuation.actions.map((action) => action.id));
       return {
         format: SPACE_ARCHIVE_FORMAT,
         version: SPACE_ARCHIVE_VERSION,
@@ -2943,8 +3743,14 @@ export class KnowledgeEngine implements Knowledge {
         raw: index.listRaw({}),
         retractions: index.listMessageRetractions(),
         tasks,
-        taskRuns: taskRuns.filter((run) => taskIds.has(run.taskId)),
+        taskRuns: taskRuns.filter((run) =>
+          taskIds.has(run.taskId)
+          || (run.workActionId !== undefined && workActionIds.has(run.workActionId))
+        ),
         chatRuns,
+        workItems,
+        workActions: workContinuation.actions,
+        workContinuationPolicies: workContinuation.policies,
         quality: this.quality.exportArchive(chatRuns),
         reminders,
         learning: this.learning.exportBySpace(space),
@@ -2979,6 +3785,11 @@ export class KnowledgeEngine implements Knowledge {
         throw new Error(`space already has learning data: ${space}`);
       }
       this.learning.assertCanRestore(archive.learning);
+      this.workItems.assertCanRestore(archive.workItems);
+      this.workContinuations.assertCanRestore({
+        actions: archive.workActions,
+        policies: archive.workContinuationPolicies,
+      });
       this.quality.assertCanRestoreArchive(archive.quality);
       const existingAgent = archive.agent ? this.agents.get(archive.agent.id) : undefined;
       const existingAgentRevisions = existingAgent
@@ -3029,6 +3840,8 @@ export class KnowledgeEngine implements Knowledge {
       const reminderIdsBefore = new Set(this.reminders.list().map((reminder) => reminder.id));
       const agentWasPresent = Boolean(existingAgent);
       let learningRestored = false;
+      let workItemsRestored = false;
+      let workContinuationRestored = false;
       let qualityRestoreReceipt: QualityArchiveRestoreReceipt | undefined;
       try {
         if (archive.agent && !existingAgent) {
@@ -3044,12 +3857,21 @@ export class KnowledgeEngine implements Knowledge {
         for (const raw of archive.raw) index.restoreRaw(raw);
         for (const record of archive.retractions) index.restoreMessageRetraction(record);
         for (const page of archive.pages) store.writePage(page);
+        refreshDigest(store);
         this.tasks.restore(archive.tasks);
         this.taskRuns.restore(archive.taskRuns);
         this.chatRuns.restore(archive.chatRuns);
         this.reminders.restore(archive.reminders);
         this.learning.restore(archive.learning);
         learningRestored = archive.learning.plans.length > 0;
+        this.workItems.restore(archive.workItems);
+        workItemsRestored = archive.workItems.length > 0;
+        this.workContinuations.restore({
+          actions: archive.workActions,
+          policies: archive.workContinuationPolicies,
+        });
+        workContinuationRestored = archive.workActions.length > 0
+          || archive.workContinuationPolicies.length > 0;
         qualityRestoreReceipt = this.quality.restoreArchive(archive.quality);
         restoreKnowledgeGovernanceAudit(store, archive.governanceAudit);
         this.registry.restoreMeta({
@@ -3078,6 +3900,8 @@ export class KnowledgeEngine implements Knowledge {
           }
         }
         if (learningRestored) this.learning.removeBySpace(space);
+        if (workContinuationRestored) this.workContinuations.removeBySpace(space);
+        if (workItemsRestored) this.workItems.removeBySpace(space);
         if (this.registry.has(space)) this.registry.remove(space);
         if (
           archive.agent
@@ -3109,6 +3933,7 @@ export class KnowledgeEngine implements Knowledge {
       pagesDeleted: 0,
       rawDeleted: 0,
       tasksDeleted: 0,
+      workItemsDeleted: 0,
       remindersDeleted: 0,
       learningPlansDeleted: 0,
     });
@@ -3120,11 +3945,19 @@ export class KnowledgeEngine implements Knowledge {
       const chatRuns = this.chatRuns.list(space);
       const reminders = this.reminders.list().filter((reminder) => reminder.space === space);
       const learning = this.learning.listBySpace(space);
+      const workItems = this.workItems.list(space);
+      const workContinuation = this.workContinuations.exportBySpace(space);
       if (taskRuns.some((run) =>
         ["awaiting_approval", "queued", "running"].includes(run.status)
         || run.retry?.status === "waiting"
       )) {
         throw new Error(`space has active task runs or waiting retries: ${space}`);
+      }
+      if (workContinuation.actions.some((action) =>
+        ["queued", "awaiting_approval", "running", "awaiting_acceptance"]
+          .includes(action.status)
+      )) {
+        throw new Error(`space has active work actions: ${space}`);
       }
       if (chatRuns.some((run) => run.status === "queued" || run.status === "running")) {
         throw new Error(`space has active chat runs: ${space}`);
@@ -3158,6 +3991,7 @@ export class KnowledgeEngine implements Knowledge {
       let tasksDeleted = 0;
       let remindersDeleted = 0;
       let learningPlansDeleted = 0;
+      let workItemsDeleted = 0;
       const learningArchive = this.learning.exportBySpace(space);
       try {
         this.taskRuns.removeBySpace(space);
@@ -3165,6 +3999,8 @@ export class KnowledgeEngine implements Knowledge {
         tasksDeleted = this.tasks.removeBySpace(space);
         remindersDeleted = this.reminders.removeBySpace(space);
         learningPlansDeleted = this.learning.removeBySpace(space);
+        this.workContinuations.removeBySpace(space);
+        workItemsDeleted = this.workItems.removeBySpace(space).length;
         this.registry.remove(space);
       } catch (err) {
         const missingTaskRuns = taskRuns.filter((run) => !this.taskRuns.has(run.id));
@@ -3181,6 +4017,16 @@ export class KnowledgeEngine implements Knowledge {
         ) {
           this.learning.restore(learningArchive);
         }
+        const missingWorkItems = workItems.filter((item) => !this.workItems.get(item.id));
+        if (missingWorkItems.length > 0) this.workItems.restore(missingWorkItems);
+        if (
+          workContinuation.actions.some((action) => !this.workContinuations.get(action.id))
+          || workContinuation.policies.some((policy) =>
+            this.workContinuations.policyFor(policy.workItemId, policy.space).updatedAt === 0
+          )
+        ) {
+          this.workContinuations.restore(workContinuation);
+        }
         throw err;
       }
       this.dreamCycles.delete(space);
@@ -3190,6 +4036,7 @@ export class KnowledgeEngine implements Knowledge {
         pagesDeleted,
         rawDeleted,
         tasksDeleted,
+        workItemsDeleted,
         remindersDeleted,
         learningPlansDeleted,
       };
@@ -3274,6 +4121,36 @@ export class KnowledgeEngine implements Knowledge {
     return this.taskRuns.get(runId);
   }
 
+  /** Resolve either a managed Task or the synthetic Task snapshot of a WorkAction Run. */
+  taskForRun(runId: string): Task | undefined {
+    const run = this.taskRuns.get(runId);
+    if (!run) return undefined;
+    const managed = this.tasks.get(run.taskId);
+    if (managed) return managed;
+    if (!run.workActionId) return undefined;
+    const action = this.workContinuations.get(run.workActionId);
+    if (!action || action.workItemId !== run.workItemId || action.space !== run.space) {
+      return undefined;
+    }
+    return {
+      id: run.taskId,
+      name: run.taskName,
+      space: run.space,
+      topic: run.topic,
+      cadence: "daily",
+      hour: 0,
+      enabled: ["queued", "awaiting_approval", "running"].includes(action.status),
+      notify: run.notify ?? true,
+      distillOnRun: run.distill,
+      timeoutMinutes: Math.max(
+        1,
+        Math.ceil((run.timeoutMs ?? TASK_TIMEOUT_MS) / 60_000),
+      ),
+      createdAt: action.createdAt,
+      updatedAt: action.updatedAt,
+    };
+  }
+
   listTaskRuns(taskId?: string): TaskRun[] {
     return this.taskRuns.list(taskId);
   }
@@ -3286,6 +4163,7 @@ export class KnowledgeEngine implements Knowledge {
         status: "error",
         error: run.error,
       });
+      this.settleWorkActionFromTaskRun(run.id);
     }
     return expired;
   }
@@ -3413,7 +4291,14 @@ export class KnowledgeEngine implements Knowledge {
   cancelTaskRun(runId: string): boolean {
     const run = this.taskRuns.get(runId);
     if (run?.status === "failed" && run.retry?.status === "waiting") {
-      return this.taskRuns.exhaustRetry(runId) !== undefined;
+      const exhausted = this.taskRuns.exhaustRetry(runId);
+      if (exhausted?.workActionId) {
+        const action = this.workContinuations.get(exhausted.workActionId);
+        if (action?.taskRunIds.at(-1) === exhausted.id) {
+          this.workContinuations.cancel(action.id, Date.now());
+        }
+      }
+      return exhausted !== undefined;
     }
     if (!run || !["awaiting_approval", "queued", "running"].includes(run.status)) return false;
     if (run.status === "awaiting_approval") {
@@ -3428,20 +4313,236 @@ export class KnowledgeEngine implements Knowledge {
           error: cancelled.error,
         });
       }
+      if (cancelled) this.settleWorkActionFromTaskRun(cancelled.id);
       return cancelled?.status === "cancelled";
     }
     if (run.status === "queued") {
       if (!this.runScheduler.cancel(runId)) return false;
-      this.taskRuns.cancel(runId, {
+      const cancelled = this.taskRuns.cancel(runId, {
         finishedAt: Math.max(Date.now(), run.startedAt),
         error: new TaskRunCancelledError().message,
       });
+      if (cancelled) this.settleWorkActionFromTaskRun(cancelled.id);
       return true;
     }
     const controller = this.taskRunControllers.get(runId);
     if (!controller) return false;
     controller.abort(new TaskRunCancelledError());
     return true;
+  }
+
+  configureWorkContinuation(workItemId: string, autoContinue: boolean) {
+    const item = this.workItems.get(workItemId);
+    if (!item) throw new Error(`work item not found: ${workItemId}`);
+    return this.workContinuations.configure(item, { autoContinue });
+  }
+
+  listDueWorkContinuations(): WorkItem[] {
+    return this.workContinuations.listPolicies()
+      .filter((policy) => policy.autoContinue)
+      .map((policy) => this.workItems.get(policy.workItemId))
+      .filter((item): item is WorkItem => item !== undefined)
+      .filter((item) => (
+        item.active
+        && item.phase === "active"
+        && item.blockers.length === 0
+        && item.nextActions.length > 0
+        && this.workContinuations.activeForWorkItem(item.id) === undefined
+      ));
+  }
+
+  startWorkContinuation(
+    workItemId: string,
+    opts: { trigger?: "manual" | "scheduled" } = {},
+  ): StartedTaskRun {
+    const item = this.workItems.get(workItemId);
+    if (!item) throw new Error(`work item not found: ${workItemId}`);
+    const action = this.workContinuations.claimNext(item);
+    if (action.taskRunIds.length > 0) {
+      throw new Error(`work action is already active: ${action.id}`);
+    }
+    const task = this.workActionTask(item, action);
+    try {
+      const started = this.launchTaskRun(
+        task,
+        opts.trigger ?? "manual",
+        false,
+        undefined,
+        task.timeoutMinutes * 60_000,
+        action.id,
+      );
+      return {
+        ...started,
+        run: this.taskRuns.get(started.run.id) ?? started.run,
+      };
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  retryWorkAction(
+    actionId: string,
+    expected: { runId?: string | null; attempt?: number } = {},
+  ): StartedTaskRun {
+    const previous = this.workContinuations.get(actionId);
+    if (!previous) throw new Error(`work action not found: ${actionId}`);
+    this.assertExpectedWorkActionState(previous, expected);
+    if (!this.isCurrentWorkActionBoundary(previous)) {
+      throw new Error(WORK_ACTION_BOUNDARY_CHANGED_ERROR);
+    }
+    const previousRunId = previous.taskRunIds.at(-1);
+    const item = this.workItems.get(previous.workItemId);
+    if (!item) throw new Error(`work item not found: ${previous.workItemId}`);
+    const action = this.workContinuations.retry(actionId);
+    this.workItems.clearActionBlocker(
+      action.workItemId,
+      action.id,
+      action.updatedAt,
+    );
+    const task = this.workActionTask(item, action);
+    return this.launchTaskRun(
+      task,
+      "retry",
+      false,
+      previousRunId,
+      task.timeoutMinutes * 60_000,
+      action.id,
+    );
+  }
+
+  acceptWorkAction(
+    actionId: string,
+    runId: string,
+    decidedBy: string,
+    note?: string,
+  ): WorkAction {
+    const pending = this.workContinuations.get(actionId);
+    if (!pending) throw new Error(`work action not found: ${actionId}`);
+    if (
+      pending.status === "awaiting_acceptance"
+      && !this.isCurrentWorkActionBoundary(pending)
+    ) {
+      throw new Error(WORK_ACTION_BOUNDARY_CHANGED_ERROR);
+    }
+    const acceptance = pending.acceptances?.at(-1);
+    this.assertWorkActionAcceptanceRaw(pending, acceptance);
+    const accepted = this.workContinuations.accept(actionId, {
+      runId,
+      decidedAt: Math.max(Date.now(), acceptance?.requestedAt ?? pending.updatedAt),
+      decidedBy,
+      mode: "human",
+      reason: note,
+    });
+    this.projectAcceptedWorkAction(accepted);
+    return accepted;
+  }
+
+  rejectWorkAction(
+    actionId: string,
+    runId: string,
+    decidedBy: string,
+    reason: string,
+  ): WorkAction {
+    const pending = this.workContinuations.get(actionId);
+    if (!pending) throw new Error(`work action not found: ${actionId}`);
+    const acceptance = pending.acceptances?.at(-1);
+    const rejected = this.workContinuations.reject(actionId, {
+      runId,
+      decidedAt: Math.max(Date.now(), acceptance?.requestedAt ?? pending.updatedAt),
+      decidedBy,
+      mode: "human",
+      reason,
+    });
+    this.excludeWorkActionRaws(rejected, acceptance?.rawId);
+    this.workItems.applyActionBlocker(
+      rejected.workItemId,
+      rejected.id,
+      rejected.instruction,
+      rejected.error ?? reason,
+      rejected.updatedAt,
+    );
+    return rejected;
+  }
+
+  cancelWorkAction(
+    actionId: string,
+    expected: { runId?: string | null; attempt?: number } = {},
+  ): boolean {
+    const action = this.workContinuations.get(actionId);
+    if (!action) return false;
+    this.assertExpectedWorkActionState(action, expected);
+    const runId = action.taskRunIds.at(-1);
+    if (!runId || !this.cancelTaskRun(runId)) return false;
+    const cancelled = this.workContinuations.cancel(actionId);
+    if (!cancelled) return false;
+    this.excludeWorkActionRaws(cancelled, this.taskRuns.get(runId)?.rawId);
+    return true;
+  }
+
+  abandonWorkAction(
+    actionId: string,
+    expected: { runId?: string | null; attempt?: number } = {},
+  ): WorkAction {
+    const action = this.workContinuations.get(actionId);
+    if (!action) throw new Error(`work action not found: ${actionId}`);
+    this.assertExpectedWorkActionState(action, expected);
+    const abandoned = this.workContinuations.abandon(actionId);
+    const runId = abandoned.taskRunIds.at(-1);
+    this.excludeWorkActionRaws(
+      abandoned,
+      runId ? this.taskRuns.get(runId)?.rawId : undefined,
+    );
+    this.workItems.clearActionBlocker(
+      abandoned.workItemId,
+      abandoned.id,
+      abandoned.updatedAt,
+    );
+    return abandoned;
+  }
+
+  private assertExpectedWorkActionState(
+    action: WorkAction,
+    expected: { runId?: string | null; attempt?: number },
+  ): void {
+    if (
+      (expected.runId !== undefined
+        && (action.taskRunIds.at(-1) ?? null) !== expected.runId)
+      || (expected.attempt !== undefined && action.attempt !== expected.attempt)
+    ) {
+      throw new Error("work action state changed: refresh before mutating the current attempt");
+    }
+  }
+
+  private workActionTask(item: WorkItem, action: WorkAction): Task {
+    const topic = [
+      "你正在继续一个已持久化的 HomeAgent 工作项。只执行本次动作，不要擅自展开后续动作。",
+      "",
+      `# 工作项\n${item.title}`,
+      item.brief ? `\n## Brief\n${item.brief}` : "",
+      item.runbook ? `\n## Runbook\n${item.runbook}` : "",
+      item.summary ? `\n## 当前进展\n${item.summary}` : "",
+      item.blockers.length > 0 ? `\n## 已知阻塞\n${item.blockers.join("\n")}` : "",
+      `\n## 本次动作\n${action.instruction}`,
+      "",
+      "只输出一个 JSON 对象，不要使用 Markdown 代码块或附加说明。格式：",
+      '{"version":1,"outcome":"completed","result":"结果摘要","blockers":[],"checks":[{"name":"实际执行的检查","status":"passed","detail":"可选说明"}]}',
+      "只有动作已完成时才使用 completed，且 blockers 必须为空；无法安全完成时使用 blocked，并至少给出一个 blocker。",
+      "每项检查的 status 只能是 passed、failed 或 not_run；不得把未执行的检查标为 passed。",
+    ].filter(Boolean).join("\n");
+    return {
+      id: action.id,
+      name: `继续：${item.title}`,
+      space: item.space,
+      topic,
+      cadence: "daily",
+      hour: 0,
+      enabled: false,
+      notify: true,
+      distillOnRun: false,
+      timeoutMinutes: DEFAULT_TASK_TIMEOUT_MINUTES,
+      createdAt: action.createdAt,
+      updatedAt: action.updatedAt,
+    };
   }
 
   approveTaskRun(runId: string, decidedBy: string): StartedTaskRun {
@@ -3453,7 +4554,28 @@ export class KnowledgeEngine implements Knowledge {
     if (!pending.executionPlan) {
       throw new Error(`task run has no immutable execution plan: ${runId}`);
     }
-    const storedTask = this.tasks.get(pending.taskId);
+    const boundaryError = this.workActionExecutionBoundaryError(pending);
+    if (boundaryError) {
+      const decidedAt = Math.max(
+        Date.now(),
+        pending.approval?.requestedAt ?? pending.startedAt,
+      );
+      const rejected = this.taskRuns.reject(runId, {
+        decidedAt,
+        decidedBy: "homeagent.boundary-guard",
+        reason: boundaryError,
+      }) ?? this.taskRuns.get(runId);
+      this.failClosedWorkActionRun(pending, boundaryError, decidedAt);
+      if (rejected?.finishedAt) {
+        this.tasks.setLastRun(rejected.taskId, {
+          at: rejected.finishedAt,
+          status: "error",
+          error: rejected.error,
+        });
+      }
+      throw new Error(boundaryError);
+    }
+    const storedTask = this.taskForRun(pending.id);
     if (!storedTask) throw new Error(`unknown task: ${pending.taskId}`);
     const approved = this.taskRuns.approve(runId, {
       decidedAt: Math.max(Date.now(), pending.approval?.requestedAt ?? pending.startedAt),
@@ -3511,16 +4633,22 @@ export class KnowledgeEngine implements Knowledge {
         error: rejected.error,
       });
     }
+    this.settleWorkActionFromTaskRun(rejected.id);
     return rejected;
   }
 
   retryTaskRun(runId: string): StartedTaskRun {
     const previous = this.taskRuns.get(runId);
     if (!previous) throw new Error(`unknown task run: ${runId}`);
+    if (previous.workActionId) {
+      throw new Error(
+        "WorkAction Task Runs must be retried through the WorkAction boundary",
+      );
+    }
     if (!["failed", "cancelled", "timed_out"].includes(previous.status)) {
       throw new Error(`task run is not retryable: ${runId}`);
     }
-    const task = this.tasks.get(previous.taskId);
+    const task = this.taskForRun(previous.id);
     if (!task) throw new Error(`unknown task: ${previous.taskId}`);
     return this.launchTaskRun({
       ...task,
@@ -3539,13 +4667,40 @@ export class KnowledgeEngine implements Knowledge {
     const scheduled: StartedTaskRun[] = [];
     for (const parent of this.taskRuns.listDueRetries(now)) {
       if (this.activeTaskRunId(parent.taskId)) continue;
-      const storedTask = this.tasks.get(parent.taskId);
+      const boundaryError = this.workActionExecutionBoundaryError(parent);
+      if (boundaryError) {
+        this.taskRuns.exhaustRetry(parent.id);
+        this.failClosedWorkActionRun(parent, boundaryError, now);
+        continue;
+      }
+      if (parent.workActionId) {
+        const action = this.workContinuations.get(parent.workActionId);
+        if (action && action.taskRunIds.length >= MAX_WORK_ACTION_RUNS) {
+          const error = "work action automatic retry limit reached";
+          this.taskRuns.exhaustRetry(parent.id);
+          this.failClosedWorkActionRun(parent, error, now);
+          continue;
+        }
+      }
+      const storedTask = this.taskForRun(parent.id);
       if (!storedTask?.enabled) {
         this.taskRuns.exhaustRetry(parent.id);
+        if (parent.workActionId) {
+          this.failClosedWorkActionRun(
+            parent,
+            "work action automatic retry is no longer enabled",
+            now,
+          );
+        }
         continue;
       }
       const child = this.taskRuns.claimRetry(parent.id, now);
       if (!child) continue;
+      if (child.workItemId) this.workItems.attachTaskRun(child.workItemId, child.id, now);
+      if (child.workActionId) {
+        this.workContinuations.claimAutomaticRetry(child.workActionId, now);
+        this.workContinuations.attachRun(child.workActionId, child.id, "queued", now);
+      }
       const task: Task = {
         ...storedTask,
         name: child.taskName,
@@ -3564,6 +4719,7 @@ export class KnowledgeEngine implements Knowledge {
     distill: boolean,
     retryOf?: string,
     timeoutMs = TASK_TIMEOUT_MS,
+    workActionId?: string,
   ): StartedTaskRun {
     const taskId = task.id;
     const activeRunId = this.activeTaskRunId(taskId);
@@ -3586,9 +4742,16 @@ export class KnowledgeEngine implements Knowledge {
     }
     const approvalRequired = snapshot.executionPlan.execution !== undefined
       && snapshot.executionPlan.execution.permission !== "read-only";
+    const workItemId = (workActionId
+      ? this.workContinuations.get(workActionId)?.workItemId
+      : undefined)
+      ?? (retryOf ? this.taskRuns.get(retryOf)?.workItemId : undefined)
+      ?? this.workItems.activeForSpace(task.space)?.id;
     const run = this.taskRuns.start({
       task,
       trigger,
+      workItemId,
+      workActionId,
       agentId: snapshot.agent?.id,
       provider: snapshot.provider,
       model: snapshot.model,
@@ -3599,6 +4762,14 @@ export class KnowledgeEngine implements Knowledge {
       timeoutMs,
       approvalRequired,
     });
+    if (workItemId) this.workItems.attachTaskRun(workItemId, run.id);
+    if (workActionId) {
+      this.workContinuations.attachRun(
+        workActionId,
+        run.id,
+        run.status === "awaiting_approval" ? "awaiting_approval" : "queued",
+      );
+    }
     if (run.status === "awaiting_approval") {
       const completion = Promise.resolve<TaskReport>({
         runId: run.id,
@@ -3694,8 +4865,18 @@ export class KnowledgeEngine implements Knowledge {
         conversationId: run.space,
       }),
       execute: async () => {
+        const boundaryError = this.workActionExecutionBoundaryError(run);
+        if (boundaryError) {
+          const finishedAt = Math.max(Date.now(), run.startedAt);
+          this.failClosedWorkActionRun(run, boundaryError, finishedAt);
+          this.taskRuns.cancel(run.id, { finishedAt, error: boundaryError });
+          throw new Error(boundaryError);
+        }
         const running = this.taskRuns.begin(run.id);
         if (!running) throw new Error(`queued task run is no longer active: ${run.id}`);
+        if (running.workActionId) {
+          this.workContinuations.markRunning(running.workActionId, running.id);
+        }
         const timeout = setTimeout(() => {
           controller.abort(new TaskRunTimeoutError(timeoutMs));
         }, timeoutMs);
@@ -3755,6 +4936,9 @@ export class KnowledgeEngine implements Knowledge {
         startedAt: settled.startedAt,
         finishedAt: settled.finishedAt ?? Date.now(),
       };
+    }).then((report) => {
+      this.settleWorkActionFromTaskRun(report.runId);
+      return report;
     }).finally(() => {
       if (this.activeTaskRuns.get(taskId) === run.id) {
         this.activeTaskRuns.delete(taskId);
@@ -3791,6 +4975,12 @@ export class KnowledgeEngine implements Knowledge {
       .filter((run) => run.status === "queued")
       .sort((a, b) => a.queuedAt - b.queuedAt || a.id.localeCompare(b.id));
     for (const run of queued) {
+      const boundaryError = this.workActionExecutionBoundaryError(run);
+      if (boundaryError) {
+        this.failClosedWorkActionRun(run, boundaryError);
+        this.finishQueuedTaskRun(run, boundaryError, "cancelled");
+        continue;
+      }
       if (!run.executionPlan) {
         this.finishQueuedTaskRun(
           run,
@@ -3816,7 +5006,7 @@ export class KnowledgeEngine implements Knowledge {
         );
         continue;
       }
-      const storedTask = this.tasks.get(run.taskId);
+      const storedTask = this.taskForRun(run.id);
       if (!storedTask) {
         this.finishQueuedTaskRun(run, `Queued task no longer exists: ${run.taskId}`);
         continue;
@@ -3905,7 +5095,7 @@ export class KnowledgeEngine implements Knowledge {
       const res = await awaitTaskRunStep(
         observedCallContext.client.complete({
           system: executionPlan.instruction || undefined,
-          prompt: researchPrompt(task.topic),
+          prompt: run.workActionId ? task.topic : researchPrompt(task.topic),
           model: executionPlan.model,
           purpose: "distill",
           space: task.space,
@@ -3921,6 +5111,10 @@ export class KnowledgeEngine implements Knowledge {
       rawId = await this.remember({
         space: task.space,
         source: "task",
+        workItemId: run.workItemId,
+        ...(run.workActionId
+          ? { workActionId: run.workActionId, admission: "held" as const }
+          : {}),
         content: `# 任务研究：${task.name}\n主题：${task.topic}\n\n${text}`,
       });
       throwIfTaskRunAborted(controller.signal);
@@ -3946,7 +5140,10 @@ export class KnowledgeEngine implements Knowledge {
           log.warn("post-task distillation failed (raw kept for nightly)", { taskId: task.id, err: String(err) });
         }
       }
-      const summary = text.slice(0, 200);
+      const providerReport = run.workActionId
+        ? parseWorkActionProviderReport(text)
+        : undefined;
+      const summary = (providerReport?.result ?? text).slice(0, 200);
       const finishedAt = Math.max(Date.now(), startedAt);
       this.tasks.setLastRun(task.id, { at: finishedAt, status: "ok", summary });
       this.taskRuns.succeed(run.id, {
@@ -4301,6 +5498,7 @@ export class KnowledgeEngine implements Knowledge {
     await this.serializer.run(space, async () => {
       const store = this.registry.ensure(space);
       store.writePage(page);
+      this.syncWorkItemPages(space);
     });
   }
 
@@ -4327,6 +5525,8 @@ export class KnowledgeEngine implements Knowledge {
           ok: true,
           pages: index.countPages(),
           pendingRaw: index.countRaw(true),
+          heldRaw: index.countRawByAdmission("held"),
+          excludedRaw: index.countRawByAdmission("excluded"),
           quarantined: listQuarantineRecords(this.registry.store(space.id)).length,
           lastDreamAt: space.lastDreamAt,
         };

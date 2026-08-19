@@ -65,6 +65,16 @@ export function formatTaskRunNotification(run: TaskRun): string {
   const warning = formatSkillWarnings(
     skillWarningViews({ skipped: run.skillEvidence?.skipped ?? [] }),
   );
+  if (run.workActionId) {
+    return [
+      `🧭 工作动作「${run.taskName}」执行已完成，结果已进入验收流程：`,
+      "",
+      summary,
+      `Run：${run.id}`,
+      "请前往 HomeAgent 管理后台查看自动或人工验收结果。",
+      ...(warning ? ["", warning] : []),
+    ].join("\n");
+  }
   return [
     `🔎 任务「${run.taskName}」已完成：`,
     "",
@@ -165,7 +175,7 @@ export class TaskScheduler {
         retriedTaskIds.add(retry.run.taskId);
         const report = await retry.completion;
         if (report.ok && this.notify) {
-          const task = this.engine.tasks.get(report.taskId);
+          const task = this.engine.taskForRun(report.runId);
           if (task?.notify) {
             try {
               await this.engine.deliverTaskRunNotification(
@@ -186,7 +196,7 @@ export class TaskScheduler {
       }
       if (this.notifyApproval) {
         for (const run of this.engine.listTaskRunApprovalsNeedingNotification(now.getTime())) {
-          const task = this.engine.tasks.get(run.taskId);
+          const task = this.engine.taskForRun(run.id);
           if (!task) continue;
           try {
             await this.engine.deliverTaskRunApprovalNotification(
@@ -206,7 +216,7 @@ export class TaskScheduler {
       }
       if (this.notify) {
         for (const run of this.engine.listTaskRunsNeedingNotification(now.getTime())) {
-          const task = this.engine.tasks.get(run.taskId);
+          const task = this.engine.taskForRun(run.id);
           if (!task) continue;
           try {
             await this.engine.deliverTaskRunNotification(

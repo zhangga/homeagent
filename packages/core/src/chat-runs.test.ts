@@ -135,7 +135,7 @@ describe("ChatRunStore", () => {
 
     expect(new ChatRunStore(dir).get(run.id)?.executionPlan).toEqual(executionPlan);
     expect(JSON.parse(readFileSync(join(dir, "config", "chat-runs.json"), "utf8")).version)
-      .toBe(4);
+      .toBe(5);
   });
 
   test("rejects an invalid resolved execution plan before persisting a run", () => {

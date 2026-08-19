@@ -81,6 +81,8 @@ export interface TaskRun {
   taskId: string;
   taskName: string;
   space: SpaceId;
+  workItemId?: string;
+  workActionId?: string;
   topic: string;
   trigger: TaskRunTrigger;
   agentId?: string;
@@ -119,13 +121,15 @@ export interface TaskRunSkillEvidence {
 }
 
 interface TaskRunsFile {
-  version: 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
+  version: 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11;
   runs: Record<string, TaskRun>;
 }
 
 export interface StartTaskRunInput {
   task: Task;
   trigger: TaskRunTrigger;
+  workItemId?: string;
+  workActionId?: string;
   agentId?: string;
   provider?: ProviderId;
   model?: string;
@@ -459,6 +463,8 @@ function isTaskRun(value: unknown): value is TaskRun {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const run = value as Partial<TaskRun>;
   const optionalStrings = [
+    run.workItemId,
+    run.workActionId,
     run.agentId,
     run.model,
     run.retryOf,
@@ -666,7 +672,7 @@ export class TaskRunStore {
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<TaskRunsFile>;
       const version = parsed.version;
-      if (version === undefined || ![2, 3, 4, 5, 6, 7, 8, 9].includes(version)) return runs;
+      if (version === undefined || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(version)) return runs;
       migratedUnapprovedRun = version < 9;
       for (const [id, value] of Object.entries(parsed.runs ?? {})) {
         const legacy = value as Partial<TaskRun>;
@@ -759,7 +765,7 @@ export class TaskRunStore {
     const configDir = dirname(this.configPath);
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const tempPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
-    const file: TaskRunsFile = { version: 9, runs: Object.fromEntries(runs) };
+    const file: TaskRunsFile = { version: 11, runs: Object.fromEntries(runs) };
     try {
       writeFileSync(tempPath, JSON.stringify(file, null, 2), { encoding: "utf8", mode: 0o600 });
       const fileDescriptor = openSync(tempPath, "r+");
@@ -846,6 +852,30 @@ export class TaskRunStore {
     for (const run of completed.slice(0, excess)) runs.delete(run.id);
   }
 
+  /**
+   * Repair the narrow capture crash window where Raw was durable before the
+   * Task Run could persist its evidence id. Existing evidence is immutable.
+   */
+  reconcileRawEvidence(id: string, rawId: string): TaskRun | undefined {
+    if (!rawId.trim()) throw new Error("Task Run Raw evidence id is required");
+    return this.commit((candidate) => {
+      const run = candidate.get(id);
+      if (!run) return undefined;
+      if (run.rawId !== undefined) {
+        if (run.rawId !== rawId) {
+          throw new Error(`Task Run Raw evidence already points elsewhere: ${id}`);
+        }
+        return clone(run);
+      }
+      const repaired = { ...run, rawId };
+      if (!isTaskRun(repaired)) {
+        throw new Error(`Task Run cannot accept recovered Raw evidence: ${id}`);
+      }
+      candidate.set(id, repaired);
+      return clone(repaired);
+    });
+  }
+
   start(input: StartTaskRunInput): TaskRun {
     if (input.executionPlan !== undefined && !isResolvedExecutionPlan(input.executionPlan)) {
       throw new Error("Resolved execution plan is invalid");
@@ -881,6 +911,8 @@ export class TaskRunStore {
         space: input.task.space,
         topic: input.task.topic,
         trigger: input.trigger,
+        workItemId: input.workItemId,
+        workActionId: input.workActionId,
         agentId: input.agentId,
         provider: input.provider,
         model: input.model,
@@ -1277,6 +1309,8 @@ export class TaskRunStore {
         space: parent.space,
         topic: parent.topic,
         trigger: "retry",
+        workItemId: parent.workItemId,
+        workActionId: parent.workActionId,
         agentId: parent.agentId,
         provider: parent.provider,
         model: parent.model,

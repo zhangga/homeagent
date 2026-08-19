@@ -34,6 +34,7 @@ import {
 } from "./task-scheduler.ts";
 import { LearningScheduler, learningNotification } from "./learning-scheduler.ts";
 import { ReminderScheduler } from "./reminder-scheduler.ts";
+import { WorkContinuationScheduler } from "./work-continuation-scheduler.ts";
 import { createSystemHealthReporter } from "./health.ts";
 import {
   homeAgentFeishuAvatarPath,
@@ -227,6 +228,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
 
   let scheduler: Scheduler | undefined;
   let taskScheduler: TaskScheduler | undefined;
+  let workContinuationScheduler: WorkContinuationScheduler | undefined;
   let learningScheduler: LearningScheduler | undefined;
   let reminderScheduler: ReminderScheduler | undefined;
   const reportHealth = createSystemHealthReporter({
@@ -235,6 +237,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
     feishuLocallyDisabled: () => feishuLocallyDisabled,
     dreamSchedulerHealth: () => scheduler?.health(),
     taskSchedulerHealth: () => taskScheduler?.health(),
+    workContinuationSchedulerHealth: () => workContinuationScheduler?.health(),
     reminderSchedulerHealth: () => reminderScheduler?.health(),
     learningSchedulerHealth: () => learningScheduler?.health(),
     runtimeHealth: () => orchestrator.health(),
@@ -332,7 +335,12 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   await scheduler.start();
   log.info("scheduler started (nightly + catch-up)");
 
-  // 4. task scheduler (research tasks). On completion, push a summary to the
+  // 4. opted-in WorkItems continue one durable action boundary per tick.
+  workContinuationScheduler = new WorkContinuationScheduler(engine);
+  await workContinuationScheduler.start();
+  log.info("work continuation scheduler started");
+
+  // 5. task scheduler (research tasks). On completion, push a summary to the
   // task's space-bound feishu chat when the task opts in.
   taskScheduler = new TaskScheduler(engine, {
     notify: async (_task, run) => {
@@ -345,7 +353,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   await taskScheduler.start();
   log.info("task scheduler started");
 
-  // 5. guided-learning scheduler. A prepared lesson remains retryable until
+  // 6. guided-learning scheduler. A prepared lesson remains retryable until
   // Feishu accepts it; an accepted lesson then waits for the learner's answer.
   learningScheduler = new LearningScheduler(engine, {
     notify: async (plan, _source, session, skillWarnings, deliveryKey) => {
@@ -363,7 +371,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   await learningScheduler.start();
   log.info("learning scheduler started");
 
-  // 6. user reminder scheduler. Delivery state advances only after Feishu
+  // 7. user reminder scheduler. Delivery state advances only after Feishu
   // accepts the outbound message, so transient failures remain retryable.
   reminderScheduler = new ReminderScheduler(engine, {
     notify: async (reminder, message, deliveryKey) => {
@@ -386,6 +394,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
       }
     };
     contain("dream scheduler", () => scheduler.stop());
+    contain("work continuation scheduler", () => workContinuationScheduler.stop());
     contain("task scheduler", () => taskScheduler.stop());
     contain("learning scheduler", () => learningScheduler.stop());
     contain("reminder scheduler", () => reminderScheduler.stop());

@@ -13,6 +13,8 @@ export * from "./task-runs.ts";
 export * from "./chat-runs.ts";
 export * from "./run-scheduler.ts";
 export * from "./reminders.ts";
+export * from "./work-items.ts";
+export * from "./work-continuation.ts";
 export * from "./space.ts";
 export * from "./sqlite.ts";
 export * from "./markdown.ts";

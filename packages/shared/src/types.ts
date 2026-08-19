@@ -18,6 +18,9 @@ export type SpaceKind = "personal" | "team";
 /** Where a raw entry originated. */
 export type RawSource = "message" | "doc" | "manual" | "task" | "learning";
 
+/** Whether a captured Raw input may enter knowledge distillation. */
+export type RawAdmission = "ready" | "held" | "excluded";
+
 /** A single attachment reference captured but (in MVP) not distilled. */
 export interface Attachment {
   kind: "image" | "pdf" | "audio" | "file";
@@ -33,6 +36,12 @@ export interface Attachment {
 export interface RawEntry {
   space: SpaceId;
   source: RawSource;
+  /** Knowledge admission state; ordinary captures default to ready. */
+  admission?: RawAdmission;
+  /** Ongoing work context that produced this input, when one is active. */
+  workItemId?: string;
+  /** WorkAction whose candidate output produced this input, when applicable. */
+  workActionId?: string;
   /** Agent that handled this inbound message, when it triggered an Agent response. */
   agentId?: string;
   /**
@@ -60,6 +69,7 @@ export interface RawRecord extends RawEntry {
   id: string;
   createdAt: number;
   ingested: boolean;
+  admission: RawAdmission;
 }
 
 /** The category of a wiki page. Mirrors llm_wiki's whole-page taxonomy. */

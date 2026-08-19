@@ -53,6 +53,7 @@ import {
   type ChatRun,
   type KnowledgeEngine,
   type TaskRun,
+  type WorkItemPhase,
 } from "@homeagent/core";
 import { layout } from "./layout.ts";
 import { agentWorkbenchView } from "./agent-workbench-view.ts";
@@ -98,6 +99,7 @@ import {
   chatRunView,
   taskRunView,
   tasksView,
+  workItemsView,
 } from "./views.ts";
 
 const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
@@ -1050,7 +1052,7 @@ export function createWebApp(opts: WebOptions): Hono {
     try {
       const result = await engine.deleteSpace(space);
       const message = result.status === "deleted"
-        ? `已删除 ${space}：${result.pagesDeleted} 个知识页、${result.rawDeleted} 条原始记录、${result.tasksDeleted} 个任务、${result.remindersDeleted} 个提醒、${result.learningPlansDeleted} 个学习计划`
+        ? `已删除 ${space}：${result.pagesDeleted} 个知识页、${result.rawDeleted} 条原始记录、${result.tasksDeleted} 个任务、${result.workItemsDeleted} 个工作项、${result.remindersDeleted} 个提醒、${result.learningPlansDeleted} 个学习计划`
         : `空间不存在：${space}`;
       return c.redirect(`/governance?ok=${encodeURIComponent(message)}`);
     } catch (err) {
@@ -1853,6 +1855,227 @@ export function createWebApp(opts: WebOptions): Hono {
     );
   });
 
+  // ---- Work context -------------------------------------------------------
+
+  const workList = (value: string): string[] => value
+    .split(/\r?\n/u)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  app.get("/work", async (c) => {
+    const ok = c.req.query("ok") ?? undefined;
+    return c.html(await layout(
+      "工作上下文",
+      [{ label: "工作上下文" }],
+      await workItemsView(engine.workItems.list(), null, engine.registry.list(), [], undefined, ok),
+      "work",
+    ));
+  });
+
+  app.get("/work/:id", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    const item = engine.workItems.get(id);
+    if (!item) return c.notFound();
+    const ok = c.req.query("ok") ?? undefined;
+    return c.html(await layout(
+      item.title,
+      [{ label: "工作上下文", href: "/work" }, { label: item.title }],
+      await workItemsView(
+        engine.workItems.list(),
+        item,
+        engine.registry.list(),
+        engine.workContinuations.list(item.id),
+        engine.workContinuations.policyFor(item.id, item.space),
+        ok,
+      ),
+      "work",
+    ));
+  });
+
+  app.post("/work", async (c) => {
+    const body = await c.req.parseBody();
+    const space = str(body, "space").trim();
+    if (!isSpaceId(space) || !engine.registry.has(space)) {
+      return c.redirect(`/work?ok=${encodeURIComponent("创建失败：请选择有效空间")}`);
+    }
+    try {
+      const item = engine.workItems.create({
+        title: str(body, "title"),
+        space,
+        brief: str(body, "brief"),
+        runbook: str(body, "runbook"),
+        phase: (str(body, "phase") || "active") as WorkItemPhase,
+      });
+      return c.redirect(`/work/${encodeURIComponent(item.id)}?ok=${encodeURIComponent("已创建并设为当前工作项")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "创建失败";
+      return c.redirect(`/work?ok=${encodeURIComponent(`创建失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/:id", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    if (!engine.workItems.get(id)) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      engine.workItems.update(id, {
+        title: str(body, "title"),
+        brief: str(body, "brief"),
+        runbook: str(body, "runbook"),
+        phase: str(body, "phase") as WorkItemPhase,
+        summary: str(body, "summary"),
+        blockers: workList(str(body, "blockers")),
+        nextActions: workList(str(body, "nextActions")),
+      });
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent("工作上下文已保存")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "保存失败";
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(`保存失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/:id/activate", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    if (!engine.workItems.get(id)) return c.notFound();
+    try {
+      engine.workItems.activate(id);
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent("已设为当前工作项")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "切换失败";
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(`切换失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/:id/continuation", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    if (!engine.workItems.get(id)) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      engine.configureWorkContinuation(id, str(body, "autoContinue") === "on");
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent("自动续跑设置已保存")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "保存失败";
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(`保存失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/:id/continue", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    if (!engine.workItems.get(id)) return c.notFound();
+    try {
+      const started = engine.startWorkContinuation(id);
+      const message = started.state === "awaiting_approval"
+        ? "动作已冻结，等待审批"
+        : "动作已进入执行队列";
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(message)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "继续失败";
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(`继续失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/actions/:actionId/cancel", async (c) => {
+    const actionId = decodeURIComponent(c.req.param("actionId"));
+    const action = engine.workContinuations.get(actionId);
+    if (!action) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      const attempt = Number(str(body, "attempt"));
+      if (!Number.isInteger(attempt) || attempt < 1) {
+        throw new Error("动作尝试次数无效");
+      }
+      const cancelled = engine.cancelWorkAction(actionId, {
+        runId: str(body, "runId") || null,
+        attempt,
+      });
+      const message = cancelled ? "当前动作已取消" : "动作已经结束，无法取消";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(message)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "取消失败";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(`取消失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/actions/:actionId/retry", async (c) => {
+    const actionId = decodeURIComponent(c.req.param("actionId"));
+    const action = engine.workContinuations.get(actionId);
+    if (!action) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      const attempt = Number(str(body, "attempt"));
+      if (!Number.isInteger(attempt) || attempt < 1) {
+        throw new Error("动作尝试次数无效");
+      }
+      const started = engine.retryWorkAction(actionId, {
+        runId: str(body, "runId") || null,
+        attempt,
+      });
+      const message = started.state === "awaiting_approval"
+        ? "重试已冻结，等待审批"
+        : "重试已进入执行队列";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(message)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "重试失败";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(`重试失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/actions/:actionId/abandon", async (c) => {
+    const actionId = decodeURIComponent(c.req.param("actionId"));
+    const action = engine.workContinuations.get(actionId);
+    if (!action) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      const attempt = Number(str(body, "attempt"));
+      if (!Number.isInteger(attempt) || attempt < 1) {
+        throw new Error("动作尝试次数无效");
+      }
+      engine.abandonWorkAction(actionId, {
+        runId: str(body, "runId") || null,
+        attempt,
+      });
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent("已放弃受阻动作，可按新的下一步继续")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "放弃失败";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(`放弃失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/actions/:actionId/accept", async (c) => {
+    const actionId = decodeURIComponent(c.req.param("actionId"));
+    const action = engine.workContinuations.get(actionId);
+    if (!action) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      const runId = str(body, "runId");
+      if (!runId) throw new Error("待验收 Run 不能为空");
+      engine.acceptWorkAction(actionId, runId, "local-admin");
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent("验收已接受，checkpoint 已写入")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "接受失败";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(`接受失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/actions/:actionId/reject", async (c) => {
+    const actionId = decodeURIComponent(c.req.param("actionId"));
+    const action = engine.workContinuations.get(actionId);
+    if (!action) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      const runId = str(body, "runId");
+      const reason = str(body, "reason");
+      if (!runId) throw new Error("待验收 Run 不能为空");
+      if (!reason) throw new Error("驳回原因不能为空");
+      if (reason.length > 2_000) throw new Error("驳回原因不能超过 2000 个字符");
+      engine.rejectWorkAction(actionId, runId, "local-admin", reason);
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent("结果已驳回，动作边界已保留")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "驳回失败";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(`驳回失败：${message}`)}`);
+    }
+  });
+
   // ---- Tasks ---------------------------------------------------------------
 
   const deliverTaskRunNotification = async (runId: string): Promise<void> => {
@@ -1892,21 +2115,38 @@ export function createWebApp(opts: WebOptions): Hono {
     const run = engine.getTaskRun(runId);
     if (!run) return c.notFound();
     const ok = c.req.query("ok") ?? undefined;
+    const action = run.workActionId
+      ? engine.workContinuations.get(run.workActionId)
+      : undefined;
+    const item = action && run.workItemId === action.workItemId
+      ? engine.workItems.get(action.workItemId)
+      : undefined;
+    const workContext = action && item && action.space === run.space
+      ? { action, item }
+      : undefined;
+    const managedTask = engine.tasks.get(run.taskId);
     return c.html(
       await layout(
         "运行详情",
-        [
-          { label: "任务", href: "/tasks" },
-          { label: run.taskName, href: `/tasks/${encodeURIComponent(run.taskId)}` },
-          { label: "运行详情" },
-        ],
+        workContext
+          ? [
+              { label: "工作上下文", href: "/work" },
+              { label: workContext.item.title, href: `/work/${encodeURIComponent(workContext.item.id)}` },
+              { label: "运行详情" },
+            ]
+          : [
+              { label: "任务", href: "/tasks" },
+              { label: run.taskName, href: `/tasks/${encodeURIComponent(run.taskId)}` },
+              { label: "运行详情" },
+            ],
         await taskRunView(
           run,
-          engine.tasks.get(run.taskId),
+          managedTask,
           ok,
           engine.runScheduler.queueInfo(run.id),
+          workContext,
         ),
-        "tasks",
+        workContext ? "work" : "tasks",
       ),
     );
   });

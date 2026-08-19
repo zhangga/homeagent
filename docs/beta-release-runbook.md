@@ -23,7 +23,7 @@ bun run verify:beta
 - 固定 AI 质量评测，以及基于 FTS 覆盖率的检索策略建议；
 - 子进程遭受 `SIGKILL` 后的数据恢复验收。
 
-Agent 生命周期、任务审批/重试、Provider 隔离、v10–v14 归档和质量重新评测还应单独运行一次聚焦回归，
+Agent 生命周期、任务审批/重试、Provider 隔离、v10–v15 归档和质量重新评测还应单独运行一次聚焦回归，
 便于把失败定位到本轮硬化范围：
 
 ```bash
@@ -153,23 +153,24 @@ KeepAlive 应自动启动新 PID。随后检查 `/readyz`，并使用第 3 节�
    确认只有该任务按冻结计划使用 Permission / Workdir / Pinned Skills。
 6. 临时修改 Pinned Skill 目录中的一个非 `SKILL.md` 资源文件，再运行先前已排队的显式任务；必须因完整目录树摘要变化而
    fail-closed，不能只校验入口文件或静默使用新内容。恢复目录并重新创建 Run 后才允许执行。
-7. 导出并恢复该空间，确认格式为 `homeagent.space v14`，Agent 发布历史、运行所引用的 revision、完整 Skill 证据和跳过原因保持不变。
+7. 在工作上下文中配置两个下一动作，手动续作第一个并确认 Task Run 成功后先生成“结果 / 检查 / 证据”验收报告；`read-only` 仅在 Raw 已落盘、输出未截断且 Provider 返回严格 JSON 报告（`outcome=completed`、无 blocker、全部检查通过）时自动验收。普通文本或畸形报告必须停在人工验收，结构化 `blocked` 必须形成 blocker 且不得消费动作；`write/full` 即使执行前已审批，执行后仍必须人工接受。接受后才写入 checkpoint、消费当前首个动作；驳回必须填写原因，保留动作和证据并允许从同一边界重试。修改计划后可显式放弃旧的受阻动作，确认系统 blocker 被清除且新的首个动作可继续。待验收时自动续跑暂停，旧 Run 页面不能决定新重试结果。失败应转为阻塞，取消不得消费动作；重启后排队动作按冻结计划恢复，已中断的运行中动作只转为阻塞、不得重放。
+8. 导出并恢复该空间，确认格式为 `homeagent.space v16`，Agent 发布历史、运行所引用的 revision、完整 Skill 证据、跳过原因、工作上下文、WorkAction/checkpoint/验收审计、自动续作策略及 Raw 准入状态保持不变；待验收动作必须阻止导出与删除。验收前 Raw 必须为 `held` 且不能被 Dream、强制重跑、隔离重试或人工重新提炼读取；接受后才变为 `ready`，驳回、取消或失败后必须为 `excluded`。
 
 这里验收的是当前 native Skill 冻结与执行链。`ManagedSkillStore` 仍是未接入 Provider 运行时的安全基础设施；不得把 Git/URL
 导入、Managed release 执行或 Skill 市场写成已发布能力。
 
-### 4.2 v10–v13 真实归档迁移验收
+### 4.2 v10–v15 真实归档迁移验收
 
-从对应历史版本各准备一份脱敏的真实 `homeagent.space v10`、v11、v12、v13 归档；不得只修改 JSON 的 `version` 字段伪造。
+从对应历史版本各准备一份脱敏的真实 `homeagent.space v10`、v11、v12、v13、v14、v15 归档；不得只修改 JSON 的 `version` 字段伪造。
 每份归档使用独立的全新数据目录执行以下步骤，避免同名空间相互覆盖：
 
 1. 先只读保存原归档、文件摘要和来源版本，再通过管理后台导入；导入失败时保留原文件和错误，不手改历史审计绕过校验。
 2. v10 确认冻结执行计划仍可查看；v11 确认 Agent 发布历史和已有审批审计仍在；v12 确认审批期限与通知审计仍在；
-   v13 确认用量、失败分类和自动重试关系仍在。旧版本本来没有的字段应保持 legacy/未知，不得补成虚假的成功、0 成本或已审批。
+   v13 确认用量、失败分类和自动重试关系仍在；v14 确认 Chat 评测 Trace 与已结束重评审计仍在；v15 确认工作上下文、WorkAction、checkpoint 与验收审计仍在，且历史 WorkAction Raw 按事实迁移为 `ready/excluded`，引用非准入来源的污染页被移除。旧版本本来没有的字段应保持 legacy/未知，不得补成虚假的成功、0 成本或已审批。
 3. 对缺少可验证审批或执行计划的历史 `write/full` 活动运行做负向检查：恢复必须 fail-closed，不能用当前 Agent 配置继续执行。
-4. 将迁移后的空间重新导出，确认版本为 `homeagent.space v14`；重启 HomeAgent 后再次导出，比对知识、Agent revision、Task/Chat Run、
+4. 将迁移后的空间重新导出，确认版本为 `homeagent.space v16`；重启 HomeAgent 后再次导出，比对知识、Agent revision、Task/Chat Run、工作上下文、WorkAction/checkpoint、Raw 准入状态、自动续作策略、
    审批/通知/重试/用量审计、提醒和学习数据的数量与关键 ID。
-5. 把该 v14 归档导入第二个全新数据目录，确认没有重复通知、自动续跑、重复原始材料或悬空质量 trace。把原归档摘要、两次 v14
+5. 把该 v16 归档导入第二个全新数据目录，确认没有重复通知、自动续跑、重复动作 checkpoint、重复原始材料、悬空工作关联、未验收 Raw 污染 Wiki 或悬空质量 trace。把原归档摘要、两次 v16
    导出摘要及逐项结果附到发布记录。
 
 ### 4.3 用量与质量重新评测验收
@@ -383,7 +384,7 @@ metadata，不得包含消息正文、Instruction、Prompt、凭据或完整模�
 - 两个架构的签名、公证和 DMG smoke 全绿；
 - 至少一个全新用户环境完成无终端安装；
 - 自动与真实崩溃恢复均通过；
-- v10、v11、v12、v13 四份真实归档均完成独立迁移、v14 再导出、重启和二次恢复，比对记录已归档；
+- v10、v11、v12、v13、v14、v15 六份真实归档均完成独立迁移、v16 再导出、重启和二次恢复，比对记录已归档；
 - Agent 草稿/发布/回滚、`write/full` 审批与过期、定时只读自动重试三个真实飞书灰度场景全部通过；
 - 普通调用的 Claude strict no-tools 或 Codex 临时只读、native Skill `no_tools_context` 跳过、TRAE 安全拒绝和图片输入边界均有真实消息证据；
 - 用量页面没有把未知成本显示为 0，质量重新评测没有外发副作用且被标记为 re-evaluation 而非 deterministic replay；

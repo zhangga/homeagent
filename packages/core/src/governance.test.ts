@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,16 @@ function tempDir(label: string): string {
   return dir;
 }
 
+function completedWorkActionOutput(result: string): string {
+  return JSON.stringify({
+    version: 1,
+    outcome: "completed",
+    result,
+    blockers: [],
+    checks: [{ name: "动作结果核对", status: "passed" }],
+  });
+}
+
 function persistArchiveFixture(dataDir: string, version: number, archive: unknown): unknown {
   const path = join(dataDir, `candidate-space-v${version}.json`);
   writeFileSync(path, `${JSON.stringify(archive, null, 2)}\n`, "utf8");
@@ -28,6 +38,832 @@ afterEach(() => {
 });
 
 describe("space data governance", () => {
+  test("archive v16 preserves a ready Raw admission state", async () => {
+    const engine = new KnowledgeEngine({ dataDir: tempDir("ha-raw-admission-archive-") });
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "manual",
+      content: "普通知识输入可直接参与提炼",
+    });
+    const candidate = structuredClone(await engine.exportSpace(SPACE)) as Record<string, any>;
+    candidate.version = 16;
+    candidate.raw[0].admission = "ready";
+    engine.close();
+
+    expect(parseSpaceArchive(candidate).raw).toEqual([
+      expect.objectContaining({ id: rawId, admission: "ready" }),
+    ]);
+  });
+
+  test("archive v16 rejects a held Raw without WorkAction provenance", async () => {
+    const engine = new KnowledgeEngine({ dataDir: tempDir("ha-held-raw-archive-") });
+    await engine.remember({
+      space: SPACE,
+      source: "manual",
+      content: "伪造为待验收的普通输入",
+    });
+    const candidate = structuredClone(await engine.exportSpace(SPACE)) as Record<string, any>;
+    candidate.raw[0].admission = "held";
+    engine.close();
+
+    expect(() => parseSpaceArchive(candidate)).toThrow(/held Raw.*WorkAction provenance/i);
+  });
+
+  test("archive v16 rejects a Raw forged onto an unknown WorkAction", async () => {
+    const engine = new KnowledgeEngine({ dataDir: tempDir("ha-forged-raw-action-archive-") });
+    await engine.remember({
+      space: SPACE,
+      source: "task",
+      content: "伪造的动作结果",
+    });
+    const candidate = structuredClone(await engine.exportSpace(SPACE)) as Record<string, any>;
+    candidate.raw[0].workActionId = "action_00000000-0000-4000-8000-000000000000";
+    engine.close();
+
+    expect(() => parseSpaceArchive(candidate)).toThrow(/Raw WorkAction association is invalid/i);
+  });
+
+  test("archive v16 rejects a forged admission state for an accepted WorkAction Raw", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-forged-raw-admission-"),
+      runProvider: async () => completedWorkActionOutput("验收完成"),
+    });
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "核对 Raw 准入态",
+      nextActions: ["执行只读核对"],
+    });
+    const started = source.startWorkContinuation(item.id);
+    await started.completion;
+    const run = source.getTaskRun(started.run.id)!;
+    const candidate = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    const raw = candidate.raw.find((entry: Record<string, unknown>) => entry.id === run.rawId)!;
+    raw.workActionId = started.run.workActionId;
+    raw.admission = "held";
+    source.close();
+
+    expect(() => parseSpaceArchive(candidate)).toThrow(/Raw admission does not match WorkAction/i);
+  });
+
+  test("archive v16 rejects a WorkAction Raw detached from its WorkItem", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-detached-action-raw-"),
+      runProvider: async () => completedWorkActionOutput("关联核对完成"),
+    });
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "核对动作 Raw 归属",
+      nextActions: ["核对关联"],
+    });
+    const started = source.startWorkContinuation(item.id);
+    await started.completion;
+    const run = source.getTaskRun(started.run.id)!;
+    const candidate = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    const raw = candidate.raw.find((entry: Record<string, unknown>) => entry.id === run.rawId)!;
+    raw.admission = "ready";
+    delete raw.workItemId;
+    source.close();
+
+    expect(() => parseSpaceArchive(candidate)).toThrow(/Raw WorkItem association is invalid/i);
+  });
+
+  test("archive v15 derives an excluded admission for a rejected WorkAction Raw", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-v15-held-raw-"),
+      runProvider: async () => "执行已结束，等待人工验收",
+    });
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "迁移待验收动作",
+      nextActions: ["人工核对结果"],
+    });
+    const started = source.startWorkContinuation(item.id);
+    await started.completion;
+    const run = source.getTaskRun(started.run.id)!;
+    source.rejectWorkAction(
+      started.run.workActionId!,
+      started.run.id,
+      "operator",
+      "验收未通过",
+    );
+    const legacy = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    legacy.version = 15;
+    for (const raw of legacy.raw) {
+      delete raw.admission;
+      delete raw.workActionId;
+    }
+    source.close();
+
+    expect(parseSpaceArchive(legacy).raw).toEqual([
+      expect.objectContaining({
+        id: run.rawId,
+        admission: "excluded",
+        workActionId: started.run.workActionId,
+      }),
+    ]);
+  });
+
+  test("archive v15 closes rejected acceptance evidence around a recovered Raw", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-v15-rejected-raw-evidence-"),
+      runProvider: async () => "旧版动作结果等待人工验收",
+    });
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "迁移旧版拒绝证据",
+      nextActions: ["执行旧版只读核对"],
+    });
+    const started = source.startWorkContinuation(item.id);
+    await started.completion;
+    const run = source.getTaskRun(started.run.id)!;
+    source.rejectWorkAction(
+      started.run.workActionId!,
+      started.run.id,
+      "operator",
+      "旧版结果不可采信",
+    );
+    const legacy = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    legacy.version = 15;
+    const legacyRun = legacy.taskRuns.find(
+      (candidate: Record<string, unknown>) => candidate.id === run.id,
+    );
+    delete legacyRun.rawId;
+    const acceptance = legacy.workActions[0].acceptances[0];
+    delete acceptance.rawId;
+    acceptance.report.evidence = acceptance.report.evidence.filter(
+      (evidence: Record<string, unknown>) => evidence.kind !== "raw",
+    );
+    const captureCheck = acceptance.report.checks.find(
+      (check: Record<string, unknown>) => check.name === "执行输出已归档",
+    );
+    captureCheck.status = "failed";
+    delete captureCheck.detail;
+    for (const raw of legacy.raw) {
+      delete raw.admission;
+      delete raw.workActionId;
+    }
+    source.close();
+
+    const parsed = parseSpaceArchive(legacy);
+    const normalizedAcceptance = parsed.workActions[0]!.acceptances![0]!;
+    expect(parsed.taskRuns[0]!.rawId).toBe(run.rawId);
+    expect(normalizedAcceptance.rawId).toBe(run.rawId);
+    expect(normalizedAcceptance.report.evidence).toContainEqual({
+      kind: "raw",
+      id: run.rawId!,
+    });
+    expect(normalizedAcceptance.report.checks).toContainEqual(expect.objectContaining({
+      name: "执行输出已归档",
+      status: "passed",
+    }));
+    expect(() => parseSpaceArchive(parsed)).not.toThrow();
+
+    const conflicting = structuredClone(legacy);
+    const conflictingAcceptance = conflicting.workActions[0].acceptances[0];
+    conflictingAcceptance.rawId = "raw_conflicting-evidence";
+    conflictingAcceptance.report.evidence.push({
+      kind: "raw",
+      id: "raw_conflicting-evidence",
+    });
+    expect(() => parseSpaceArchive(conflicting)).toThrow(/conflicts with recovered Raw/i);
+  });
+
+  test("archive v16 keeps failed attempt Raw excluded after a later attempt succeeds", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-multi-attempt-raw-archive-"),
+      runProvider: async () => completedWorkActionOutput("只读核对完成"),
+    });
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "保留多次尝试的准入边界",
+      nextActions: ["执行只读核对"],
+    });
+    const succeed = spyOn(source.taskRuns, "succeed").mockImplementationOnce(() => {
+      throw new Error("injected TaskRun success persistence failure");
+    });
+    const first = source.startWorkContinuation(item.id);
+    await first.completion;
+    succeed.mockRestore();
+    const firstRun = source.getTaskRun(first.run.id)!;
+    const retry = source.retryWorkAction(first.run.workActionId!);
+    await retry.completion;
+    const retryRun = source.getTaskRun(retry.run.id)!;
+
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+    const parsed = parseSpaceArchive(archive);
+    expect(parsed.raw.find((raw) => raw.id === firstRun.rawId)).toEqual(
+      expect.objectContaining({ admission: "excluded" }),
+    );
+    expect(parsed.raw.find((raw) => raw.id === retryRun.rawId)).toEqual(
+      expect.objectContaining({ admission: "ready" }),
+    );
+  });
+
+  test("archive v15 recovers uniquely captured WorkAction Raw and removes its polluted page", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-v15-orphan-action-raw-"),
+      runProvider: async () => {
+        throw new Error("旧版捕获后终态落盘失败");
+      },
+    });
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "迁移捕获崩溃窗口",
+      nextActions: ["执行旧版只读检查"],
+    });
+    const started = source.startWorkContinuation(item.id);
+    await started.completion;
+    const run = source.getTaskRun(started.run.id)!;
+    const rawId = await source.remember({
+      space: SPACE,
+      source: "task",
+      workItemId: item.id,
+      content: `# 任务研究：${run.taskName}\n主题：${run.topic}\n\n旧版已捕获但未关联的结果`,
+      createdAt: run.finishedAt,
+    });
+    await source.upsertPage(SPACE, {
+      slug: "analysis/v15-orphan-action-result",
+      type: "analysis",
+      title: "旧版孤儿动作结果",
+      summary: "不应继续作为知识恢复",
+      aliases: [],
+      tags: [],
+      sources: [rawId],
+      links: [],
+      content: "# 旧版孤儿动作结果\n\n不应继续作为知识恢复。",
+      updatedAt: run.finishedAt!,
+      contentHash: "v15-orphan-action-result",
+    });
+    const legacy = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    legacy.version = 15;
+    for (const raw of legacy.raw) {
+      delete raw.admission;
+      delete raw.workActionId;
+    }
+    source.close();
+
+    const parsed = parseSpaceArchive(legacy);
+    expect(parsed.taskRuns.find((candidate) => candidate.id === run.id)?.rawId).toBe(rawId);
+    expect(parsed.raw.find((raw) => raw.id === rawId)).toEqual(expect.objectContaining({
+      admission: "excluded",
+      workActionId: started.run.workActionId,
+      ingested: false,
+    }));
+    expect(parsed.pages.map((page) => page.slug))
+      .not.toContain("analysis/v15-orphan-action-result");
+    expect(() => parseSpaceArchive(parsed)).not.toThrow();
+
+    const ambiguous = structuredClone(legacy);
+    const duplicate = structuredClone(
+      ambiguous.raw.find((candidate: Record<string, unknown>) => candidate.id === rawId),
+    );
+    duplicate.id = `${rawId}-duplicate`;
+    ambiguous.raw.push(duplicate);
+    ambiguous.workItems[0].rawIds.push(duplicate.id);
+    expect(() => parseSpaceArchive(ambiguous)).toThrow(/Raw evidence is ambiguous/i);
+  });
+
+  test("archive v16 rejects a Wiki page sourced from an excluded WorkAction Raw", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-excluded-raw-page-"),
+      runProvider: async () => "执行已结束，等待人工验收",
+    });
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "隔离未验收知识",
+      nextActions: ["生成候选结论"],
+    });
+    const started = source.startWorkContinuation(item.id);
+    await started.completion;
+    const run = source.getTaskRun(started.run.id)!;
+    source.rejectWorkAction(
+      started.run.workActionId!,
+      started.run.id,
+      "operator",
+      "结论不可采信",
+    );
+    const candidate = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    candidate.pages.push({
+      slug: "analysis/forged-action-result",
+      type: "analysis",
+      title: "被污染的动作结论",
+      summary: "不应恢复",
+      aliases: [],
+      tags: [],
+      sources: [run.rawId!],
+      links: [],
+      content: "# 被污染的动作结论\n\n不应恢复。",
+      updatedAt: Date.now(),
+      contentHash: "forged-action-result",
+    });
+    candidate.raw.find((raw: Record<string, unknown>) => raw.id === run.rawId)!.admission =
+      "excluded";
+    source.close();
+
+    expect(() => parseSpaceArchive(candidate)).toThrow(/page.*non-ready Raw/i);
+  });
+
+  test("archive v15 removes a polluted page and requeues its ready Raw sources", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-v15-polluted-page-"),
+      runProvider: async () => "执行已结束，等待人工验收",
+    });
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "迁移旧知识污染",
+      nextActions: ["生成候选结论"],
+    });
+    const started = source.startWorkContinuation(item.id);
+    await started.completion;
+    const run = source.getTaskRun(started.run.id)!;
+    source.rejectWorkAction(
+      started.run.workActionId!,
+      started.run.id,
+      "operator",
+      "旧结论不可采信",
+    );
+    const readyRawId = await source.remember({
+      space: SPACE,
+      source: "manual",
+      content: "仍可用于重建页面的可信来源",
+    });
+    source.registry.store(SPACE).index().markIngested([readyRawId]);
+    const legacy = structuredClone(await source.exportSpace(SPACE)) as Record<string, any>;
+    legacy.version = 15;
+    legacy.pages.push({
+      slug: "analysis/legacy-polluted-result",
+      type: "analysis",
+      title: "旧版污染页面",
+      summary: "混入未验收动作结果",
+      aliases: [],
+      tags: [],
+      sources: [run.rawId!, readyRawId],
+      links: [],
+      content: "# 旧版污染页面\n\n需要从可信来源重建。",
+      updatedAt: Date.now(),
+      contentHash: "legacy-polluted-result",
+    });
+    for (const digest of ["index", "glossary", "overview"] as const) {
+      legacy.pages.push({
+        slug: digest,
+        type: digest,
+        title: digest,
+        summary: "包含旧版污染页面摘要",
+        aliases: [],
+        tags: [],
+        sources: [],
+        links: ["analysis/legacy-polluted-result"],
+        content: `# ${digest}\n\n旧版污染页面：混入未验收动作结果。`,
+        updatedAt: Date.now(),
+        contentHash: `legacy-${digest}`,
+      });
+    }
+    legacy.workItems[0].pageSlugs.push(
+      "analysis/legacy-polluted-result",
+      "index",
+      "glossary",
+      "overview",
+    );
+    legacy.workActions[0].acceptances[0].report.evidence.push({
+      kind: "page",
+      id: "analysis/legacy-polluted-result",
+    });
+    for (const raw of legacy.raw) {
+      delete raw.admission;
+      delete raw.workActionId;
+    }
+    source.close();
+
+    const parsed = parseSpaceArchive(legacy);
+    expect(parsed.pages.some((page) => page.slug === "analysis/legacy-polluted-result"))
+      .toBe(false);
+    expect(parsed.pages.map((page) => page.slug)).not.toContain("index");
+    expect(parsed.pages.map((page) => page.slug)).not.toContain("glossary");
+    expect(parsed.pages.map((page) => page.slug)).not.toContain("overview");
+    expect(parsed.raw.find((raw) => raw.id === readyRawId)).toEqual(
+      expect.objectContaining({ admission: "ready", ingested: false }),
+    );
+    expect(parsed.raw.find((raw) => raw.id === run.rawId)).toEqual(
+      expect.objectContaining({ admission: "excluded" }),
+    );
+    expect(parsed.workItems[0]!.pageSlugs).not.toContain("analysis/legacy-polluted-result");
+    expect(parsed.workActions[0]!.acceptances![0]!.report.evidence)
+      .not.toContainEqual(expect.objectContaining({
+        kind: "page",
+        id: "analysis/legacy-polluted-result",
+      }));
+    expect(() => parseSpaceArchive(parsed)).not.toThrow();
+  });
+
+  test("archive v16 round-trips work context, continuation, and Raw admission", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-work-archive-source-"),
+      runProvider: async () => completedWorkActionOutput("恢复验证完成"),
+    });
+    const workItem = source.workItems.create({
+      space: SPACE,
+      title: "完成工作上下文归档",
+      summary: "保存当前进展",
+      nextActions: ["验证恢复"],
+    });
+    const rawId = await source.remember({
+      space: SPACE,
+      source: "manual",
+      content: "归档必须保留工作上下文",
+    });
+    source.configureWorkContinuation(workItem.id, true);
+    const started = source.startWorkContinuation(workItem.id);
+    await started.completion;
+
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+
+    expect(archive.version).toBe(16);
+    expect(archive.workItems).toEqual([
+      expect.objectContaining({ id: workItem.id, rawIds: expect.arrayContaining([rawId]) }),
+    ]);
+    expect(archive.workActions).toEqual([
+      expect.objectContaining({
+        id: started.run.workActionId,
+        status: "succeeded",
+        taskRunIds: [started.run.id],
+      }),
+    ]);
+    expect(archive.taskRuns).toEqual([
+      expect.objectContaining({ id: started.run.id, workActionId: started.run.workActionId }),
+    ]);
+    expect(archive.workContinuationPolicies).toEqual([
+      expect.objectContaining({ workItemId: workItem.id, autoContinue: true }),
+    ]);
+    const actionRawId = archive.taskRuns[0]!.rawId!;
+    expect(archive.raw.find((raw) => raw.id === actionRawId)).toEqual(
+      expect.objectContaining({
+        admission: "ready",
+        workActionId: started.run.workActionId,
+      }),
+    );
+
+    const legacyV15 = structuredClone(archive) as Record<string, any>;
+    legacyV15.version = 15;
+    for (const raw of legacyV15.raw) {
+      delete raw.admission;
+      delete raw.workActionId;
+    }
+    expect(parseSpaceArchive(legacyV15).raw.find((raw) => raw.id === actionRawId)).toEqual(
+      expect.objectContaining({
+        admission: "ready",
+        workActionId: started.run.workActionId,
+      }),
+    );
+
+    const malformed = structuredClone(archive);
+    malformed.workItems[0]!.completedActionIds = ["action_unknown"];
+    expect(() => parseSpaceArchive(malformed)).toThrow("completed work action");
+
+    const succeededWithoutAcceptance = structuredClone(archive);
+    succeededWithoutAcceptance.workActions[0]!.acceptances = [];
+    expect(() => parseSpaceArchive(succeededWithoutAcceptance)).toThrow(
+      /workActions|succeeded without its current accepted result/,
+    );
+
+    const forgedAttemptOrder = structuredClone(archive);
+    forgedAttemptOrder.workActions[0]!.attempt = 99;
+    forgedAttemptOrder.workActions[0]!.acceptances![0]!.attempt = 99;
+    expect(() => parseSpaceArchive(forgedAttemptOrder)).toThrow(
+      /workActions|acceptance attempt/,
+    );
+
+    const cancelledWithCheckpoint = structuredClone(archive);
+    cancelledWithCheckpoint.workActions[0]!.status = "cancelled";
+    cancelledWithCheckpoint.workActions[0]!.acceptances = [];
+    cancelledWithCheckpoint.workItems[0]!.completedActionIds = [];
+    expect(() => parseSpaceArchive(cancelledWithCheckpoint)).toThrow(
+      /workActions|checkpoint is only valid for a succeeded action/,
+    );
+
+    const forgedAcceptance = structuredClone(archive);
+    forgedAcceptance.workActions[0]!.acceptances![0]!.summary = "伪造的验收摘要";
+    forgedAcceptance.workActions[0]!.acceptances![0]!.report.result = "伪造的验收摘要";
+    forgedAcceptance.workActions[0]!.checkpoint!.summary = "伪造的验收摘要";
+    expect(() => parseSpaceArchive(forgedAcceptance)).toThrow(
+      "acceptance result does not match its run",
+    );
+
+    const forgedProviderReport = structuredClone(archive);
+    forgedProviderReport.taskRuns[0]!.output = JSON.stringify({
+      version: 1,
+      outcome: "blocked",
+      result: "恢复验证完成",
+      blockers: ["归档中的真实执行结果仍被阻塞"],
+      checks: [{ name: "动作结果核对", status: "failed" }],
+    });
+    expect(() => parseSpaceArchive(forgedProviderReport)).toThrow(
+      "acceptance report does not match its run output",
+    );
+
+    const humanAcceptedBlocked = structuredClone(archive);
+    humanAcceptedBlocked.taskRuns[0]!.output = JSON.stringify({
+      version: 1,
+      outcome: "blocked",
+      result: "恢复验证完成",
+      blockers: ["缺少恢复权限"],
+      checks: [{ name: "动作结果核对", status: "failed" }],
+    });
+    const blockedAcceptance = humanAcceptedBlocked.workActions[0]!.acceptances![0]!;
+    blockedAcceptance.mode = "human";
+    blockedAcceptance.decidedBy = "operator";
+    blockedAcceptance.report.outcome = "blocked";
+    blockedAcceptance.report.blockers = ["缺少恢复权限"];
+    blockedAcceptance.report.checks[1] = {
+      name: "动作结果核对",
+      status: "failed",
+    };
+    expect(() => parseSpaceArchive(humanAcceptedBlocked)).toThrow(
+      /workActions|blocked result cannot be accepted/,
+    );
+
+    const forgedCheckpoint = structuredClone(archive);
+    forgedCheckpoint.workActions[0]!.checkpoint!.summary = "伪造的检查点摘要";
+    expect(() => parseSpaceArchive(forgedCheckpoint)).toThrow(
+      /workActions|work action|checkpoint acceptance/,
+    );
+
+    const forgedCheckpointRaw = structuredClone(archive);
+    forgedCheckpointRaw.workActions[0]!.checkpoint!.rawId = rawId;
+    expect(() => parseSpaceArchive(forgedCheckpointRaw)).toThrow(
+      /workActions|work action|checkpoint acceptance/,
+    );
+
+    const target = new KnowledgeEngine({ dataDir: tempDir("ha-work-archive-target-") });
+    await target.restoreSpace(archive);
+
+    expect(target.workItems.get(workItem.id)).toEqual(archive.workItems[0]);
+    expect(target.workContinuations.get(started.run.workActionId!)).toEqual(archive.workActions[0]);
+    expect(target.workContinuations.policyFor(workItem.id, SPACE).autoContinue).toBe(true);
+    expect(target.registry.store(SPACE).index().getRaw(rawId)?.workItemId).toBe(workItem.id);
+    target.close();
+  });
+
+  test("human-accepted unverified output round-trips without weakening blocked results", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-work-unverified-source-"),
+      runProvider: async () => "写入已完成，等待人工核对",
+    });
+    source.ensureSpace(SPACE);
+    const agent = source.agents.create({
+      name: "人工验收助手",
+      permission: "write",
+      workdir: tempDir("ha-work-unverified-workdir-"),
+    });
+    source.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "归档未验证结果",
+      nextActions: ["更新灰度配置"],
+    });
+    const pending = source.startWorkContinuation(item.id);
+    await source.approveTaskRun(pending.run.id, "operator").completion;
+    const accepted = source.acceptWorkAction(
+      pending.run.workActionId!,
+      pending.run.id,
+      "operator",
+    );
+
+    expect(accepted.acceptances?.at(-1)).toEqual(expect.objectContaining({
+      status: "accepted",
+      mode: "human",
+      report: expect.objectContaining({ outcome: "unverified" }),
+    }));
+    const archive = await source.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+    source.close();
+
+    const target = new KnowledgeEngine({ dataDir: tempDir("ha-work-unverified-target-") });
+    await target.restoreSpace(archive);
+    expect(target.workContinuations.get(pending.run.workActionId!)?.acceptances?.at(-1))
+      .toEqual(expect.objectContaining({
+        status: "accepted",
+        mode: "human",
+        report: expect.objectContaining({ outcome: "unverified" }),
+      }));
+    target.close();
+  });
+
+  test("deleting a space removes its work context", async () => {
+    const engine = new KnowledgeEngine({ dataDir: tempDir("ha-work-delete-") });
+    const workItem = engine.workItems.create({
+      space: SPACE,
+      title: "删除时一起清理",
+      nextActions: ["确认删除"],
+    });
+    engine.configureWorkContinuation(workItem.id, true);
+    const action = engine.workContinuations.claimNext(workItem);
+    engine.workContinuations.cancel(action.id);
+    await engine.remember({ space: SPACE, source: "manual", content: "待删除" });
+
+    const result = await engine.deleteSpace(SPACE);
+
+    expect(result.workItemsDeleted).toBe(1);
+    expect(engine.workItems.get(workItem.id)).toBeUndefined();
+    expect(engine.workContinuations.get(action.id)).toBeUndefined();
+    expect(engine.workContinuations.listPolicies(SPACE)).toEqual([]);
+    engine.close();
+  });
+
+  test("pending action acceptance blocks both export and deletion", async () => {
+    const engine = new KnowledgeEngine({
+      dataDir: tempDir("ha-work-acceptance-guard-"),
+      runProvider: async () => "写入完成，等待核对",
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "变更助手",
+      permission: "write",
+      workdir: tempDir("ha-work-acceptance-workdir-"),
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "执行受控变更",
+      nextActions: ["更新灰度配置"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    await engine.approveTaskRun(pending.run.id, "operator").completion;
+
+    expect(engine.workContinuations.get(pending.run.workActionId!)?.status)
+      .toBe("awaiting_acceptance");
+    await expect(engine.exportSpace(SPACE)).rejects.toThrow("active work actions");
+    await expect(engine.deleteSpace(SPACE)).rejects.toThrow("active work actions");
+    expect(engine.registry.has(SPACE)).toBe(true);
+    engine.close();
+  });
+
+  test("a blocked action archive validates its projected blocker", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-work-blocked-archive-"),
+      runProvider: async () => {
+        throw new Error("检查服务不可用");
+      },
+    });
+    source.ensureSpace(SPACE);
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "完成发布检查",
+      nextActions: ["执行发布前检查"],
+    });
+    const started = source.startWorkContinuation(item.id);
+    await started.completion;
+
+    const archive = await source.exportSpace(SPACE);
+
+    expect(archive.workActions).toEqual([
+      expect.objectContaining({ status: "blocked", error: expect.stringContaining("检查服务不可用") }),
+    ]);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+    source.close();
+  });
+
+  test("a rejected action preserves its acceptance audit across archive restore", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-work-rejected-archive-"),
+      runProvider: async () => "变更执行完成",
+    });
+    source.ensureSpace(SPACE);
+    const agent = source.agents.create({
+      name: "归档变更助手",
+      permission: "write",
+      workdir: tempDir("ha-work-rejected-workdir-"),
+    });
+    source.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "归档验收驳回",
+      nextActions: ["更新灰度配置"],
+    });
+    const pending = source.startWorkContinuation(item.id);
+    await source.approveTaskRun(pending.run.id, "operator").completion;
+    source.rejectWorkAction(
+      pending.run.workActionId!,
+      pending.run.id,
+      "local-admin",
+      "结果缺少核对证据",
+    );
+    source.workItems.update(item.id, { phase: "active", blockers: [] });
+
+    const archive = await source.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+    const target = new KnowledgeEngine({ dataDir: tempDir("ha-work-rejected-target-") });
+    await target.restoreSpace(archive);
+
+    expect(target.workContinuations.get(pending.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "blocked",
+        acceptances: [expect.objectContaining({
+          taskRunId: pending.run.id,
+          status: "rejected",
+          reason: "结果缺少核对证据",
+        })],
+      }),
+    );
+    expect(target.workItems.get(item.id)?.blockers).toEqual([
+      "更新灰度配置：结果缺少核对证据",
+    ]);
+    source.close();
+    target.close();
+  });
+
+  test("rejects an archive that turns a historical rejection into an acceptance", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-work-historical-acceptance-"),
+      runProvider: async () => "变更执行完成",
+    });
+    source.ensureSpace(SPACE);
+    const agent = source.agents.create({
+      name: "历史验收防重放助手",
+      permission: "write",
+      workdir: tempDir("ha-work-historical-acceptance-workdir-"),
+    });
+    source.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "阻止历史验收重放",
+      nextActions: ["更新灰度配置"],
+    });
+    const first = source.startWorkContinuation(item.id);
+    await source.approveTaskRun(first.run.id, "operator").completion;
+    source.rejectWorkAction(
+      first.run.workActionId!,
+      first.run.id,
+      "local-admin",
+      "第一次结果缺少核对证据",
+    );
+    const second = source.retryWorkAction(first.run.workActionId!);
+    await source.approveTaskRun(second.run.id, "operator").completion;
+    source.rejectWorkAction(
+      second.run.workActionId!,
+      second.run.id,
+      "local-admin",
+      "第二次结果仍缺少核对证据",
+    );
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+    const forged = structuredClone(archive);
+    forged.workActions[0]!.acceptances![0]!.status = "accepted";
+
+    expect(() => parseSpaceArchive(forged)).toThrow(/workActions|accepted/i);
+  });
+
+  test("cancelling a rejected action retry leaves an archive-safe projection", async () => {
+    const source = new KnowledgeEngine({
+      dataDir: tempDir("ha-work-cancelled-retry-archive-"),
+      runProvider: async () => "变更执行完成",
+    });
+    source.ensureSpace(SPACE);
+    const agent = source.agents.create({
+      name: "取消重试助手",
+      permission: "write",
+      workdir: tempDir("ha-work-cancelled-retry-workdir-"),
+    });
+    source.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = source.workItems.create({
+      space: SPACE,
+      title: "取消被驳回动作的重试",
+      nextActions: ["更新灰度配置"],
+    });
+    const first = source.startWorkContinuation(item.id);
+    await source.approveTaskRun(first.run.id, "operator").completion;
+    source.rejectWorkAction(
+      first.run.workActionId!,
+      first.run.id,
+      "local-admin",
+      "结果缺少核对证据",
+    );
+
+    const retry = source.retryWorkAction(first.run.workActionId!);
+    expect(retry.state).toBe("awaiting_approval");
+    expect(source.cancelWorkAction(first.run.workActionId!)).toBe(true);
+    expect(source.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      actionBlockers: {},
+      nextActions: ["更新灰度配置"],
+    }));
+
+    const archive = await source.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+    const target = new KnowledgeEngine({ dataDir: tempDir("ha-work-cancelled-retry-target-") });
+    await target.restoreSpace(archive);
+    expect(target.workContinuations.get(first.run.workActionId!)).toEqual(
+      expect.objectContaining({ status: "cancelled", checkpoint: undefined }),
+    );
+    source.close();
+    target.close();
+  });
+
   test("archive v14 restores the source trace referenced by a durable Chat Run", async () => {
     const source = new KnowledgeEngine({ dataDir: tempDir("ha-quality-archive-source-") });
     source.ensureSpace(SPACE);
@@ -62,7 +898,7 @@ describe("space data governance", () => {
     const archive = await source.exportSpace(SPACE);
     source.close();
 
-    expect(archive.version).toBe(14);
+    expect(archive.version).toBe(16);
     expect(archive.quality).toEqual({ traces: [trace], reruns: [] });
     const llm: LlmClient = {
       async complete() {
@@ -225,7 +1061,7 @@ describe("space data governance", () => {
 
     const archive = await source.exportSpace(SPACE);
     source.close();
-    expect(archive.version).toBe(14);
+    expect(archive.version).toBe(16);
     const archivedChild = archive.taskRuns.find((item) => item.id === child.id)!;
     expect(archivedChild).toEqual(expect.objectContaining({
       failure: { phase: "provider", kind: "overloaded", retryable: true },
@@ -324,7 +1160,7 @@ describe("space data governance", () => {
 
     const archive = await source.exportSpace(SPACE);
     source.close();
-    expect(archive.version).toBe(14);
+    expect(archive.version).toBe(16);
     expect(archive.taskRuns[0]).toEqual(expect.objectContaining({
       approval: expect.objectContaining({
         status: "expired",
@@ -376,7 +1212,7 @@ describe("space data governance", () => {
     const expectedRevisions = source.agents.listRevisions(created.id);
     const archive = await source.exportSpace(SPACE);
     source.close();
-    expect(archive.version).toBe(14);
+    expect(archive.version).toBe(16);
     expect(archive.agentRevisions).toEqual(expectedRevisions);
     expect(archive.taskRuns[0]?.approval).toEqual(expect.objectContaining({
       status: "approved",
@@ -540,7 +1376,7 @@ describe("space data governance", () => {
     const restarted = new KnowledgeEngine({ dataDir: restoredDir });
     expect(restarted.listTaskRuns(task.id)[0]?.executionPlan).toEqual(expectedPlan);
     const upgraded = await restarted.exportSpace(SPACE);
-    expect(upgraded.version).toBe(14);
+    expect(upgraded.version).toBe(16);
     expect(upgraded.taskRuns[0]?.executionPlan).toEqual(expectedPlan);
     restarted.close();
 
@@ -856,7 +1692,7 @@ describe("space data governance", () => {
     expect(restarted.agents.listRevisions(agent.id)).toEqual(expectedRevisions);
     expect(restarted.listTaskRuns(task.id)[0]?.approval).toEqual(expectedApproval);
     const upgraded = await restarted.exportSpace(SPACE);
-    expect(upgraded.version).toBe(14);
+    expect(upgraded.version).toBe(16);
     restarted.close();
 
     const fresh = new KnowledgeEngine({ dataDir: tempDir("ha-v11-disk-fresh-") });
@@ -958,7 +1794,7 @@ describe("space data governance", () => {
       approvalNotification: expectedNotification,
     }));
     const upgraded = await restarted.exportSpace(SPACE);
-    expect(upgraded.version).toBe(14);
+    expect(upgraded.version).toBe(16);
     restarted.close();
 
     const fresh = new KnowledgeEngine({ dataDir: tempDir("ha-v12-disk-fresh-") });
@@ -1087,7 +1923,7 @@ describe("space data governance", () => {
     expect(restarted.getTaskRun(child.id)).toEqual(expectedChild);
     expect(restarted.chatRuns.get(chat.id)?.traceId).toBeUndefined();
     const upgraded = await restarted.exportSpace(SPACE);
-    expect(upgraded.version).toBe(14);
+    expect(upgraded.version).toBe(16);
     expect(upgraded.quality).toEqual({ traces: [], reruns: [] });
     restarted.close();
 
@@ -1295,7 +2131,7 @@ describe("space data governance", () => {
     expect(archive).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 14,
+        version: 16,
         space: expect.objectContaining({
           id: SPACE,
           name: "治理群",
@@ -1394,7 +2230,7 @@ describe("space data governance", () => {
     } = archive;
     const parsed = parseSpaceArchive({ ...withoutLearning, version: 1 });
 
-    expect(parsed.version).toBe(14);
+    expect(parsed.version).toBe(16);
     expect(parsed.learning).toEqual({ plans: [], sources: [], sessions: [] });
     expect(parsed.governanceAudit).toEqual([]);
     expect(parsed.taskRuns).toEqual([]);
@@ -1426,7 +2262,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(14);
+    expect(parsed.version).toBe(16);
     expect(parsed.learning.plans[0]).toEqual(expect.objectContaining({
       id: plan.id,
       mode: "reading",
@@ -1474,7 +2310,7 @@ describe("space data governance", () => {
     expect(target.learning.source(plan.id)?.materials).toEqual([
       expect.objectContaining({ title: "Async Book", rawIds: ["raw_async"] }),
     ]);
-    expect((await target.exportSpace(SPACE)).version).toBe(14);
+    expect((await target.exportSpace(SPACE)).version).toBe(16);
     target.close();
   });
 
@@ -1578,7 +2414,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(14);
+    expect(parsed.version).toBe(16);
     expect(parsed.taskRuns).toEqual([]);
   });
 
@@ -1606,7 +2442,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(14);
+    expect(parsed.version).toBe(16);
     expect(parsed.tasks[0]?.timeoutMinutes).toBe(12);
     expect(parsed.taskRuns).toEqual([
       expect.objectContaining({
@@ -1691,6 +2527,7 @@ describe("space data governance", () => {
       pagesDeleted: 1,
       rawDeleted: 1,
       tasksDeleted: 1,
+      workItemsDeleted: 0,
       remindersDeleted: 1,
       learningPlansDeleted: 1,
     });
@@ -1708,6 +2545,7 @@ describe("space data governance", () => {
       pagesDeleted: 0,
       rawDeleted: 0,
       tasksDeleted: 0,
+      workItemsDeleted: 0,
       remindersDeleted: 0,
       learningPlansDeleted: 0,
     });
@@ -1736,6 +2574,7 @@ describe("space data governance", () => {
       space: SPACE,
       content: record.id,
       attachments: [],
+      admission: "ready" as const,
     })) as SpaceArchive["raw"];
     await engine.restoreSpace({
       format: "homeagent.space",

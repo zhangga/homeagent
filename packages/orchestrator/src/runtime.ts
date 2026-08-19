@@ -903,8 +903,15 @@ export class Orchestrator {
     retryOf?: string,
   ): ChatRun {
     const snapshot = this.engine.agentRunExecutionSnapshot(writeSpace);
-    return this.engine.chatRuns.start({
+    const rawWorkItemId = rawId && this.engine.registry.has(writeSpace)
+      ? this.engine.registry.store(writeSpace).index().getRaw(rawId)?.workItemId
+      : undefined;
+    const workItemId = rawWorkItemId
+      ?? (retryOf ? this.engine.chatRuns.get(retryOf)?.workItemId : undefined)
+      ?? this.engine.workItems.activeForSpace(writeSpace)?.id;
+    const run = this.engine.chatRuns.start({
       space: writeSpace,
+      workItemId,
       rawId,
       chatId: msg.chatId,
       messageId: msg.messageId,
@@ -920,6 +927,8 @@ export class Orchestrator {
       executionPlan: snapshot.executionPlan,
       retryOf,
     });
+    if (workItemId) this.engine.workItems.attachChatRun(workItemId, run.id);
+    return run;
   }
 
   private async scheduleChatRun(

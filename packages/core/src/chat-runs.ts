@@ -68,6 +68,7 @@ export interface ChatRunDelivery {
 export interface ChatRun {
   id: string;
   space: SpaceId;
+  workItemId?: string;
   rawId?: string;
   chatId?: string;
   messageId?: string;
@@ -108,6 +109,7 @@ export function isChatRunDeliveryInFlight(
 
 export interface StartChatRunInput {
   space: SpaceId;
+  workItemId?: string;
   rawId?: string;
   chatId?: string;
   messageId?: string;
@@ -145,7 +147,7 @@ export interface FinishChatRunFailureInput {
 }
 
 interface ChatRunsFile {
-  version: 1 | 2 | 3 | 4;
+  version: 1 | 2 | 3 | 4 | 5;
   runs: Record<string, ChatRun>;
 }
 
@@ -228,7 +230,7 @@ export function isChatRun(value: unknown): value is ChatRun {
       || (typeof run.finishedAt === "number"
         && Number.isFinite(run.finishedAt)
         && run.finishedAt >= (run.runStartedAt ?? run.startedAt)))
-    && [run.rawId, run.chatId, run.messageId, run.author, run.agentId, run.model, run.retryOf]
+    && [run.workItemId, run.rawId, run.chatId, run.messageId, run.author, run.agentId, run.model, run.retryOf]
       .every((item) => item === undefined || typeof item === "string")
     && [run.output, run.traceId]
       .every((item) => item === undefined || typeof item === "string")
@@ -306,7 +308,7 @@ export class ChatRunStore {
     if (!existsSync(this.configPath)) return runs;
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<ChatRunsFile>;
-      if (![1, 2, 3, 4].includes(Number(parsed.version))) return runs;
+      if (![1, 2, 3, 4, 5].includes(Number(parsed.version))) return runs;
       for (const [id, value] of Object.entries(parsed.runs ?? {})) {
         const legacy = value as Partial<ChatRun>;
         const normalized = parsed.version === 1
@@ -330,7 +332,7 @@ export class ChatRunStore {
     const configDir = dirname(this.configPath);
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const tempPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
-    const file: ChatRunsFile = { version: 4, runs: Object.fromEntries(runs) };
+    const file: ChatRunsFile = { version: 5, runs: Object.fromEntries(runs) };
     try {
       writeFileSync(tempPath, JSON.stringify(file, null, 2), {
         encoding: "utf8",

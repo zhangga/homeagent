@@ -16,8 +16,10 @@ import { KnowledgeEngine } from "./engine.ts";
 import { FakeLlm } from "./testing.ts";
 import { config, type Page, type SpaceId } from "@homeagent/shared";
 import { BudgetExceededError, localDay, ProviderRunError } from "@homeagent/llm";
+import { Database } from "bun:sqlite";
 import { SkillCatalog } from "./skill-catalog.ts";
 import type { AggregatedRunUsage } from "./usage.ts";
+import { parseSpaceArchive } from "./governance.ts";
 
 let dir: string;
 let engine: KnowledgeEngine;
@@ -37,6 +39,26 @@ function page(slug: string, title: string, content: string): Page {
     updatedAt: Date.now(),
     contentHash: "h",
   };
+}
+
+function completedWorkActionOutput(result: string): string {
+  return JSON.stringify({
+    version: 1,
+    outcome: "completed",
+    result,
+    blockers: [],
+    checks: [{ name: "动作结果核对", status: "passed" }],
+  });
+}
+
+function blockedWorkActionOutput(result: string, blocker: string): string {
+  return JSON.stringify({
+    version: 1,
+    outcome: "blocked",
+    result,
+    blockers: [blocker],
+    checks: [{ name: "动作前置条件", status: "failed", detail: blocker }],
+  });
 }
 
 beforeEach(() => {
@@ -99,6 +121,2243 @@ describe("Knowledge seam contract", () => {
     expect(typeof id).toBe("string");
     // no pages yet (distillation is a separate step)
     expect(await engine.listPages(SPACE)).toEqual([]);
+  });
+
+  test("remember automatically associates raw input with the current work item", async () => {
+    const workItem = engine.workItems.create({
+      space: SPACE,
+      title: "收敛知识摄取",
+    });
+
+    const id = await engine.remember({
+      space: SPACE,
+      source: "message",
+      content: "这条上下文属于当前工作项",
+    });
+
+    expect(engine.registry.store(SPACE).index().getRaw(id)?.workItemId).toBe(workItem.id);
+    expect(engine.workItems.get(workItem.id)?.rawIds).toEqual([id]);
+  });
+
+  test("remember rejects a work item from another space before writing raw data", async () => {
+    const workItem = engine.workItems.create({
+      space: SPACE,
+      title: "仅限当前团队",
+    });
+    const otherSpace: SpaceId = "team/oc_other";
+
+    await expect(engine.remember({
+      space: otherSpace,
+      source: "message",
+      workItemId: workItem.id,
+      content: "不能串到另一个团队",
+    })).rejects.toThrow("does not belong to space");
+
+    expect(engine.registry.has(otherSpace)).toBe(false);
+  });
+
+  test("a new Task Run is attached to the current work item", async () => {
+    const workItem = engine.workItems.create({
+      space: SPACE,
+      title: "验证定时研究",
+    });
+    const task = engine.tasks.create({
+      name: "每日研究",
+      space: SPACE,
+      topic: "检查知识新鲜度",
+    })!;
+
+    const started = engine.startTaskRun(task.id, { distill: false });
+
+    expect(started.run.workItemId).toBe(workItem.id);
+    expect(engine.workItems.get(workItem.id)?.taskRunIds).toContain(started.run.id);
+    await started.completion;
+  });
+
+  test("a Task Run keeps its original work context if the current item changes mid-run", async () => {
+    let markProviderStarted!: () => void;
+    let releaseProvider!: (output: string) => void;
+    const providerStarted = new Promise<void>((resolve) => {
+      markProviderStarted = resolve;
+    });
+    const providerOutput = new Promise<string>((resolve) => {
+      releaseProvider = resolve;
+    });
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        markProviderStarted();
+        return providerOutput;
+      },
+    });
+    const original = engine.workItems.create({ space: SPACE, title: "原工作项" });
+    const task = engine.tasks.create({ name: "上下文测试", space: SPACE, topic: "验证归属" })!;
+
+    const started = engine.startTaskRun(task.id, { distill: false });
+    await providerStarted;
+    const replacement = engine.workItems.create({ space: SPACE, title: "新工作项" });
+    releaseProvider("研究输出");
+    const report = await started.completion;
+
+    const raw = engine.registry.store(SPACE).index().getRaw(report.rawId!);
+    expect(raw?.workItemId).toBe(original.id);
+    expect(engine.workItems.get(original.id)?.rawIds).toContain(report.rawId!);
+    expect(engine.workItems.get(replacement.id)?.rawIds).toEqual([]);
+  });
+
+  test("continuing a work item executes its first action and records an action-boundary checkpoint", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async (_provider, input) => {
+        expect(input.prompt).toContain("执行只读发布前检查");
+        expect(input.prompt).toContain("灰度目标");
+        expect(input.prompt).toContain("先检查再报告");
+        return completedWorkActionOutput("检查完成：所有发布前条件均满足");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "完成灰度发布",
+      brief: "灰度目标：验证新版本可安全上线。",
+      runbook: "先检查再报告。",
+      nextActions: ["执行只读发布前检查", "生成灰度报告"],
+    });
+
+    const started = engine.startWorkContinuation(item.id);
+    const report = await started.completion;
+
+    expect(report.ok).toBe(true);
+    expect(started.run.workActionId).toBeDefined();
+    expect(engine.workContinuations.get(started.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "succeeded",
+        checkpoint: expect.objectContaining({
+          summary: "检查完成：所有发布前条件均满足",
+          rawId: report.rawId,
+          taskRunId: started.run.id,
+        }),
+        acceptances: [expect.objectContaining({
+          taskRunId: started.run.id,
+          permission: "read-only",
+          status: "accepted",
+          mode: "automatic",
+          decidedBy: "homeagent.auto-accept",
+        })],
+      }),
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      summary: "检查完成：所有发布前条件均满足",
+      nextActions: ["生成灰度报告"],
+    }));
+  });
+
+  test("plain read-only output that reports a blocker is never auto-accepted", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () =>
+        "无法安全完成：缺少访问发布检查服务的权限，当前动作仍被阻塞",
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "保护被阻塞的只读动作",
+      nextActions: ["执行只读发布前检查"],
+    });
+
+    const started = engine.startWorkContinuation(item.id);
+    const report = await started.completion;
+    expect(report.status).toBe("succeeded");
+
+    expect(engine.workContinuations.get(started.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "awaiting_acceptance",
+        checkpoint: undefined,
+        acceptances: [expect.objectContaining({
+          status: "pending",
+          report: expect.objectContaining({
+            outcome: "unverified",
+            checks: expect.arrayContaining([
+              expect.objectContaining({
+                name: "结构化执行报告",
+                status: "failed",
+              }),
+            ]),
+          }),
+        })],
+      }),
+    );
+    expect(engine.workItems.get(item.id)?.nextActions).toEqual(["执行只读发布前检查"]);
+  });
+
+  test("a structured blocked result becomes a blocker without consuming the action", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => blockedWorkActionOutput(
+        "发布检查无法执行",
+        "缺少发布检查服务权限",
+      ),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "保留结构化阻塞结果",
+      nextActions: ["执行只读发布前检查"],
+    });
+
+    const started = engine.startWorkContinuation(item.id);
+    const report = await started.completion;
+    expect(report.status).toBe("succeeded");
+
+    expect(engine.workContinuations.get(started.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "blocked",
+        checkpoint: undefined,
+        error: "缺少发布检查服务权限",
+        acceptances: [expect.objectContaining({
+          status: "rejected",
+          mode: "automatic",
+          decidedBy: "homeagent.execution-report",
+          report: expect.objectContaining({
+            outcome: "blocked",
+            blockers: ["缺少发布检查服务权限"],
+          }),
+        })],
+      }),
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      nextActions: ["执行只读发布前检查"],
+      blockers: ["执行只读发布前检查：缺少发布检查服务权限"],
+    }));
+    expect(engine.registry.store(SPACE).index().getRaw(report.rawId!))
+      .toEqual(expect.objectContaining({
+        admission: "excluded",
+        workActionId: started.run.workActionId,
+      }));
+  });
+
+  test("a writable work continuation waits for approval before execution and acceptance afterward", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "写入完成";
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "发布执行助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "发布新版本",
+      nextActions: ["更新灰度环境配置"],
+    });
+
+    const pending = engine.startWorkContinuation(item.id);
+
+    expect(pending.state).toBe("awaiting_approval");
+    expect(providerCalls).toBe(0);
+    expect(engine.workContinuations.get(pending.run.workActionId!)).toEqual(
+      expect.objectContaining({ status: "awaiting_approval" }),
+    );
+
+    const approved = engine.approveTaskRun(pending.run.id, "operator");
+    const report = await approved.completion;
+    expect(report.ok).toBe(true);
+    expect(providerCalls).toBe(1);
+    expect(engine.workContinuations.get(pending.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "awaiting_acceptance",
+        checkpoint: undefined,
+        acceptances: [expect.objectContaining({
+          taskRunId: pending.run.id,
+          permission: "write",
+          status: "pending",
+          rawId: report.rawId,
+        })],
+      }),
+    );
+    expect(engine.workItems.get(item.id)?.nextActions).toEqual(["更新灰度环境配置"]);
+
+    const accepted = engine.acceptWorkAction(
+      pending.run.workActionId!,
+      pending.run.id,
+      "local-admin",
+    );
+
+    expect(accepted.status).toBe("succeeded");
+    expect(engine.workItems.get(item.id)?.nextActions).toEqual([]);
+  });
+
+  test("a WorkAction Raw stays out of Dream while its result awaits acceptance", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async (_provider, input) => {
+        if (/JSON Schema/.test(input.prompt) && /operations/.test(input.prompt)) {
+          return JSON.stringify({ operations: [], skippedRawIds: [] });
+        }
+        return completedWorkActionOutput("灰度配置已写入，等待人工验收");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "待验收 Raw 隔离助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "隔离未验收输出",
+      nextActions: ["更新灰度配置"],
+    });
+
+    const pending = engine.startWorkContinuation(item.id);
+    const report = await engine.approveTaskRun(pending.run.id, "operator").completion;
+    const raw = engine.registry.store(SPACE).index().getRaw(report.rawId!);
+
+    expect(engine.workContinuations.get(pending.run.workActionId!)?.status)
+      .toBe("awaiting_acceptance");
+    expect(raw).toEqual(expect.objectContaining({
+      admission: "held",
+      workActionId: pending.run.workActionId,
+      ingested: false,
+    }));
+    expect(engine.registry.store(SPACE).index().listRaw({ onlyPending: true }))
+      .not.toContainEqual(expect.objectContaining({ id: report.rawId }));
+
+    const dream = await engine.runDreamCycle(SPACE);
+    expect(dream.examined).toBe(0);
+    expect(await engine.listPages(SPACE)).toEqual([]);
+  });
+
+  test("an explicit forced Dream cannot bypass a held WorkAction Raw", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async (_provider, input) => {
+        if (/JSON Schema/.test(input.prompt) && /operations/.test(input.prompt)) {
+          return JSON.stringify({ operations: [], skippedRawIds: [] });
+        }
+        return completedWorkActionOutput("受控写入完成");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "强制提炼隔离助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "阻止强制提炼绕过",
+      nextActions: ["写入受控结果"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    const report = await engine.approveTaskRun(pending.run.id, "operator").completion;
+
+    const dream = await engine.runDreamCycle(SPACE, {
+      rawIds: [report.rawId!],
+      force: true,
+    });
+
+    expect(dream.examined).toBe(0);
+    expect(engine.registry.store(SPACE).index().getRaw(report.rawId!))
+      .toEqual(expect.objectContaining({ admission: "held", ingested: false }));
+    expect(await engine.listPages(SPACE)).toEqual([]);
+  });
+
+  test("a global forced Dream still excludes held WorkAction Raw", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("全局重跑前仍待验收"),
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "全局重跑准入助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "保护全局强制提炼",
+      nextActions: ["生成全局待验收结果"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    const report = await engine.approveTaskRun(pending.run.id, "operator").completion;
+
+    const dream = await engine.runDreamCycle(SPACE, { force: true });
+
+    expect(dream.examined).toBe(0);
+    expect(engine.registry.store(SPACE).index().getRaw(report.rawId!))
+      .toEqual(expect.objectContaining({ admission: "held", ingested: false }));
+  });
+
+  test("manual redistillation rejects a held WorkAction Raw", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("人工提炼前仍待验收"),
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "人工提炼准入助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "保护人工提炼入口",
+      nextActions: ["生成待验收结果"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    const report = await engine.approveTaskRun(pending.run.id, "operator").completion;
+
+    await expect(engine.redistillRaw(
+      SPACE,
+      report.rawId!,
+      "local-admin",
+    )).rejects.toThrow("尚未通过动作验收");
+    expect(engine.registry.store(SPACE).index().getRaw(report.rawId!))
+      .toEqual(expect.objectContaining({ admission: "held", ingested: false }));
+  });
+
+  test("accepting a WorkAction promotes its Raw into the Dream queue", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async (_provider, input) => {
+        if (/JSON Schema/.test(input.prompt) && /operations/.test(input.prompt)) {
+          return JSON.stringify({ operations: [], skippedRawIds: [] });
+        }
+        return completedWorkActionOutput("验收后允许形成知识");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "Raw 晋级助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "晋级验收结果",
+      nextActions: ["写入待晋级结果"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    const report = await engine.approveTaskRun(pending.run.id, "operator").completion;
+
+    engine.acceptWorkAction(
+      pending.run.workActionId!,
+      pending.run.id,
+      "local-admin",
+    );
+
+    expect(engine.registry.store(SPACE).index().getRaw(report.rawId!))
+      .toEqual(expect.objectContaining({
+        admission: "ready",
+        workActionId: pending.run.workActionId,
+        ingested: false,
+      }));
+    expect((await engine.runDreamCycle(SPACE)).examined).toBe(1);
+  });
+
+  test("acceptance fails closed before committing when its held Raw is missing", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("缺失证据不能验收"),
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "验收证据完整性助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "拒绝缺失 Raw 的验收",
+      nextActions: ["生成必须留存的候选结果"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    const report = await engine.approveTaskRun(pending.run.id, "operator").completion;
+    engine.registry.store(SPACE).index().deleteRaw(report.rawId!);
+
+    expect(() => engine.acceptWorkAction(
+      pending.run.workActionId!,
+      pending.run.id,
+      "local-admin",
+    )).toThrow("acceptance Raw is missing");
+    expect(engine.workContinuations.get(pending.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "awaiting_acceptance",
+        checkpoint: undefined,
+        acceptances: [expect.objectContaining({ status: "pending" })],
+      }),
+    );
+    expect(engine.workItems.get(item.id)?.nextActions)
+      .toEqual(["生成必须留存的候选结果"]);
+  });
+
+  test("human acceptance cannot commit after the WorkItem action boundary changes", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => "写入完成",
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "发布执行助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "验证验收边界",
+      nextActions: ["更新灰度环境配置"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    await engine.approveTaskRun(pending.run.id, "operator").completion;
+    engine.workItems.update(item.id, { nextActions: ["执行新的发布步骤"] });
+
+    expect(() => engine.acceptWorkAction(
+      pending.run.workActionId!,
+      pending.run.id,
+      "local-admin",
+    )).toThrow("action boundary changed");
+    expect(engine.workContinuations.get(pending.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "awaiting_acceptance",
+        checkpoint: undefined,
+        acceptances: [expect.objectContaining({ status: "pending" })],
+      }),
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      completedActionIds: [],
+      nextActions: ["执行新的发布步骤"],
+    }));
+
+    engine.workItems.update(item.id, { nextActions: ["更新灰度环境配置"] });
+    expect(engine.acceptWorkAction(
+      pending.run.workActionId!,
+      pending.run.id,
+      "local-admin",
+    ).status).toBe("succeeded");
+  });
+
+  test("automatic acceptance stays pending if the WorkItem action boundary changes mid-run", async () => {
+    let releaseProvider!: () => void;
+    const providerGate = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        await providerGate;
+        return "只读检查通过";
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "验证自动验收边界",
+      nextActions: ["执行只读发布检查"],
+    });
+    const started = engine.startWorkContinuation(item.id);
+    engine.workItems.update(item.id, { nextActions: ["执行替代检查"] });
+    releaseProvider();
+    await started.completion;
+
+    expect(engine.workContinuations.get(started.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "awaiting_acceptance",
+        checkpoint: undefined,
+        acceptances: [expect.objectContaining({
+          status: "pending",
+        })],
+      }),
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      completedActionIds: [],
+      nextActions: ["执行替代检查"],
+    }));
+  });
+
+  test("rejecting an action preserves its boundary and stale results cannot accept a retry", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return providerCalls === 1 ? "首次写入结果" : "修正后的写入结果";
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "发布执行助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "发布新版本",
+      nextActions: ["更新灰度环境配置"],
+    });
+    const first = engine.startWorkContinuation(item.id);
+    await engine.approveTaskRun(first.run.id, "operator").completion;
+
+    const rejected = engine.rejectWorkAction(
+      first.run.workActionId!,
+      first.run.id,
+      "local-admin",
+      "缺少变更后的核对证据",
+    );
+
+    expect(rejected).toEqual(expect.objectContaining({
+      status: "blocked",
+      checkpoint: undefined,
+      acceptances: [expect.objectContaining({
+        taskRunId: first.run.id,
+        status: "rejected",
+        reason: "缺少变更后的核对证据",
+      })],
+    }));
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      blockers: ["更新灰度环境配置：缺少变更后的核对证据"],
+      nextActions: ["更新灰度环境配置"],
+    }));
+
+    const retry = engine.retryWorkAction(first.run.workActionId!);
+    expect(retry.state).toBe("awaiting_approval");
+    await engine.approveTaskRun(retry.run.id, "operator").completion;
+    expect(() => engine.acceptWorkAction(
+      first.run.workActionId!,
+      first.run.id,
+      "local-admin",
+    )).toThrow("not the current work action acceptance candidate");
+    expect(engine.workContinuations.get(first.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "awaiting_acceptance",
+        attempt: 2,
+        acceptances: [
+          expect.objectContaining({ taskRunId: first.run.id, status: "rejected" }),
+          expect.objectContaining({ taskRunId: retry.run.id, status: "pending" }),
+        ],
+      }),
+    );
+
+    engine.acceptWorkAction(
+      first.run.workActionId!,
+      retry.run.id,
+      "local-admin",
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      nextActions: [],
+    }));
+  });
+
+  test("rejecting a WorkAction permanently excludes its Raw from knowledge", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("结果不满足验收要求"),
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "Raw 排除助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "排除驳回结果",
+      nextActions: ["生成候选结果"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    const report = await engine.approveTaskRun(pending.run.id, "operator").completion;
+
+    engine.rejectWorkAction(
+      pending.run.workActionId!,
+      pending.run.id,
+      "local-admin",
+      "验收证据不足",
+    );
+
+    expect(engine.registry.store(SPACE).index().getRaw(report.rawId!))
+      .toEqual(expect.objectContaining({
+        admission: "excluded",
+        workActionId: pending.run.workActionId,
+        ingested: false,
+      }));
+    expect((await engine.runDreamCycle(SPACE, { force: true })).examined).toBe(0);
+    await expect(engine.redistillRaw(SPACE, report.rawId!, "local-admin"))
+      .rejects.toThrow("已被动作验收排除");
+  });
+
+  test("cancelling after Raw capture excludes the orphaned WorkAction evidence", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("取消前已经生成候选结果"),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "取消已捕获的候选结果",
+      nextActions: ["执行可取消检查"],
+    });
+    const remember = engine.remember.bind(engine);
+    let capturedRawId: string | undefined;
+    engine.remember = async (entry) => {
+      const rawId = await remember(entry);
+      if (entry.workActionId) {
+        capturedRawId = rawId;
+        expect(engine.cancelWorkAction(entry.workActionId)).toBe(true);
+      }
+      return rawId;
+    };
+
+    const started = engine.startWorkContinuation(item.id);
+    const report = await started.completion;
+
+    expect(report.status).toBe("cancelled");
+    expect(capturedRawId).toBeDefined();
+    expect(engine.workContinuations.get(started.run.workActionId!))
+      .toEqual(expect.objectContaining({ status: "cancelled" }));
+    expect(engine.registry.store(SPACE).index().getRaw(capturedRawId!))
+      .toEqual(expect.objectContaining({
+        admission: "excluded",
+        workActionId: started.run.workActionId,
+      }));
+    expect((await engine.runDreamCycle(SPACE, { force: true })).examined).toBe(0);
+  });
+
+  test("a failure after Raw capture excludes the WorkAction evidence", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("候选结果已捕获但终态写入失败"),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "收敛捕获后的失败",
+      nextActions: ["执行只读检查"],
+    });
+    spyOn(engine.taskRuns, "succeed").mockImplementation(() => {
+      throw new Error("injected TaskRun success persistence failure");
+    });
+
+    const started = engine.startWorkContinuation(item.id);
+    const report = await started.completion;
+    const raws = engine.registry.store(SPACE).index()
+      .listRawsByWorkAction(started.run.workActionId!);
+
+    expect(report.status).toBe("failed");
+    expect(raws).toHaveLength(1);
+    expect(raws[0]).toEqual(expect.objectContaining({
+      admission: "excluded",
+      workActionId: started.run.workActionId,
+      ingested: false,
+    }));
+    expect(engine.workContinuations.get(started.run.workActionId!))
+      .toEqual(expect.objectContaining({ status: "blocked" }));
+  });
+
+  test("startup holds legacy unaccepted WorkAction Raw and removes pages it polluted", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("旧版本留下的待验收结果"),
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "旧库准入迁移助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "清理升级前的知识污染",
+      nextActions: ["生成仍待验收的旧结果"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    const report = await engine.approveTaskRun(pending.run.id, "operator").completion;
+    const trustedRawId = await engine.remember({
+      space: SPACE,
+      source: "message",
+      content: "可信的普通消息来源",
+    });
+    const store = engine.registry.store(SPACE);
+    store.index().markIngested([trustedRawId]);
+    expect(store.index().reconcileWorkActionRawAdmission(
+      report.rawId!,
+      pending.run.workActionId!,
+      "ready",
+    )).toBe(true);
+    store.writePage({
+      ...page("entities/legacy-contamination", "旧污染页", "未验收秘密不应留在知识库"),
+      sources: [report.rawId!, trustedRawId],
+    });
+    for (const slug of ["index", "glossary", "overview"]) {
+      store.writePage(page(slug, slug, "未验收秘密的派生摘要"));
+    }
+    const dbPath = store.dbPath;
+
+    engine.close();
+    const database = new Database(dbPath);
+    database.run(
+      "UPDATE raw SET admission = 'ready', work_action_id = NULL WHERE id = ?",
+      [report.rawId!],
+    );
+    database.close();
+
+    engine = new KnowledgeEngine({ dataDir: dir });
+    const migrated = engine.registry.store(SPACE);
+
+    expect(migrated.index().getRaw(report.rawId!)).toEqual(expect.objectContaining({
+      admission: "held",
+      workActionId: pending.run.workActionId,
+      ingested: false,
+    }));
+    expect(migrated.index().getRaw(trustedRawId)?.ingested).toBe(false);
+    expect(migrated.index().getPage("entities/legacy-contamination")).toBeNull();
+    for (const slug of ["index", "glossary", "overview"]) {
+      const digest = migrated.index().getPage(slug);
+      expect(digest).not.toBeNull();
+      expect(digest?.content).not.toContain("未验收秘密");
+    }
+    expect(engine.workContinuations.get(pending.run.workActionId!))
+      .toEqual(expect.objectContaining({ status: "awaiting_acceptance" }));
+  });
+
+  test("startup excludes a legacy captured Raw whose interrupted Run never persisted rawId", async () => {
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "恢复旧版捕获崩溃窗口",
+      nextActions: ["执行旧版只读检查"],
+    });
+    const action = engine.workContinuations.claimNext(item);
+    const task = {
+      id: action.id,
+      name: `继续：${item.title}`,
+      space: SPACE,
+      topic: action.instruction,
+      cadence: "daily" as const,
+      hour: 0,
+      enabled: false,
+      notify: true,
+      distillOnRun: false,
+      timeoutMinutes: 12,
+      createdAt: action.createdAt,
+      updatedAt: action.updatedAt,
+    };
+    const snapshot = engine.agentRunExecutionSnapshot(SPACE, true);
+    const run = engine.taskRuns.start({
+      task,
+      trigger: "manual",
+      workItemId: item.id,
+      workActionId: action.id,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      executionPlan: snapshot.executionPlan,
+      skillEvidence: snapshot.skillEvidence,
+      distill: false,
+    });
+    engine.workItems.attachTaskRun(item.id, run.id);
+    engine.workContinuations.attachRun(action.id, run.id, "queued", run.startedAt);
+    engine.taskRuns.begin(run.id, run.startedAt + 1);
+    engine.workContinuations.markRunning(action.id, run.id, run.startedAt + 1);
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "task",
+      workItemId: item.id,
+      content: `# 任务研究：${run.taskName}\n主题：${run.topic}\n\n旧版已捕获但未关联的结果`,
+      createdAt: run.startedAt + 2,
+    });
+    expect(engine.registry.store(SPACE).index().getRaw(rawId))
+      .toEqual(expect.objectContaining({ admission: "ready" }));
+    expect(engine.registry.store(SPACE).index().getRaw(rawId)?.workActionId).toBeUndefined();
+
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      recoverInterruptedTaskRuns: true,
+    });
+
+    expect(engine.getTaskRun(run.id)).toEqual(expect.objectContaining({ status: "failed" }));
+    expect(engine.workContinuations.get(action.id))
+      .toEqual(expect.objectContaining({ status: "blocked" }));
+    expect(engine.registry.store(SPACE).index().getRaw(rawId)).toEqual(expect.objectContaining({
+      admission: "excluded",
+      workActionId: action.id,
+      ingested: false,
+    }));
+    expect(engine.getTaskRun(run.id)?.rawId).toBe(rawId);
+    expect(parseSpaceArchive(await engine.exportSpace(SPACE)).raw)
+      .toContainEqual(expect.objectContaining({
+        id: rawId,
+        admission: "excluded",
+        workActionId: action.id,
+      }));
+  });
+
+  test("startup restores WorkItem Raw evidence after capture attachment crashes", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("Raw 已落库但 WorkItem 关联写入失败"),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "闭合 WorkItem Raw 证据图",
+      nextActions: ["执行证据闭合检查"],
+    });
+    spyOn(engine.workItems, "attachRaw").mockImplementationOnce(() => {
+      throw new Error("injected WorkItem Raw attachment failure");
+    });
+
+    const started = engine.startWorkContinuation(item.id);
+    expect((await started.completion).status).toBe("failed");
+    const actionId = started.run.workActionId!;
+    const raws = engine.registry.store(SPACE).index().listRawsByWorkAction(actionId);
+    expect(raws).toHaveLength(1);
+    const rawId = raws[0]!.id;
+    expect(raws[0]).toEqual(expect.objectContaining({ admission: "excluded" }));
+    expect(engine.getTaskRun(started.run.id)?.rawId).toBeUndefined();
+    expect(engine.workItems.get(item.id)?.rawIds).not.toContain(rawId);
+
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir });
+
+    expect(engine.getTaskRun(started.run.id)?.rawId).toBe(rawId);
+    expect(engine.registry.store(SPACE).index().getRaw(rawId)).toEqual(expect.objectContaining({
+      admission: "excluded",
+      workActionId: actionId,
+    }));
+    expect(engine.workItems.get(item.id)?.rawIds).toContain(rawId);
+    expect(parseSpaceArchive(await engine.exportSpace(SPACE)).raw)
+      .toContainEqual(expect.objectContaining({ id: rawId, workItemId: item.id }));
+  });
+
+  test("startup recovers ownerless Raw when both its action and Run rawId evidence were lost", async () => {
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "恢复双重丢失的动作证据",
+      nextActions: ["执行旧版双重丢失检查"],
+    });
+    const action = engine.workContinuations.claimNext(item);
+    const task = {
+      id: action.id,
+      name: `继续：${item.title}`,
+      space: SPACE,
+      topic: action.instruction,
+      cadence: "daily" as const,
+      hour: 0,
+      enabled: false,
+      notify: true,
+      distillOnRun: false,
+      timeoutMinutes: 12,
+      createdAt: action.createdAt,
+      updatedAt: action.updatedAt,
+    };
+    const snapshot = engine.agentRunExecutionSnapshot(SPACE, true);
+    const run = engine.taskRuns.start({
+      task,
+      trigger: "manual",
+      workItemId: item.id,
+      workActionId: action.id,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      executionPlan: snapshot.executionPlan,
+      skillEvidence: snapshot.skillEvidence,
+      distill: false,
+    });
+    engine.workItems.attachTaskRun(item.id, run.id);
+    engine.workContinuations.attachRun(action.id, run.id, "queued", run.startedAt);
+    engine.taskRuns.begin(run.id, run.startedAt + 1);
+    engine.workContinuations.markRunning(action.id, run.id, run.startedAt + 1);
+    spyOn(engine.workItems, "attachRaw").mockImplementationOnce(() => {
+      throw new Error("injected legacy WorkItem Raw attachment failure");
+    });
+    const content = `# 任务研究：${run.taskName}\n主题：${run.topic}\n\n双重丢失窗口中的敏感结果`;
+    await expect(engine.remember({
+      space: SPACE,
+      source: "task",
+      workItemId: item.id,
+      content,
+      createdAt: run.startedAt + 2,
+    })).rejects.toThrow("injected legacy WorkItem Raw attachment failure");
+    engine.taskRuns.fail(run.id, {
+      finishedAt: run.startedAt + 3,
+      error: "legacy terminal persistence gap",
+    });
+    const store = engine.registry.store(SPACE);
+    const raw = store.index().listRaw({}).find((candidate) => candidate.content === content)!;
+    expect(raw).toEqual(expect.objectContaining({ admission: "ready" }));
+    expect(raw.workActionId).toBeUndefined();
+    expect(engine.getTaskRun(run.id)?.rawId).toBeUndefined();
+    expect(engine.workItems.get(item.id)?.rawIds).not.toContain(raw.id);
+    const pollutedSlug = "entities/double-lost-action-contamination";
+    store.writePage({
+      ...page(pollutedSlug, "双重丢失污染页", "双重丢失窗口中的敏感结果"),
+      sources: [raw.id],
+    });
+    const pollutedPath = join(store.wikiDir, `${pollutedSlug}.md`);
+
+    engine.close();
+    writeFileSync(join(dir, "config", "work-continuation.json"), "{broken", "utf8");
+    engine = new KnowledgeEngine({ dataDir: dir });
+    const recovered = engine.registry.store(SPACE);
+
+    expect(engine.getTaskRun(run.id)?.rawId).toBe(raw.id);
+    expect(recovered.index().getRaw(raw.id)).toEqual(expect.objectContaining({
+      admission: "excluded",
+      workActionId: action.id,
+      ingested: false,
+    }));
+    expect(engine.workItems.get(item.id)?.rawIds).toContain(raw.id);
+    expect(recovered.readPageFile(pollutedSlug)).toBeNull();
+    expect(recovered.index().getPage(pollutedSlug)).toBeNull();
+    expect(existsSync(pollutedPath)).toBe(false);
+    expect((await engine.runDreamCycle(SPACE, { force: true })).examined).toBe(0);
+  });
+
+  test("startup excludes TaskRun-owned Raw when the WorkContinuation file is corrupt", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("动作记录损坏前已生成的敏感结果"),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "恢复动作记录损坏后的 Raw 准入",
+      nextActions: ["执行只读证据检查"],
+    });
+    const started = engine.startWorkContinuation(item.id);
+    const report = await started.completion;
+    const rawId = report.rawId!;
+    const actionId = started.run.workActionId!;
+    const store = engine.registry.store(SPACE);
+    const pollutedSlug = "entities/corrupt-action-contamination";
+    store.writePage({
+      ...page(pollutedSlug, "动作记录损坏污染页", "动作记录损坏前已生成的敏感结果"),
+      sources: [rawId],
+    });
+    const pollutedPath = join(store.wikiDir, `${pollutedSlug}.md`);
+    expect(existsSync(pollutedPath)).toBe(true);
+    expect(engine.getTaskRun(started.run.id)).toEqual(expect.objectContaining({
+      status: "succeeded",
+      workActionId: actionId,
+      rawId,
+      workItemId: item.id,
+    }));
+
+    engine.close();
+    const database = new Database(store.dbPath);
+    database.run(
+      "UPDATE raw SET admission = 'ready', work_action_id = NULL, ingested = 1 WHERE id = ?",
+      [rawId],
+    );
+    database.close();
+    writeFileSync(join(dir, "config", "work-continuation.json"), "{broken", "utf8");
+
+    engine = new KnowledgeEngine({ dataDir: dir });
+    const recovered = engine.registry.store(SPACE);
+    expect(recovered.index().getRaw(rawId)).toEqual(expect.objectContaining({
+      admission: "excluded",
+      workActionId: actionId,
+      ingested: false,
+    }));
+    expect(recovered.index().getPage(pollutedSlug)).toBeNull();
+    expect(recovered.readPageFile(pollutedSlug)).toBeNull();
+    expect(existsSync(pollutedPath)).toBe(false);
+    expect(recovered.index().getPage("index")?.content ?? "")
+      .not.toContain("动作记录损坏前已生成的敏感结果");
+  });
+
+  test("startup excludes a uniquely matched cancelled-action Raw after its TaskRun is lost", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("TaskRun 丢失前捕获的敏感结果"),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "恢复 TaskRun 丢失后的 Raw 准入",
+      nextActions: ["执行可取消证据检查"],
+    });
+    const remember = engine.remember.bind(engine);
+    let rawId: string | undefined;
+    engine.remember = async (entry) => {
+      const captured = await remember(entry);
+      if (entry.workActionId) {
+        rawId = captured;
+        expect(engine.cancelWorkAction(entry.workActionId)).toBe(true);
+      }
+      return captured;
+    };
+    const started = engine.startWorkContinuation(item.id);
+    expect((await started.completion).status).toBe("cancelled");
+    const actionId = started.run.workActionId!;
+    const store = engine.registry.store(SPACE);
+    expect(rawId).toBeDefined();
+    expect(store.index().reconcileWorkActionRawAdmission(rawId!, actionId, "ready"))
+      .toBe(true);
+    const pollutedSlug = "entities/missing-run-disk-only-contamination";
+    store.writePage({
+      ...page(pollutedSlug, "TaskRun 丢失污染页", "TaskRun 丢失前捕获的敏感结果"),
+      sources: [rawId!],
+    });
+    const pollutedPath = join(store.wikiDir, `${pollutedSlug}.md`);
+    store.index().deletePage(pollutedSlug);
+    expect(existsSync(pollutedPath)).toBe(true);
+    expect(store.index().getPage(pollutedSlug)).toBeNull();
+
+    engine.close();
+    const database = new Database(store.dbPath);
+    database.run(
+      "UPDATE raw SET admission = 'ready', work_action_id = NULL, ingested = 1 WHERE id = ?",
+      [rawId!],
+    );
+    database.close();
+    const taskRunPath = join(dir, "config", "task-runs.json");
+    const taskRunFile = JSON.parse(readFileSync(taskRunPath, "utf8")) as {
+      version: number;
+      runs: Record<string, unknown>;
+    };
+    delete taskRunFile.runs[started.run.id];
+    writeFileSync(taskRunPath, `${JSON.stringify(taskRunFile, null, 2)}\n`, "utf8");
+
+    engine = new KnowledgeEngine({ dataDir: dir });
+    const recovered = engine.registry.store(SPACE);
+    expect(engine.getTaskRun(started.run.id)).toBeUndefined();
+    expect(recovered.index().getRaw(rawId!)).toEqual(expect.objectContaining({
+      admission: "excluded",
+      workActionId: actionId,
+      ingested: false,
+    }));
+    expect(recovered.readPageFile(pollutedSlug)).toBeNull();
+    expect(recovered.index().getPage(pollutedSlug)).toBeNull();
+    expect(existsSync(pollutedPath)).toBe(false);
+    expect(recovered.index().getPage("index")?.content ?? "")
+      .not.toContain("TaskRun 丢失前捕获的敏感结果");
+  });
+
+  test("startup fails closed when a missing TaskRun leaves ambiguous WorkAction Raw evidence", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("无法唯一归属的动作结果"),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "拒绝歧义的动作 Raw",
+      nextActions: ["执行歧义证据检查"],
+    });
+    const remember = engine.remember.bind(engine);
+    const rawIds: string[] = [];
+    engine.remember = async (entry) => {
+      const captured = await remember(entry);
+      if (entry.workActionId) {
+        rawIds.push(captured);
+        rawIds.push(await remember({
+          space: entry.space,
+          source: "task",
+          workItemId: entry.workItemId,
+          content: entry.content,
+          createdAt: entry.createdAt,
+        }));
+        expect(engine.cancelWorkAction(entry.workActionId)).toBe(true);
+      }
+      return captured;
+    };
+    const started = engine.startWorkContinuation(item.id);
+    expect((await started.completion).status).toBe("cancelled");
+    const actionId = started.run.workActionId!;
+    const store = engine.registry.store(SPACE);
+    expect(rawIds).toHaveLength(2);
+    expect(store.index().reconcileWorkActionRawAdmission(rawIds[0]!, actionId, "ready"))
+      .toBe(true);
+
+    engine.close();
+    const database = new Database(store.dbPath);
+    database.run(
+      "UPDATE raw SET admission = 'ready', work_action_id = NULL WHERE id IN (?, ?)",
+      rawIds,
+    );
+    database.close();
+    const taskRunPath = join(dir, "config", "task-runs.json");
+    const taskRunFile = JSON.parse(readFileSync(taskRunPath, "utf8")) as {
+      version: number;
+      runs: Record<string, unknown>;
+    };
+    delete taskRunFile.runs[started.run.id];
+    writeFileSync(taskRunPath, `${JSON.stringify(taskRunFile, null, 2)}\n`, "utf8");
+
+    expect(() => new KnowledgeEngine({ dataDir: dir }))
+      .toThrow(`work action Raw evidence is ambiguous: ${actionId}`);
+    Bun.gc(true);
+  });
+
+  test("startup fails closed instead of rebinding TaskRun Raw owned by another action", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("已有冲突 owner 的动作结果"),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "拒绝覆盖动作 Raw owner",
+      nextActions: ["执行 owner 一致性检查"],
+    });
+    const started = engine.startWorkContinuation(item.id);
+    const report = await started.completion;
+    const rawId = report.rawId!;
+    const conflictingActionId = "action_00000000-0000-4000-8000-000000000000";
+    const store = engine.registry.store(SPACE);
+
+    engine.close();
+    const database = new Database(store.dbPath);
+    database.run(
+      "UPDATE raw SET admission = 'ready', work_action_id = ? WHERE id = ?",
+      [conflictingActionId, rawId],
+    );
+    database.close();
+
+    expect(() => new KnowledgeEngine({ dataDir: dir }))
+      .toThrow(`work action Raw belongs to another action: ${rawId}`);
+    Bun.gc(true);
+  });
+
+  test("startup removes pages that cite a missing rejected WorkAction Raw", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("最终被拒绝的敏感动作结果"),
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "缺失拒绝证据恢复助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "清理缺失的拒绝证据引用",
+      nextActions: ["生成需要人工验收的结果"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    const report = await engine.approveTaskRun(pending.run.id, "operator").completion;
+    const rawId = report.rawId!;
+    const actionId = pending.run.workActionId!;
+    engine.rejectWorkAction(actionId, pending.run.id, "operator", "证据不可信");
+    const store = engine.registry.store(SPACE);
+    expect(store.index().reconcileWorkActionRawAdmission(rawId, actionId, "ready"))
+      .toBe(true);
+    const pollutedSlug = "entities/missing-rejected-raw-contamination";
+    store.writePage({
+      ...page(pollutedSlug, "缺失拒绝证据污染页", "最终被拒绝的敏感动作结果"),
+      sources: [rawId],
+    });
+    const pollutedPath = join(store.wikiDir, `${pollutedSlug}.md`);
+    expect(existsSync(pollutedPath)).toBe(true);
+    expect(store.index().getPage(pollutedSlug)).not.toBeNull();
+
+    engine.close();
+    const database = new Database(store.dbPath);
+    database.run("DELETE FROM raw WHERE id = ?", [rawId]);
+    database.close();
+
+    engine = new KnowledgeEngine({ dataDir: dir });
+    const recovered = engine.registry.store(SPACE);
+    expect(recovered.index().getRaw(rawId)).toBeNull();
+    expect(recovered.readPageFile(pollutedSlug)).toBeNull();
+    expect(recovered.index().getPage(pollutedSlug)).toBeNull();
+    expect(existsSync(pollutedPath)).toBe(false);
+    expect(recovered.index().getPage("index")?.content ?? "")
+      .not.toContain("最终被拒绝的敏感动作结果");
+  });
+
+  test("startup fails closed when accepted WorkAction Raw evidence is missing", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("已自动验收但随后丢失的结果"),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "保护已验收证据完整性",
+      nextActions: ["执行只读完整性检查"],
+    });
+    const started = engine.startWorkContinuation(item.id);
+    const report = await started.completion;
+    const rawId = report.rawId!;
+    expect(engine.workContinuations.get(started.run.workActionId!))
+      .toEqual(expect.objectContaining({
+        status: "succeeded",
+        checkpoint: expect.objectContaining({ rawId }),
+      }));
+    const store = engine.registry.store(SPACE);
+
+    engine.close();
+    const database = new Database(store.dbPath);
+    database.run("DELETE FROM raw WHERE id = ?", [rawId]);
+    database.close();
+
+    expect(() => new KnowledgeEngine({ dataDir: dir }))
+      .toThrow(`accepted WorkAction Raw evidence is missing: ${rawId}`);
+    Bun.gc(true);
+  });
+
+  test("startup excludes an early missing-attempt Raw after a later retry was accepted", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("多次尝试产生的动作结果"),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "隔离成功动作的早期失败证据",
+      nextActions: ["执行可重试证据检查"],
+    });
+    const remember = engine.remember.bind(engine);
+    const rawIds: string[] = [];
+    engine.remember = async (entry) => {
+      const rawId = await remember(entry);
+      if (entry.workActionId) rawIds.push(rawId);
+      return rawId;
+    };
+    spyOn(engine.taskRuns, "succeed").mockImplementationOnce(() => {
+      throw new Error("injected first-attempt terminal write failure");
+    });
+    const first = engine.startWorkContinuation(item.id);
+    expect((await first.completion).status).toBe("failed");
+    const actionId = first.run.workActionId!;
+    const retried = engine.retryWorkAction(actionId);
+    expect((await retried.completion).status).toBe("succeeded");
+    expect(rawIds).toHaveLength(2);
+    const [earlyRawId, acceptedRawId] = rawIds as [string, string];
+    expect(engine.workContinuations.get(actionId)).toEqual(expect.objectContaining({
+      status: "succeeded",
+      checkpoint: expect.objectContaining({ rawId: acceptedRawId }),
+      taskRunIds: [first.run.id, retried.run.id],
+    }));
+    const store = engine.registry.store(SPACE);
+    expect(store.index().reconcileWorkActionRawAdmission(earlyRawId, actionId, "ready"))
+      .toBe(true);
+    const pollutedSlug = "entities/missing-early-attempt-contamination";
+    store.writePage({
+      ...page(pollutedSlug, "早期失败尝试污染页", "首个失败尝试不应因重试成功而获准"),
+      sources: [earlyRawId],
+    });
+    const pollutedPath = join(store.wikiDir, `${pollutedSlug}.md`);
+
+    engine.close();
+    const database = new Database(store.dbPath);
+    database.run(
+      "UPDATE raw SET admission = 'ready', work_action_id = NULL, ingested = 1 WHERE id = ?",
+      [earlyRawId],
+    );
+    database.close();
+    const taskRunPath = join(dir, "config", "task-runs.json");
+    const taskRunFile = JSON.parse(readFileSync(taskRunPath, "utf8")) as {
+      version: number;
+      runs: Record<string, unknown>;
+    };
+    delete taskRunFile.runs[first.run.id];
+    writeFileSync(taskRunPath, `${JSON.stringify(taskRunFile, null, 2)}\n`, "utf8");
+
+    engine = new KnowledgeEngine({ dataDir: dir });
+    const recovered = engine.registry.store(SPACE);
+    expect(recovered.index().getRaw(earlyRawId)).toEqual(expect.objectContaining({
+      admission: "excluded",
+      workActionId: actionId,
+      ingested: false,
+    }));
+    expect(recovered.index().getRaw(acceptedRawId)).toEqual(expect.objectContaining({
+      admission: "ready",
+      workActionId: actionId,
+    }));
+    expect(recovered.readPageFile(pollutedSlug)).toBeNull();
+    expect(recovered.index().getPage(pollutedSlug)).toBeNull();
+    expect(existsSync(pollutedPath)).toBe(false);
+  });
+
+  test("abandoning a rejected action releases its owned blocker after the WorkItem head changes", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => "旧动作执行结果",
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "动作放弃助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "切换发布动作",
+      nextActions: ["执行旧发布动作"],
+    });
+    const first = engine.startWorkContinuation(item.id);
+    await engine.approveTaskRun(first.run.id, "operator").completion;
+    const actionId = first.run.workActionId!;
+    const rejected = engine.rejectWorkAction(
+      actionId,
+      first.run.id,
+      "local-admin",
+      "旧方案不再适用",
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      nextActions: ["执行旧发布动作"],
+      actionBlockers: { [actionId]: expect.any(String) },
+    }));
+
+    engine.workItems.update(item.id, { nextActions: ["执行新发布动作"] });
+    engine.abandonWorkAction(actionId, {
+      runId: first.run.id,
+      attempt: rejected.attempt,
+    });
+
+    expect(engine.workContinuations.get(actionId)).toEqual(expect.objectContaining({
+      status: "cancelled",
+      attempt: 1,
+      taskRunIds: [first.run.id],
+    }));
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      actionBlockers: {},
+      nextActions: ["执行新发布动作"],
+    }));
+
+    const next = engine.startWorkContinuation(item.id);
+    expect(next.state).toBe("awaiting_approval");
+    expect(next.run.workActionId).not.toBe(actionId);
+    expect(engine.workContinuations.get(next.run.workActionId!)).toEqual(
+      expect.objectContaining({ instruction: "执行新发布动作" }),
+    );
+  });
+
+  test("a crash after persisting retry intent fails closed and can retry again", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => "首次写入结果",
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "发布执行助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "恢复重试窗口",
+      nextActions: ["更新灰度环境配置"],
+    });
+    const first = engine.startWorkContinuation(item.id);
+    await engine.approveTaskRun(first.run.id, "operator").completion;
+    engine.rejectWorkAction(
+      first.run.workActionId!,
+      first.run.id,
+      "local-admin",
+      "需要补充证据",
+    );
+
+    // Simulate a process exit after retry intent was persisted but before the
+    // replacement Task Run was durably created and associated.
+    engine.workContinuations.retry(first.run.workActionId!);
+    engine.close();
+
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => "修正后的写入结果",
+    });
+    expect(engine.workContinuations.get(first.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "blocked",
+        attempt: 2,
+        taskRunIds: [first.run.id],
+        error: expect.stringContaining("新 Task Run"),
+      }),
+    );
+
+    const recovered = engine.retryWorkAction(first.run.workActionId!);
+    expect(recovered.state).toBe("awaiting_approval");
+    expect(recovered.run.retryOf).toBe(first.run.id);
+    expect(engine.workContinuations.get(first.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "awaiting_approval",
+        attempt: 2,
+        taskRunIds: [first.run.id, recovered.run.id],
+      }),
+    );
+  });
+
+  test("a failed work continuation becomes a visible blocker without consuming the next action", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        throw new Error("发布检查服务不可用");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "完成灰度发布",
+      nextActions: ["执行只读发布前检查"],
+    });
+
+    const started = engine.startWorkContinuation(item.id);
+    const report = await started.completion;
+
+    expect(report.ok).toBe(false);
+    expect(engine.workContinuations.get(started.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "blocked",
+        error: expect.stringContaining("发布检查服务不可用"),
+      }),
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      blockers: [expect.stringContaining("发布检查服务不可用")],
+      nextActions: ["执行只读发布前检查"],
+    }));
+  });
+
+  test("retrying a blocked work action creates a new run and clears its blocker on success", async () => {
+    let shouldFail = true;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        if (shouldFail) throw new Error("临时检查故障");
+        return completedWorkActionOutput("重试检查通过");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "完成灰度发布",
+      nextActions: ["执行只读发布前检查"],
+    });
+    const failed = engine.startWorkContinuation(item.id);
+    await failed.completion;
+    shouldFail = false;
+
+    const retried = engine.retryWorkAction(failed.run.workActionId!);
+    const report = await retried.completion;
+
+    expect(report.ok).toBe(true);
+    expect(retried.run.id).not.toBe(failed.run.id);
+    expect(engine.workContinuations.get(failed.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "succeeded",
+        attempt: 2,
+        taskRunIds: [failed.run.id, retried.run.id],
+      }),
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      nextActions: [],
+    }));
+  });
+
+  test("cancelling a work action preserves its next action without creating a blocker", () => {
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "发布执行助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "发布新版本",
+      nextActions: ["更新灰度环境配置"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+
+    expect(engine.cancelWorkAction(pending.run.workActionId!)).toBe(true);
+
+    expect(engine.getTaskRun(pending.run.id)?.status).toBe("cancelled");
+    expect(engine.workContinuations.get(pending.run.workActionId!)).toEqual(
+      expect.objectContaining({ status: "cancelled" }),
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      blockers: [],
+      nextActions: ["更新灰度环境配置"],
+    }));
+  });
+
+  test("an automatic read-only continuation waits for its durable retry before blocking", async () => {
+    let shouldFail = true;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        if (shouldFail) {
+          throw new ProviderRunError("claude", "API Error: 429 Too Many Requests", {
+            inputTokens: 1,
+            outputTokens: 0,
+            costBasis: "unavailable",
+            source: "claude-json",
+          });
+        }
+        return completedWorkActionOutput("自动重试完成");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "完成灰度发布",
+      nextActions: ["执行只读发布前检查"],
+    });
+
+    const first = engine.startWorkContinuation(item.id, { trigger: "scheduled" });
+    const failed = await first.completion;
+    const failedRun = engine.getTaskRun(failed.runId)!;
+
+    expect(failedRun.retry?.status).toBe("waiting");
+    expect(engine.workContinuations.get(first.run.workActionId!)).toEqual(
+      expect.objectContaining({ status: "queued" }),
+    );
+    expect(engine.workItems.get(item.id)?.blockers).toEqual([]);
+
+    shouldFail = false;
+    const retries = engine.retryDueTaskRuns(failed.finishedAt + 60_000);
+    expect(retries).toHaveLength(1);
+    const recovered = await retries[0]!.completion;
+
+    expect(recovered.ok).toBe(true);
+    expect(engine.workContinuations.get(first.run.workActionId!)).toEqual(
+      expect.objectContaining({ status: "succeeded", attempt: 2 }),
+    );
+    expect(engine.workItems.get(item.id)?.nextActions).toEqual([]);
+  });
+
+  test("cancelling a waiting automatic WorkAction retry closes the action without replay", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        throw new ProviderRunError("claude", "API Error: 429 Too Many Requests", {
+          inputTokens: 1,
+          outputTokens: 0,
+          costBasis: "unavailable",
+          source: "claude-json",
+        });
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "取消自动续跑",
+      nextActions: ["执行只读发布前检查"],
+    });
+    const first = engine.startWorkContinuation(item.id, { trigger: "scheduled" });
+    await first.completion;
+    const failedRun = engine.getTaskRun(first.run.id)!;
+    const dueAt = failedRun.retry!.nextAttemptAt!;
+
+    expect(failedRun.retry?.status).toBe("waiting");
+    expect(engine.workContinuations.get(first.run.workActionId!)?.status).toBe("queued");
+    expect(engine.cancelTaskRun(failedRun.id)).toBe(true);
+
+    expect(engine.getTaskRun(failedRun.id)?.retry).toEqual({
+      attempt: 1,
+      maxAttempts: 2,
+      status: "exhausted",
+    });
+    expect(engine.workContinuations.get(first.run.workActionId!)).toEqual(
+      expect.objectContaining({ status: "cancelled" }),
+    );
+    expect(engine.retryDueTaskRuns(dueAt)).toEqual([]);
+    expect(providerCalls).toBe(1);
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      blockers: [],
+      nextActions: ["执行只读发布前检查"],
+    }));
+  });
+
+  test("restart repairs an automatic retry Run created before its action attempt was linked", async () => {
+    const recoveryDir = join(dir, "automatic-work-retry-link-recovery");
+    const first = new KnowledgeEngine({
+      dataDir: recoveryDir,
+      runProvider: async () => {
+        throw new ProviderRunError("claude", "API Error: 429 Too Many Requests", {
+          inputTokens: 1,
+          outputTokens: 0,
+          costBasis: "unavailable",
+          source: "claude-json",
+        });
+      },
+    });
+    first.ensureSpace(SPACE);
+    const item = first.workItems.create({
+      space: SPACE,
+      title: "恢复自动重试关联",
+      nextActions: ["执行只读发布前检查"],
+    });
+    const initial = first.startWorkContinuation(item.id, { trigger: "scheduled" });
+    await initial.completion;
+    const parent = first.getTaskRun(initial.run.id)!;
+    const child = first.taskRuns.claimRetry(parent.id, parent.retry!.nextAttemptAt!)!;
+    expect(child.workActionId).toBe(initial.run.workActionId);
+    expect(first.workContinuations.get(initial.run.workActionId!)).toEqual(
+      expect.objectContaining({ attempt: 1, taskRunIds: [parent.id] }),
+    );
+    first.close();
+
+    let providerCalls = 0;
+    const reopened = new KnowledgeEngine({
+      dataDir: recoveryDir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return completedWorkActionOutput("自动重试恢复完成");
+      },
+    });
+    expect(reopened.workContinuations.get(initial.run.workActionId!)).toEqual(
+      expect.objectContaining({ attempt: 2, taskRunIds: [parent.id, child.id] }),
+    );
+    expect(reopened.workItems.get(item.id)?.taskRunIds).toContain(child.id);
+
+    const resumed = reopened.resumeQueuedTaskRuns();
+    expect(resumed).toHaveLength(1);
+    expect(resumed[0]!.run.id).toBe(child.id);
+    expect((await resumed[0]!.completion).status).toBe("succeeded");
+    expect(providerCalls).toBe(1);
+    expect(reopened.workContinuations.get(initial.run.workActionId!)).toEqual(
+      expect.objectContaining({ status: "succeeded", attempt: 2 }),
+    );
+    reopened.close();
+  });
+
+  test("a writable WorkAction cannot be approved after its WorkItem boundary changes", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return completedWorkActionOutput("旧动作不应执行");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "边界审批助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "阻止过期审批",
+      nextActions: ["更新旧灰度配置"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    expect(pending.state).toBe("awaiting_approval");
+
+    engine.workItems.update(item.id, { nextActions: ["执行新的发布步骤"] });
+    let approval: ReturnType<KnowledgeEngine["approveTaskRun"]> | undefined;
+    let approvalError: unknown;
+    try {
+      approval = engine.approveTaskRun(pending.run.id, "operator");
+    } catch (error) {
+      approvalError = error;
+    }
+    if (approval) await approval.completion;
+
+    expect(approvalError).toBeInstanceOf(Error);
+    expect(providerCalls).toBe(0);
+    expect(engine.workItems.get(item.id)?.nextActions).toEqual(["执行新的发布步骤"]);
+  });
+
+  test("a writable WorkAction cannot be approved after its WorkItem becomes blocked", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return completedWorkActionOutput("已阻塞动作不应执行");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "阻塞审批助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "阻止失效审批",
+      nextActions: ["更新灰度环境配置"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    expect(pending.state).toBe("awaiting_approval");
+    expect(providerCalls).toBe(0);
+
+    engine.workItems.update(item.id, {
+      phase: "blocked",
+      blockers: ["等待变更窗口"],
+    });
+    let approval: ReturnType<KnowledgeEngine["approveTaskRun"]> | undefined;
+    let approvalError: unknown;
+    try {
+      approval = engine.approveTaskRun(pending.run.id, "operator");
+    } catch (error) {
+      approvalError = error;
+    }
+    if (approval) await approval.completion;
+
+    expect(approvalError).toBeInstanceOf(Error);
+    expect(providerCalls).toBe(0);
+    expect(engine.workContinuations.get(pending.run.workActionId!)).toEqual(
+      expect.objectContaining({ status: "blocked" }),
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      nextActions: ["更新灰度环境配置"],
+      blockers: expect.arrayContaining(["等待变更窗口"]),
+      actionBlockers: expect.objectContaining({
+        [pending.run.workActionId!]: expect.any(String),
+      }),
+    }));
+  });
+
+  test("generic Task Run retry rejects a WorkAction Run", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return completedWorkActionOutput("不应由通用重试执行");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "重试边界助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "拒绝通用动作重试",
+      nextActions: ["更新灰度配置"],
+    });
+    const pending = engine.startWorkContinuation(item.id);
+    engine.rejectTaskRun(pending.run.id, "operator", "暂不执行");
+
+    let retry: ReturnType<KnowledgeEngine["retryTaskRun"]> | undefined;
+    let retryError: unknown;
+    try {
+      retry = engine.retryTaskRun(pending.run.id);
+    } catch (error) {
+      retryError = error;
+    }
+    if (retry?.state === "scheduled") await retry.completion;
+
+    expect(retryError).toBeInstanceOf(Error);
+    expect(retry).toBeUndefined();
+    expect(providerCalls).toBe(0);
+  });
+
+  test("an automatic WorkAction retry fails closed when its boundary changes", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        if (providerCalls === 1) {
+          throw new ProviderRunError("claude", "API Error: 429 Too Many Requests", {
+            inputTokens: 1,
+            outputTokens: 0,
+            costBasis: "unavailable",
+            source: "claude-json",
+          });
+        }
+        return completedWorkActionOutput("过期自动重试不应执行");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "阻止过期自动重试",
+      nextActions: ["执行旧发布检查"],
+    });
+    const first = engine.startWorkContinuation(item.id, { trigger: "scheduled" });
+    const failed = await first.completion;
+    const failedRun = engine.getTaskRun(failed.runId)!;
+    expect(failedRun.retry?.status).toBe("waiting");
+
+    engine.workItems.update(item.id, { nextActions: ["执行新的发布检查"] });
+    const retries = engine.retryDueTaskRuns(failedRun.retry!.nextAttemptAt!);
+    await Promise.all(retries.map((retry) => retry.completion));
+
+    expect(retries).toEqual([]);
+    expect(providerCalls).toBe(1);
+    expect(engine.workContinuations.get(first.run.workActionId!)).toEqual(
+      expect.objectContaining({ status: "blocked" }),
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      nextActions: ["执行新的发布检查"],
+    }));
+    expect(engine.workItems.get(item.id)?.blockers.length).toBeGreaterThan(0);
+  });
+
+  test("a queued WorkAction revalidates its boundary before provider execution", async () => {
+    let releaseBlockingProvider!: (value: string) => void;
+    let markBlockingProviderStarted!: () => void;
+    const blockingProviderStarted = new Promise<void>((resolve) => {
+      markBlockingProviderStarted = resolve;
+    });
+    const blockingProviderOutput = new Promise<string>((resolve) => {
+      releaseBlockingProvider = resolve;
+    });
+    let workActionProviderCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async (_provider, input) => {
+        if (input.prompt.includes("占用同空间执行槽")) {
+          markBlockingProviderStarted();
+          return blockingProviderOutput;
+        }
+        workActionProviderCalls += 1;
+        return completedWorkActionOutput("过期排队动作不应执行");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const blockingTask = engine.tasks.create({
+      name: "占用执行槽",
+      space: SPACE,
+      topic: "占用同空间执行槽",
+      distillOnRun: false,
+    })!;
+    const blocking = engine.startTaskRun(blockingTask.id, { distill: false });
+    await blockingProviderStarted;
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "阻止过期排队动作",
+      nextActions: ["执行旧排队动作"],
+    });
+    const queued = engine.startWorkContinuation(item.id);
+    expect(engine.getTaskRun(queued.run.id)?.status).toBe("queued");
+
+    engine.workItems.update(item.id, { nextActions: ["执行新的排队动作"] });
+    releaseBlockingProvider("释放执行槽");
+    await blocking.completion;
+    await queued.completion;
+
+    expect(workActionProviderCalls).toBe(0);
+    expect(engine.workContinuations.get(queued.run.workActionId!)).toEqual(
+      expect.objectContaining({ status: "blocked" }),
+    );
+    expect(engine.workItems.get(item.id)?.nextActions).toEqual(["执行新的排队动作"]);
+  });
+
+  test("a queued WorkAction refuses provider execution after its WorkItem becomes blocked", async () => {
+    let releaseBlockingProvider!: (value: string) => void;
+    let markBlockingProviderStarted!: () => void;
+    const blockingProviderStarted = new Promise<void>((resolve) => {
+      markBlockingProviderStarted = resolve;
+    });
+    const blockingProviderOutput = new Promise<string>((resolve) => {
+      releaseBlockingProvider = resolve;
+    });
+    let workActionProviderCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async (_provider, input) => {
+        if (input.prompt.includes("占用 readiness 执行槽")) {
+          markBlockingProviderStarted();
+          return blockingProviderOutput;
+        }
+        workActionProviderCalls += 1;
+        return completedWorkActionOutput("已阻塞排队动作不应执行");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const blockingTask = engine.tasks.create({
+      name: "占用 readiness 执行槽",
+      space: SPACE,
+      topic: "占用 readiness 执行槽",
+      distillOnRun: false,
+    })!;
+    const blocking = engine.startTaskRun(blockingTask.id, { distill: false });
+    await blockingProviderStarted;
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "阻止失效排队动作",
+      nextActions: ["执行排队发布动作"],
+    });
+    const queued = engine.startWorkContinuation(item.id);
+    expect(engine.getTaskRun(queued.run.id)?.status).toBe("queued");
+
+    engine.workItems.update(item.id, {
+      phase: "blocked",
+      blockers: ["等待发布窗口"],
+    });
+    releaseBlockingProvider("释放 readiness 执行槽");
+    await blocking.completion;
+    await queued.completion;
+
+    expect(workActionProviderCalls).toBe(0);
+    expect(engine.workContinuations.get(queued.run.workActionId!)).toEqual(
+      expect.objectContaining({ status: "blocked" }),
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      nextActions: ["执行排队发布动作"],
+      blockers: expect.arrayContaining(["等待发布窗口"]),
+      actionBlockers: expect.objectContaining({
+        [queued.run.workActionId!]: expect.any(String),
+      }),
+    }));
+  });
+
+  test("retrying a WorkAction at its Run history limit is rejected without partial persistence", () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return completedWorkActionOutput("不应执行第 101 次尝试");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "达到动作运行历史上限",
+      nextActions: ["执行历史已满动作"],
+    });
+    const claimed = engine.workContinuations.claimNext(item);
+    for (let index = 1; index <= 100; index += 1) {
+      engine.workContinuations.attachRun(
+        claimed.id,
+        `run_history_${index}`,
+        "queued",
+        claimed.updatedAt + index,
+      );
+    }
+    const full = engine.workContinuations.failClosed(
+      claimed.id,
+      "动作运行历史已满",
+      claimed.updatedAt + 101,
+    );
+    engine.workItems.applyActionBlocker(
+      item.id,
+      full.id,
+      full.instruction,
+      full.error!,
+      full.updatedAt,
+    );
+    const taskRunIdsBefore = engine.listTaskRuns().map((run) => run.id);
+    const itemRunIdsBefore = engine.workItems.get(item.id)!.taskRunIds;
+
+    expect(() => engine.retryWorkAction(full.id, {
+      runId: "run_history_100",
+      attempt: 100,
+    })).toThrow();
+
+    expect(providerCalls).toBe(0);
+    expect(engine.listTaskRuns().map((run) => run.id)).toEqual(taskRunIdsBefore);
+    expect(engine.workContinuations.get(full.id)).toEqual(expect.objectContaining({
+      status: "blocked",
+      attempt: 100,
+      taskRunIds: expect.arrayContaining(["run_history_1", "run_history_100"]),
+    }));
+    expect(engine.workContinuations.get(full.id)?.taskRunIds).toHaveLength(100);
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      taskRunIds: itemRunIdsBefore,
+      actionBlockers: { [full.id]: expect.any(String) },
+    }));
+
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "" });
+    expect(engine.workContinuations.get(full.id)).toEqual(expect.objectContaining({
+      status: "blocked",
+      attempt: 100,
+    }));
+    expect(engine.workContinuations.get(full.id)?.taskRunIds).toHaveLength(100);
+  });
+
+  test("an automatic WorkAction retry at its Run history limit exhausts without claiming a child", () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return completedWorkActionOutput("不应执行自动第 101 次尝试");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "自动重试达到动作历史上限",
+      nextActions: ["执行自动重试动作"],
+    });
+    const action = engine.workContinuations.claimNext(item);
+    for (let index = 1; index < 100; index += 1) {
+      engine.workContinuations.attachRun(
+        action.id,
+        `run_automatic_history_${index}`,
+        "queued",
+        action.updatedAt + index,
+      );
+    }
+    const task = {
+      id: action.id,
+      name: `继续：${item.title}`,
+      space: SPACE,
+      topic: "执行自动重试动作",
+      cadence: "daily" as const,
+      hour: 0,
+      enabled: false,
+      notify: true,
+      distillOnRun: false,
+      timeoutMinutes: 12,
+      createdAt: action.createdAt,
+      updatedAt: action.updatedAt,
+    };
+    const snapshot = engine.agentRunExecutionSnapshot(SPACE, true);
+    const parent = engine.taskRuns.start({
+      task,
+      trigger: "scheduled",
+      workItemId: item.id,
+      workActionId: action.id,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      executionPlan: snapshot.executionPlan,
+      skillEvidence: snapshot.skillEvidence,
+      distill: false,
+    });
+    engine.workItems.attachTaskRun(item.id, parent.id);
+    engine.workContinuations.attachRun(action.id, parent.id, "queued", parent.startedAt);
+    engine.taskRuns.begin(parent.id, parent.startedAt + 1);
+    engine.workContinuations.markRunning(action.id, parent.id, parent.startedAt + 1);
+    const finishedAt = parent.startedAt + 2;
+    const dueAt = finishedAt + 60_000;
+    engine.taskRuns.fail(parent.id, {
+      finishedAt,
+      error: "API Error: 429 Too Many Requests",
+      failure: { phase: "provider", kind: "rate_limited", retryable: true },
+      retry: {
+        attempt: 1,
+        maxAttempts: 2,
+        status: "waiting",
+        nextAttemptAt: dueAt,
+      },
+    });
+    engine.workContinuations.waitForRetry(
+      action.id,
+      "API Error: 429 Too Many Requests",
+      { runId: parent.id, finishedAt },
+    );
+    expect(engine.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "queued",
+      attempt: 100,
+    }));
+    expect(engine.workContinuations.get(action.id)?.taskRunIds).toHaveLength(100);
+    const taskRunCountBefore = engine.listTaskRuns().length;
+    const itemRunIdsBefore = engine.workItems.get(item.id)!.taskRunIds;
+
+    expect(engine.retryDueTaskRuns(dueAt)).toEqual([]);
+
+    expect(providerCalls).toBe(0);
+    expect(engine.listTaskRuns()).toHaveLength(taskRunCountBefore);
+    expect(engine.listTaskRuns().filter((run) => run.retryOf === parent.id)).toEqual([]);
+    expect(engine.getTaskRun(parent.id)?.retry).toEqual({
+      attempt: 1,
+      maxAttempts: 2,
+      status: "exhausted",
+    });
+    expect(engine.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "blocked",
+      attempt: 100,
+      error: expect.any(String),
+    }));
+    expect(engine.workContinuations.get(action.id)?.taskRunIds).toHaveLength(100);
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      taskRunIds: itemRunIdsBefore,
+      actionBlockers: { [action.id]: expect.any(String) },
+    }));
+  });
+
+  test("a Wiki page inherits work context from its raw provenance", async () => {
+    const workItem = engine.workItems.create({
+      space: SPACE,
+      title: "沉淀发布知识",
+    });
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "message",
+      content: "发布前必须完成回滚演练",
+    });
+    const releasePage = page("guides/release", "发布指南", "发布前完成回滚演练");
+    releasePage.sources = [rawId];
+
+    await engine.upsertPage(SPACE, releasePage);
+
+    expect(engine.workItems.get(workItem.id)?.pageSlugs).toEqual(["guides/release"]);
   });
 
   test("message author can retract a pending capture by chat and message id", async () => {
@@ -331,6 +2590,36 @@ describe("Knowledge seam contract", () => {
     expect(got?.title).toBe("Alice");
   });
 
+  test("upsertPage rejects non-admitted sources before changing disk or index", async () => {
+    const store = engine.registry.store(SPACE);
+    const rawId = store.index().insertRaw({
+      space: SPACE,
+      source: "task",
+      workActionId: "action-page-boundary",
+      admission: "held",
+      content: "still awaiting acceptance",
+    });
+    const fresh = {
+      ...page("entities/held-candidate", "Held", "must never be visible"),
+      sources: [rawId],
+    };
+
+    await expect(engine.upsertPage(SPACE, fresh)).rejects.toThrow("not admitted");
+    expect(store.readPageFile(fresh.slug)).toBeNull();
+    expect(store.index().getPage(fresh.slug)).toBeNull();
+
+    const baseline = page("entities/existing", "Existing", "trusted baseline");
+    await engine.upsertPage(SPACE, baseline);
+    await expect(engine.upsertPage(SPACE, {
+      ...baseline,
+      content: "attempted unaccepted replacement",
+      sources: [rawId],
+    })).rejects.toThrow("not admitted");
+    expect(store.readPageFile(baseline.slug)?.content).toContain("trusted baseline");
+    expect(store.readPageFile(baseline.slug)?.content).not.toContain("unaccepted");
+    expect(store.index().getPage(baseline.slug)?.content).toBe("trusted baseline");
+  });
+
   test("search unions across spaces", async () => {
     const other: SpaceId = "personal/ou_me";
     await engine.upsertPage(SPACE, page("entities/a", "A", "关于缓存策略"));
@@ -373,6 +2662,31 @@ describe("Knowledge seam contract", () => {
     expect(res.rebuilt).toBe(1);
     expect(res.corrupt).toEqual([]);
     expect(await engine.getPage(SPACE, "entities/alice")).not.toBeNull();
+  });
+
+  test("space restore rebuilds missing digest pages from the sanitized archive", async () => {
+    const sourceDir = join(dir, "digest-restore-source");
+    const source = new KnowledgeEngine({ dataDir: sourceDir });
+    source.ensureSpace(SPACE);
+    await source.upsertPage(
+      SPACE,
+      page("entities/trusted", "可信页面", "恢复后应出现在新摘要中"),
+    );
+    const exported = await source.exportSpace(SPACE);
+    source.close();
+    const sanitized = {
+      ...exported,
+      pages: exported.pages.filter((candidate) =>
+        !["index", "glossary", "overview"].includes(candidate.slug)
+      ),
+    };
+
+    expect(await engine.restoreSpace(sanitized)).toBe(SPACE);
+
+    const store = engine.registry.store(SPACE);
+    expect(store.index().getPage("index")?.content).toContain("可信页面");
+    expect(store.index().getPage("glossary")?.content).toContain("可信页面");
+    expect(store.index().getPage("overview")?.content).toContain("共 1 个知识页");
   });
 
   test("dream cycle stub is callable and returns a report", async () => {
@@ -453,6 +2767,35 @@ describe("Knowledge seam contract", () => {
     expect(engine.registry.store(SPACE).index().countRaw(true)).toBe(1);
   });
 
+  test("quarantine retry refuses a source that is no longer admitted", async () => {
+    engine.close();
+    const fake = new FakeLlm();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "task",
+      content: "先形成隔离记录，随后进入动作验收边界",
+    });
+    fake.queueJSON({
+      operations: [{ type: "concept", name: "held-retry", title: "Held Retry", rawIds: [rawId] }],
+      skippedRawIds: [],
+    });
+    fake.queueJSON({ title: "Held Retry", summary: "", content: "" });
+    await engine.runDreamCycle(SPACE);
+    const record = (await engine.listQuarantines(SPACE))[0]!;
+    expect(engine.registry.store(SPACE).index()
+      .reconcileWorkActionRawAdmission(rawId, "action-held-retry", "held")).toBe(true);
+
+    const result = await engine.retryQuarantine(SPACE, record.id);
+
+    expect(result).toEqual({
+      status: "failed",
+      id: record.id,
+      reason: "部分原始来源尚未通过动作验收、已被排除或不存在，无法安全重试",
+    });
+    expect(await engine.listQuarantines(SPACE)).toEqual([record]);
+  });
+
   test("an analysis failure keeps the quarantine and returns a fixed public reason", async () => {
     engine.close();
     const fake = new FakeLlm();
@@ -494,7 +2837,7 @@ describe("Knowledge seam contract", () => {
     expect(await engine.retryQuarantine(SPACE, record.id)).toEqual({
       status: "failed",
       id: record.id,
-      reason: "部分原始来源已不存在，无法安全重试",
+      reason: "部分原始来源尚未通过动作验收、已被排除或不存在，无法安全重试",
     });
     expect((await engine.listQuarantines(SPACE)).map((item) => item.id)).toEqual([record.id]);
   });
@@ -683,6 +3026,36 @@ describe("Knowledge seam contract", () => {
         lastExamined: 1,
       }),
     ]);
+  });
+
+  test("health separates ready, held, and excluded Raw counts", async () => {
+    await engine.remember({ space: SPACE, source: "message", content: "普通待提炼记录" });
+    await engine.remember({
+      space: SPACE,
+      source: "task",
+      admission: "held",
+      workActionId: "action-health-held",
+      content: "待动作验收记录",
+    });
+    const excludedId = await engine.remember({
+      space: SPACE,
+      source: "task",
+      admission: "held",
+      workActionId: "action-health-excluded",
+      content: "已排除记录",
+    });
+    engine.registry.store(SPACE).index()
+      .excludeRawAdmission(excludedId, "action-health-excluded");
+
+    const report = await engine.health();
+    const spaces = report.details?.spaces as Array<Record<string, unknown>>;
+
+    expect(spaces).toEqual([expect.objectContaining({
+      id: SPACE,
+      pendingRaw: 1,
+      heldRaw: 1,
+      excludedRaw: 1,
+    })]);
   });
 
   test("a task rejects a second run while its first run is active", async () => {
@@ -3067,6 +5440,602 @@ describe("Knowledge seam contract", () => {
       status: "failed",
       error: expect.stringMatching(/Skill.*changed/i),
     }));
+  });
+
+  test("an orphaned claimed action fails closed after restart and can be retried", async () => {
+    const recoveryDir = join(dir, "orphaned-work-action-recovery");
+    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    first.ensureSpace(SPACE);
+    const item = first.workItems.create({
+      space: SPACE,
+      title: "恢复孤儿动作",
+      nextActions: ["执行发布检查"],
+    });
+    const action = first.workContinuations.claimNext(item);
+    first.close();
+
+    const reopened = new KnowledgeEngine({
+      dataDir: recoveryDir,
+      runProvider: async () => completedWorkActionOutput("恢复后的检查通过"),
+    });
+
+    expect(reopened.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "blocked",
+      error: expect.stringContaining("没有关联的 Task Run"),
+    }));
+    expect(reopened.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      blockers: [expect.stringContaining("没有关联的 Task Run")],
+      nextActions: ["执行发布检查"],
+    }));
+
+    const retried = reopened.retryWorkAction(action.id);
+    expect(retried.run.retryOf).toBeUndefined();
+    expect((await retried.completion).status).toBe("succeeded");
+    expect(reopened.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "succeeded",
+      attempt: 1,
+      taskRunIds: [retried.run.id],
+    }));
+    expect(reopened.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      nextActions: [],
+    }));
+    reopened.close();
+  });
+
+  test("restart repairs a blocked WorkAction whose WorkItem blocker projection was interrupted", async () => {
+    const recoveryDir = join(dir, "blocked-work-action-projection-recovery");
+    const restoreDir = join(dir, "blocked-work-action-projection-restore");
+    engine.close();
+    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    first.ensureSpace(SPACE);
+    const item = first.workItems.create({
+      space: SPACE,
+      title: "恢复跨 Store 阻塞投影",
+      nextActions: ["执行发布检查"],
+    });
+    const action = first.workContinuations.claimNext(item);
+    const error = "工作动作恢复失败：模拟 action 已落盘但 WorkItem blocker 尚未落盘";
+    first.workContinuations.failClosed(action.id, error, action.updatedAt + 1);
+
+    expect(first.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "blocked",
+      error,
+    }));
+    expect(first.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      actionBlockers: {},
+    }));
+    first.close();
+
+    engine = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const projectedMessage = `执行发布检查：${error}`;
+    expect(engine.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "blocked",
+      error,
+    }));
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      blockers: [projectedMessage],
+      actionBlockers: { [action.id]: projectedMessage },
+      nextActions: ["执行发布检查"],
+    }));
+
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      blockers: [projectedMessage],
+      actionBlockers: { [action.id]: projectedMessage },
+    }));
+    const archive = parseSpaceArchive(await engine.exportSpace(SPACE));
+
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: restoreDir, runProvider: async () => "" });
+    expect(await engine.restoreSpace(archive)).toBe(SPACE);
+    expect(engine.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "blocked",
+      error,
+    }));
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      blockers: [projectedMessage],
+      actionBlockers: { [action.id]: projectedMessage },
+      nextActions: ["执行发布检查"],
+    }));
+  });
+
+  test("restart clears an abandoned action blocker while preserving blocked action projections", () => {
+    const recoveryDir = join(dir, "abandoned-work-action-projection-recovery");
+    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    first.ensureSpace(SPACE);
+
+    const abandonedItem = first.workItems.create({
+      space: SPACE,
+      title: "清理已放弃动作投影",
+      nextActions: ["执行已放弃动作"],
+    });
+    const abandonedAction = first.workContinuations.claimNext(abandonedItem);
+    const abandonedError = "旧动作已经失效";
+    const blockedBeforeAbandon = first.workContinuations.failClosed(
+      abandonedAction.id,
+      abandonedError,
+      abandonedAction.updatedAt + 1,
+    );
+    first.workItems.applyActionBlocker(
+      abandonedItem.id,
+      abandonedAction.id,
+      abandonedAction.instruction,
+      abandonedError,
+      blockedBeforeAbandon.updatedAt,
+    );
+    first.workContinuations.abandon(abandonedAction.id, blockedBeforeAbandon.updatedAt + 1);
+
+    const blockedItem = first.workItems.create({
+      space: SPACE,
+      title: "补回仍受阻动作投影",
+      nextActions: ["执行仍受阻动作"],
+    });
+    const claimedBlockedAction = first.workContinuations.claimNext(blockedItem);
+    const blockedError = "前置检查仍未通过";
+    first.workContinuations.failClosed(
+      claimedBlockedAction.id,
+      blockedError,
+      claimedBlockedAction.updatedAt + 1,
+    );
+
+    expect(first.workContinuations.get(abandonedAction.id)?.status).toBe("cancelled");
+    expect(first.workItems.get(abandonedItem.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      actionBlockers: { [abandonedAction.id]: expect.any(String) },
+    }));
+    expect(first.workContinuations.get(claimedBlockedAction.id)?.status).toBe("blocked");
+    expect(first.workItems.get(blockedItem.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      actionBlockers: {},
+    }));
+    first.close();
+
+    const assertRecoveredState = (reopened: KnowledgeEngine) => {
+      expect(reopened.workContinuations.get(abandonedAction.id)).toEqual(
+        expect.objectContaining({ status: "cancelled" }),
+      );
+      expect(reopened.workItems.get(abandonedItem.id)).toEqual(expect.objectContaining({
+        phase: "active",
+        blockers: [],
+        actionBlockers: {},
+        nextActions: ["执行已放弃动作"],
+      }));
+      expect(reopened.workContinuations.get(claimedBlockedAction.id)).toEqual(
+        expect.objectContaining({ status: "blocked", error: blockedError }),
+      );
+      expect(reopened.workItems.get(blockedItem.id)).toEqual(expect.objectContaining({
+        phase: "blocked",
+        blockers: [expect.stringContaining(blockedError)],
+        actionBlockers: {
+          [claimedBlockedAction.id]: expect.stringContaining(blockedError),
+        },
+        nextActions: ["执行仍受阻动作"],
+      }));
+    };
+
+    let reopened = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    assertRecoveredState(reopened);
+    reopened.close();
+
+    reopened = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    assertRecoveredState(reopened);
+    reopened.close();
+  });
+
+  test("a writable successful result remains pending acceptance after restart", async () => {
+    const recoveryDir = join(dir, "pending-work-acceptance-recovery");
+    const first = new KnowledgeEngine({
+      dataDir: recoveryDir,
+      runProvider: async () => "写入已完成",
+    });
+    first.ensureSpace(SPACE);
+    const agent = first.agents.create({
+      name: "writable continuation agent",
+      permission: "write",
+      workdir: recoveryDir,
+    });
+    first.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = first.workItems.create({
+      space: SPACE,
+      title: "恢复待验收结果",
+      nextActions: ["修改灰度配置"],
+    });
+    const pending = first.startWorkContinuation(item.id);
+    await first.approveTaskRun(pending.run.id, "operator").completion;
+    first.agents.update(agent.id, { permission: "read-only" });
+    first.close();
+
+    const reopened = new KnowledgeEngine({ dataDir: recoveryDir });
+
+    expect(reopened.workContinuations.get(pending.run.workActionId!)).toEqual(
+      expect.objectContaining({
+        status: "awaiting_acceptance",
+        checkpoint: undefined,
+        acceptances: [expect.objectContaining({
+          taskRunId: pending.run.id,
+          permission: "write",
+          status: "pending",
+        })],
+      }),
+    );
+    expect(reopened.workItems.get(item.id)?.nextActions).toEqual(["修改灰度配置"]);
+    reopened.close();
+  });
+
+  test("a read-only pending acceptance converges once after restart without replaying the provider", async () => {
+    const recoveryDir = join(dir, "automatic-work-acceptance-recovery");
+    const first = new KnowledgeEngine({ dataDir: recoveryDir });
+    first.ensureSpace(SPACE);
+    const item = first.workItems.create({
+      space: SPACE,
+      title: "恢复自动验收",
+      nextActions: ["执行只读检查"],
+    });
+    const action = first.workContinuations.claimNext(item);
+    const task = {
+      id: action.id,
+      name: `继续：${item.title}`,
+      space: SPACE,
+      topic: "执行只读检查",
+      cadence: "daily" as const,
+      hour: 0,
+      enabled: false,
+      notify: true,
+      distillOnRun: false,
+      timeoutMinutes: 12,
+      createdAt: action.createdAt,
+      updatedAt: action.updatedAt,
+    };
+    const snapshot = first.agentRunExecutionSnapshot(SPACE, true);
+    const run = first.taskRuns.start({
+      task,
+      trigger: "scheduled",
+      workItemId: item.id,
+      workActionId: action.id,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      executionPlan: snapshot.executionPlan,
+      skillEvidence: snapshot.skillEvidence,
+      distill: false,
+    });
+    first.workItems.attachTaskRun(item.id, run.id);
+    first.workContinuations.attachRun(action.id, run.id, "queued", run.startedAt);
+    first.taskRuns.begin(run.id, run.startedAt + 1);
+    first.workContinuations.markRunning(action.id, run.id, run.startedAt + 1);
+    const rawId = await first.remember({
+      space: SPACE,
+      source: "task",
+      content: "只读检查通过",
+      workItemId: item.id,
+    });
+    const finishedAt = run.startedAt + 2;
+    first.taskRuns.succeed(run.id, {
+      finishedAt,
+      output: "只读检查通过",
+      summary: "只读检查通过",
+      rawId,
+    });
+    first.workContinuations.submitForAcceptance(action.id, {
+      runId: run.id,
+      permission: "read-only",
+      summary: "只读检查通过",
+      rawId,
+      finishedAt,
+      report: {
+        version: 1,
+        outcome: "completed",
+        result: "只读检查通过",
+        blockers: [],
+        checks: [{ name: "只读检查", status: "passed" }],
+      },
+    });
+    first.close();
+
+    let providerCalls = 0;
+    const reopened = new KnowledgeEngine({
+      dataDir: recoveryDir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "must not replay";
+      },
+    });
+
+    expect(providerCalls).toBe(0);
+    expect(reopened.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "succeeded",
+      checkpoint: expect.objectContaining({ taskRunId: run.id, rawId }),
+      acceptances: [expect.objectContaining({
+        taskRunId: run.id,
+        status: "accepted",
+        mode: "automatic",
+      })],
+    }));
+    expect(reopened.workItems.get(item.id)?.nextActions).toEqual([]);
+    reopened.close();
+  });
+
+  test("a queued work action resumes after restart from its frozen action boundary", async () => {
+    const recoveryDir = join(dir, "queued-work-action-recovery");
+    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    first.ensureSpace(SPACE);
+    const agent = first.agents.create({
+      name: "queued continuation agent",
+      provider: "claude",
+      instruction: "Use the frozen continuation persona.",
+    });
+    first.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = first.workItems.create({
+      space: SPACE,
+      title: "恢复灰度检查",
+      nextActions: ["恢复后执行检查"],
+    });
+    const action = first.workContinuations.claimNext(item);
+    const task = {
+      id: action.id,
+      name: `继续：${item.title}`,
+      space: SPACE,
+      topic: "冻结工作上下文\n本次动作：恢复后执行检查",
+      cadence: "daily" as const,
+      hour: 0,
+      enabled: false,
+      notify: true,
+      distillOnRun: false,
+      timeoutMinutes: 12,
+      createdAt: action.createdAt,
+      updatedAt: action.updatedAt,
+    };
+    const snapshot = first.agentRunExecutionSnapshot(SPACE, true);
+    const queued = first.taskRuns.start({
+      task,
+      trigger: "scheduled",
+      workItemId: item.id,
+      workActionId: action.id,
+      agentId: snapshot.agent?.id,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      executionPlan: snapshot.executionPlan,
+      skillEvidence: snapshot.skillEvidence,
+      distill: false,
+    });
+    first.agents.update(agent.id, { instruction: "Changed live persona." });
+    first.close();
+
+    let observedSystem: string | undefined;
+    const reopened = new KnowledgeEngine({
+      dataDir: recoveryDir,
+      recoverInterruptedTaskRuns: true,
+      runProvider: async (_provider, input) => {
+        observedSystem = input.system;
+        return completedWorkActionOutput("恢复检查完成");
+      },
+    });
+    const resumed = reopened.resumeQueuedTaskRuns();
+    const report = await resumed[0]!.completion;
+
+    expect(resumed).toHaveLength(1);
+    expect(report.ok).toBe(true);
+    expect(observedSystem).toBe("Use the frozen continuation persona.");
+    expect(reopened.workContinuations.get(action.id)).toEqual(
+      expect.objectContaining({ status: "succeeded" }),
+    );
+    expect(reopened.workItems.get(item.id)?.nextActions).toEqual([]);
+    reopened.close();
+  });
+
+  test("an interrupted running work action becomes blocked instead of replaying after restart", () => {
+    const recoveryDir = join(dir, "interrupted-work-action-recovery");
+    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    first.ensureSpace(SPACE);
+    const item = first.workItems.create({
+      space: SPACE,
+      title: "中断的灰度检查",
+      nextActions: ["修改灰度配置"],
+    });
+    const action = first.workContinuations.claimNext(item);
+    const task = {
+      id: action.id,
+      name: `继续：${item.title}`,
+      space: SPACE,
+      topic: "修改灰度配置",
+      cadence: "daily" as const,
+      hour: 0,
+      enabled: false,
+      notify: true,
+      distillOnRun: false,
+      timeoutMinutes: 12,
+      createdAt: action.createdAt,
+      updatedAt: action.updatedAt,
+    };
+    const snapshot = first.agentRunExecutionSnapshot(SPACE, true);
+    const run = first.taskRuns.start({
+      task,
+      trigger: "scheduled",
+      workItemId: item.id,
+      workActionId: action.id,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      executionPlan: snapshot.executionPlan,
+      skillEvidence: snapshot.skillEvidence,
+      distill: false,
+    });
+    first.taskRuns.begin(run.id, run.startedAt + 1);
+    first.workItems.attachTaskRun(item.id, run.id);
+    first.workContinuations.attachRun(action.id, run.id, "queued", run.startedAt);
+    first.workContinuations.markRunning(action.id, run.id, run.startedAt + 1);
+    first.close();
+
+    let providerCalls = 0;
+    const reopened = new KnowledgeEngine({
+      dataDir: recoveryDir,
+      recoverInterruptedTaskRuns: true,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "must not replay";
+      },
+    });
+
+    expect(reopened.resumeQueuedTaskRuns()).toEqual([]);
+    expect(providerCalls).toBe(0);
+    expect(reopened.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "blocked",
+      error: expect.stringContaining("完成前停止"),
+    }));
+    expect(reopened.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      blockers: [expect.stringContaining("完成前停止")],
+      nextActions: ["修改灰度配置"],
+    }));
+    reopened.close();
+  });
+
+  test("recovery keeps a WorkAction cancelled when its running Run is recovered as failed", () => {
+    const recoveryDir = join(dir, "cancelled-running-work-action-recovery");
+    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    first.ensureSpace(SPACE);
+    const item = first.workItems.create({
+      space: SPACE,
+      title: "恢复已取消运行中动作",
+      nextActions: ["执行可取消动作"],
+    });
+    const action = first.workContinuations.claimNext(item);
+    const task = {
+      id: action.id,
+      name: `继续：${item.title}`,
+      space: SPACE,
+      topic: "执行可取消动作",
+      cadence: "daily" as const,
+      hour: 0,
+      enabled: false,
+      notify: true,
+      distillOnRun: false,
+      timeoutMinutes: 12,
+      createdAt: action.createdAt,
+      updatedAt: action.updatedAt,
+    };
+    const snapshot = first.agentRunExecutionSnapshot(SPACE, true);
+    const run = first.taskRuns.start({
+      task,
+      trigger: "scheduled",
+      workItemId: item.id,
+      workActionId: action.id,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      executionPlan: snapshot.executionPlan,
+      skillEvidence: snapshot.skillEvidence,
+      distill: false,
+    });
+    first.workItems.attachTaskRun(item.id, run.id);
+    first.workContinuations.attachRun(action.id, run.id, "queued", run.startedAt);
+    first.taskRuns.begin(run.id, run.startedAt + 1);
+    first.workContinuations.markRunning(action.id, run.id, run.startedAt + 1);
+    first.workContinuations.cancel(action.id, run.startedAt + 2);
+    expect(first.getTaskRun(run.id)?.status).toBe("running");
+    expect(first.workContinuations.get(action.id)?.status).toBe("cancelled");
+    first.close();
+
+    let reopened: KnowledgeEngine | undefined;
+    expect(() => {
+      reopened = new KnowledgeEngine({
+        dataDir: recoveryDir,
+        recoverInterruptedTaskRuns: true,
+        runProvider: async () => "must not replay",
+      });
+    }).not.toThrow();
+    expect(reopened!.getTaskRun(run.id)).toEqual(expect.objectContaining({
+      status: "failed",
+      error: expect.stringContaining("完成前停止"),
+    }));
+    expect(reopened!.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "cancelled",
+      acceptances: [],
+      checkpoint: undefined,
+    }));
+    expect(reopened!.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      nextActions: ["执行可取消动作"],
+    }));
+    expect(reopened!.resumeQueuedTaskRuns()).toEqual([]);
+    reopened!.close();
+  });
+
+  test("a late succeeded Run cannot resurrect a cancelled WorkAction", () => {
+    const recoveryDir = join(dir, "cancelled-late-success-work-action-recovery");
+    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    first.ensureSpace(SPACE);
+    const item = first.workItems.create({
+      space: SPACE,
+      title: "忽略终止信号的动作",
+      nextActions: ["执行可取消检查"],
+    });
+    const action = first.workContinuations.claimNext(item);
+    const task = {
+      id: action.id,
+      name: `继续：${item.title}`,
+      space: SPACE,
+      topic: "执行可取消检查",
+      cadence: "daily" as const,
+      hour: 0,
+      enabled: false,
+      notify: true,
+      distillOnRun: false,
+      timeoutMinutes: 12,
+      createdAt: action.createdAt,
+      updatedAt: action.updatedAt,
+    };
+    const snapshot = first.agentRunExecutionSnapshot(SPACE, true);
+    const run = first.taskRuns.start({
+      task,
+      trigger: "scheduled",
+      workItemId: item.id,
+      workActionId: action.id,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      executionPlan: snapshot.executionPlan,
+      skillEvidence: snapshot.skillEvidence,
+      distill: false,
+    });
+    first.workItems.attachTaskRun(item.id, run.id);
+    first.workContinuations.attachRun(action.id, run.id, "queued", run.startedAt);
+    first.taskRuns.begin(run.id, run.startedAt + 1);
+    first.workContinuations.markRunning(action.id, run.id, run.startedAt + 1);
+
+    // Simulate a provider that ignored abort and durably reported success only
+    // after the user's cancellation decision had already been persisted.
+    first.workContinuations.cancel(action.id, run.startedAt + 2);
+    first.taskRuns.succeed(run.id, {
+      finishedAt: run.startedAt + 3,
+      output: completedWorkActionOutput("晚到的成功结果"),
+      summary: "晚到的成功结果",
+    });
+    expect(first.getTaskRun(run.id)?.status).toBe("succeeded");
+    expect(first.workContinuations.get(action.id)?.status).toBe("cancelled");
+    first.close();
+
+    const reopened = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    expect(reopened.getTaskRun(run.id)?.status).toBe("succeeded");
+    expect(reopened.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "cancelled",
+      acceptances: [],
+      checkpoint: undefined,
+    }));
+    expect(reopened.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      completedActionIds: [],
+      nextActions: ["执行可取消检查"],
+    }));
+    reopened.close();
   });
 
   test("a legacy queued task without an execution plan fails closed on recovery", async () => {

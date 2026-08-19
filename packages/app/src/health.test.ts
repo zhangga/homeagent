@@ -352,6 +352,51 @@ describe("system health reporter", () => {
     engine.close();
   });
 
+  test("sums held and excluded Raw for observability without degrading readiness", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-raw-admission-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    engine.ensureSpace("team/oc_health_a", { chatId: "oc_health_a" });
+    engine.ensureSpace("team/oc_health_b", { chatId: "oc_health_b" });
+    const readCoreHealth = engine.health.bind(engine);
+    engine.health = async () => {
+      const health = await readCoreHealth();
+      const spaces = (health.details?.spaces as Array<Record<string, unknown>>).map((space) => ({
+        ...space,
+        heldRaw: space.id === "team/oc_health_a" ? 2 : 1,
+        excludedRaw: space.id === "team/oc_health_a" ? 1 : 4,
+      }));
+      return { ...health, details: { ...health.details, spaces } };
+    };
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" },
+      ],
+      requiredProviderIds: () => ["codex"],
+    });
+
+    const snapshot = await reportHealth();
+    engine.close();
+    expect(snapshot.ready).toBe(true);
+    expect(snapshot.status).toBe("ok");
+    expect(snapshot.components.knowledge).toEqual(expect.objectContaining({
+      status: "ok",
+      summary: "2 个空间，0 条待提炼，3 条待验收，5 条已排除",
+      details: expect.objectContaining({ heldRaw: 3, excludedRaw: 5 }),
+    }));
+  });
+
   test("quarantined distillations degrade knowledge health without blocking readiness", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hb-health-quarantine-"));
     dirs.push(dir);

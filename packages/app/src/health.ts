@@ -22,6 +22,7 @@ export interface SystemHealthSources {
   feishuLocallyDisabled?: () => boolean;
   dreamSchedulerHealth: () => RuntimeLoopHealth | undefined;
   taskSchedulerHealth: () => RuntimeLoopHealth | undefined;
+  workContinuationSchedulerHealth?: () => RuntimeLoopHealth | undefined;
   reminderSchedulerHealth?: () => RuntimeLoopHealth | undefined;
   learningSchedulerHealth?: () => RuntimeLoopHealth | undefined;
   runtimeHealth?: () => OrchestratorHealth;
@@ -116,14 +117,22 @@ export function createSystemHealthReporter(
         (sum, space) => sum + (typeof space.pendingRaw === "number" ? space.pendingRaw : 0),
         0,
       );
+      const heldRaw = spaces.reduce(
+        (sum, space) => sum + (typeof space.heldRaw === "number" ? space.heldRaw : 0),
+        0,
+      );
+      const excludedRaw = spaces.reduce(
+        (sum, space) => sum + (typeof space.excludedRaw === "number" ? space.excludedRaw : 0),
+        0,
+      );
       const quarantined = spaces.reduce(
         (sum, space) => sum + (typeof space.quarantined === "number" ? space.quarantined : 0),
         0,
       );
       components.knowledge = {
         status: core.ok ? quarantined > 0 ? "degraded" : "ok" : "down",
-        summary: `${core.spaces} 个空间，${pending} 条待提炼${quarantined > 0 ? `，${quarantined} 条提炼失败待恢复` : ""}`,
-        details: { ...core.details, quarantined },
+        summary: `${core.spaces} 个空间，${pending} 条待提炼${heldRaw > 0 ? `，${heldRaw} 条待验收` : ""}${excludedRaw > 0 ? `，${excludedRaw} 条已排除` : ""}${quarantined > 0 ? `，${quarantined} 条提炼失败待恢复` : ""}`,
+        details: { ...core.details, heldRaw, excludedRaw, quarantined },
       };
     } catch (err) {
       core = { ok: false, spaces: 0, details: { error: String(err) } };
@@ -357,6 +366,12 @@ export function createSystemHealthReporter(
     const taskHealth = taskLoop.health;
     components.dreamScheduler = dreamLoop.component;
     components.taskScheduler = taskLoop.component;
+    const workContinuationLoop = sources.workContinuationSchedulerHealth
+      ? probeLoopComponent("工作续跑调度器", sources.workContinuationSchedulerHealth)
+      : undefined;
+    if (workContinuationLoop) {
+      components.workContinuationScheduler = workContinuationLoop.component;
+    }
     const reminderLoop = sources.reminderSchedulerHealth
       ? probeLoopComponent("提醒调度器", sources.reminderSchedulerHealth)
       : undefined;
@@ -393,6 +408,10 @@ export function createSystemHealthReporter(
       dreamHealth.lastStatus !== "error" &&
       taskHealth?.started === true &&
       taskHealth.lastStatus !== "error" &&
+      (!workContinuationLoop || (
+        workContinuationLoop.health?.started === true
+        && workContinuationLoop.health.lastStatus !== "error"
+      )) &&
       (!reminderLoop || (
         reminderLoop.health?.started === true
         && reminderLoop.health.lastStatus !== "error"
