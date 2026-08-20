@@ -12,6 +12,7 @@ const REQUIRED_FILES = [
   ".github/workflows/ci.yml",
   ".github/workflows/release-macos.yml",
   "docs/beta-release-runbook.md",
+  "scripts/soak-feishu-e2e.ts",
   "quality/evaluation-cases.json",
   "assets/brand/homeagent-mark.svg",
   "assets/brand/homeagent-glyph.svg",
@@ -27,6 +28,35 @@ const SIGNING_ENVIRONMENT = [
   "APPLE_TEAM_ID",
   "APPLE_APP_PASSWORD",
 ] as const;
+
+const RELEASE_SPACE_ARCHIVE_CONTRACT = "homeagent.space v14";
+const RELEASE_AGENT_SOAK_SCENARIOS = [
+  "agent_revision_lifecycle",
+  "writable_task_approval",
+  "readonly_task_retry",
+] as const;
+const RELEASE_WORKFLOW_REQUIRED_COMMANDS = [
+  "bun run evaluate:quality",
+  "bun run verify:crash-recovery",
+  "bun run verify:beta -- --checks-only",
+] as const;
+const RELEASE_WORKFLOW_REQUIRED_SETTINGS = ["draft: true", "prerelease: true"] as const;
+
+function hasWorkflowRunCommand(workflow: string, command: string): boolean {
+  return workflow.split(/\r?\n/).some((line) => line.trim() === `- run: ${command}`);
+}
+
+function hasWorkflowSetting(workflow: string, setting: string): boolean {
+  return workflow.split(/\r?\n/).some((line) => line.trim() === setting);
+}
+
+function declaredAgentPlatformSoakScenarios(source: string): Set<string> {
+  const declaration = /export const AGENT_PLATFORM_SOAK_SCENARIOS\s*=\s*\[([\s\S]*?)\]\s*as const/.exec(source);
+  if (!declaration) return new Set();
+  return new Set(
+    [...declaration[1]!.matchAll(/["']([^"']+)["']/g)].map((match) => match[1]!),
+  );
+}
 
 interface CommandResult {
   code: number;
@@ -100,6 +130,36 @@ export async function verifyBetaReadiness(
     || !/^\d+\.\d+\.\d+-beta(?:\.[0-9A-Za-z.-]+)?$/u.test(pkg.version)
   ) {
     throw new Error("package.json must contain a semantic beta version");
+  }
+  const releaseRunbook = readFileSync(
+    join(repoRoot, "docs/beta-release-runbook.md"),
+    "utf8",
+  );
+  if (!releaseRunbook.includes(RELEASE_SPACE_ARCHIVE_CONTRACT)) {
+    throw new Error(
+      `beta release runbook must document ${RELEASE_SPACE_ARCHIVE_CONTRACT}`,
+    );
+  }
+  const soakDriver = readFileSync(join(repoRoot, "scripts/soak-feishu-e2e.ts"), "utf8");
+  const declaredSoakScenarios = declaredAgentPlatformSoakScenarios(soakDriver);
+  for (const scenario of RELEASE_AGENT_SOAK_SCENARIOS) {
+    if (!releaseRunbook.includes(scenario) || !declaredSoakScenarios.has(scenario)) {
+      throw new Error(`beta release contract is missing Agent soak scenario: ${scenario}`);
+    }
+  }
+  const releaseWorkflow = readFileSync(
+    join(repoRoot, ".github/workflows/release-macos.yml"),
+    "utf8",
+  );
+  for (const command of RELEASE_WORKFLOW_REQUIRED_COMMANDS) {
+    if (!hasWorkflowRunCommand(releaseWorkflow, command)) {
+      throw new Error(`macOS tag release workflow must run ${command}`);
+    }
+  }
+  for (const setting of RELEASE_WORKFLOW_REQUIRED_SETTINGS) {
+    if (!hasWorkflowSetting(releaseWorkflow, setting)) {
+      throw new Error(`macOS tag release workflow must keep candidate assets private with ${setting}`);
+    }
   }
   if (!options.allowDirty) {
     const status = await mustRun(runner, ["git", "status", "--porcelain"], repoRoot);

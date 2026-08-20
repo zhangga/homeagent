@@ -1,4 +1,7 @@
-import type { DetectedProvider } from "@homeagent/llm";
+import {
+  providerSupportsOrdinaryCompletion,
+  type DetectedProvider,
+} from "@homeagent/llm";
 import type { LarkSetupStatus } from "@homeagent/shared";
 import type { FeishuRuntimeStatus } from "./integrations.ts";
 
@@ -22,7 +25,9 @@ export interface SetupSnapshotInput {
 
 export function buildSetupSnapshot(input: SetupSnapshotInput): SetupSnapshot {
   const selectedProviderReady = input.providers.some(
-    (provider) => provider.id === input.defaultProvider && provider.available,
+    (provider) => provider.id === input.defaultProvider
+      && provider.available
+      && providerSupportsOrdinaryCompletion(provider.id),
   );
   const larkReady = input.lark.state === "ready" && input.lark.verified;
   const runtimeReady = larkReady && !input.restartRequired && input.runtime.ready;

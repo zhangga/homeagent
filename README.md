@@ -2,7 +2,7 @@
 
 深度绑定飞书的团队/家庭 AI 知识库 Agent。定位是「最了解我们的 agent」：它常驻飞书群与私聊，
 默默收录大家分享的知识，夜间提炼成 wiki 知识页，并在被 @ 或私聊时基于知识库作答（带引用）；也能按天带读一本书，提问、反馈并记录进度。
-回复飞书图片或含图片的富文本消息后，可以直接让 Codex Agent 分析视觉内容。
+图片仍会作为受治理的消息附件保存；Codex 普通会话可通过临时只读模式接收原生图片输入，其他不支持图片的 Provider 会明确提示能力边界。
 
 知识引擎借鉴 [`nashsu/llm_wiki`](https://github.com/nashsu/llm_wiki) 的设计（项目明确采用无 embedding 路线：
 中文 CJK bigram、整页范式、成熟的 ingest/检索思路）与 `gbrain` 的 dream cycle 思路，
@@ -40,18 +40,21 @@ data/workspaces/<dir>/
 
 ## 普通用户安装（macOS 13+）
 
-正式发布后，普通用户只需下载与 Mac 架构对应的 DMG，把 `HomeAgent.app` 拖入“应用程序”并双击：
+目标的正式发布体验是：普通用户只需下载与 Mac 架构对应的 DMG，把 `HomeAgent.app` 拖入“应用程序”并双击。
+当前候选尚未满足下面第 2 步的无终端要求，因此不能按此标准对外放量：
 
 1. HomeAgent 自动安装并启动当前用户的后台服务，然后在默认浏览器打开设置向导。
-2. 点击“安装并连接 ChatGPT”，明确同意后由 HomeAgent 下载、校验并安装 OpenAI 官方 Codex；登录在
-   OpenAI 官方页面完成，不需要复制 API Key。
+2. 设置向导会检查可用于普通对话的 Claude 或 Codex CLI。Claude 使用严格 no-tools 模式；Codex 使用
+   `ephemeral + ignore config/rules + read-only` 限制模式，并以绑定 Agent 的 Workdir（如已配置）作为只读上下文根目录。Codex 可在向导中安装并登录，Claude 仍需预先安装并登录。
 3. 点击“一键创建飞书机器人”，在飞书页面确认。HomeAgent 会自动申请运行权限、验证机器人身份，并引导完成消息监听。
 4. 消息监听就绪后首次设置即完成。之后把机器人加入企业内部群聊，群主或管理员按群内提示发送
    “@HomeAgent 启用群聊”；确认前 HomeAgent 不会读取或记录该群消息。
 5. 如需加入外部群，完成首次设置后在“飞书连接”的可选对外共享配置中打开当前应用；完成飞书版本发布和管理员审批后，用一条真实外部群消息验证。
 
-应用包已自带 Bun 运行时、`lark-cli` 和 macOS 附件提取助手，用户不需要安装 Git、Bun、Node、npm、
-Homebrew 或全局 CLI。知识数据保存在 `~/Library/Application Support/HomeAgent`，日志保存在
+应用包已自带 Bun 运行时、`lark-cli` 和 macOS 附件提取助手，用户不需要安装 Git、Bun、Node、npm 或
+Homebrew。当前候选版仍需单独安装并登录 Claude；在 HomeAgent 提供受托管的 Claude 安装/登录路径前，
+“全新用户无终端安装”仍是发布阻塞项，不能以预装 Claude 的内部 Soak 代替。知识数据保存在
+`~/Library/Application Support/HomeAgent`，日志保存在
 `~/Library/Logs/HomeAgent`；替换应用版本不会覆盖知识数据。
 
 需要统一飞书机器人头像时，可在 HomeAgent 的“飞书连接”页面下载本地品牌头像 PNG，再到飞书开放平台手动上传。
@@ -63,7 +66,8 @@ HomeAgent 不会自动修改任何已有飞书应用；上传后请在飞书的�
 ## 从源码运行的环境要求
 
 - **Bun**（`curl -fsSL https://bun.sh/install | bash`），Node v22 仅作参考。
-- **Agent CLI**：至少安装并登录 `claude`、`codex`、`trae-cli` 之一。旧 LLM 网关仅用于兼容测试，生产主流程不依赖它。
+- **Agent CLI**：普通问答、提炼和学习可使用已登录的 `claude` 或 `codex`。Claude 使用 strict no-tools
+  completion；Codex 使用临时、忽略用户配置与规则的只读执行，并从绑定 Agent 的 Workdir（如已配置）检索上下文。`trae-cli` 仅用于显式任务。旧 LLM 网关仅用于兼容测试，生产主流程不依赖它。
 - **飞书 `lark-cli`**：需已安装并可执行。首次启动可在浏览器里一键创建并验证飞书应用；
   附件下载使用 bot 身份，应用需开通 `im:message:readonly` 权限。读取用户文档时的 user 授权仍由
   `lark-cli auth login` 管理。
@@ -177,35 +181,39 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 左侧导航包含：
 
 - **空间 / 知识**：空间列表、知识页、原始条目、问答测试、手动触发提炼，以及提炼失败记录的单条/批量恢复。支持编辑 `purpose.md` / `schema.md`、查看完整原始记录及其关联知识页、单条重新提炼、固定目标重新生成、删除知识页和提交可追溯的人工纠错；所有人工治理操作都会写入审计记录。
-- **Agents**（三栏工作台）：左侧选择 Agent，中间编辑配置，右侧查看真实的 CLI 状态、当前空间/飞书群绑定和该 Agent 最近处理的 Chat / 研究任务运行。Chat 记录会固定归属到实际处理它的 Agent，并可从 Recent runs 进入对应的原始消息详情。支持新建 / 编辑 / 删除，配置 **名称、Provider、Instruction（人格，会注入到回答）、Model、推理强度、Visibility、Permission、Workdir、Pinned Skills**；所有更改都要显式保存，不会自动写入。
+- **Agents**（三栏工作台）：左侧选择 Agent，中间编辑配置，右侧查看真实的 CLI 状态、当前空间/飞书群绑定和该 Agent 最近处理的 Chat / 研究任务运行。Chat 记录会固定归属到实际处理它的 Agent，并可从 Recent runs 进入对应的原始消息详情。支持新建 / 删除，以及配置 **名称、Provider、Instruction（人格，会注入到回答）、Model、推理强度、Visibility、Permission、Workdir、Pinned Skills**；编辑先保存为草稿，显式发布后才影响未来运行，发布历史不可变并支持通过新版本回滚，避免在途运行被原地改写。
   - 桌面端保持三栏并可拖拽或用方向键调整栏宽；窄屏把右侧信息收进详情抽屉，手机端在 Agent 列表和详情之间切换。页面不显示 HomeAgent 没有实现的 Mew Device、Repository、Environment、Concurrency 或独立 Chats 模块。
-  - **Provider = 本机已安装的 agent CLI**（`claude` / `codex` / `trae-cli`）。**所有 LLM 工作（自然对话/问答 ask + 提炼 dream + 任务）都通过当前空间配置的本机 CLI 子进程执行，homeagent 不直连任何网络 API**。普通消息不再先调用一次通用意图分类：明确的副作用操作由窄规则处理，其他表达默认交给 Agent 自然回应，指代不清时只追问一个关键问题。后台**探测本机** CLI，只让可用的可选（装了但跑不了的灰显并标注原因，如 WSL 下无 Linux node 的 codex）。
+  - **Provider = 本机已安装的 agent CLI**（`claude` / `codex` / `trae-cli`）。所有 LLM 工作都通过当前空间配置的本机 CLI 子进程执行，homeagent 不直连网络 API。普通问答、提炼和学习使用受限调用：Claude 使用 safe mode、禁用全部工具且不保存会话；Codex 使用 ephemeral、忽略用户配置/规则、禁止审批并启用 read-only sandbox，同时以绑定 Agent 的 Workdir（如已配置）作为当前目录；TRAE 当前仍只用于显式任务。后台会探测本机 CLI 的安装和可运行状态。
   - **Pinned Skill 绑定属于 Agent，不属于群聊**：飞书群绑定团队空间，空间再绑定 Team Agent；个人空间绑定 Personal Agent。因此不同群可以使用不同 Agent，并自然获得各自的 Instruction、Provider、Model 与显式固定能力。Agent 编辑器只扫描并选择 `~/.agents/skills` 中的共享 Skill，不接受 Git URL 或任意路径输入。
-  - **全局继承是默认行为**：Agent 没有固定任何 Skill 时，Codex、Claude 或 TRAE 仍可按各自的默认规则使用电脑上安装的全局 Skills；固定后的 Pinned Skills 才由 HomeAgent 在每次调用时显式解析与加载。空列表不表示“禁用全部 Skills”。
+  - **不继承隐式能力**：普通受限调用不会加载用户级规则、Hooks、Plugins、MCP 或全局 Skills，也不会把 Provider 会话写入全局历史。只有显式任务才会按冻结的执行计划启用工具；固定的 Pinned Skills 会在任务执行前重新核验。
   - **本机 Skill 目录**：共享 Skill 来自 `~/.agents/skills`，选择器按来源保存精确绑定；同名同内容合并展示，同名不同内容标出冲突。后端仍识别 Codex、Claude 和 TRAE 的原生 Skill 目录，用于运行时解析、优先级和遮蔽判断，但 Provider 专属 Skill 不在普通清单或选择器中重复展示。页面不暴露绝对路径或 `SKILL.md` 正文。
-  - **Pinned Skill 执行边界**：普通问答、提炼和学习都会显式加载空间 Agent 的 Pinned Skills，但始终使用 `read-only` 且不传 Workdir；研究任务加载同一组 Pinned Skills，并使用 Agent 的 Permission / Workdir。每次调用前都会重新核对文件、名称与内容哈希；缺失、损坏、不兼容或被遮蔽的 Skill 会被跳过，基础 Agent 继续运行，并在问答或任务通知中给出安全警告。
-  - **图片分析使用 Codex 的原生视觉输入**：在飞书中回复图片或含图片的富文本消息，再说“分析一下”“看看这张图”等即可。每次最多传入 4 张、总计 20 MiB，回答完成后立即清理临时文件；下载失败或当前 Agent 不是 Codex 时会明确提示，不会假装已经看过图片。
+  - **Pinned Skill 执行边界**：研究任务加载冻结的 Pinned Skills，并使用 Agent 的 Permission / Workdir。每次真正执行前都会重新核对来源、名称及完整目录树的路径、文件模式与内容摘要；缺失、损坏、不兼容、资源超限或被遮蔽时 fail-closed，不会静默换成同名的新内容。普通问答/提炼为保持受限执行，暂不执行本机 Skill。
+  - **图片输入的安全边界**：Codex 临时只读普通会话支持原生图片参数（每次最多 4 张）；其他不支持图片输入的 Provider 会明确失败，不会假装已经看过图片。
   - **Model 随 Provider 变化**：切 Provider 时 Model 下拉自动换成该 provider 的维护清单（CLI 无“列模型”接口）；Codex 当前提供 `gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna / gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex-spark`。其中 `gpt-5.6-sol` 是 GPT-5.6 Sol 的完整模型 ID；HomeAgent 日常问答优先选择较快、成本更低的 `gpt-5.6-luna`，复杂研究可选择 `gpt-5.6-terra` 或 `gpt-5.6-sol`。
-  - **推理强度按 Agent 配置**：Codex Agent 可选择继承默认值，或从当前模型支持的档位中选择；GPT-5.6 系列支持 `none / low / medium / high / xhigh / max`，旧模型不会显示不支持的档位。普通问答建议从 `medium` 开始，级别越高通常耗时和 token 越多。其他 Provider 暂不传递此配置。
+  - **推理强度按 Agent 配置**：Codex Agent 可选择继承默认值，或从当前模型支持的档位中选择；GPT-5.6 系列支持 `none / low / medium / high / xhigh / max`，旧模型不会显示不支持的档位。此配置当前用于显式 Codex 任务；其他 Provider 暂不传递。
   - **Visibility 会限制空间绑定**：Team Agent 只能绑定群空间；Personal Agent 只能绑定个人空间。群设置只展示 Team Agent，个人空间详情页只展示 Personal Agent，后端也会拒绝类型不匹配的绑定。已有不兼容绑定时不能直接切换 Visibility，必须先解除绑定；显式删除 Agent 则会先一次性清除所有绑定，让这些空间回退到默认 AI。
-  - **任务权限会真实映射到 CLI 沙箱**：`read-only` 开启只读工具并禁止写入，`write` 以 Workdir 为工作根目录并启用 Provider 的工作区写入模式，`full` 会绕过 Provider 沙箱。`write/full` 必须配置存在的 Workdir。Permission 与 Workdir 只影响研究任务；Skills 则属于 Agent 的统一能力，并遵守上一条的普通调用只读边界。
+  - **任务权限会真实映射到 CLI 沙箱**：`read-only` 开启只读工具并禁止写入，`write` 以 Workdir 为工作根目录并启用 Provider 的工作区写入模式，`full` 会绕过 Provider 沙箱。`write/full` 必须配置存在的 Workdir；高权限运行还必须经过持久化人工审批。Permission 与 Skills 只作用于显式任务；Workdir 还会作为普通 Codex 受限调用的只读上下文目录，但不会因此获得 Agent 配置的写入权限。
 - **Skills**（共享能力清单）：只读展示 `~/.agents/skills` 中可跨 Provider 分配的共享 Skills、同名冲突/无效配置，以及反向的 **Used by Agents**。Codex、Claude 和 TRAE 的 Provider 专属 Skills 仍由各自 CLI 自动发现，HomeAgent 后端保留扫描用于运行时解析和冲突诊断，但不在普通清单和 Agent 选择器中重复展示。支持本地搜索、状态筛选和手动刷新；安装与更新仍由本机 CLI/Skill 管理工具负责。
 - **任务**（研究任务执行）：新建定期任务，让某空间的 Agent CLI 定期研究一个主题；产出**存为该空间的原始材料**（`source=task`），**运行结束立即触发一次本空间提炼**（当场变成 wiki 知识页，而非等夜间），并可**推送摘要到该空间绑定的飞书群/私聊**。
   - 字段：名称、目标空间、研究主题、周期（每天几点 / 每小时）、最长运行时间、启用开关、推送开关、完成后立即提炼开关。
-  - **定时**（TaskScheduler，每任务独立周期，启动即 catch-up）+ **后台「立即运行」**。每次启动会立即生成持久化运行编号，并保存启动时实际采用的 Agent、Provider、Model 与 Skill 解析证据；之后即使空间重新绑定、Agent 改配置或本机 Skill 文件变化，历史归属和当次实际加载/跳过情况也不会被改写。任务详情页可查看状态、触发来源、耗时、完整输出或错误，并可重试失败、取消或超时的运行；Agent 工作台按准确归属展示最近记录。
-  - 同一任务只允许一个活动运行；后台、定时调度和飞书命令共享互斥保护，不会重复执行。任务可配置 1–60 分钟的运行上限，后台可取消活动运行，超时或取消都会向本机 CLI 发出终止信号并保存独立状态。每个任务保留最近 100 条完成记录，应用异常退出时未完成记录会自动标为失败。
+  - **定时**（TaskScheduler，每任务独立周期，启动即 catch-up）+ **后台「立即运行」**。每次启动会立即生成持久化运行编号，并冻结当时的 Agent 发布版本、Instruction、Provider、Model、Permission、Workdir 与完整 Skill 证据；之后即使空间重新绑定、Agent 发布新版本或本机 Skill 变化，当次计划也不会被替换。任务详情页可查看状态、触发来源、耗时、用量/成本覆盖、完整输出或错误，并可重试失败、取消或超时的运行；Agent 工作台按准确归属展示最近记录。
+  - `write/full` 运行先进入持久化人工审批，页面展示真正被冻结的主题、权限、Workdir、Provider、Model、Agent 版本和计划摘要；审批 24 小时过期，批准、拒绝、过期、通知尝试均留审计。`read-only` 保持直接排队，但仍使用冻结计划并在执行前重新核验 Workdir 与 Skill。
+  - 同一任务只允许一个活动运行；后台、定时调度和飞书命令共享互斥保护，不会重复执行。任务可配置 1–60 分钟的运行上限，后台可取消活动运行，超时或取消都会等待本机 CLI 退出或达到安全上限后再释放并发位。排队项在重启后按冻结计划恢复；已经运行的项会标记为失败，不会拿当前 Agent 配置偷偷续跑。
+  - 仅定时触发、`read-only`、尚未产生输出且属于可重试 Provider 故障的运行会在 60 秒后自动再尝试一次；这是创建一条关联的新运行，不是进程 checkpoint。工作续作的 Task Run 成功只会提交带“结果 / 检查 / 证据”的验收候选；自动验收还要求冻结权限为 `read-only`、Raw 已落盘、输出未截断，并收到严格 JSON 执行报告（`outcome=completed`、无 blocker、全部检查通过）。普通文本或畸形报告统一停在人工验收，结构化 `blocked` 结果则保留动作边界并形成 blocker；`write/full/unknown` 必须人工接受后才记录动作边界 checkpoint。手动重试、禁用任务、取消或高权限运行都会终结/替代等待中的自动重试，避免重复执行。
+  - Provider 报告的 token 与成本会按调用聚合到 Chat / Task / 质量 trace；无法从 CLI 获得的字段保持“未知”，不会伪装成 0。每日美元预算只会按已知成本执行硬门禁，并同时展示未知成本调用与记账覆盖率。
   - 飞书推送采用持久化通知状态：发送失败会记录错误、尝试次数和退避时间，TaskScheduler 后续自动重试，运行详情页也可手动重试；任务本身的成功结果不会因通知通道暂时故障而丢失。
-  - 研究按空间 Agent 的 Permission / Workdir / Skills 执行；未指定 Agent 时默认 `read-only`。任务写入是异步的，不占用空间写锁；即时提炼始终回到无工具模式并尽力而为——失败不影响任务成功，原始材料仍会被夜间提炼兜底。
-  - **飞书里也能管任务**（`/task` 命令，在群或私聊，控制消息不会被当成知识收录）：
+  - 研究按空间 Agent 的 Permission / Workdir / Skills 执行；未指定 Agent 时默认 `read-only`。任务写入是异步的，不占用空间写锁；即时提炼始终回到普通受限模式并尽力而为——失败不影响任务成功，原始材料仍会被夜间提炼兜底。
+  - **飞书里也能管任务**（`/task` 命令；群聊仅群主/管理员可执行，私聊由本人管理；控制消息不会被当成知识收录）：
     - `/task` 或 `/task list` — 查看本空间任务
     - `/task new <主题>` — 新建每日研究任务（写入本空间）
     - `/task run <名称或序号>` — 立即运行
     - `/task help` — 帮助
   - **消息撤回**：回复原消息，@机器人说「别记这条」。原作者、群主或群管理员可执行；系统会删除该消息派生的全部原始记录，二次撤回会明确提示且事件重投不会重新入库。若内容已经进入知识页，会先移除受影响页面，再用仍有效的来源完成重新提炼后回复。撤回控制命令本身不会入库。
 - **学习**（材料阅读 + 持续迭代的主题学习）：回复书籍、文章、附件或飞书文档后发送 `/learn new <名称>`，HomeAgent 会保存清洗后的材料快照，按标题和段落边界每天带读一课。也可以直接发送 `/learn topic <主题>`；Agent 会先提出 3–6 个入学诊断问题，了解已有经验、概念基础、实践能力、学习目标、可投入时间和偏好，再生成真正适合当前水平的路线。
+  - 群聊里的 `/learn` 创建、刷新与治理操作，以及“重新提炼”，仅允许群主/管理员触发；私聊仍由本人管理。鉴权发生在 Provider 调用和任何持久化变更之前。
   - 主题计划可以继续回复其他材料并发送 `/learn add <名称或序号>`；课程会使用 `[材料1]` 这样的标记引用用户材料，并把“来源材料”“模型一般知识”和“推荐资料”分栏展示。
   - 每当入学诊断或学习反馈生成了新路线，下一课准备前会按当前水平、目标和知识缺口自动联网检索 1–5 份资料。系统优先选择官方文档、标准、大学课程、研究机构与原始论文，实际打开页面核验后才保存 HTTPS 链接，并以 `[联网资料1]` 引用。也可以发送 `/learn resources <名称或序号>` 主动刷新和查看推荐。
-  - 联网检索复用本机 Agent CLI：Codex 使用原生 Web Search，Claude 使用 WebSearch/WebFetch，不需要额外配置第三方搜索 API Key；TRAE 当前不支持该通道。网络、提供方或结果校验失败时，课程会明确写“本次未获得可验证的联网资料”，继续使用用户材料和标注为“未经外部检索验证”的模型一般知识，不会伪造来源或链接。
+  - 联网检索复用本机 Agent CLI：Claude 仅开放 WebSearch/WebFetch，不开放本地文件工具，也不需要额外配置第三方搜索 API Key；Codex/TRAE 因无法可靠隔离联网与本地文件工具，当前不启用该通道。网络、提供方或结果校验失败时，课程会明确写“本次未获得可验证的联网资料”，继续使用用户材料和标注为“未经外部检索验证”的模型一般知识，不会伪造来源或链接。
   - 用 `学习回答：<你的回答>` 完成入学诊断或提交每日作答。材料阅读计划给出基于原文的点评；主题计划会从回答中提取新的水平证据、知识优势和缺口，重新判断学习节奏，并只修订尚未开始的后续步骤。达到目标后进入下一步，存在关键误解时保留当前步骤并换一种方式补强；已经完成的路线和课程历史不会被改写。完成记录都会以 `source=learning` 写回知识空间。
   - 完整闭环是：**主题创建 → 入学诊断 → 个性化路线 → 每日一课 → 回答反馈 → 画像与后续路线迭代**。`/learn route <名称或序号>` 可查看当前路线、学习次数、最近一次路线调整和下一课重点；暂停、恢复、跳过和删除仍使用 `/learn pause`、`/learn resume`、`/learn skip`、`/learn delete`。
   - 默认每天北京时间 8:00 推送，停机后启动会补发当日未送课程；发送失败保留同一课重试，不会误推进。如果课程送达 24 小时后仍未作答，系统每天最多友好跟进一次，并在三次后停止催促；暂停计划也会停止跟进。
@@ -226,7 +234,7 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
   ```
 
   首版沿用现有附件/文档导入能力：支持 UTF-8 文本与 Markdown、带文本层的 PDF，以及飞书文档；单个附件上限 20 MiB，提取文本最多 200,000 字符。扫描版 PDF、EPUB、Office、音频和视频暂不支持。
-- **提醒**（与研究任务、知识记忆相互独立）：在群聊或私聊中 @机器人说“周日上午提醒我去茶饼斋”或“1 小时后提醒我喝水”，确定格式会直接按上海时区创建。规则无法可靠解析时，系统会让当前空间的 Agent 提取候选内容和时间并回显；只有原用户在 15 分钟内回复“确认”才会持久化，回复“取消”或不确认都不会进入提醒调度。
+- **提醒**（与研究任务、知识记忆相互独立）：在群聊或私聊中 @机器人说“周日上午提醒我去茶饼斋”或“1 小时后提醒我喝水”，确定格式会直接按上海时区创建。群聊中的创建、候选确认、查询、延后、取消和完成统一要求群主或群管理员授权；私聊仍由本人直接管理。规则无法可靠解析时，系统会让当前空间的 Agent 提取候选内容和时间并回显；只有发起者在 15 分钟内回复“确认”且仍具备群管理权限时才会持久化，回复“取消”或不确认都不会进入提醒调度。
   - “我最近一周有什么安排”“我这周有哪些安排”直接查询提醒数据，不依赖夜间知识提炼。
   - 支持“确认/完成……”“取消……的提醒”“把……的提醒延后 2 小时”。管理后台也可查看、完成或取消提醒。
   - 支持“提前 2 天提醒……，每隔 3 小时重复，直到确认”；重复提醒会明确要求在群里回复并 @机器人确认。
@@ -241,8 +249,9 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 - **Bot 停用与更换**：在 HomeAgent 中停用 Bot 只关闭本机事件消费和发送，不删除 `lark-cli` 系统钥匙串凭据，
   也不撤销读取飞书文档所用的用户授权。重新启用或更换 Bot 后必须重启 HomeAgent；旧 App 的群绑定会显示为
   “需要重连”，不会被新旧运行实例混用。对外共享状态也按 App ID 独立记录。
-- **运行状态**：集中展示后台托管方式、PID、启动时间、两条飞书事件消费者的详细状态、必需 CLI、知识存储、任务、提醒、学习、Dream Cycle 与四个调度器；同时展示 AI 回答延迟、失败/超时、主动参与结果和事件队列积压。质量或积压告警会标为 degraded，但不会把仍可服务的实例误判为未就绪。LaunchAgent 托管时可从页面安全重启。
-- **数据治理**：按空间导出 `homeagent.space v7` JSON 完整备份（知识页、原始记录、人工治理审计、撤回标记、任务及运行历史、Skill 解析证据、运行时限、通知状态、提醒、学习计划、主题路线、多来源材料及课程历史、空间元数据及关联 Agent），兼容恢复 v1–v7 备份；v6 及更早的字符串 Skill 会保留为待解析的 legacy 绑定，不会被静默绑定到错误来源。也可永久删除整个空间，或按保留周期立即清理已提炼的过期消息。
+- **运行状态**：集中展示后台托管方式、PID、启动时间、两条飞书事件消费者的详细状态、必需 CLI、知识存储、任务、提醒、学习、Dream Cycle 与五个调度器；同时展示 AI 回答延迟、失败/超时、主动参与结果和事件队列积压。质量或积压告警会标为 degraded，但不会把仍可服务的实例误判为未就绪。LaunchAgent 托管时可从页面安全重启。
+- **工作上下文**：为每个空间维护目标、Brief、Runbook、当前进展、阻塞项与下一步；新 Raw、Chat Run、Task Run 和由 Raw 生成的 Wiki 页会自动关联到当前工作项，并投影为 `work/<id>/{brief.md,runbook.md,status.json}`。可手动执行下一动作，也可对单个工作项显式开启自动续作；每轮最多领取一个动作，复用 Task Run 的冻结计划、权限审批、通知、超时与一次安全重试。Task Run 成功后先进入动作验收门：后台展示结构化结果、确定性检查和 Run/Raw 证据，只有验收通过才消费当前首个下一步并记录 checkpoint；驳回会保留动作边界和证据、形成可见 blocker，并允许从同一动作重试。计划改变时可显式放弃受阻动作并清除其系统 blocker，再继续新的首个动作。待验收期间自动续作暂停；重启只恢复尚未执行的排队动作，绝不重放已中断的运行中动作。
+- **数据治理**：按空间导出 `homeagent.space v16` JSON 完整备份（知识页、原始记录及其动作验收准入状态、工作上下文、续作动作/checkpoint/验收审计/策略及其证据关联、人工治理审计、撤回标记、任务及 Chat 运行历史、冻结执行计划、Agent 发布历史、审批/重试/通知/用量审计、Skill 证据、相关质量 trace 与封闭的重评记录、提醒、学习计划、主题路线、多来源材料及课程历史、空间元数据），兼容恢复 v1–v16 备份；WorkAction 输出在验收前保持 `held`、接受后才进入待提炼队列，驳回/取消/失败后永久 `excluded`。旧版缺失的高权限审批与执行计划会 fail-closed，legacy Skill 不会被静默绑定到错误来源；升级时会重新派生 WorkAction Raw 状态并清理引用未准入来源的旧 Wiki 页。导出、恢复和删除会阻止仍在运行、等待审批/验收/重试或正在外发的工作，恢复会校验 WorkItem、WorkAction、Task Run、验收证据、Raw 准入与 checkpoint 的双向关联，避免删除后继续副作用、恢复后重复执行、污染知识或重复通知。
 - **设置**：**默认 Provider + 默认 Model**（群未指定 Agent 时用它）、每日预算、提炼时刻、原始消息保留周期、端口。
 
 后台默认只监听 `127.0.0.1`，无需登录。若通过 `HOMEAGENT_WEB_HOST` 开放到非回环地址，启动时会强制要求
@@ -260,10 +269,11 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 - 每次 `ask()` 都会在本机 `data/quality/quality.json` 保存有上限的回答追踪，包括来源、引用、耗时和成功/失败结果；健康页只读取聚合指标，不展示问题、回答或错误正文。
 - 管理后台的问答测试页提供“有帮助 / 没帮助 / 引用有误”反馈。每个回答只接受一次反馈，反馈与回答追踪一起留在本机。
 - 管理后台的“AI 质量”工作台集中展示“没帮助 / 引用有误”的待处理回答，可跳转到引用知识页进行人工纠错、写处理说明并保留已解决历史。
+- 已完成的 Chat 可按原始问题与冻结的 Agent 执行计划发起候选重评，并对比 Provider、Model、Agent 版本、Prompt / Skill / 引用页面摘要及用量；这是可审计的重新评估，不宣称能确定性 replay 已变化的外部模型。
 - 负面反馈可加入本机待校准评测集，并从 `/quality/evaluation-cases.json` 导出版本化 JSON。候选只记录当时的答案、引用、反馈和人工校准说明；确认正确答案与引用后才手工并入固定评测集，不会自动学习或改写知识库。
 - `bun run evaluate:quality` 离线运行固定评测集，覆盖检索与引用、对话路由、群聊主动参与和学习路线校验。命令会输出机器可读报告及检索建议：
   - `keep_fts`：当前 FTS、路由和引用达到阈值；
-  - `improve_fts_retrieval`：路由和引用正常，但 FTS 覆盖率低于 85%，应补强知识页 aliases/tags、查询改写和大目录路由；
+  - `improve_fts_retrieval`：路由和引用正常，但 FTS 覆盖率低于 85%，应补强知识页 aliases/tags 生成与大目录有界路由；
   - `insufficient_data`：检索样本不足，暂不调整架构。
 - 项目架构决定不引入 embedding；后续检索改进保持 FTS + LLM 路由路线，不新增向量模型、向量索引或知识数据外发通道。
 - 评测已进入 CI 和 `verify:beta`。阶段二不引入个人空间隐藏或隐私策略，仍以家庭和团队协作为产品边界。
@@ -271,8 +281,9 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 ### 首次启动与飞书连接
 
 1. 普通用户双击 `HomeAgent.app`；源码开发者运行 `bun start`。全新数据目录会自动进入 `/setup`。
-2. 应用包用户点击“安装并连接 ChatGPT”即可完成 Codex 下载、校验与 OpenAI 官方登录；源码运行会提供
-   已检测到的 Codex、Claude Code 或 TRAE CLI，并把手动安装命令留在高级路径。
+2. 向导要求检测到并登录可执行受限普通调用的 Claude 或 Codex CLI；当前 Claude 安装与登录仍需单独完成。
+   应用包用户可选“安装 Codex”，由 HomeAgent 下载、校验并进入 OpenAI 官方登录，登录后可将它选为普通问答
+   Provider，也可用于显式任务。TRAE 仍只用于显式任务。
 3. 点击“一键创建飞书机器人”，在飞书官方页面确认。HomeAgent 通过官方 Node SDK 显式提交完整授权清单，
    一次申请私聊、群内 @、群内全部消息、消息读取/发送、附件、表情、群信息、机器人进群权限和两条事件订阅。
    App Secret 只通过 stdin 写入 `lark-cli` 的系统钥匙串，不进入 HomeAgent 设置、页面或日志。
@@ -309,9 +320,10 @@ bun run build:macos --target arm64 --allow-dirty
 bun run smoke:macos --app dist/HomeAgent.app
 ```
 
-正式发布由 `v*` tag 触发 GitHub Actions，分别在 Apple Silicon 与 Intel runner 上构建，签名嵌套可执行文件，
-生成并公证两个架构的 DMG，最后发布带 SHA-256 的更新清单。流水线要求 Apple 签名/公证 secrets，且只有
-仓库变量 `BINARY_REDISTRIBUTION_APPROVED=true` 时才允许进入二进制发布阶段。
+候选构建由 `v*` tag 触发 GitHub Actions，分别在 Apple Silicon 与 Intel runner 上构建，签名嵌套可执行文件，
+生成并公证两个架构的 DMG 与带 SHA-256 的更新清单，但只上传为 Draft Prerelease。流水线要求 Apple
+签名/公证 secrets，且只有仓库变量 `BINARY_REDISTRIBUTION_APPROVED=true` 时才允许进入二进制候选阶段；
+全新 Mac、真实飞书和 24–48 小时 Soak 等外部门禁全部通过后，维护者才把 Draft 公开为 Prerelease。
 
 ### 附件提炼（P2 首版）
 
@@ -326,7 +338,7 @@ bun run smoke:macos --app dist/HomeAgent.app
 都会覆盖这些派生记录。macOS 使用系统自带的 Vision/PDFKit；其他平台仍可提取上述 UTF-8 文本文件，
 但会安全跳过图片 OCR 和 PDF 文本提取。音频转写、Office 文件、视频理解和 `post` 消息内嵌资源暂不支持。
 
-> **CLI-only 的代价（务必知悉）**：claude/trae-cli 是完整编码 agent，单次调用**慢、开销大**，dream 批量提炼会明显变慢；它们**自带鉴权和模型选择**，不一定尊重你在 homeagent 里选的 model。dream 的结构化抽取靠"让 CLI 只输出 JSON + 解析校验 + 失败隔离（quarantine）"，偶有条目建不出页。失败记录会持续显示在对应空间的“提炼失败”页，并让知识健康状态降级但不阻断 `/readyz`；可单条或批量重试，且每次只处理该记录关联的原始来源，不会连带重跑无关消息。恢复所需来源不会被原始消息保留策略清理；若来源被撤回，旧失败记录会移除，仍有效的其他来源会重新进入待提炼队列。每日预算仅对可计费的 provider 有意义。
+> **CLI-only 的代价（务必知悉）**：这些本机 CLI 单次调用**慢、开销大**，dream 批量提炼会明显变慢；它们**自带鉴权和模型选择**，不一定尊重 HomeAgent 里选择的 model。普通问答/提炼/学习可使用严格 no-tools 的 Claude 或临时只读的 Codex；TRAE 仅用于显式任务。dream 的结构化抽取靠“让 CLI 只输出 JSON + 解析校验 + 失败隔离（quarantine）”，偶有条目建不出页。失败记录会持续显示在对应空间的“提炼失败”页，并让知识健康状态降级但不阻断 `/readyz`；可单条或批量重试，且每次只处理该记录关联的原始来源，不会连带重跑无关消息。恢复所需来源不会被原始消息保留策略清理；若来源被撤回，旧失败记录会移除，仍有效的其他来源会重新进入待提炼队列。CLI 未报告的成本会明确记为未知，因此无法仅靠美元预算对这部分调用执行硬限制。
 
 ### 生产启动（接真实飞书）
 

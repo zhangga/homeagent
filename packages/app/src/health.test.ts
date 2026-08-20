@@ -352,6 +352,51 @@ describe("system health reporter", () => {
     engine.close();
   });
 
+  test("sums held and excluded Raw for observability without degrading readiness", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-raw-admission-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    engine.ensureSpace("team/oc_health_a", { chatId: "oc_health_a" });
+    engine.ensureSpace("team/oc_health_b", { chatId: "oc_health_b" });
+    const readCoreHealth = engine.health.bind(engine);
+    engine.health = async () => {
+      const health = await readCoreHealth();
+      const spaces = (health.details?.spaces as Array<Record<string, unknown>>).map((space) => ({
+        ...space,
+        heldRaw: space.id === "team/oc_health_a" ? 2 : 1,
+        excludedRaw: space.id === "team/oc_health_a" ? 1 : 4,
+      }));
+      return { ...health, details: { ...health.details, spaces } };
+    };
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" },
+      ],
+      requiredProviderIds: () => ["codex"],
+    });
+
+    const snapshot = await reportHealth();
+    engine.close();
+    expect(snapshot.ready).toBe(true);
+    expect(snapshot.status).toBe("ok");
+    expect(snapshot.components.knowledge).toEqual(expect.objectContaining({
+      status: "ok",
+      summary: "2 个空间，0 条待提炼，3 条待验收，5 条已排除",
+      details: expect.objectContaining({ heldRaw: 3, excludedRaw: 5 }),
+    }));
+  });
+
   test("quarantined distillations degrade knowledge health without blocking readiness", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hb-health-quarantine-"));
     dirs.push(dir);
@@ -392,6 +437,155 @@ describe("system health reporter", () => {
     }));
     expect(snapshot.components.knowledge?.details?.quarantined).toBe(1);
     engine.close();
+  });
+
+  test("is ready when Codex is the ordinary provider", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-ordinary-provider-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" },
+      ],
+      requiredProviderIds: () => ["codex"],
+      ordinaryProviderId: () => "codex",
+    });
+
+    const snapshot = await reportHealth();
+    engine.close();
+    expect(snapshot.ready).toBe(true);
+    expect(snapshot.components.providers).toEqual(expect.objectContaining({
+      status: "ok",
+      details: expect.objectContaining({
+        ordinaryProvider: "codex",
+        unavailable: [],
+        noToolsUnsupported: [],
+      }),
+    }));
+  });
+
+  test("reports an unavailable no-tools ordinary provider separately", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-ordinary-unavailable-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "claude", name: "Claude", bin: "claude", available: false, detail: "missing" },
+      ],
+      requiredProviderIds: () => [],
+      ordinaryProviderId: () => "claude",
+    });
+
+    const snapshot = await reportHealth();
+    engine.close();
+    expect(snapshot.ready).toBe(false);
+    expect(snapshot.components.providers).toEqual(expect.objectContaining({
+      status: "down",
+      details: expect.objectContaining({
+        ordinaryProvider: "claude",
+        unavailable: ["claude"],
+        noToolsUnsupported: [],
+      }),
+    }));
+  });
+
+  test("is ready when the ordinary provider is available and supports no-tools", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-ordinary-ready-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "claude", name: "Claude", bin: "claude", available: true, detail: "2.0" },
+      ],
+      requiredProviderIds: () => [],
+      ordinaryProviderId: () => "claude",
+    });
+
+    const snapshot = await reportHealth();
+    expect(snapshot.ready).toBe(true);
+    expect(snapshot.components.providers).toEqual(expect.objectContaining({
+      status: "ok",
+      details: expect.objectContaining({
+        ordinaryProvider: "claude",
+        unavailable: [],
+        noToolsUnsupported: [],
+      }),
+    }));
+    engine.close();
+  });
+
+  test("is not ready when a bound TRAE Agent cannot run restricted ordinary calls", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-space-ordinary-provider-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    const space = "team/oc_health" as const;
+    engine.ensureSpace(space, { chatId: "oc_health" });
+    const agent = engine.agents.create({ name: "Task-only Agent", provider: "trae-cli" });
+    engine.updateSpaceMeta(space, { agentId: agent.id });
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "claude", name: "Claude", bin: "claude", available: true, detail: "2.0" },
+        { id: "trae-cli", name: "TRAE", bin: "trae-cli", available: true, detail: "1.0" },
+      ],
+      requiredProviderIds: () => ["claude", "trae-cli"],
+      ordinaryProviderId: () => "claude",
+      ordinaryProviderIds: () => ["claude", "trae-cli"],
+    });
+
+    const snapshot = await reportHealth();
+    engine.close();
+    expect(snapshot.ready).toBe(false);
+    expect(snapshot.components.providers).toEqual(expect.objectContaining({
+      status: "down",
+      details: expect.objectContaining({
+        ordinaryProviders: ["claude", "trae-cli"],
+        noToolsUnsupported: ["trae-cli"],
+      }),
+    }));
   });
 
   test("a caller-controlled task timeout degrades the task without taking provider readiness down", async () => {

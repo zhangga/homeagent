@@ -100,6 +100,9 @@ export class SpaceStore {
 
   /** Write a page to markdown and mirror it into the index. */
   writePage(page: Page): void {
+    // Markdown is authoritative and can be read without consulting SQLite, so
+    // reject non-admitted evidence before creating or replacing the file.
+    this.index().assertPageSourcesAdmitted(page);
     const path = this.pagePath(page.slug);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, pageToMarkdown(page), "utf8");

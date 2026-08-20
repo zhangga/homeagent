@@ -53,6 +53,11 @@ export function shouldRunTask(task: Task, now: Date): boolean {
 
 /** Called after a successful run when the task opts into notifications. */
 export type TaskNotify = (task: Task, run: TaskRun) => void | Promise<void>;
+export type TaskApprovalNotify = (
+  task: Task,
+  run: TaskRun,
+  deliveryKey: string,
+) => void | Promise<void>;
 
 export function formatTaskRunNotification(run: TaskRun): string {
   const summary = run.summary?.trim();
@@ -60,6 +65,16 @@ export function formatTaskRunNotification(run: TaskRun): string {
   const warning = formatSkillWarnings(
     skillWarningViews({ skipped: run.skillEvidence?.skipped ?? [] }),
   );
+  if (run.workActionId) {
+    return [
+      `🧭 工作动作「${run.taskName}」执行已完成，结果已进入验收流程：`,
+      "",
+      summary,
+      `Run：${run.id}`,
+      "请前往 HomeAgent 管理后台查看自动或人工验收结果。",
+      ...(warning ? ["", warning] : []),
+    ].join("\n");
+  }
   return [
     `🔎 任务「${run.taskName}」已完成：`,
     "",
@@ -68,10 +83,27 @@ export function formatTaskRunNotification(run: TaskRun): string {
   ].join("\n");
 }
 
+export function formatTaskApprovalNotification(run: TaskRun): string {
+  const approval = run.approval;
+  if (approval?.status !== "pending" || approval.expiresAt === undefined) {
+    throw new Error(`task run has no pending approval: ${run.taskName}`);
+  }
+  const permission = run.executionPlan?.execution?.permission ?? "unknown";
+  return [
+    `🔐 任务「${run.taskName}」等待高权限审批`,
+    "",
+    `权限：${permission}`,
+    `审批截止：${new Date(approval.expiresAt).toLocaleString("zh-CN", { hour12: false })}`,
+    `Run：${run.id}`,
+    "请前往 HomeAgent 管理后台查看冻结执行计划并作出决定。",
+  ].join("\n");
+}
+
 export class TaskScheduler {
   private engine: KnowledgeEngine;
   private cfg: TaskScheduleConfig;
   private notify?: TaskNotify;
+  private notifyApproval?: TaskApprovalNotify;
   private timer?: ReturnType<typeof setInterval>;
   private running = false;
   private started = false;
@@ -82,10 +114,15 @@ export class TaskScheduler {
   private lastReason?: string;
   private lastError?: string;
 
-  constructor(engine: KnowledgeEngine, opts: { cfg?: Partial<TaskScheduleConfig>; notify?: TaskNotify } = {}) {
+  constructor(engine: KnowledgeEngine, opts: {
+    cfg?: Partial<TaskScheduleConfig>;
+    notify?: TaskNotify;
+    notifyApproval?: TaskApprovalNotify;
+  } = {}) {
     this.engine = engine;
     this.cfg = { ...DEFAULT_TASK_SCHEDULE, ...opts.cfg };
     this.notify = opts.notify;
+    this.notifyApproval = opts.notifyApproval;
   }
 
   /** Start the loop and run an immediate catch-up pass. */
@@ -131,10 +168,55 @@ export class TaskScheduler {
     this.lastReason = reason;
     const ran: string[] = [];
     const errors: string[] = [];
+    const retriedTaskIds = new Set<string>();
     try {
+      this.engine.expireTaskRunApprovals(now.getTime());
+      for (const retry of this.engine.retryDueTaskRuns(now.getTime())) {
+        retriedTaskIds.add(retry.run.taskId);
+        const report = await retry.completion;
+        if (report.ok && this.notify) {
+          const task = this.engine.taskForRun(report.runId);
+          if (task?.notify) {
+            try {
+              await this.engine.deliverTaskRunNotification(
+                report.runId,
+                (run) => this.notify!(task, run),
+                { attemptedAt: Math.max(now.getTime(), report.finishedAt) },
+              );
+            } catch (error) {
+              errors.push(`notification ${report.runId}: ${String(error)}`);
+              log.warn("retried task notification failed", {
+                runId: report.runId,
+                taskId: report.taskId,
+                err: String(error),
+              });
+            }
+          }
+        }
+      }
+      if (this.notifyApproval) {
+        for (const run of this.engine.listTaskRunApprovalsNeedingNotification(now.getTime())) {
+          const task = this.engine.taskForRun(run.id);
+          if (!task) continue;
+          try {
+            await this.engine.deliverTaskRunApprovalNotification(
+              run.id,
+              (current, deliveryKey) => this.notifyApproval!(task, current, deliveryKey),
+              { attemptedAt: now.getTime() },
+            );
+          } catch (error) {
+            errors.push(`approval notification ${run.id}: ${String(error)}`);
+            log.warn("task approval notification retry failed", {
+              runId: run.id,
+              taskId: task.id,
+              err: String(error),
+            });
+          }
+        }
+      }
       if (this.notify) {
         for (const run of this.engine.listTaskRunsNeedingNotification(now.getTime())) {
-          const task = this.engine.tasks.get(run.taskId);
+          const task = this.engine.taskForRun(run.id);
           if (!task) continue;
           try {
             await this.engine.deliverTaskRunNotification(
@@ -153,11 +235,31 @@ export class TaskScheduler {
         }
       }
       for (const task of this.engine.tasks.list()) {
+        if (retriedTaskIds.has(task.id)) continue;
         if (!shouldRunTask(task, now)) continue;
         log.info("running scheduled task", { taskId: task.id, space: task.space, reason });
         try {
           const report = await this.engine.runTask(task.id, { trigger: "scheduled" });
           ran.push(task.id);
+          if (report.status === "awaiting_approval" && this.notifyApproval) {
+            const pending = this.engine.getTaskRun(report.runId);
+            if (pending) {
+              try {
+                await this.engine.deliverTaskRunApprovalNotification(
+                  pending.id,
+                  (current, deliveryKey) => this.notifyApproval!(task, current, deliveryKey),
+                  { attemptedAt: Math.max(now.getTime(), pending.startedAt) },
+                );
+              } catch (error) {
+                errors.push(`approval notification ${pending.id}: ${String(error)}`);
+                log.warn("task approval notification failed", {
+                  runId: pending.id,
+                  taskId: task.id,
+                  err: String(error),
+                });
+              }
+            }
+          }
           if (report.ok && task.notify && this.notify) {
             try {
               await this.engine.deliverTaskRunNotification(

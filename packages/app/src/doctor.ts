@@ -2,7 +2,11 @@ import { constants, accessSync, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createConnection } from "node:net";
-import { detectProviders } from "@homeagent/llm";
+import {
+  detectProviders as detectLocalProviders,
+  providerSupportsOrdinaryCompletion,
+  type DetectedProvider,
+} from "@homeagent/llm";
 import { brandedEnv, readSettings } from "@homeagent/shared";
 import { resolveRuntimePaths, type RuntimePaths } from "./runtime-paths.ts";
 
@@ -49,6 +53,7 @@ export interface DoctorOptions {
   timeoutMs?: number;
   now?: () => number;
   probes?: Partial<DoctorProbeSet>;
+  detectProviders?: (timeoutMs?: number) => Promise<DetectedProvider[]>;
 }
 
 const MESSAGES: Record<DoctorCheckId, Record<DoctorStatus, string>> = {
@@ -68,8 +73,8 @@ const MESSAGES: Record<DoctorCheckId, Record<DoctorStatus, string>> = {
     fail: "飞书连接组件缺失、损坏或检查超时",
   },
   "ai-provider": {
-    pass: "至少一个本地 AI 提供方可以正常运行",
-    action: "需要在设置中连接一个 AI 提供方",
+    pass: "至少一个支持安全普通对话的本地 AI 提供方可以正常运行",
+    action: "需要在设置中连接并登录一个支持安全普通对话的 AI 提供方",
     fail: "AI 提供方检查失败或超时",
   },
   port: {
@@ -101,6 +106,7 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     port,
     timeoutMs,
     platform: options.platform ?? process.platform,
+    detectProviders: options.detectProviders ?? detectLocalProviders,
   });
   const probes: DoctorProbeSet = { ...defaults, ...options.probes };
 
@@ -209,6 +215,7 @@ function defaultProbes(input: {
   port: number;
   timeoutMs: number;
   platform: typeof process.platform;
+  detectProviders: (timeoutMs?: number) => Promise<DetectedProvider[]>;
 }): DoctorProbeSet {
   return {
     dataDirectory: () => {
@@ -228,8 +235,12 @@ function defaultProbes(input: {
     },
     aiProvider: async () => {
       const perProviderMs = Math.max(100, Math.floor(input.timeoutMs / 4));
-      const detected = await detectProviders(perProviderMs);
-      return detected.some((provider) => provider.available) ? "pass" : "action";
+      const detected = await input.detectProviders(perProviderMs);
+      return detected.some(
+        (provider) => provider.available && providerSupportsOrdinaryCompletion(provider.id),
+      )
+        ? "pass"
+        : "action";
     },
     port: async () => {
       if (!(await isTcpListening(input.port, input.timeoutMs))) return "pass";

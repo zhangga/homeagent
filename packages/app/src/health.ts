@@ -10,6 +10,7 @@ import type { OrchestratorHealth } from "@homeagent/orchestrator";
 import {
   detectProviders as detectLocalProviders,
   isCliProvider,
+  providerSupportsOrdinaryCompletion,
   type DetectedProvider,
 } from "@homeagent/llm";
 import type { RuntimeLoopHealth } from "./scheduler.ts";
@@ -21,12 +22,15 @@ export interface SystemHealthSources {
   feishuLocallyDisabled?: () => boolean;
   dreamSchedulerHealth: () => RuntimeLoopHealth | undefined;
   taskSchedulerHealth: () => RuntimeLoopHealth | undefined;
+  workContinuationSchedulerHealth?: () => RuntimeLoopHealth | undefined;
   reminderSchedulerHealth?: () => RuntimeLoopHealth | undefined;
   learningSchedulerHealth?: () => RuntimeLoopHealth | undefined;
   runtimeHealth?: () => OrchestratorHealth;
   serviceHealth?: () => RuntimeServiceStatus;
   detectProviders?: () => Promise<DetectedProvider[]>;
   requiredProviderIds?: () => string[];
+  ordinaryProviderId?: () => string;
+  ordinaryProviderIds?: () => string[];
   now?: () => number;
   providerProbeTtlMs?: number;
 }
@@ -113,14 +117,22 @@ export function createSystemHealthReporter(
         (sum, space) => sum + (typeof space.pendingRaw === "number" ? space.pendingRaw : 0),
         0,
       );
+      const heldRaw = spaces.reduce(
+        (sum, space) => sum + (typeof space.heldRaw === "number" ? space.heldRaw : 0),
+        0,
+      );
+      const excludedRaw = spaces.reduce(
+        (sum, space) => sum + (typeof space.excludedRaw === "number" ? space.excludedRaw : 0),
+        0,
+      );
       const quarantined = spaces.reduce(
         (sum, space) => sum + (typeof space.quarantined === "number" ? space.quarantined : 0),
         0,
       );
       components.knowledge = {
         status: core.ok ? quarantined > 0 ? "degraded" : "ok" : "down",
-        summary: `${core.spaces} 个空间，${pending} 条待提炼${quarantined > 0 ? `，${quarantined} 条提炼失败待恢复` : ""}`,
-        details: { ...core.details, quarantined },
+        summary: `${core.spaces} 个空间，${pending} 条待提炼${heldRaw > 0 ? `，${heldRaw} 条待验收` : ""}${excludedRaw > 0 ? `，${excludedRaw} 条已排除` : ""}${quarantined > 0 ? `，${quarantined} 条提炼失败待恢复` : ""}`,
+        details: { ...core.details, heldRaw, excludedRaw, quarantined },
       };
     } catch (err) {
       core = { ok: false, spaces: 0, details: { error: String(err) } };
@@ -228,15 +240,40 @@ export function createSystemHealthReporter(
       providerErrors.push(`CLI 探测：${String(err)}`);
     }
     let required: string[] = [];
+    let ordinaryProvider: string | undefined;
+    const ordinaryProviders = new Set<string>();
     try {
       required = [...new Set(requiredProviderIds())].sort();
     } catch (err) {
       providerErrors.push(`必需 CLI 配置：${String(err)}`);
     }
+    if (sources.ordinaryProviderId) {
+      try {
+        ordinaryProvider = sources.ordinaryProviderId();
+        ordinaryProviders.add(ordinaryProvider);
+        required = [...new Set([...required, ordinaryProvider])].sort();
+      } catch (err) {
+        providerErrors.push(`普通对话 CLI 配置：${String(err)}`);
+      }
+    }
+    if (sources.ordinaryProviderIds) {
+      try {
+        for (const provider of sources.ordinaryProviderIds()) {
+          if (provider) ordinaryProviders.add(provider);
+        }
+        required = [...new Set([...required, ...ordinaryProviders])].sort();
+      } catch (err) {
+        providerErrors.push(`空间普通对话 CLI 配置：${String(err)}`);
+      }
+    }
     const detectedById = new Map<string, DetectedProvider>(
       detected.map((provider) => [provider.id, provider]),
     );
     const unavailable = required.filter((id) => !detectedById.get(id)?.available);
+    const ordinaryProviderList = [...ordinaryProviders].sort();
+    const noToolsUnsupported = ordinaryProviderList.filter(
+      (provider) => !providerSupportsOrdinaryCompletion(provider),
+    );
     const providerRuns =
       (core.details?.providerRuns as Array<Record<string, unknown>> | undefined) ?? [];
     const latestRuntimeFailures = providerRuns.filter(
@@ -246,7 +283,11 @@ export function createSystemHealthReporter(
       (run) => required.includes(String(run.provider)) && run.lastStatus === "timeout",
     );
     const providerReady =
-      providerErrors.length === 0 && required.length > 0 && unavailable.length === 0 && latestRuntimeFailures.length === 0;
+      providerErrors.length === 0
+      && required.length > 0
+      && unavailable.length === 0
+      && noToolsUnsupported.length === 0
+      && latestRuntimeFailures.length === 0;
     components.providers = {
       status: providerReady ? latestRuntimeTimeouts.length > 0 ? "degraded" : "ok" : "down",
       summary: providerReady
@@ -257,11 +298,17 @@ export function createSystemHealthReporter(
           ? "CLI 状态检查失败"
           : unavailable.length > 0
             ? `CLI 不可用：${unavailable.join("、")}`
-            : latestRuntimeFailures.length > 0
-              ? `CLI 最近执行失败：${latestRuntimeFailures.map((run) => run.provider).join("、")}`
-              : "未配置可用 CLI",
+            : noToolsUnsupported.length > 0
+              ? `普通对话 CLI 不支持 no-tools：${noToolsUnsupported.join("、")}`
+              : latestRuntimeFailures.length > 0
+                ? `CLI 最近执行失败：${latestRuntimeFailures.map((run) => run.provider).join("、")}`
+                : "未配置可用 CLI",
       details: {
         required,
+        ...(ordinaryProvider ? { ordinaryProvider } : {}),
+        ordinaryProviders: ordinaryProviderList,
+        unavailable,
+        noToolsUnsupported,
         detected,
         providerRuns,
         ...(providerErrors.length > 0 ? { errors: providerErrors } : {}),
@@ -319,6 +366,12 @@ export function createSystemHealthReporter(
     const taskHealth = taskLoop.health;
     components.dreamScheduler = dreamLoop.component;
     components.taskScheduler = taskLoop.component;
+    const workContinuationLoop = sources.workContinuationSchedulerHealth
+      ? probeLoopComponent("工作续跑调度器", sources.workContinuationSchedulerHealth)
+      : undefined;
+    if (workContinuationLoop) {
+      components.workContinuationScheduler = workContinuationLoop.component;
+    }
     const reminderLoop = sources.reminderSchedulerHealth
       ? probeLoopComponent("提醒调度器", sources.reminderSchedulerHealth)
       : undefined;
@@ -355,6 +408,10 @@ export function createSystemHealthReporter(
       dreamHealth.lastStatus !== "error" &&
       taskHealth?.started === true &&
       taskHealth.lastStatus !== "error" &&
+      (!workContinuationLoop || (
+        workContinuationLoop.health?.started === true
+        && workContinuationLoop.health.lastStatus !== "error"
+      )) &&
       (!reminderLoop || (
         reminderLoop.health?.started === true
         && reminderLoop.health.lastStatus !== "error"

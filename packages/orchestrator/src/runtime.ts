@@ -25,6 +25,7 @@ import { isProviderTimeoutError } from "@homeagent/llm";
 import {
   resolveGroupParticipationLevel,
   type AnswerOutcome,
+  type AskFailureTrace,
   type ChatRun,
   type ChatRunError,
   type FeishuGroupBinding,
@@ -51,7 +52,11 @@ import {
   type KnowledgeControl,
 } from "./conversation-interpreter.ts";
 import { formatAnswer } from "./format.ts";
-import { coldStartNote, providerNotice } from "./messages.ts";
+import {
+  GROUP_REMINDER_AUTOMATION_DENIAL,
+  coldStartNote,
+  providerNotice,
+} from "./messages.ts";
 import { parseTaskCommand, handleTaskCommand } from "./task-commands.ts";
 import {
   handleLearningAnswer,
@@ -64,6 +69,7 @@ import {
   REMINDER_TIME_CLARIFICATION,
   formatReminderTime,
   handleReminderMessage,
+  isReminderAutomationMessage,
   needsReminderInference,
   parseReminderRequest,
   scheduleReminderDraft,
@@ -523,6 +529,26 @@ export class Orchestrator {
     );
   }
 
+  private async authorizeGroupAutomation(
+    msg: InboundMessage,
+    denial: string,
+  ): Promise<boolean> {
+    if (msg.chatType !== "group") return true;
+    try {
+      if (await this.connector.isChatAdministrator?.(msg.chatId, msg.senderId) === true) {
+        return true;
+      }
+    } catch (err) {
+      log.warn("group automation administrator lookup failed", {
+        chatId: msg.chatId,
+        senderId: msg.senderId,
+        err: String(err),
+      });
+    }
+    await this.send(msg, denial);
+    return false;
+  }
+
   private async handle(event: InboundEvent): Promise<void> {
     if (!this.markSeen(event.eventId)) {
       log.debug("dropping duplicate event", { eventId: event.eventId });
@@ -547,15 +573,20 @@ export class Orchestrator {
       });
       return;
     }
-    // Task control commands (/task ...) are handled BEFORE capture/gate: they're
-    // instructions, not knowledge, so they're never stored, and they always get
-    // a reply (even in a group without an @-mention).
+    // Task control commands (/task ...) are handled BEFORE capture/gate because
+    // they are instructions, not knowledge. Group commands are privileged:
+    // even a read-only Task can expose host files through a provider CLI, so an
+    // explicit group administrator check is the authorization boundary.
     const taskControlText = msg.mentionsBot
       ? msg.text.trim().replace(/^@\S+\s+(?=\/tasks?\b)/iu, "")
       : msg.text;
     const taskCmd = parseTaskCommand(taskControlText);
     if (taskCmd) {
       return this.withThinking(msg, async () => {
+        if (!await this.authorizeGroupAutomation(
+          msg,
+          "只有群主或群管理员可以管理本群任务。",
+        )) return;
         this.engine.ensureSpace(writeSpace, { chatId: msg.chatId });
         const reply = await handleTaskCommand(this.engine, writeSpace, taskCmd);
         await this.send(msg, reply);
@@ -568,6 +599,10 @@ export class Orchestrator {
     const learningCmd = parseLearningCommand(msg.text);
     if (learningCmd) {
       return this.withThinking(msg, async () => {
+        if (!await this.authorizeGroupAutomation(
+          msg,
+          "只有群主或群管理员可以管理本群学习计划。",
+        )) return;
         this.engine.ensureSpace(writeSpace, { chatId: msg.chatId });
         let sourceMessageId: string | undefined;
         if (learningCommandNeedsSource(learningCmd)) {
@@ -591,12 +626,34 @@ export class Orchestrator {
     }
 
     // A staged model interpretation is scoped to this chat and sender. Explicit
-    // confirmation/cancellation is a control message, so it bypasses group @ gating
-    // and is never captured as knowledge.
-    const pendingReminderReply = this.handlePendingReminderControl(msg, writeSpace, Date.now());
-    if (pendingReminderReply) {
-      return this.withThinking(msg, () => this.send(msg, pendingReminderReply));
+    // confirmation/cancellation bypasses group @ gating, but group creation is
+    // still re-authorized immediately before its durable mutation.
+    const reminderControlNow = Date.now();
+    const pendingReminderControl = ["确认", "确认创建", "取消", "取消创建"]
+      .includes(reminderControlText(msg.text))
+      && this.pendingReminderConfirmations.has(this.pendingReminderKey(msg, writeSpace));
+    if (pendingReminderControl) {
+      return this.withThinking(msg, async () => {
+        if (!await this.authorizeGroupAutomation(
+          msg,
+          GROUP_REMINDER_AUTOMATION_DENIAL,
+        )) return;
+        const reply = this.handlePendingReminderControl(msg, writeSpace, reminderControlNow);
+        if (reply) await this.send(msg, reply);
+      });
     }
+    this.prunePendingReminderConfirmations(reminderControlNow);
+
+    // Reminder controls are automations, not ordinary group conversation.
+    // Authorize before capture, proactive-participation inference, reminder
+    // inference, or any ReminderStore mutation.
+    if (
+      isReminderAutomationMessage(msg.text)
+      && !await this.authorizeGroupAutomation(
+        msg,
+        GROUP_REMINDER_AUTOMATION_DENIAL,
+      )
+    ) return;
 
     const participationLevel = resolveGroupParticipationLevel(groupBinding);
     let decision = gate(msg, {
@@ -846,8 +903,15 @@ export class Orchestrator {
     retryOf?: string,
   ): ChatRun {
     const snapshot = this.engine.agentRunExecutionSnapshot(writeSpace);
-    return this.engine.chatRuns.start({
+    const rawWorkItemId = rawId && this.engine.registry.has(writeSpace)
+      ? this.engine.registry.store(writeSpace).index().getRaw(rawId)?.workItemId
+      : undefined;
+    const workItemId = rawWorkItemId
+      ?? (retryOf ? this.engine.chatRuns.get(retryOf)?.workItemId : undefined)
+      ?? this.engine.workItems.activeForSpace(writeSpace)?.id;
+    const run = this.engine.chatRuns.start({
       space: writeSpace,
+      workItemId,
       rawId,
       chatId: msg.chatId,
       messageId: msg.messageId,
@@ -860,8 +924,11 @@ export class Orchestrator {
       reasoningEffort: snapshot.reasoningEffort,
       skillEvidence: snapshot.skillEvidence,
       execution: snapshot.execution,
+      executionPlan: snapshot.executionPlan,
       retryOf,
     });
+    if (workItemId) this.engine.workItems.attachChatRun(workItemId, run.id);
+    return run;
   }
 
   private async scheduleChatRun(
@@ -898,13 +965,14 @@ export class Orchestrator {
       if (current?.status === "queued") {
         const finishedAt = Date.now();
         if (error instanceof RunQueueTimeoutError) {
-          this.engine.chatRuns.timeout(run.id, {
+          const timedOut = this.engine.chatRuns.timeout(run.id, {
             finishedAt,
             error: {
               kind: "timeout",
               message: `Chat Run waited more than ${this.chatQueueTimeoutMs}ms in the queue.`,
             },
           });
+          if (!timedOut) return;
           await this.send(msg, "当前请求排队时间过长，请稍后重试。");
           return;
         }
@@ -964,6 +1032,16 @@ export class Orchestrator {
       .filter((run) => run.status === "queued")
       .sort((a, b) => a.queuedAt - b.queuedAt || a.id.localeCompare(b.id));
     for (const run of queued) {
+      if (!run.executionPlan) {
+        this.engine.chatRuns.fail(run.id, {
+          finishedAt: Date.now(),
+          error: {
+            kind: "interrupted",
+            message: "Queued Chat Run has no immutable execution plan; refusing to use live Agent state.",
+          },
+        });
+        continue;
+      }
       if (!run.chatId || !run.messageId) {
         this.engine.chatRuns.fail(run.id, {
           finishedAt: Date.now(),
@@ -1030,10 +1108,11 @@ export class Orchestrator {
     runId: string,
     markdown: string,
   ): Promise<void> {
-    this.engine.chatRuns.succeed(runId, {
+    const succeeded = this.engine.chatRuns.succeed(runId, {
       finishedAt: Date.now(),
       output: markdown,
     });
+    if (!succeeded) return;
     await this.send(msg, markdown, runId);
   }
 
@@ -1048,20 +1127,29 @@ export class Orchestrator {
     const answerStartedAt = Date.now();
     let outcome: AnswerOutcome | undefined;
     try {
-      // The engine picks the LLM client for the write space (its agent's CLI, or
-      // the global default CLI). We still pass model/instruction as ask options so
-      // the persona reaches synthesis; provider routing is the engine's job.
-      const agent = this.engine.agentForSpace(writeSpace);
+      const run = this.engine.chatRuns.get(runId);
+      if (!run?.executionPlan) {
+        throw new Error("Chat Run has no immutable execution plan");
+      }
       let context: ConversationContext = { text: userText, images: [] };
+      let failureTrace: AskFailureTrace | undefined;
       let res;
       try {
         context = await this.withReplyContext(msg, userText, writeSpace);
-        res = await this.engine.ask(readSpaces, context.text, {
-          model: agent?.model || undefined,
-          instruction: agent?.instruction || undefined,
-          images: context.images.map((image) => ({ path: image.localPath })),
-          signal,
-        });
+        res = await this.engine.askWithExecutionPlan(
+          readSpaces,
+          context.text,
+          run.executionPlan,
+          run.skillEvidence,
+          {
+            images: context.images.map((image) => ({ path: image.localPath })),
+            signal,
+            onFailureTrace: (trace) => {
+              failureTrace = trace;
+            },
+          },
+          run.agentId,
+        );
       } catch (err) {
         // No runnable provider (unset agent + no usable default CLI), or the CLI
         // failed to answer. Tell the user to configure, rather than fail silently.
@@ -1071,22 +1159,30 @@ export class Orchestrator {
         });
         outcome = isProviderTimeoutError(err) ? "timed_out" : "failed";
         const failure = chatRunError(err);
+        let finished: ChatRun | undefined;
         if (failure.kind === "cancelled") {
-          this.engine.chatRuns.cancel(runId, {
+          finished = this.engine.chatRuns.cancel(runId, {
             finishedAt: Date.now(),
             error: failure,
+            traceId: failureTrace?.traceId,
+            usage: failureTrace?.usage,
           });
         } else if (outcome === "timed_out") {
-          this.engine.chatRuns.timeout(runId, {
+          finished = this.engine.chatRuns.timeout(runId, {
             finishedAt: Date.now(),
             error: failure,
+            traceId: failureTrace?.traceId,
+            usage: failureTrace?.usage,
           });
         } else {
-          this.engine.chatRuns.fail(runId, {
+          finished = this.engine.chatRuns.fail(runId, {
             finishedAt: Date.now(),
             error: failure,
+            traceId: failureTrace?.traceId,
+            usage: failureTrace?.usage,
           });
         }
+        if (!finished) return;
         await this.send(
           msg,
           failure.kind === "cancelled" ? "本次请求已取消。" : providerNotice(err),
@@ -1099,14 +1195,20 @@ export class Orchestrator {
       // Cold-start honesty (Q3): if general and the KB is essentially empty, add a
       // gentle nudge to feed knowledge.
       let text = formatAnswer(res);
-      if (res.source === "general" && (await this.isColdStart(readSpaces))) {
+      if (
+        res.source === "general"
+        && res.context !== "agent-workdir"
+        && (await this.isColdStart(readSpaces))
+      ) {
         text = `${text}\n\n${coldStartNote()}`;
       }
-      this.engine.chatRuns.succeed(runId, {
+      const succeeded = this.engine.chatRuns.succeed(runId, {
         finishedAt: Date.now(),
         output: text,
         traceId: res.traceId,
+        usage: res.traceId ? this.engine.answerTrace(res.traceId)?.usage : undefined,
       });
+      if (!succeeded) return;
       await this.send(msg, text, runId);
       outcome = "succeeded";
     } catch (err) {
@@ -1283,6 +1385,10 @@ export class Orchestrator {
     control: KnowledgeControl,
   ): Promise<void> {
     if (control !== "redistill") return;
+    if (!await this.authorizeGroupAutomation(
+      msg,
+      "只有群主或群管理员可以重新提炼本群知识。",
+    )) return;
     await this.send(msg, "开始重新提炼本空间知识，稍后完成。");
     void this.engine.runDreamCycle(writeSpace).catch((err) =>
       log.error("manual dream failed", { err: String(err) })
@@ -1467,7 +1573,10 @@ export class Orchestrator {
       return;
     }
     const inThread = groupBinding?.replyInThread ?? false;
-    if (chatRunId) this.engine.chatRuns.startDeliveryAttempt(chatRunId, Date.now());
+    if (
+      chatRunId
+      && !this.engine.chatRuns.startDeliveryAttempt(chatRunId, Date.now())
+    ) return;
     try {
       await this.connector.reply({
         chatId: msg.chatId,

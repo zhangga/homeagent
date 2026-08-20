@@ -1,7 +1,9 @@
 import { Database } from "bun:sqlite";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  appendFileSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -27,9 +29,22 @@ export const AUTOMATED_FEISHU_SOAK_SCENARIOS = [
   "reminder_delivery",
   "learning_interaction",
   "distill_citation",
-] as const satisfies readonly FeishuSoakScenario[];
+  "agent_revision_lifecycle",
+  "writable_task_approval",
+  "readonly_task_retry",
+] as const;
 
-type AutomatedScenario = (typeof AUTOMATED_FEISHU_SOAK_SCENARIOS)[number];
+export type AutomatedScenario = (typeof AUTOMATED_FEISHU_SOAK_SCENARIOS)[number];
+export const AGENT_PLATFORM_SOAK_SCENARIOS = [
+  "agent_revision_lifecycle",
+  "writable_task_approval",
+  "readonly_task_retry",
+] as const;
+export type AgentPlatformScenario = (typeof AGENT_PLATFORM_SOAK_SCENARIOS)[number];
+
+function isAgentPlatformScenario(value: AutomatedScenario): value is AgentPlatformScenario {
+  return (AGENT_PLATFORM_SOAK_SCENARIOS as readonly string[]).includes(value);
+}
 
 export interface LarkMessage {
   message_id: string;
@@ -42,6 +57,12 @@ export interface LarkMessage {
     open_bot_id?: string;
   };
   thread_replies?: LarkMessage[];
+}
+
+export interface LarkMessagePage {
+  messages: LarkMessage[];
+  hasMore: boolean;
+  pageToken?: string;
 }
 
 interface LarkCliEnvelope {
@@ -60,7 +81,12 @@ export interface StoredTask {
   id: string;
   name: string;
   space: string;
+  topic?: string;
+  cadence?: string;
+  hour?: number;
+  enabled?: boolean;
   notify?: boolean;
+  distillOnRun?: boolean;
   timeoutMinutes?: number;
 }
 
@@ -68,12 +94,66 @@ export interface StoredTaskRun {
   id: string;
   taskId: string;
   taskName?: string;
+  space?: string;
+  topic?: string;
   status: string;
   trigger?: string;
+  agentId?: string;
+  provider?: string;
+  model?: string;
+  executionPlan?: {
+    version?: number;
+    agentRevisionId?: string;
+    instruction: string;
+    provider?: string;
+    model?: string;
+    reasoningEffort?: string;
+    execution?: {
+      permission?: string;
+      workdir?: string;
+      skills?: string[];
+      webSearch?: boolean;
+    };
+    resolutionError?: string;
+  };
+  skillEvidence?: unknown;
+  distill?: boolean;
+  notify?: boolean;
+  timeoutMs?: number;
+  priority?: string;
   startedAt: number;
+  runStartedAt?: number;
   finishedAt?: number;
+  output?: string;
+  summary?: string;
+  usage?: unknown;
   rawId?: string;
   pagesWritten?: number;
+  failure?: {
+    phase?: string;
+    kind?: string;
+    retryable?: boolean;
+  };
+  retry?: {
+    attempt?: number;
+    maxAttempts?: number;
+    status?: string;
+    nextAttemptAt?: number;
+    claimedByRunId?: string;
+  };
+  retryOf?: string;
+  approval?: {
+    status?: string;
+    requestedAt?: number;
+    expiresAt?: number;
+    decidedAt?: number;
+    decidedBy?: string;
+  };
+  approvalNotification?: {
+    status?: string;
+    attempts?: number;
+    sentAt?: number;
+  };
   notification?: {
     status?: string;
     sentAt?: number;
@@ -123,9 +203,14 @@ export interface FeishuSoakDriverOptions {
   dataDir: string;
   evidencePath: string;
   monitorPath: string;
+  windowStartedAt?: number;
   adminUrl: string;
   adminToken?: string;
   researchTaskName?: string;
+  approvalExpiredRunId?: string;
+  approvalIdempotencyRunId?: string;
+  retryTaskId?: string;
+  retryBusinessMarker?: string;
   scenarios: AutomatedScenario[];
   responseTimeoutMs: number;
   longTimeoutMs: number;
@@ -143,12 +228,25 @@ interface StoredFeishuBinding {
   replyInThread: boolean;
 }
 
+interface StoredSpaceMeta {
+  id: string;
+  agentId?: string;
+}
+
 export interface FeishuSoakAdminFormRequest {
   adminUrl: string;
   adminToken?: string;
   path: string;
   form: Record<string, string>;
-  fetchImpl?: typeof fetch;
+  fetchImpl?: (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => Promise<Response>;
+}
+
+export interface FeishuSoakAdminFormResponse {
+  status: number;
+  location: string;
 }
 
 export interface UiUserAction {
@@ -261,6 +359,414 @@ export async function executeVerifiedScenario(
   const artifactId = (await verify()).trim();
   if (!artifactId) throw new Error(`${scenario} did not produce an artifact id`);
   return recordSoakEvidence(evidencePath, { scenario, ok: true, artifactId });
+}
+
+export interface AgentPlatformSoakEvidence {
+  at: number;
+  scenario: AgentPlatformScenario;
+  ok: true;
+  artifactId: string;
+  details?: Record<string, unknown>;
+}
+
+function sha256Evidence(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function safeEvidenceString(value: unknown): string | undefined {
+  return typeof value === "string"
+      && value.length > 0
+      && value.length <= 200
+      && !/[\r\n]/u.test(value)
+    ? value
+    : undefined;
+}
+
+function safeEvidenceNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Strictly allowlist non-sensitive metadata before writing the shared sidecar. */
+export function sanitizeAgentPlatformEvidenceDetails(
+  value: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!value) return undefined;
+  const result: Record<string, unknown> = {};
+  const triggerPath = safeEvidenceString(value.triggerPath);
+  if (["web_admin_post", "production_scheduler_retry"].includes(triggerPath ?? "")) {
+    result.triggerPath = triggerPath;
+  }
+  const windowStartedAt = safeEvidenceNumber(value.windowStartedAt);
+  if (windowStartedAt !== undefined) result.windowStartedAt = windowStartedAt;
+
+  const resourceSource = object(value.resourceIds);
+  const resourceIds: Record<string, string> = {};
+  for (const key of [
+    "agentId",
+    "taskId",
+    "firstRevisionId",
+    "secondRevisionId",
+    "rollbackRevisionId",
+    "secondRevisionRunId",
+    "rollbackRunId",
+    "approvedRunId",
+    "rejectedRunId",
+    "expiredRunId",
+    "idempotencyRunId",
+    "parentRunId",
+    "retryRunId",
+  ]) {
+    const id = safeEvidenceString(resourceSource[key]);
+    if (id) resourceIds[key] = id;
+  }
+  if (Object.keys(resourceIds).length > 0) result.resourceIds = resourceIds;
+
+  const revisions = Array.isArray(value.revisions)
+    ? value.revisions.slice(0, 10).flatMap((candidate) => {
+      const revision = object(candidate);
+      const id = safeEvidenceString(revision.id);
+      const source = safeEvidenceString(revision.source);
+      const snapshotSha256 = safeEvidenceString(revision.snapshotSha256);
+      if (!id || !source || !/^[a-f0-9]{64}$/u.test(snapshotSha256 ?? "")) return [];
+      const basedOnRevisionId = safeEvidenceString(revision.basedOnRevisionId);
+      return [{ id, source, snapshotSha256, ...(basedOnRevisionId ? { basedOnRevisionId } : {}) }];
+    })
+    : [];
+  if (revisions.length > 0) result.revisions = revisions;
+
+  const allowedRunStrings = [
+    "id", "taskId", "status", "trigger", "agentId", "agentRevisionId",
+    "executionPlanSha256", "outputSha256", "notificationStatus", "approvalStatus",
+    "approvalNotificationStatus", "failurePhase", "failureKind", "retryStatus",
+    "retryClaimedByRunId", "retryOf", "rawId",
+  ] as const;
+  const allowedRunNumbers = [
+    "startedAt", "runStartedAt", "finishedAt", "notificationSentAt",
+    "approvalRequestedAt", "approvalExpiresAt", "approvalDecidedAt",
+    "approvalNotificationAttempts", "approvalNotificationSentAt", "retryAttempt",
+    "retryMaxAttempts", "pagesWritten",
+  ] as const;
+  const runs = Array.isArray(value.runs)
+    ? value.runs.slice(0, 10).flatMap((candidate) => {
+      const run = object(candidate);
+      const id = safeEvidenceString(run.id);
+      if (!id) return [];
+      const safe: Record<string, unknown> = { id };
+      for (const key of allowedRunStrings) {
+        const field = safeEvidenceString(run[key]);
+        if (
+          field
+          && (!key.endsWith("Sha256") || /^[a-f0-9]{64}$/u.test(field))
+        ) safe[key] = field;
+      }
+      for (const key of allowedRunNumbers) {
+        const field = safeEvidenceNumber(run[key]);
+        if (field !== undefined) safe[key] = field;
+      }
+      if (typeof run.failureRetryable === "boolean") {
+        safe.failureRetryable = run.failureRetryable;
+      }
+      return [safe];
+    })
+    : [];
+  if (runs.length > 0) result.runs = runs;
+
+  const messages = Array.isArray(value.messages)
+    ? value.messages.slice(0, 20).flatMap((candidate) => {
+      const message = object(candidate);
+      const id = safeEvidenceString(message.id);
+      const contentSha256 = safeEvidenceString(message.contentSha256);
+      if (!id || !/^[a-f0-9]{64}$/u.test(contentSha256 ?? "")) return [];
+      const createTime = safeEvidenceString(message.createTime);
+      return [{ id, contentSha256, ...(createTime ? { createTime } : {}) }];
+    })
+    : [];
+  if (messages.length > 0) result.messages = messages;
+  return result;
+}
+
+function durableRunMetadata(run: StoredTaskRun): Record<string, unknown> {
+  return {
+    id: run.id,
+    taskId: run.taskId,
+    status: run.status,
+    ...(run.trigger ? { trigger: run.trigger } : {}),
+    ...(run.agentId ? { agentId: run.agentId } : {}),
+    ...(run.executionPlan?.agentRevisionId
+      ? { agentRevisionId: run.executionPlan.agentRevisionId }
+      : {}),
+    executionPlanSha256: sha256Evidence(run.executionPlan ?? null),
+    outputSha256: sha256Evidence([run.output ?? null, run.summary ?? null]),
+    startedAt: run.startedAt,
+    ...(run.runStartedAt !== undefined ? { runStartedAt: run.runStartedAt } : {}),
+    ...(run.finishedAt !== undefined ? { finishedAt: run.finishedAt } : {}),
+    ...(run.notification?.status ? { notificationStatus: run.notification.status } : {}),
+    ...(run.notification?.sentAt !== undefined
+      ? { notificationSentAt: run.notification.sentAt }
+      : {}),
+    ...(run.approval?.status ? { approvalStatus: run.approval.status } : {}),
+    ...(run.approval?.requestedAt !== undefined
+      ? { approvalRequestedAt: run.approval.requestedAt }
+      : {}),
+    ...(run.approval?.expiresAt !== undefined
+      ? { approvalExpiresAt: run.approval.expiresAt }
+      : {}),
+    ...(run.approval?.decidedAt !== undefined
+      ? { approvalDecidedAt: run.approval.decidedAt }
+      : {}),
+    ...(run.approvalNotification?.status
+      ? { approvalNotificationStatus: run.approvalNotification.status }
+      : {}),
+    ...(run.approvalNotification?.attempts !== undefined
+      ? { approvalNotificationAttempts: run.approvalNotification.attempts }
+      : {}),
+    ...(run.approvalNotification?.sentAt !== undefined
+      ? { approvalNotificationSentAt: run.approvalNotification.sentAt }
+      : {}),
+    ...(run.failure?.phase ? { failurePhase: run.failure.phase } : {}),
+    ...(run.failure?.kind ? { failureKind: run.failure.kind } : {}),
+    ...(run.failure?.retryable !== undefined
+      ? { failureRetryable: run.failure.retryable }
+      : {}),
+    ...(run.retry?.attempt !== undefined ? { retryAttempt: run.retry.attempt } : {}),
+    ...(run.retry?.maxAttempts !== undefined
+      ? { retryMaxAttempts: run.retry.maxAttempts }
+      : {}),
+    ...(run.retry?.status ? { retryStatus: run.retry.status } : {}),
+    ...(run.retry?.claimedByRunId
+      ? { retryClaimedByRunId: run.retry.claimedByRunId }
+      : {}),
+    ...(run.retryOf ? { retryOf: run.retryOf } : {}),
+    ...(run.rawId ? { rawId: run.rawId } : {}),
+    ...(run.pagesWritten !== undefined ? { pagesWritten: run.pagesWritten } : {}),
+  };
+}
+
+function durableMessageMetadata(message: LarkMessage): Record<string, unknown> {
+  return {
+    id: message.message_id,
+    contentSha256: sha256Evidence(message.content ?? ""),
+    ...(message.create_time ? { createTime: message.create_time } : {}),
+  };
+}
+
+export interface AgentPlatformSoakFailureEvidence {
+  at: number;
+  scenario: AgentPlatformScenario;
+  ok: false;
+  artifactId: string;
+  reason: string;
+  cleanupErrors: string[];
+  manualRecovery: string;
+}
+
+export type SoakCleanupEntry = {
+  scenario: AgentPlatformScenario;
+  label: string;
+  manualRecovery: string;
+  interrupt: (reason: string) => void;
+  cleanup: () => Promise<string[]>;
+};
+
+export type SoakCleanupRegistration = {
+  cleanup: () => Promise<string[]>;
+};
+
+type RegisteredSoakCleanup = SoakCleanupEntry & {
+  token: symbol;
+  cleanupPromise?: Promise<string[]>;
+};
+
+export interface SoakCleanupFailure {
+  scenario: AgentPlatformScenario;
+  label: string;
+  cleanupErrors: string[];
+  manualRecovery: string;
+}
+
+/**
+ * Process-wide ownership registry for acceptance resources. Registrations are
+ * made before the first mutation and cleanup is idempotent so a signal and the
+ * scenario's normal finally path can safely race.
+ */
+export class SoakCleanupRegistry {
+  private readonly entries = new Map<symbol, RegisteredSoakCleanup>();
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  register(entry: SoakCleanupEntry): SoakCleanupRegistration {
+    const token = Symbol(entry.label);
+    const registered: RegisteredSoakCleanup = { ...entry, token };
+    this.entries.set(token, registered);
+    return {
+      cleanup: () => this.cleanupEntry(registered),
+    };
+  }
+
+  private async cleanupEntry(entry: RegisteredSoakCleanup): Promise<string[]> {
+    if (entry.cleanupPromise) return entry.cleanupPromise;
+    const attempt = Promise.resolve()
+      .then(entry.cleanup)
+      .catch((error) => [`cleanup threw: ${safeError(error)}`]);
+    entry.cleanupPromise = attempt;
+    const errors = await attempt;
+    if (entry.cleanupPromise === attempt) {
+      entry.cleanupPromise = undefined;
+      if (errors.length === 0) this.entries.delete(entry.token);
+    }
+    return errors;
+  }
+
+  async shutdown(reason: string, timeoutMs: number): Promise<SoakCleanupFailure[]> {
+    const entries = [...this.entries.values()].reverse();
+    for (const entry of entries) {
+      try {
+        entry.interrupt(reason);
+      } catch {
+        // Cleanup still has a chance to make the owned production state safe.
+      }
+    }
+    if (entries.length === 0) return [];
+
+    const boundedMs = Math.max(1, timeoutMs);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<"timeout">((resolveTimeout) => {
+      timeout = setTimeout(() => resolveTimeout("timeout"), boundedMs);
+    });
+    const completed = (async () => {
+      const results: Array<{ entry: RegisteredSoakCleanup; errors: string[] }> = [];
+      for (const entry of entries) {
+        results.push({ entry, errors: await this.cleanupEntry(entry) });
+      }
+      return results;
+    })();
+    const outcome = await Promise.race([completed, timedOut]);
+    if (timeout) clearTimeout(timeout);
+
+    if (outcome === "timeout") {
+      return entries.map((entry) => ({
+        scenario: entry.scenario,
+        label: entry.label,
+        cleanupErrors: [`cleanup timed out after ${boundedMs}ms`],
+        manualRecovery: entry.manualRecovery,
+      }));
+    }
+    return outcome.map(({ entry, errors }) => ({
+      scenario: entry.scenario,
+      label: entry.label,
+      cleanupErrors: errors,
+      manualRecovery: entry.manualRecovery,
+    }));
+  }
+}
+
+export function shouldAbortRemainingAgentPlatformScenarios(
+  failedScenario: AutomatedScenario,
+  registry: SoakCleanupRegistry,
+): boolean {
+  return isAgentPlatformScenario(failedScenario) && registry.size > 0;
+}
+
+interface SoakProcessEvents {
+  on(event: string, listener: (...args: unknown[]) => void): unknown;
+  off(event: string, listener: (...args: unknown[]) => void): unknown;
+}
+
+export function installSoakShutdownHandlers(options: {
+  registry: SoakCleanupRegistry;
+  processEvents: SoakProcessEvents;
+  timeoutMs: number;
+  recordFailure: (failure: AgentPlatformSoakFailureEvidence) => void;
+  exit: (code: number) => void;
+}): () => void {
+  let shuttingDown = false;
+  const shutdown = (reason: "SIGINT" | "SIGTERM" | "beforeExit", exitCode: number) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void options.registry.shutdown(reason, options.timeoutMs)
+      .then((failures) => {
+        for (const failure of failures) {
+          options.recordFailure({
+            at: Date.now(),
+            scenario: failure.scenario,
+            ok: false,
+            artifactId: failure.label,
+            reason,
+            cleanupErrors: failure.cleanupErrors,
+            manualRecovery: failure.manualRecovery,
+          });
+        }
+      })
+      .catch((error) => {
+        console.error(`[F5] ${reason} cleanup failed: ${safeError(error)}`);
+      })
+      .finally(() => options.exit(exitCode));
+  };
+  const onSigint = () => shutdown("SIGINT", 130);
+  const onSigterm = () => shutdown("SIGTERM", 143);
+  const onBeforeExit = (...args: unknown[]) => {
+    if (options.registry.size === 0) return;
+    const currentCode = typeof args[0] === "number" ? args[0] : 0;
+    shutdown("beforeExit", currentCode === 0 ? 1 : currentCode);
+  };
+  options.processEvents.on("SIGINT", onSigint);
+  options.processEvents.on("SIGTERM", onSigterm);
+  options.processEvents.on("beforeExit", onBeforeExit);
+  return () => {
+    options.processEvents.off("SIGINT", onSigint);
+    options.processEvents.off("SIGTERM", onSigterm);
+    options.processEvents.off("beforeExit", onBeforeExit);
+  };
+}
+
+export function agentPlatformEvidencePath(legacyEvidencePath: string): string {
+  const absolute = resolve(legacyEvidencePath);
+  return join(
+    dirname(absolute),
+    `${basename(absolute, ".jsonl")}.agent-platform.jsonl`,
+  );
+}
+
+export function recordAgentPlatformFailureEvidence(
+  evidencePath: string,
+  evidence: AgentPlatformSoakFailureEvidence,
+): AgentPlatformSoakFailureEvidence {
+  const output = resolve(evidencePath);
+  mkdirSync(dirname(output), { recursive: true });
+  appendFileSync(output, `${JSON.stringify(evidence)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  return evidence;
+}
+
+export async function executeVerifiedAgentPlatformScenario(
+  scenario: AgentPlatformScenario,
+  evidencePath: string,
+  verify: () => Promise<string>,
+  details: () => Record<string, unknown> | undefined = () => undefined,
+): Promise<AgentPlatformSoakEvidence> {
+  const artifactId = (await verify()).trim();
+  if (!artifactId || artifactId.length > 200 || /[\r\n]/u.test(artifactId)) {
+    throw new Error(`${scenario} did not produce a short artifact id`);
+  }
+  const durableDetails = sanitizeAgentPlatformEvidenceDetails(details());
+  const evidence: AgentPlatformSoakEvidence = {
+    at: Date.now(),
+    scenario,
+    ok: true,
+    artifactId,
+    ...(durableDetails ? { details: durableDetails } : {}),
+  };
+  const output = resolve(evidencePath);
+  mkdirSync(dirname(output), { recursive: true });
+  appendFileSync(output, `${JSON.stringify(evidence)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  return evidence;
 }
 
 export function selectReusableResearchRun(
@@ -466,6 +972,99 @@ function messagesFrom(envelope: LarkCliEnvelope): LarkMessage[] {
   return Array.isArray(messages) ? messages as LarkMessage[] : [];
 }
 
+export function currentSoakWindowStartedAt(
+  monitorPath: string,
+  declaredStartedAt: number | undefined,
+): number {
+  if (declaredStartedAt === undefined) {
+    throw new Error("--window-started-at is required for Agent platform acceptance");
+  }
+  if (
+    !Number.isSafeInteger(declaredStartedAt)
+    || declaredStartedAt <= 0
+  ) {
+    throw new Error("--window-started-at must be a positive epoch-millisecond timestamp or ISO date");
+  }
+  if (!existsSync(monitorPath)) {
+    throw new Error(`monitor file does not exist: ${monitorPath}`);
+  }
+  let hasCurrentSample = false;
+  const lines = readFileSync(monitorPath, "utf8").split(/\r?\n/u);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    if (!line.trim()) continue;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = object(JSON.parse(line));
+    } catch {
+      throw new Error(`monitor line ${index + 1} is not valid JSON`);
+    }
+    if (typeof parsed.at !== "number" || !Number.isFinite(parsed.at)) {
+      throw new Error(`monitor line ${index + 1} has no numeric at timestamp`);
+    }
+    if (parsed.at >= declaredStartedAt) hasCurrentSample = true;
+  }
+  if (!hasCurrentSample) {
+    throw new Error("monitor has no sample in the declared current window");
+  }
+  return declaredStartedAt;
+}
+
+function messagePageFrom(envelope: LarkCliEnvelope): LarkMessagePage {
+  const data = object(envelope.data);
+  const pageToken = data.page_token ?? data.pageToken;
+  return {
+    messages: messagesFrom(envelope),
+    hasMore: data.has_more === true || data.hasMore === true,
+    ...(typeof pageToken === "string" && pageToken.trim()
+      ? { pageToken: pageToken.trim() }
+      : {}),
+  };
+}
+
+export async function collectLarkMessagesSince(
+  loadPage: (pageToken?: string) => Promise<LarkMessagePage>,
+  windowStartedAt: number,
+  maxPages = 100,
+): Promise<LarkMessage[]> {
+  if (!Number.isFinite(windowStartedAt) || windowStartedAt < 0) {
+    throw new Error("message evidence window start is invalid");
+  }
+  if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 1_000) {
+    throw new Error("message evidence page limit is invalid");
+  }
+  const threshold = windowStartedAt - 60_000;
+  const seenTokens = new Set<string>();
+  const messages = new Map<string, LarkMessage>();
+  let pageToken: string | undefined;
+  for (let pageNumber = 0; pageNumber < maxPages; pageNumber += 1) {
+    const page = await loadPage(pageToken);
+    for (const candidate of page.messages) {
+      if (!messages.has(candidate.message_id)) messages.set(candidate.message_id, candidate);
+    }
+    const timestamps = page.messages.map((candidate) =>
+      candidate.create_time ? parseLarkCreateTime(candidate.create_time) : NaN
+    );
+    const reachedWindowStart = timestamps.length > 0
+      && timestamps.every(Number.isFinite)
+      && Math.min(...timestamps) < threshold;
+    if (!page.hasMore || reachedWindowStart) {
+      return [...messages.values()].filter((candidate) => {
+        const createdAt = candidate.create_time
+          ? parseLarkCreateTime(candidate.create_time)
+          : NaN;
+        return !Number.isFinite(createdAt) || createdAt >= threshold;
+      });
+    }
+    if (!page.pageToken || seenTokens.has(page.pageToken)) {
+      throw new Error("Feishu message pagination did not advance");
+    }
+    seenTokens.add(page.pageToken);
+    pageToken = page.pageToken;
+  }
+  throw new Error("Feishu message pagination did not reach the soak window start");
+}
+
 function crc32(input: Buffer): number {
   let crc = 0xffffffff;
   for (const byte of input) {
@@ -586,6 +1185,17 @@ function configuredWebPort(
   return 3_000;
 }
 
+function timestampArg(args: string[], flag: string): number | undefined {
+  const raw = stringArg(args, flag);
+  if (raw === undefined) return undefined;
+  const numeric = Number(raw);
+  const parsed = Number.isFinite(numeric) ? numeric : Date.parse(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${flag} must be a positive epoch-millisecond timestamp or ISO date`);
+  }
+  return parsed;
+}
+
 function normalizeAdminUrl(value: string): string {
   let url: URL;
   try {
@@ -618,6 +1228,11 @@ export function parseFeishuSoakOptions(
     "--evidence",
     "--monitor",
     "--research-task",
+    "--approval-expired-run-id",
+    "--approval-idempotency-run-id",
+    "--retry-task-id",
+    "--retry-business-marker",
+    "--window-started-at",
     "--scenarios",
     "--sender",
     "--response-timeout-seconds",
@@ -647,7 +1262,12 @@ export function parseFeishuSoakOptions(
     monitorPath: resolve(
       stringArg(args, "--monitor", join(dirname(evidencePath), "soak-24h.jsonl"))!,
     ),
+    windowStartedAt: timestampArg(args, "--window-started-at"),
     researchTaskName: stringArg(args, "--research-task"),
+    approvalExpiredRunId: stringArg(args, "--approval-expired-run-id"),
+    approvalIdempotencyRunId: stringArg(args, "--approval-idempotency-run-id"),
+    retryTaskId: stringArg(args, "--retry-task-id"),
+    retryBusinessMarker: stringArg(args, "--retry-business-marker"),
     adminUrl: normalizeAdminUrl(
       stringArg(
         args,
@@ -664,14 +1284,546 @@ export function parseFeishuSoakOptions(
   };
 }
 
+/**
+ * Fail before the driver performs any management mutation when production-only
+ * evidence cannot be generated through HomeAgent's public administration UI.
+ */
+export function assertAgentPlatformPreconditions(options: FeishuSoakDriverOptions): void {
+  if (options.scenarios.includes("writable_task_approval")) {
+    if (!options.approvalExpiredRunId) {
+      throw new Error(
+        "writable_task_approval requires --approval-expired-run-id from the production expiry loop",
+      );
+    }
+    if (!options.approvalIdempotencyRunId) {
+      throw new Error(
+        "writable_task_approval requires --approval-idempotency-run-id with at least two delivery attempts",
+      );
+    }
+  }
+  if (options.scenarios.includes("readonly_task_retry")) {
+    if (!options.retryTaskId) {
+      throw new Error(
+        "readonly_task_retry requires --retry-task-id for a scheduled read-only fault-injection task",
+      );
+    }
+    const marker = options.retryBusinessMarker?.trim();
+    if (!marker) {
+      throw new Error(
+        "readonly_task_retry requires --retry-business-marker from the task's unique output contract",
+      );
+    }
+    if (marker.length > 120 || /[\r\n]/u.test(marker)) {
+      throw new Error("--retry-business-marker must be a short single-line marker");
+    }
+  }
+  if (
+    options.scenarios.some(isAgentPlatformScenario)
+    && options.windowStartedAt === undefined
+  ) {
+    throw new Error("Agent platform acceptance requires --window-started-at for this soak session");
+  }
+}
+
+export interface StoredAgentRevisionSnapshot {
+  name: string;
+  instruction: string;
+  model: string;
+  reasoningEffort: string;
+  provider: string;
+  visibility: string;
+  workdir?: string;
+  permission: string;
+  skills: unknown[];
+}
+
+export interface StoredAgent extends StoredAgentRevisionSnapshot {
+  id: string;
+  publishedRevisionId?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface StoredAgentRevision {
+  id: string;
+  agentId: string;
+  number: number;
+  source: string;
+  basedOnRevisionId?: string;
+  createdAt: number;
+  snapshot: StoredAgentRevisionSnapshot;
+}
+
+export interface AgentRevisionLifecycleEvidenceInput {
+  agent: StoredAgent;
+  revisions: StoredAgentRevision[];
+  runs: StoredTaskRun[];
+  firstRevisionId: string;
+  secondRevisionId: string;
+  rollbackRevisionId: string;
+  secondRevisionRunId: string;
+  rollbackRunId: string;
+  businessMarkers: {
+    secondRevision: string;
+    rollback: string;
+  };
+  businessNotices: LarkMessage[];
+  botOpenId: string;
+}
+
+/**
+ * Validate the production evidence needed for an Agent release/rollback gate.
+ * This deliberately consumes only durable public artifacts: Agent revision
+ * history and Task Run execution plans. A redirect alone is never acceptance.
+ */
+export function assertAgentRevisionLifecycleEvidence(
+  input: AgentRevisionLifecycleEvidenceInput,
+): string {
+  const revision = (id: string, label: string): StoredAgentRevision => {
+    const found = input.revisions.find((candidate) => candidate.id === id);
+    if (!found || found.agentId !== input.agent.id) {
+      throw new Error(`${label} revision is missing from the Agent history`);
+    }
+    return found;
+  };
+  const run = (id: string, label: string): StoredTaskRun => {
+    const found = input.runs.find((candidate) => candidate.id === id);
+    if (!found) throw new Error(`${label} Run is missing from durable history`);
+    if (found.status !== "succeeded") throw new Error(`${label} Run did not succeed`);
+    if (found.agentId !== input.agent.id) {
+      throw new Error(`${label} Run is not attributed to the acceptance Agent`);
+    }
+    return found;
+  };
+
+  const first = revision(input.firstRevisionId, "v1");
+  const second = revision(input.secondRevisionId, "v2");
+  const rolledBack = revision(input.rollbackRevisionId, "rollback");
+  if (first.source === "draft") throw new Error("v1 evidence points to an unpublished draft");
+  if (second.source !== "release") throw new Error("v2 evidence is not a published release");
+  if (
+    rolledBack.source !== "rollback"
+    || rolledBack.basedOnRevisionId !== first.id
+  ) {
+    throw new Error("rollback is not a new publication based on v1");
+  }
+  const materializedSnapshot: StoredAgentRevisionSnapshot = {
+    name: input.agent.name,
+    instruction: input.agent.instruction,
+    model: input.agent.model,
+    reasoningEffort: input.agent.reasoningEffort,
+    provider: input.agent.provider,
+    visibility: input.agent.visibility,
+    ...(input.agent.workdir ? { workdir: input.agent.workdir } : {}),
+    permission: input.agent.permission,
+    skills: input.agent.skills,
+  };
+  const snapshotKey = (snapshot: StoredAgentRevisionSnapshot): string => JSON.stringify([
+    snapshot.name,
+    snapshot.instruction,
+    snapshot.model,
+    snapshot.reasoningEffort,
+    snapshot.provider,
+    snapshot.visibility,
+    snapshot.workdir ?? null,
+    snapshot.permission,
+    snapshot.skills,
+  ]);
+  if (
+    snapshotKey(rolledBack.snapshot) !== snapshotKey(first.snapshot)
+    || snapshotKey(materializedSnapshot) !== snapshotKey(first.snapshot)
+  ) {
+    throw new Error("rollback revision did not restore the v1 snapshot");
+  }
+  if (input.agent.publishedRevisionId !== rolledBack.id) {
+    throw new Error("the rolled-back revision is not the Agent's published head");
+  }
+
+  const secondRun = run(input.secondRevisionRunId, "v2");
+  const rollbackRun = run(input.rollbackRunId, "rollback");
+  const executionPlanMatches = (
+    candidate: StoredTaskRun,
+    expected: StoredAgentRevisionSnapshot,
+  ): boolean => {
+    const skillNames = expected.skills.map((binding) => {
+      const name = object(binding).name;
+      return typeof name === "string" ? name : undefined;
+    });
+    const plan = candidate.executionPlan;
+    return plan?.version === 1
+      && plan.instruction === expected.instruction
+      && plan.provider === expected.provider
+      && (plan.model ?? "") === expected.model
+      && (plan.reasoningEffort ?? "") === expected.reasoningEffort
+      && plan.resolutionError === undefined
+      && plan.execution?.permission === expected.permission
+      && (plan.execution.workdir ?? undefined) === expected.workdir
+      && skillNames.every((name): name is string => name !== undefined)
+      && JSON.stringify(plan.execution.skills ?? []) === JSON.stringify(skillNames);
+  };
+  if (secondRun.executionPlan?.agentRevisionId !== second.id) {
+    throw new Error("v2 Run is not attributed to the published v2 revision");
+  }
+  if (!executionPlanMatches(secondRun, second.snapshot)) {
+    throw new Error("v2 Run did not freeze the complete v2 execution plan");
+  }
+  if (rollbackRun.executionPlan?.agentRevisionId !== rolledBack.id) {
+    throw new Error("post-rollback Run is not attributed to the rollback revision");
+  }
+  if (!executionPlanMatches(rollbackRun, first.snapshot)) {
+    throw new Error("post-rollback Run did not freeze the complete restored v1 execution plan");
+  }
+  if (
+    secondRun.startedAt < second.createdAt
+    || secondRun.startedAt >= rolledBack.createdAt
+    || secondRun.finishedAt === undefined
+    || secondRun.finishedAt < rolledBack.createdAt
+    || rollbackRun.startedAt < rolledBack.createdAt
+  ) {
+    throw new Error("Agent lifecycle Run ordering is inconsistent with its revisions");
+  }
+
+  const markers = input.businessMarkers;
+  if (
+    !markers.secondRevision.trim()
+    || !markers.rollback.trim()
+    || markers.secondRevision === markers.rollback
+  ) {
+    throw new Error("Agent lifecycle business markers must be non-empty and distinct");
+  }
+  const visibleMessageIds: string[] = [];
+  for (const [label, candidate, marker] of [
+    ["v2", secondRun, markers.secondRevision],
+    ["rollback", rollbackRun, markers.rollback],
+  ] as const) {
+    if (candidate.notification?.status !== "sent") {
+      throw new Error(`${label} Run completion notification was not durably sent`);
+    }
+    if (!(candidate.output ?? candidate.summary ?? "").includes(marker)) {
+      throw new Error(`${label} Run output does not contain its business marker`);
+    }
+    if (!candidate.taskName) {
+      throw new Error(`${label} Run has no frozen Task name for Feishu attribution`);
+    }
+    const visible = flattenLarkMessages(input.businessNotices).filter((message) =>
+      isBotMessage(message, input.botOpenId)
+      && (message.content ?? "").includes(candidate.taskName!)
+      && (message.content ?? "").includes(marker)
+    );
+    if (visible.length !== 1) {
+      throw new Error(
+        `${label} Feishu business notification expected one message, found ${visible.length}`,
+      );
+    }
+    visibleMessageIds.push(visible[0]!.message_id);
+  }
+  if (new Set(visibleMessageIds).size !== visibleMessageIds.length) {
+    throw new Error("Agent lifecycle markers were combined into one Feishu business message");
+  }
+
+  return `${input.agent.id}:${secondRun.id}:${rollbackRun.id}`;
+}
+
+export interface WritableTaskApprovalEvidenceInput {
+  /** Snapshot captured from durable storage before the approval mutation. */
+  pending: StoredTaskRun;
+  /** The same Run after approval and execution. */
+  approved: StoredTaskRun;
+  /** A separate Run closed through the public reject action. */
+  rejected: StoredTaskRun;
+  /** A separate Run closed by the production expiry loop. */
+  expired: StoredTaskRun;
+  /** A fault-injected delivery sample; it may be a different approval Run. */
+  idempotency: StoredTaskRun;
+  spaceId: string;
+  windowStartedAt: number;
+  /** Messages fetched from Feishu after a retried approval delivery. */
+  approvalNotices: LarkMessage[];
+  botOpenId: string;
+  completionMarker: string;
+}
+
+function hasProviderExecutionEvidence(run: StoredTaskRun): boolean {
+  return run.runStartedAt !== undefined
+    || run.usage !== undefined
+    || run.output !== undefined
+    || run.rawId !== undefined
+    || (run.pagesWritten ?? 0) > 0;
+}
+
+/** Validate durable approval, expiry and transport-idempotency evidence. */
+export function assertWritableTaskApprovalEvidence(
+  input: WritableTaskApprovalEvidenceInput,
+): string {
+  const evidenceRuns = [
+    input.pending,
+    input.approved,
+    input.rejected,
+    input.expired,
+    input.idempotency,
+  ];
+  if (evidenceRuns.some((run) =>
+    run.space !== input.spaceId || run.startedAt < input.windowStartedAt
+  )) {
+    throw new Error("approval evidence is outside the current soak window or target space");
+  }
+  if (new Set([
+    input.approved.id,
+    input.rejected.id,
+    input.expired.id,
+    input.idempotency.id,
+  ]).size !== 4) {
+    throw new Error("approval evidence Run ids must be distinct");
+  }
+  const permission = input.pending.executionPlan?.execution?.permission;
+  if (
+    !["write", "full"].includes(permission ?? "")
+    || !input.pending.executionPlan?.execution?.workdir
+  ) {
+    throw new Error("approval evidence is not for a writable frozen execution plan");
+  }
+  if (
+    input.pending.status !== "awaiting_approval"
+    || input.pending.approval?.status !== "pending"
+  ) {
+    throw new Error("pending approval snapshot is missing");
+  }
+  if (hasProviderExecutionEvidence(input.pending) || input.pending.finishedAt !== undefined) {
+    throw new Error("Provider evidence exists before approval");
+  }
+
+  if (input.approved.id !== input.pending.id || input.approved.status !== "succeeded") {
+    throw new Error("approved Run did not complete successfully");
+  }
+  const decisionAt = input.approved.approval?.decidedAt;
+  if (
+    input.approved.approval?.status !== "approved"
+    || decisionAt === undefined
+    || input.approved.runStartedAt === undefined
+    || input.approved.runStartedAt < decisionAt
+  ) {
+    throw new Error("approved Run began before its durable approval decision");
+  }
+  if (!hasProviderExecutionEvidence(input.approved)) {
+    throw new Error("approved Run has no Provider execution evidence");
+  }
+  if (input.approved.notification?.status !== "sent") {
+    throw new Error("approved Run completion notification was not durably sent");
+  }
+  if (
+    !input.completionMarker.trim()
+    || !(input.approved.output ?? input.approved.summary ?? "").includes(input.completionMarker)
+  ) {
+    throw new Error("approved Run output does not contain its completion marker");
+  }
+
+  for (const [label, run, expected] of [
+    ["rejected", input.rejected, "rejected"],
+    ["expired", input.expired, "expired"],
+  ] as const) {
+    if (run.status !== "cancelled" || run.approval?.status !== expected) {
+      throw new Error(`${label} approval did not reach its durable terminal state`);
+    }
+    if (hasProviderExecutionEvidence(run)) {
+      throw new Error(`${label} approval unexpectedly executed its Provider`);
+    }
+  }
+
+  if (input.approved.approvalNotification?.status !== "sent") {
+    throw new Error("approved Run has no sent approval notification audit");
+  }
+  const idempotencyDecisionAt = input.idempotency.approval?.decidedAt;
+  if (
+    input.idempotency.status !== "succeeded"
+    || input.idempotency.approval?.status !== "approved"
+    || idempotencyDecisionAt === undefined
+    || input.idempotency.runStartedAt === undefined
+    || input.idempotency.runStartedAt < idempotencyDecisionAt
+    || !hasProviderExecutionEvidence(input.idempotency)
+  ) {
+    throw new Error("idempotency approval Run was not approved and successfully executed");
+  }
+  if (
+    input.idempotency.approvalNotification?.status !== "sent"
+    || (input.idempotency.approvalNotification.attempts ?? 0) < 2
+    || input.idempotency.approvalNotification.sentAt === undefined
+    || input.idempotency.approvalNotification.sentAt > idempotencyDecisionAt
+  ) {
+    throw new Error("approval notification was not durably retried and sent");
+  }
+  const visibleNotices = flattenLarkMessages(input.approvalNotices).filter((candidate) =>
+    isBotMessage(candidate, input.botOpenId)
+    && (candidate.content ?? "").includes(input.idempotency.id)
+  );
+  if (visibleNotices.length !== 1) {
+    throw new Error(
+      `approval notification idempotency expected one Feishu message, found ${visibleNotices.length}`,
+    );
+  }
+  if (!input.approved.taskName) {
+    throw new Error("approved Run has no frozen Task name for Feishu attribution");
+  }
+  const completionNotices = flattenLarkMessages(input.approvalNotices).filter((candidate) =>
+    isBotMessage(candidate, input.botOpenId)
+    && (candidate.content ?? "").includes(input.approved.taskName!)
+    && (candidate.content ?? "").includes(input.completionMarker)
+  );
+  if (completionNotices.length !== 1) {
+    throw new Error(
+      `approved Feishu business notification expected one message, found ${completionNotices.length}`,
+    );
+  }
+  if (completionNotices[0]!.message_id === visibleNotices[0]!.message_id) {
+    throw new Error("approval request and completion evidence resolved to one Feishu message");
+  }
+
+  return `${input.approved.id}:${input.rejected.id}:${input.expired.id}:${input.idempotency.id}`;
+}
+
+export interface ReadonlyTaskRetryEvidenceInput {
+  runs: StoredTaskRun[];
+  taskId: string;
+  parentRunId: string;
+  retryRunId: string;
+  windowStartedAt: number;
+  /** Unique marker demanded in both Provider output and the Feishu notice. */
+  businessMarker: string;
+  businessNotices: LarkMessage[];
+  botOpenId: string;
+}
+
+/** Validate one fresh automatic retry, not a Provider checkpoint or manual rerun. */
+export function assertReadonlyTaskRetryEvidence(
+  input: ReadonlyTaskRetryEvidenceInput,
+): string {
+  const taskRuns = input.runs.filter((run) => run.taskId === input.taskId);
+  const parent = taskRuns.find((run) => run.id === input.parentRunId);
+  const child = taskRuns.find((run) => run.id === input.retryRunId);
+  if (!parent || !child) throw new Error("automatic retry parent/child evidence is missing");
+  if (
+    parent.startedAt < input.windowStartedAt
+    || child.startedAt < input.windowStartedAt
+  ) {
+    throw new Error("automatic retry evidence is outside the current soak window");
+  }
+  if (
+    parent.trigger !== "scheduled"
+    || parent.status !== "failed"
+    || parent.executionPlan?.execution?.permission !== "read-only"
+    || parent.failure?.phase !== "provider"
+    || parent.failure.retryable !== true
+  ) {
+    throw new Error("retry parent is not an eligible scheduled read-only Provider failure");
+  }
+  if (!["overloaded", "rate_limited", "transient_provider"].includes(
+    parent.failure.kind ?? "",
+  )) {
+    throw new Error("retry parent failure kind is not transient");
+  }
+  if (
+    parent.retry?.attempt !== 1
+    || parent.retry.maxAttempts !== 2
+    || parent.retry.status !== "claimed"
+    || parent.retry.claimedByRunId !== child.id
+  ) {
+    throw new Error("retry parent did not atomically claim exactly one child Run");
+  }
+  const linkedChildren = taskRuns.filter((run) => run.retryOf === parent.id);
+  if (linkedChildren.length !== 1 || linkedChildren[0]?.id !== child.id) {
+    throw new Error(`retry parent has ${linkedChildren.length} linked child Runs`);
+  }
+  if (
+    child.trigger !== "retry"
+    || child.retryOf !== parent.id
+    || child.retry?.attempt !== 2
+    || child.retry.maxAttempts !== 2
+    || child.status !== "succeeded"
+  ) {
+    throw new Error("automatic retry child did not succeed as attempt 2 of 2");
+  }
+  if (
+    parent.finishedAt === undefined
+    || child.startedAt < parent.finishedAt + 60_000
+  ) {
+    throw new Error("automatic retry did not preserve the production retry delay");
+  }
+  const frozenKey = (run: StoredTaskRun): string => JSON.stringify([
+    run.taskId,
+    run.taskName ?? null,
+    run.space ?? null,
+    run.topic ?? null,
+    run.agentId ?? null,
+    run.provider ?? null,
+    run.model ?? null,
+    run.executionPlan?.version ?? null,
+    run.executionPlan?.agentRevisionId ?? null,
+    run.executionPlan?.instruction ?? null,
+    run.executionPlan?.provider ?? null,
+    run.executionPlan?.model ?? null,
+    run.executionPlan?.reasoningEffort ?? null,
+    run.executionPlan?.execution?.permission ?? null,
+    run.executionPlan?.execution?.workdir ?? null,
+    run.executionPlan?.execution?.skills ?? null,
+    run.executionPlan?.execution?.webSearch ?? null,
+    run.executionPlan?.resolutionError ?? null,
+    run.skillEvidence ?? null,
+    run.distill ?? null,
+    run.notify ?? null,
+    run.timeoutMs ?? null,
+    run.priority ?? null,
+  ]);
+  if (frozenKey(child) !== frozenKey(parent)) {
+    throw new Error("automatic retry child did not reuse the frozen execution plan");
+  }
+
+  const produced = [parent, child].filter((run) =>
+    run.rawId !== undefined
+    || run.output !== undefined
+    || (run.pagesWritten ?? 0) > 0
+  );
+  if (
+    produced.length !== 1
+    || produced[0]?.id !== child.id
+    || !child.rawId
+    || !(child.output ?? "").includes(input.businessMarker)
+  ) {
+    throw new Error("retry chain did not produce exactly one marked business output");
+  }
+  const notified = [parent, child].filter((run) => run.notification?.status === "sent");
+  if (notified.length !== 1 || notified[0]?.id !== child.id) {
+    throw new Error("retry chain did not durably send exactly one business notification");
+  }
+  const visible = flattenLarkMessages(input.businessNotices).filter((candidate) =>
+    isBotMessage(candidate, input.botOpenId)
+    && (candidate.content ?? "").includes(child.taskName ?? "")
+    && (candidate.content ?? "").includes(input.businessMarker)
+  );
+  if (visible.length !== 1) {
+    throw new Error(`expected one Feishu business notification, found ${visible.length}`);
+  }
+
+  return `${parent.id}:${child.id}:${child.rawId}`;
+}
+
 function allowedAdminMutationPath(path: string): boolean {
   if (path === "/integrations/groups/connect") return true;
-  return /^\/integrations\/groups\/[^/?#]+\/disconnect$/u.test(path);
+  return [
+    /^\/integrations\/groups\/[^/?#]+\/disconnect$/u,
+    /^\/agents$/u,
+    /^\/agents\/[^/?#]+$/u,
+    /^\/agents\/[^/?#]+\/delete$/u,
+    /^\/agents\/[^/?#]+\/revisions\/[^/?#]+\/rollback$/u,
+    /^\/spaces\/[^/?#]+\/agent$/u,
+    /^\/tasks$/u,
+    /^\/tasks\/[^/?#]+$/u,
+    /^\/tasks\/[^/?#]+\/(?:run|delete)$/u,
+    /^\/tasks\/runs\/[^/?#]+\/(?:approve|reject|cancel)$/u,
+  ].some((pattern) => pattern.test(path));
 }
 
 export async function postFeishuSoakAdminForm(
   request: FeishuSoakAdminFormRequest,
-): Promise<void> {
+): Promise<FeishuSoakAdminFormResponse> {
   if (!allowedAdminMutationPath(request.path)) {
     throw new Error("unsupported soak administration path");
   }
@@ -714,6 +1866,34 @@ export async function postFeishuSoakAdminForm(
       }`,
     );
   }
+  if (!location.startsWith("/") || location.startsWith("//") || /[\r\n]/u.test(location)) {
+    throw new Error("HomeAgent administration response did not contain a safe redirect");
+  }
+  return { status: response.status, location };
+}
+
+export function resourceIdFromAdminRedirect(location: string, prefix: string): string {
+  const pathname = new URL(location, "http://homeagent.invalid").pathname;
+  if (!prefix.startsWith("/") || !prefix.endsWith("/") || !pathname.startsWith(prefix)) {
+    throw new Error("HomeAgent administration redirect did not identify one direct resource");
+  }
+  const encoded = pathname.slice(prefix.length);
+  if (!encoded || encoded.includes("/")) {
+    throw new Error("HomeAgent administration redirect did not identify one direct resource");
+  }
+  const id = decodeURIComponent(encoded);
+  if (!id || /[\r\n/]/u.test(id)) {
+    throw new Error("HomeAgent administration redirect contained an invalid resource id");
+  }
+  return id;
+}
+
+export function canRestoreTemporaryAgentBinding(
+  currentAgentId: string,
+  originalAgentId: string,
+  temporaryAgentId: string,
+): boolean {
+  return currentAgentId === originalAgentId || currentAgentId === temporaryAgentId;
 }
 
 function safeError(error: unknown): string {
@@ -726,15 +1906,21 @@ class FeishuSoakDriver {
   private readonly runMarker: string;
   private readonly fixtureDir: string;
   private readonly processRunner: ProcessRunner;
+  private readonly cleanupRegistry: SoakCleanupRegistry;
+  private readonly inFlightAdminMutations = new Set<Promise<FeishuSoakAdminFormResponse>>();
+  private readonly platformEvidenceDetails = new Map<AgentPlatformScenario, Record<string, unknown>>();
+  private interruptedReason?: string;
   private attachmentMessageId?: string;
   private captured?: { messageId: string; rawId: string; token: string };
 
   constructor(
     options: FeishuSoakDriverOptions,
     processRunner: ProcessRunner = defaultProcessRunner,
+    cleanupRegistry: SoakCleanupRegistry = new SoakCleanupRegistry(),
   ) {
     this.options = options;
     this.processRunner = processRunner;
+    this.cleanupRegistry = cleanupRegistry;
     this.runMarker = `F5-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${randomUUID().slice(0, 8)}`;
     this.fixtureDir = mkdtempSync(join(tmpdir(), "homeagent-f5-e2e-"));
   }
@@ -748,6 +1934,319 @@ class FeishuSoakDriver {
       join(this.options.dataDir, "config", "feishu-group-bindings.json"),
       "bindings",
     ).find((binding) => binding.chatId === this.options.chatId);
+  }
+
+  private spaceId(): string {
+    return `team/${this.options.chatId}`;
+  }
+
+  private storedSpaces(): StoredSpaceMeta[] {
+    return valuesFromFile<StoredSpaceMeta>(
+      join(this.options.dataDir, "config", "spaces.json"),
+      "spaces",
+    );
+  }
+
+  private storedSpace(): StoredSpaceMeta | undefined {
+    return this.storedSpaces().find((space) => space.id === this.spaceId());
+  }
+
+  private storedAgent(id: string): StoredAgent | undefined {
+    return this.storedAgents().find((agent) => agent.id === id);
+  }
+
+  private storedAgents(): StoredAgent[] {
+    return valuesFromFile<StoredAgent>(
+      join(this.options.dataDir, "config", "agents.json"),
+      "agents",
+    );
+  }
+
+  private storedAgentRevisions(id: string): StoredAgentRevision[] {
+    const path = join(this.options.dataDir, "config", "agents.json");
+    if (!existsSync(path)) return [];
+    const parsed = object(JSON.parse(readFileSync(path, "utf8")));
+    const revisions = object(parsed.revisions)[id];
+    return Array.isArray(revisions) ? revisions as StoredAgentRevision[] : [];
+  }
+
+  private async adminForm(
+    path: string,
+    form: Record<string, string> = {},
+    allowInterrupted = false,
+  ): Promise<FeishuSoakAdminFormResponse> {
+    if (!allowInterrupted) this.assertNotInterrupted();
+    const mutation = postFeishuSoakAdminForm({
+      adminUrl: this.options.adminUrl,
+      adminToken: this.options.adminToken,
+      path,
+      form,
+    });
+    this.inFlightAdminMutations.add(mutation);
+    try {
+      const response = await mutation;
+      if (!allowInterrupted) this.assertNotInterrupted();
+      return response;
+    } finally {
+      this.inFlightAdminMutations.delete(mutation);
+    }
+  }
+
+  private assertNotInterrupted(): void {
+    if (this.interruptedReason) {
+      throw new Error(`soak interrupted by ${this.interruptedReason}`);
+    }
+  }
+
+  private interrupt(reason: string): void {
+    this.interruptedReason ??= reason;
+  }
+
+  private async waitForAdminMutationsForCleanup(timeoutMs = 16_000): Promise<void> {
+    const mutations = [...this.inFlightAdminMutations];
+    if (mutations.length === 0) return;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error(`in-flight administration mutation did not settle in ${timeoutMs}ms`)),
+        timeoutMs,
+      );
+    });
+    try {
+      await Promise.race([Promise.allSettled(mutations), timedOut]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  private async assignSpaceAgent(agentId: string, allowInterrupted = false): Promise<void> {
+    await this.adminForm(
+      `/spaces/${encodeURIComponent(this.spaceId())}/agent`,
+      { agentId },
+      allowInterrupted,
+    );
+    await this.poll("space Agent assignment", 15_000, async () => {
+      const assigned = this.storedSpace()?.agentId ?? "";
+      return assigned === agentId ? true : undefined;
+    }, 250, allowInterrupted);
+  }
+
+  private async waitForTaskRunTerminal(runId: string): Promise<StoredTaskRun> {
+    return this.poll("Task Run terminal state", this.options.longTimeoutMs, async () => {
+      const run = this.taskRuns().find((candidate) => candidate.id === runId);
+      if (!run) return undefined;
+      if (["failed", "timed_out", "cancelled"].includes(run.status)) {
+        throw new Error(`Task Run ${run.id} ended with ${run.status}`);
+      }
+      return run.status === "succeeded" ? run : undefined;
+    }, 2_000);
+  }
+
+  private async waitForTaskRunNotified(runId: string): Promise<StoredTaskRun> {
+    return this.poll("Task Run completion notification", this.options.longTimeoutMs, async () => {
+      const run = this.taskRuns().find((candidate) => candidate.id === runId);
+      if (!run) return undefined;
+      if (["failed", "timed_out", "cancelled"].includes(run.status)) {
+        throw new Error(`Task Run ${run.id} ended with ${run.status}`);
+      }
+      if (run.notification?.status === "failed") {
+        throw new Error(`Task Run ${run.id} completion notification failed`);
+      }
+      return run.status === "succeeded" && run.notification?.status === "sent"
+        ? run
+        : undefined;
+    }, 2_000);
+  }
+
+  private async cancelTaskRunForCleanup(runId: string): Promise<void> {
+    const current = this.taskRuns().find((run) => run.id === runId);
+    if (!current || !["awaiting_approval", "queued", "running"].includes(current.status)) {
+      return;
+    }
+    await this.adminForm(`/tasks/runs/${encodeURIComponent(runId)}/cancel`, {}, true);
+    await this.poll("Task Run cleanup cancellation", 15_000, async () => {
+      const run = this.taskRuns().find((candidate) => candidate.id === runId);
+      return !run || !["awaiting_approval", "queued", "running"].includes(run.status)
+        ? true
+        : undefined;
+    }, 250, true);
+  }
+
+  private async cleanupTemporaryAgentTask(input: {
+    label: string;
+    originalAgentId: string;
+    agentName: string;
+    taskName: string;
+    agentId?: string;
+    taskId?: string;
+    runIds: string[];
+  }): Promise<string[]> {
+    const errors: string[] = [];
+    try {
+      await this.waitForAdminMutationsForCleanup();
+    } catch (error) {
+      errors.push(`wait for administration mutation: ${safeError(error)}`);
+    }
+
+    let agentId = input.agentId;
+    if (agentId) {
+      const stored = this.storedAgent(agentId);
+      if (stored && stored.name !== input.agentName) {
+        errors.push(`Agent ${agentId} does not match owned name ${input.agentName}; left unchanged`);
+        agentId = undefined;
+      }
+    } else {
+      const candidates = this.storedAgents().filter((agent) => agent.name === input.agentName);
+      if (candidates.length === 1) agentId = candidates[0]!.id;
+      if (candidates.length > 1) {
+        errors.push(`multiple Agents match owned name ${input.agentName}; left unchanged`);
+      }
+    }
+
+    let taskId = input.taskId;
+    if (taskId) {
+      const stored = this.tasks().find((task) => task.id === taskId);
+      if (stored && stored.name !== input.taskName) {
+        errors.push(`Task ${taskId} does not match owned name ${input.taskName}; left unchanged`);
+        taskId = undefined;
+      }
+    } else {
+      const candidates = this.tasks().filter((task) => task.name === input.taskName);
+      if (candidates.length === 1) taskId = candidates[0]!.id;
+      if (candidates.length > 1) {
+        errors.push(`multiple Tasks match owned name ${input.taskName}; left unchanged`);
+      }
+    }
+
+    if (taskId) {
+      const task = this.tasks().find((candidate) => candidate.id === taskId);
+      if (task) {
+        try {
+          await this.adminForm(
+            `/tasks/${encodeURIComponent(taskId)}`,
+            this.taskEditorForm(task, { enabled: false }),
+            true,
+          );
+          await this.poll(`${input.label} Task disable`, 15_000, async () => {
+            const current = this.tasks().find((candidate) => candidate.id === taskId);
+            return !current || current.enabled === false ? true : undefined;
+          }, 250, true);
+        } catch (error) {
+          errors.push(`disable ${taskId}: ${safeError(error)}`);
+        }
+      }
+    }
+
+    const ownedRunIds = new Set(input.runIds);
+    if (taskId) {
+      for (const run of this.taskRuns()) {
+        if (run.taskId === taskId && ["awaiting_approval", "queued", "running"].includes(run.status)) {
+          ownedRunIds.add(run.id);
+        }
+      }
+    }
+    for (const runId of ownedRunIds) {
+      try {
+        await this.cancelTaskRunForCleanup(runId);
+      } catch (error) {
+        errors.push(`cancel ${runId}: ${safeError(error)}`);
+      }
+    }
+    if (taskId) {
+      try {
+        await this.adminForm(`/tasks/${encodeURIComponent(taskId)}/delete`, {}, true);
+        await this.poll(`${input.label} Task deletion`, 15_000, async () =>
+          this.tasks().some((task) => task.id === taskId) ? undefined : true, 250, true
+        );
+      } catch (error) {
+        errors.push(`delete ${taskId}: ${safeError(error)}`);
+      }
+    }
+    const currentAgentId = this.storedSpace()?.agentId ?? "";
+    const expectedTemporaryAgentId = agentId ?? input.originalAgentId;
+    if (!canRestoreTemporaryAgentBinding(
+      currentAgentId,
+      input.originalAgentId,
+      expectedTemporaryAgentId,
+    )) {
+      errors.push(
+        `restore space Agent: assignment changed concurrently to ${currentAgentId}; left unchanged`,
+      );
+    } else {
+      try {
+        await this.assignSpaceAgent(input.originalAgentId, true);
+      } catch (error) {
+        errors.push(`restore space Agent: ${safeError(error)}`);
+      }
+    }
+    if (agentId) {
+      const bindings = this.storedSpaces().filter(
+        (space) => space.agentId === agentId,
+      );
+      if (bindings.length > 0) {
+        errors.push(
+          `delete ${agentId}: still bound to ${bindings.map((space) => space.id).join(", ")}`,
+        );
+      } else {
+        try {
+          await this.adminForm(`/agents/${encodeURIComponent(agentId)}/delete`, {}, true);
+          await this.poll(`${input.label} Agent deletion`, 15_000, async () =>
+            this.storedAgent(agentId!) ? undefined : true, 250, true
+          );
+        } catch (error) {
+          errors.push(`delete ${agentId}: ${safeError(error)}`);
+        }
+      }
+    }
+    return errors;
+  }
+
+  private taskEditorForm(
+    task: StoredTask,
+    overrides: Partial<Pick<StoredTask, "topic" | "enabled" | "notify">> = {},
+  ): Record<string, string> {
+    const enabled = overrides.enabled ?? task.enabled ?? false;
+    const notify = overrides.notify ?? task.notify ?? false;
+    return {
+      name: task.name,
+      space: task.space,
+      topic: overrides.topic ?? task.topic ?? "",
+      cadence: task.cadence ?? "daily",
+      hour: String(task.hour ?? 8),
+      timeoutMinutes: String(task.timeoutMinutes ?? 12),
+      ...(enabled ? { enabled: "on" } : {}),
+      ...(notify ? { notify: "on" } : {}),
+      ...(task.distillOnRun ? { distillOnRun: "on" } : {}),
+    };
+  }
+
+  private registerTemporaryAgentCleanup(input: {
+    scenario: "agent_revision_lifecycle" | "writable_task_approval";
+    label: string;
+    originalAgentId: string;
+    agentName: string;
+    taskName: string;
+    ownership: { agentId?: string; taskId?: string; runIds: string[] };
+  }): SoakCleanupRegistration {
+    const manualRecovery =
+      `SIGKILL cannot be caught. Restore ${this.spaceId()} to Agent `
+      + `${input.originalAgentId || "<default>"}; disable/delete Task named ${input.taskName}; `
+      + `then remove Agent named ${input.agentName} only if no Space is bound to it.`;
+    return this.cleanupRegistry.register({
+      scenario: input.scenario,
+      label: input.agentName,
+      manualRecovery,
+      interrupt: (reason) => this.interrupt(reason),
+      cleanup: () => this.cleanupTemporaryAgentTask({
+        label: input.label,
+        originalAgentId: input.originalAgentId,
+        agentName: input.agentName,
+        taskName: input.taskName,
+        agentId: input.ownership.agentId,
+        taskId: input.ownership.taskId,
+        runIds: input.ownership.runIds,
+      }),
+    });
   }
 
   private async waitForBinding(
@@ -1028,7 +2527,7 @@ class FeishuSoakDriver {
     return messageIdFrom(envelope);
   }
 
-  private async listMessages(): Promise<LarkMessage[]> {
+  private async listMessagePage(pageToken?: string): Promise<LarkMessagePage> {
     const envelope = await this.lark([
       "im", "+chat-messages-list",
       "--as", "bot",
@@ -1036,8 +2535,20 @@ class FeishuSoakDriver {
       "--page-size", "50",
       "--order", "desc",
       "--no-reactions",
+      ...(pageToken ? ["--page-token", pageToken] : []),
     ]);
-    return messagesFrom(envelope);
+    return messagePageFrom(envelope);
+  }
+
+  private async listMessages(): Promise<LarkMessage[]> {
+    return (await this.listMessagePage()).messages;
+  }
+
+  private async listMessagesSince(windowStartedAt: number): Promise<LarkMessage[]> {
+    return collectLarkMessagesSince(
+      (pageToken) => this.listMessagePage(pageToken),
+      windowStartedAt,
+    );
   }
 
   private async poll<T>(
@@ -1045,12 +2556,15 @@ class FeishuSoakDriver {
     timeoutMs: number,
     check: () => Promise<T | undefined>,
     intervalMs = 3_000,
+    allowInterrupted = false,
   ): Promise<T> {
     const deadline = Date.now() + timeoutMs;
     let lastError: unknown;
     while (Date.now() < deadline) {
+      if (!allowInterrupted) this.assertNotInterrupted();
       try {
         const result = await check();
+        if (!allowInterrupted) this.assertNotInterrupted();
         if (result !== undefined) return result;
       } catch (error) {
         lastError = error;
@@ -1223,6 +2737,478 @@ class FeishuSoakDriver {
     );
     this.attachmentMessageId = messageId;
     return messageId;
+  }
+
+  private agentEditorForm(
+    agent: StoredAgent,
+    instruction: string,
+    expectedHeadRevisionId: string,
+    agentAction: "draft" | "publish",
+  ): Record<string, string> {
+    return {
+      name: agent.name,
+      instruction,
+      provider: agent.provider,
+      model: agent.model,
+      reasoningEffort: agent.reasoningEffort,
+      visibility: agent.visibility,
+      permission: agent.permission,
+      workdir: agent.workdir ?? "",
+      skillSelectorPresent: "1",
+      expectedHeadRevisionId,
+      agentAction,
+    };
+  }
+
+  private async startTaskRunFromAdmin(taskId: string): Promise<StoredTaskRun> {
+    const response = await this.adminForm(`/tasks/${encodeURIComponent(taskId)}/run`);
+    const runId = resourceIdFromAdminRedirect(response.location, "/tasks/runs/");
+    return this.poll("Task Run creation", this.options.responseTimeoutMs, async () =>
+      this.taskRuns().find((candidate) => candidate.id === runId), 250
+    );
+  }
+
+  private async agentRevisionLifecycle(): Promise<string> {
+    const originalSpace = this.storedSpace();
+    if (!originalSpace) {
+      throw new Error(
+        `agent_revision_lifecycle requires an existing connected space: ${this.spaceId()}`,
+      );
+    }
+    const windowStartedAt = currentSoakWindowStartedAt(
+      this.options.monitorPath,
+      this.options.windowStartedAt,
+    );
+    const originalAgentId = originalSpace.agentId ?? "";
+    const v1Instruction = `${this.runMarker}-AGENT-V1 immutable acceptance instruction`;
+    const v2Instruction = `${this.runMarker}-AGENT-V2 immutable acceptance instruction`;
+    const agentName = `${this.runMarker}-release-gate`;
+    const taskName = `${this.runMarker}-agent-lifecycle`;
+    const v2Marker = `${this.runMarker}-V2-COMPLETE`;
+    const rollbackMarker = `${this.runMarker}-ROLLBACK-COMPLETE`;
+    const ownership: { agentId?: string; taskId?: string; runIds: string[] } = { runIds: [] };
+    const cleanupRegistration = this.registerTemporaryAgentCleanup({
+      scenario: "agent_revision_lifecycle",
+      label: "acceptance",
+      originalAgentId,
+      agentName,
+      taskName,
+      ownership,
+    });
+    let artifactId: string | undefined;
+    let scenarioError: unknown;
+
+    try {
+      const createdResponse = await this.adminForm("/agents", {
+        name: agentName,
+        instruction: v1Instruction,
+        model: "",
+        visibility: "Team",
+        permission: "read-only",
+        skillSelectorPresent: "1",
+      });
+      ownership.agentId = resourceIdFromAdminRedirect(createdResponse.location, "/agents/");
+      const created = await this.poll("acceptance Agent creation", 15_000, async () =>
+        this.storedAgent(ownership.agentId!), 250
+      );
+      const firstRevisionId = created.publishedRevisionId;
+      if (!firstRevisionId) throw new Error("created Agent has no published v1 revision");
+      await this.assignSpaceAgent(created.id);
+
+      await this.adminForm(
+        `/agents/${encodeURIComponent(created.id)}`,
+        this.agentEditorForm(created, v2Instruction, firstRevisionId, "publish"),
+      );
+      const publishedV2 = await this.poll("Agent v2 publication", 15_000, async () => {
+        const current = this.storedAgent(created.id);
+        return current?.publishedRevisionId
+          && current.publishedRevisionId !== firstRevisionId
+          && current.instruction === v2Instruction
+          ? current
+          : undefined;
+      }, 250);
+      const secondRevisionId = publishedV2.publishedRevisionId!;
+
+      const taskResponse = await this.adminForm("/tasks", {
+        name: taskName,
+        space: this.spaceId(),
+        topic: `Return a concise acceptance result containing exactly ${v2Marker}.`,
+        cadence: "daily",
+        hour: "8",
+        notify: "on",
+        timeoutMinutes: String(Math.max(1, Math.ceil(this.options.longTimeoutMs / 60_000))),
+      });
+      ownership.taskId = resourceIdFromAdminRedirect(taskResponse.location, "/tasks/");
+      const createdTask = await this.poll("acceptance Task creation", 15_000, async () =>
+        this.tasks().find((task) => task.id === ownership.taskId), 250
+      );
+      if (createdTask.enabled !== false) {
+        throw new Error("acceptance Task must remain scheduler-disabled during manual validation");
+      }
+      if (createdTask.notify !== true) {
+        throw new Error("acceptance Task must enable completion notifications");
+      }
+
+      const v2Run = await this.startTaskRunFromAdmin(ownership.taskId);
+      ownership.runIds.push(v2Run.id);
+      if (!["queued", "running"].includes(v2Run.status)) {
+        throw new Error(
+          "v2 Task Run completed before the rollback boundary could be observed",
+        );
+      }
+
+      await this.adminForm(
+        `/agents/${encodeURIComponent(created.id)}/revisions/${encodeURIComponent(firstRevisionId)}/rollback`,
+        { expectedHeadRevisionId: secondRevisionId },
+      );
+      const rolledBack = await this.poll("Agent v1 rollback publication", 15_000, async () => {
+        const current = this.storedAgent(created.id);
+        return current?.publishedRevisionId
+          && current.publishedRevisionId !== secondRevisionId
+          && current.instruction === v1Instruction
+          ? current
+          : undefined;
+      }, 250);
+      const rollbackRevisionId = rolledBack.publishedRevisionId!;
+      await this.waitForTaskRunNotified(v2Run.id);
+
+      const taskForRollback = this.tasks().find((task) => task.id === ownership.taskId);
+      if (!taskForRollback) throw new Error("acceptance Task disappeared before rollback Run");
+      await this.adminForm(
+        `/tasks/${encodeURIComponent(taskForRollback.id)}`,
+        this.taskEditorForm(taskForRollback, {
+          topic: `Return a concise acceptance result containing exactly ${rollbackMarker}.`,
+          notify: true,
+        }),
+      );
+      await this.poll("rollback Task marker update", 15_000, async () => {
+        const current = this.tasks().find((task) => task.id === taskForRollback.id);
+        return current?.topic?.includes(rollbackMarker) && current.notify === true
+          ? current
+          : undefined;
+      }, 250);
+
+      const rollbackRun = await this.startTaskRunFromAdmin(ownership.taskId);
+      ownership.runIds.push(rollbackRun.id);
+      await this.waitForTaskRunNotified(rollbackRun.id);
+      const revisions = this.storedAgentRevisions(created.id);
+      const lifecycleRuns = this.taskRuns().filter((run) => run.taskId === ownership.taskId);
+      const businessNotices = await this.listMessagesSince(windowStartedAt);
+      artifactId = assertAgentRevisionLifecycleEvidence({
+        agent: rolledBack,
+        revisions,
+        runs: lifecycleRuns,
+        firstRevisionId,
+        secondRevisionId,
+        rollbackRevisionId,
+        secondRevisionRunId: v2Run.id,
+        rollbackRunId: rollbackRun.id,
+        businessMarkers: { secondRevision: v2Marker, rollback: rollbackMarker },
+        businessNotices,
+        botOpenId: this.options.botOpenId,
+      });
+      this.platformEvidenceDetails.set("agent_revision_lifecycle", {
+        triggerPath: "web_admin_post",
+        windowStartedAt,
+        resourceIds: {
+          agentId: rolledBack.id,
+          taskId: ownership.taskId,
+          firstRevisionId,
+          secondRevisionId,
+          rollbackRevisionId,
+          secondRevisionRunId: v2Run.id,
+          rollbackRunId: rollbackRun.id,
+        },
+        revisions: revisions.filter((revision) =>
+          [firstRevisionId, secondRevisionId, rollbackRevisionId].includes(revision.id)
+        ).map((revision) => ({
+          id: revision.id,
+          source: revision.source,
+          ...(revision.basedOnRevisionId
+            ? { basedOnRevisionId: revision.basedOnRevisionId }
+            : {}),
+          snapshotSha256: sha256Evidence(revision.snapshot),
+        })),
+        runs: lifecycleRuns.filter((run) =>
+          [v2Run.id, rollbackRun.id].includes(run.id)
+        ).map(durableRunMetadata),
+        messages: businessNotices.filter((message) =>
+          [v2Marker, rollbackMarker].some((marker) => (message.content ?? "").includes(marker))
+        ).map(durableMessageMetadata),
+      });
+    } catch (error) {
+      scenarioError = error;
+    }
+
+    const cleanupErrors = await cleanupRegistration.cleanup();
+
+    if (scenarioError) {
+      throw new Error(
+        `${safeError(scenarioError)}${cleanupErrors.length > 0
+          ? `; cleanup failed: ${cleanupErrors.join("; ")}`
+          : ""}`,
+      );
+    }
+    if (cleanupErrors.length > 0) {
+      throw new Error(`agent_revision_lifecycle cleanup failed: ${cleanupErrors.join("; ")}`);
+    }
+    if (!artifactId) throw new Error("agent_revision_lifecycle produced no evidence");
+    return artifactId;
+  }
+
+  private async writableTaskApproval(): Promise<string> {
+    const originalSpace = this.storedSpace();
+    if (!originalSpace) {
+      throw new Error(
+        `writable_task_approval requires an existing connected space: ${this.spaceId()}`,
+      );
+    }
+    const windowStartedAt = currentSoakWindowStartedAt(
+      this.options.monitorPath,
+      this.options.windowStartedAt,
+    );
+    const expired = this.taskRuns().find(
+      (run) => run.id === this.options.approvalExpiredRunId,
+    );
+    if (!expired) {
+      throw new Error(
+        `expired approval Run is missing: ${this.options.approvalExpiredRunId}`,
+      );
+    }
+    const idempotency = this.taskRuns().find(
+      (run) => run.id === this.options.approvalIdempotencyRunId,
+    );
+    if (!idempotency) {
+      throw new Error(
+        `idempotency approval Run is missing: ${this.options.approvalIdempotencyRunId}`,
+      );
+    }
+    if (expired.id === idempotency.id) {
+      throw new Error("approval expiry and idempotency evidence require distinct Run ids");
+    }
+    if ([expired, idempotency].some((run) =>
+      run.space !== this.spaceId() || run.startedAt < windowStartedAt
+    )) {
+      throw new Error("external approval evidence is outside the current soak window or space");
+    }
+    if (
+      expired.status !== "cancelled"
+      || expired.approval?.status !== "expired"
+      || hasProviderExecutionEvidence(expired)
+    ) {
+      throw new Error("--approval-expired-run-id is not a zero-execution expired approval");
+    }
+    if (
+      idempotency.status !== "succeeded"
+      || idempotency.approval?.status !== "approved"
+      || idempotency.approval.decidedAt === undefined
+      || idempotency.runStartedAt === undefined
+      || idempotency.runStartedAt < idempotency.approval.decidedAt
+      || !hasProviderExecutionEvidence(idempotency)
+      || idempotency.approvalNotification?.status !== "sent"
+      || (idempotency.approvalNotification.attempts ?? 0) < 2
+      || idempotency.approvalNotification.sentAt === undefined
+      || idempotency.approvalNotification.sentAt > idempotency.approval.decidedAt
+    ) {
+      throw new Error(
+        "--approval-idempotency-run-id is not an approved successful post-retry sample",
+      );
+    }
+
+    const originalAgentId = originalSpace.agentId ?? "";
+    const agentName = `${this.runMarker}-approval-gate`;
+    const taskName = `${this.runMarker}-approval`;
+    const completionMarker = `${this.runMarker}-APPROVED`;
+    const ownership: { agentId?: string; taskId?: string; runIds: string[] } = { runIds: [] };
+    const cleanupRegistration = this.registerTemporaryAgentCleanup({
+      scenario: "writable_task_approval",
+      label: "writable acceptance",
+      originalAgentId,
+      agentName,
+      taskName,
+      ownership,
+    });
+    let artifactId: string | undefined;
+    let scenarioError: unknown;
+
+    try {
+      const createdResponse = await this.adminForm("/agents", {
+        name: agentName,
+        instruction: `${this.runMarker}-WRITE execute only after durable approval`,
+        model: "",
+        visibility: "Team",
+        permission: "write",
+        workdir: this.fixtureDir,
+        skillSelectorPresent: "1",
+      });
+      ownership.agentId = resourceIdFromAdminRedirect(createdResponse.location, "/agents/");
+      const agent = await this.poll("writable acceptance Agent creation", 15_000, async () =>
+        this.storedAgent(ownership.agentId!), 250
+      );
+      if (agent.permission !== "write" || agent.workdir !== this.fixtureDir) {
+        throw new Error("writable acceptance Agent did not persist its execution boundary");
+      }
+      await this.assignSpaceAgent(agent.id);
+
+      const taskResponse = await this.adminForm("/tasks", {
+        name: taskName,
+        space: this.spaceId(),
+        topic: `Do not modify files. Return a concise result containing ${completionMarker}.`,
+        cadence: "daily",
+        hour: "8",
+        notify: "on",
+        timeoutMinutes: String(Math.max(1, Math.ceil(this.options.longTimeoutMs / 60_000))),
+      });
+      ownership.taskId = resourceIdFromAdminRedirect(taskResponse.location, "/tasks/");
+      const createdTask = await this.poll("writable acceptance Task creation", 15_000, async () =>
+        this.tasks().find((task) => task.id === ownership.taskId), 250
+      );
+      if (createdTask.enabled !== false) {
+        throw new Error("writable acceptance Task must remain scheduler-disabled");
+      }
+      if (createdTask.notify !== true) {
+        throw new Error("writable acceptance Task must enable completion notifications");
+      }
+
+      const pendingRun = await this.startTaskRunFromAdmin(ownership.taskId);
+      ownership.runIds.push(pendingRun.id);
+      if (
+        pendingRun.status !== "awaiting_approval"
+        || pendingRun.approval?.status !== "pending"
+        || hasProviderExecutionEvidence(pendingRun)
+      ) {
+        throw new Error("write Task did not stop before Provider execution for approval");
+      }
+      const pending = structuredClone(pendingRun);
+      await this.poll("approval notification delivery", this.options.longTimeoutMs, async () => {
+        const current = this.taskRuns().find((run) => run.id === pending.id);
+        return current?.approvalNotification?.status === "sent" ? current : undefined;
+      }, 2_000);
+      await this.adminForm(`/tasks/runs/${encodeURIComponent(pending.id)}/approve`);
+      const approved = await this.waitForTaskRunNotified(pending.id);
+
+      const pendingReject = await this.startTaskRunFromAdmin(ownership.taskId);
+      ownership.runIds.push(pendingReject.id);
+      if (
+        pendingReject.status !== "awaiting_approval"
+        || pendingReject.approval?.status !== "pending"
+        || hasProviderExecutionEvidence(pendingReject)
+      ) {
+        throw new Error("rejection sample executed before its approval decision");
+      }
+      await this.adminForm(`/tasks/runs/${encodeURIComponent(pendingReject.id)}/reject`);
+      const rejected = await this.poll("approval rejection", 15_000, async () => {
+        const current = this.taskRuns().find((run) => run.id === pendingReject.id);
+        return current?.status === "cancelled" && current.approval?.status === "rejected"
+          ? current
+          : undefined;
+      }, 250);
+
+      const approvalNotices = await this.listMessagesSince(windowStartedAt);
+      artifactId = assertWritableTaskApprovalEvidence({
+        pending,
+        approved,
+        rejected,
+        expired,
+        idempotency,
+        spaceId: this.spaceId(),
+        windowStartedAt,
+        approvalNotices,
+        botOpenId: this.options.botOpenId,
+        completionMarker,
+      });
+      this.platformEvidenceDetails.set("writable_task_approval", {
+        triggerPath: "web_admin_post",
+        windowStartedAt,
+        resourceIds: {
+          agentId: ownership.agentId,
+          taskId: ownership.taskId,
+          approvedRunId: approved.id,
+          rejectedRunId: rejected.id,
+          expiredRunId: expired.id,
+          idempotencyRunId: idempotency.id,
+        },
+        runs: [pending, approved, rejected, expired, idempotency].map(durableRunMetadata),
+        messages: approvalNotices.filter((message) => {
+          const content = message.content ?? "";
+          return content.includes(completionMarker) || content.includes(idempotency.id);
+        }).map(durableMessageMetadata),
+      });
+    } catch (error) {
+      scenarioError = error;
+    }
+
+    const cleanupErrors = await cleanupRegistration.cleanup();
+
+    if (scenarioError) {
+      throw new Error(
+        `${safeError(scenarioError)}${cleanupErrors.length > 0
+          ? `; cleanup failed: ${cleanupErrors.join("; ")}`
+          : ""}`,
+      );
+    }
+    if (cleanupErrors.length > 0) {
+      throw new Error(`writable_task_approval cleanup failed: ${cleanupErrors.join("; ")}`);
+    }
+    if (!artifactId) throw new Error("writable_task_approval produced no evidence");
+    return artifactId;
+  }
+
+  private async readonlyTaskRetry(): Promise<string> {
+    const taskId = this.options.retryTaskId!;
+    const marker = this.options.retryBusinessMarker!;
+    const task = this.tasks().find((candidate) => candidate.id === taskId);
+    if (!task) throw new Error(`retry acceptance Task is missing: ${taskId}`);
+    if (task.space !== this.spaceId()) {
+      throw new Error(`retry acceptance Task is not bound to ${this.spaceId()}`);
+    }
+    const windowStartedAt = currentSoakWindowStartedAt(
+      this.options.monitorPath,
+      this.options.windowStartedAt,
+    );
+    const runs = this.taskRuns().filter((run) =>
+      run.taskId === taskId && run.startedAt >= windowStartedAt
+    );
+    const parent = runs
+      .filter((run) =>
+        run.trigger === "scheduled"
+        && run.status === "failed"
+        && run.retry?.status === "claimed"
+        && run.retry.claimedByRunId
+      )
+      .sort((left, right) => right.startedAt - left.startedAt)[0];
+    if (!parent?.retry?.claimedByRunId) {
+      throw new Error(
+        "readonly_task_retry requires a supervised transient Provider failure inside the soak window",
+      );
+    }
+    const child = runs.find((run) => run.id === parent.retry!.claimedByRunId);
+    if (!child) throw new Error("automatic retry child is missing from the soak window");
+    const businessNotices = await this.listMessagesSince(windowStartedAt);
+    const artifactId = assertReadonlyTaskRetryEvidence({
+      runs,
+      taskId,
+      parentRunId: parent.id,
+      retryRunId: child.id,
+      windowStartedAt,
+      businessMarker: marker,
+      businessNotices,
+      botOpenId: this.options.botOpenId,
+    });
+    this.platformEvidenceDetails.set("readonly_task_retry", {
+      triggerPath: "production_scheduler_retry",
+      windowStartedAt,
+      resourceIds: {
+        taskId,
+        parentRunId: parent.id,
+        retryRunId: child.id,
+      },
+      runs: [parent, child].map(durableRunMetadata),
+      messages: businessNotices.filter((message) =>
+        (message.content ?? "").includes(marker)
+      ).map(durableMessageMetadata),
+    });
+    return artifactId;
   }
 
   private tasks(): StoredTask[] {
@@ -1404,6 +3390,9 @@ class FeishuSoakDriver {
       reminder_delivery: () => this.reminderDelivery(),
       learning_interaction: () => this.learningInteraction(),
       distill_citation: () => this.distillCitation(),
+      agent_revision_lifecycle: () => this.agentRevisionLifecycle(),
+      writable_task_approval: () => this.writableTaskApproval(),
+      readonly_task_retry: () => this.readonlyTaskRetry(),
     };
     return verifiers[scenario];
   }
@@ -1413,17 +3402,46 @@ class FeishuSoakDriver {
     for (const scenario of this.options.scenarios) {
       console.log(`[F5] ${scenario}: running`);
       try {
-        const evidence = await executeVerifiedScenario(
-          scenario,
-          this.options.evidencePath,
-          this.verifier(scenario),
-        );
+        const evidence = isAgentPlatformScenario(scenario)
+          ? await executeVerifiedAgentPlatformScenario(
+            scenario,
+            agentPlatformEvidencePath(this.options.evidencePath),
+            this.verifier(scenario),
+            () => this.platformEvidenceDetails.get(scenario),
+          )
+          : await executeVerifiedScenario(
+            scenario,
+            this.options.evidencePath,
+            this.verifier(scenario),
+          );
         results.push({ scenario, ok: true, artifactId: evidence.artifactId });
         console.log(`[F5] ${scenario}: passed (${evidence.artifactId})`);
       } catch (error) {
         const message = safeError(error);
         results.push({ scenario, ok: false, error: message });
         console.error(`[F5] ${scenario}: failed (${message})`);
+        if (isAgentPlatformScenario(scenario) && !this.interruptedReason) {
+          recordAgentPlatformFailureEvidence(
+            agentPlatformEvidencePath(this.options.evidencePath),
+            {
+              at: Date.now(),
+              scenario,
+              ok: false,
+              artifactId: `${this.runMarker}:${scenario}`,
+              reason: message,
+              cleanupErrors: /cleanup failed/iu.test(message) ? [message] : [],
+              manualRecovery:
+                `Inspect ${this.spaceId()}, disable/delete temporary Tasks named ${this.runMarker}-*, `
+                + `and remove temporary Agents named ${this.runMarker}-* only when no Space binds them.`,
+            },
+          );
+        }
+        if (shouldAbortRemainingAgentPlatformScenarios(scenario, this.cleanupRegistry)) {
+          console.error(
+            `[F5] ${scenario}: cleanup ownership remains; aborting later Agent platform mutations`,
+          );
+          break;
+        }
       }
     }
     return results;
@@ -1435,13 +3453,42 @@ function printPlan(options: FeishuSoakDriverOptions): void {
     chatId: options.chatId,
     adminUrl: options.adminUrl,
     evidencePath: options.evidencePath,
+    agentPlatformEvidencePath: agentPlatformEvidencePath(options.evidencePath),
     monitorPath: options.monitorPath,
+    windowStartedAt: options.windowStartedAt
+      ?? "required for Agent platform scenarios: current soak session epoch-ms or ISO timestamp",
     scenarios: options.scenarios,
     sender: options.sender,
     requiredUserScopes: options.sender === "api"
       ? ["im:message.send_as_user", "im:message", "im:resource:upload", "im:resource"]
       : [],
     uiActionPrefix: options.sender === "ui" ? "[F5_USER_ACTION]" : undefined,
+    agentPlatformPreconditions: {
+      triggerPath:
+        "HomeAgent Web administration POST forms; this does not claim Feishu /task run coverage",
+      writable_task_approval: {
+        approvalExpiredRunId: options.approvalExpiredRunId
+          ?? "required: production-expired zero-execution approval Run",
+        approvalIdempotencyRunId: options.approvalIdempotencyRunId
+          ?? "required: approval Run with >=2 delivery attempts and one visible Feishu notice",
+        externalAction:
+          "use production expiry and a supervised post-send delivery retry; the driver will not alter clocks or persistence",
+      },
+      readonly_task_retry: {
+        retryTaskId: options.retryTaskId
+          ?? "required: scheduled read-only fault-injection Task",
+        retryBusinessMarker: options.retryBusinessMarker
+          ?? "required: unique marker present in Provider output and Feishu notice",
+        externalAction:
+          "cause one transient Provider failure during the soak window, then restore it before the 60s retry",
+      },
+    },
+    interruptionCleanup: {
+      captured: ["SIGINT", "SIGTERM", "beforeExit"],
+      timeoutSeconds: 45,
+      sigkill:
+        "SIGKILL cannot be caught: restore the target Space Agent binding, disable/delete F5-* temporary Tasks, then remove unbound F5-* temporary Agents.",
+    },
     supervisedScenario: "network_recovery",
   }, null, 2));
 }
@@ -1454,7 +3501,24 @@ if (import.meta.main) {
     if (options.dryRun) {
       printPlan(options);
     } else {
-      const driver = new FeishuSoakDriver(options);
+      assertAgentPlatformPreconditions(options);
+      const cleanupRegistry = new SoakCleanupRegistry();
+      const disposeShutdownHandlers = installSoakShutdownHandlers({
+        registry: cleanupRegistry,
+        processEvents: process,
+        timeoutMs: 45_000,
+        recordFailure: (failure) => {
+          recordAgentPlatformFailureEvidence(
+            agentPlatformEvidencePath(options.evidencePath),
+            failure,
+          );
+          console.error(
+            `[F5] ${failure.reason}: ${failure.manualRecovery}`,
+          );
+        },
+        exit: (code) => process.exit(code),
+      });
+      const driver = new FeishuSoakDriver(options, defaultProcessRunner, cleanupRegistry);
       try {
         const results = await driver.run();
         const failed = results.filter((result) => !result.ok);
@@ -1467,6 +3531,7 @@ if (import.meta.main) {
         if (failed.length > 0) process.exitCode = 1;
       } finally {
         driver.close();
+        if (cleanupRegistry.size === 0) disposeShutdownHandlers();
       }
     }
   } catch (error) {

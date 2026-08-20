@@ -41,11 +41,19 @@ export function formatAnswer(res: AskResult): string {
   const parts: string[] = [res.answer.trim()];
 
   if (res.source === "knowledge" && res.citations.length > 0) {
-    const list = res.citations.map((c) => `[[${c.slug}|${c.title}]]`).join("、");
+    const list = res.citations.map((citation) => {
+      const scope = citation.space?.startsWith("personal/")
+        ? "个人空间"
+        : citation.space?.startsWith("team/")
+          ? "群空间"
+          : undefined;
+      const title = scope ? `${citation.title}（${scope}）` : citation.title;
+      return `[[${citation.slug}|${title}]]`;
+    }).join("、");
     parts.push("", `— 依据：${list}`);
   }
 
-  if (res.gaps && res.gaps.length > 0) {
+  if (res.context !== "agent-workdir" && res.gaps && res.gaps.length > 0) {
     parts.push("", `（尚缺：${res.gaps.join("；")}）`);
   }
 

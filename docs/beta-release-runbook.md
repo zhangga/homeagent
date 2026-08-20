@@ -1,8 +1,8 @@
 # HomeAgent Beta 发布与稳定性演练
 
 本清单用于 `0.x beta` 发布候选。目标是验证普通用户无需终端即可安装，并确认进程异常退出后，
-知识、任务、提醒和学习状态不会丢失。签名、公证、真实飞书消息和长时间运行必须在发布环境完成，
-不能只用离线单测代替。
+知识、Agent 发布历史、任务审批/重试、提醒、学习和质量审计不会丢失。签名、公证、真实飞书消息、
+旧归档迁移和长时间运行必须在发布环境完成，不能只用离线单测代替。
 
 ## 1. 候选代码本地预检
 
@@ -23,9 +23,26 @@ bun run verify:beta
 - 固定 AI 质量评测，以及基于 FTS 覆盖率的检索策略建议；
 - 子进程遭受 `SIGKILL` 后的数据恢复验收。
 
+Agent 生命周期、任务审批/重试、Provider 隔离、v10–v15 归档和质量重新评测还应单独运行一次聚焦回归，
+便于把失败定位到本轮硬化范围：
+
+```bash
+bun test \
+  packages/core/src/agents.test.ts \
+  packages/core/src/engine.test.ts \
+  packages/core/src/task-runs.test.ts \
+  packages/core/src/governance.test.ts \
+  packages/core/src/quality-rerun.test.ts \
+  packages/core/src/usage.test.ts \
+  packages/llm/src/budget.test.ts \
+  packages/llm/src/providers.test.ts \
+  packages/app/src/task-scheduler.test.ts \
+  packages/web/src/app.test.ts
+```
+
 质量评测必须覆盖检索与引用、对话路由、群聊主动参与和学习路线四类用例。当前候选只有在全部
-固定用例通过时才进入后续发布门禁；报告中的 `improve_fts_retrieval` 表示下一轮应补强 aliases/tags、
-查询改写和大目录路由。项目明确不引入 embedding、向量索引或相关外部数据通道。
+固定用例通过时才进入后续发布门禁；报告中的 `improve_fts_retrieval` 表示下一轮应补强 aliases/tags
+生成和大目录有界路由。项目明确不引入 embedding、向量索引或相关外部数据通道。
 
 真实试用中出现的“没帮助 / 引用有误”回答应进入管理后台“AI 质量”工作台：先查看回答轨迹与引用，
 必要时跳转知识页人工纠错，再加入待校准评测集并记录处理说明。导出的候选 JSON 仍需人工确认标准答案
@@ -57,18 +74,21 @@ GitHub `macos-release` environment 必须配置：
 `true`。发布工作流会在导入证书前只报告缺少的变量名称，不输出任何凭据内容。
 
 确认 `package.json` 版本后，由维护者创建匹配的 `v<version>` 标签。标签会触发双架构构建、
-Developer ID 签名、公证、staple、DMG 挂载 smoke 和 GitHub Release 发布。
+Developer ID 签名、公证、staple、DMG 挂载 smoke，并把产物上传到 **Draft Prerelease**。Draft 只供维护者和
+受控测试人员完成下面的外部门禁；在第 6 节全部通过前不得公开。
 
 ## 3. DMG 与无终端安装验收
 
 arm64 和 Intel 架构至少各完成一次；测试机不得依赖仓库 checkout、全局 Bun、Node、npm、
 Homebrew 或 lark-cli。
 
-1. 下载 GitHub Release 中对应架构的 DMG。
+1. 由有仓库权限的测试人员从 Draft Prerelease 下载对应架构的 DMG；不要先公开 Release。
 2. 验证 Gatekeeper 未提示“开发者无法验证”或已损坏。
 3. 将 `HomeAgent.app` 拖入 `/Applications`，双击启动。
 4. 确认应用自动安装并启动 LaunchAgent，然后自动打开 `/setup`。
-5. 完成 Codex 安装和 ChatGPT 登录。
+5. 验证普通调用 Provider。Claude CLI 必须使用 strict no-tools 模式；Codex / ChatGPT 登录可直接用于普通问答，
+   但必须记录 `ephemeral`、忽略用户配置/规则、`approval_policy=never` 与 `read-only` sandbox 证据。若所选 Provider 仍要求用户打开终端补齐安装或登录，本轮“无终端安装”应记为失败；
+   内部 Soak 可预装 Claude 继续硬化，但不得拿它代替新用户门禁。
 6. 创建或连接飞书机器人，确认两个事件消费者就绪。
 7. 加入测试群，确认机器人只登记待确认并发送一次提示；由群主或管理员发送“@HomeAgent 启用群聊”，
    再发送真实消息完成首次知识收录并记下原始记录 ID。
@@ -116,16 +136,51 @@ launchctl kill SIGKILL "gui/$(id -u)/com.homeagent.agent"
 KeepAlive 应自动启动新 PID。随后检查 `/readyz`，并使用第 3 节记录的名称或 ID 确认原始知识、
 任务配置、待发送提醒和学习进度均仍存在。将前后 PID、四类记录的检查结果写入发布记录。
 
-### 4.1 Agent Skill 绑定验收
+### 4.1 Agent 发布与 Skill 执行边界验收
 
-在发布机的 Agents 工作台完成一次本机 Skill 验收：
+在发布机的 Agents 工作台完成一次生命周期与本机 Skill 验收：
 
-1. 分别在两个测试群对应的团队空间绑定两个 Team Agent，并为它们选择不同的本机 Skill。
-2. 确认搜索、刷新、勾选、移除和切换 Provider 都不会丢失尚未保存的选择；页面不显示用户绝对路径或 `SKILL.md` 正文。
-3. 在两个群各发起一次 @ 问答，确认使用各自 Agent；普通调用为只读且没有 Workdir。
-4. 各运行一次研究任务，确认任务运行记录保存实际加载与跳过的 Skill 证据，并沿用 Agent 的 Permission / Workdir。
-5. 临时移走一个已绑定的 `SKILL.md` 后再次问答，确认基础 Agent 仍返回结果且飞书回复出现安全警告；恢复文件并刷新目录后警告消失。
-6. 导出并恢复该空间，确认导出格式为 `homeagent.space v7`，精确来源绑定与历史任务 Skill 证据保持不变。
+1. 为测试群绑定一个 Claude Team Agent，保存一版带唯一指令标记的 v1；修改 Instruction 和 Pinned Skills 后只点“保存草稿”，
+   确认线上版本、群回答和历史运行仍引用 v1，工作台显示“有未发布草稿”。
+2. 发布草稿为 v2，确认发布历史同时保留不可变的 v1/v2；启动一条研究任务后立刻修改 Agent，确认该 Run 仍显示启动时冻结的
+   Agent revision、Provider、Model、Permission、Workdir 和完整 Skill 证据。
+3. 从发布历史选择 v1 回滚，确认系统不是原地改写 v1，而是创建并发布一个内容等同 v1 的新版本；回滚前已创建的 Run 仍引用 v2，
+   回滚后新建的 Run 引用新的线上版本。
+4. 在飞书发起一次普通 @ 问答。Claude 必须使用 safe mode、空工具集且不保存 Provider 会话；Codex 必须使用临时只读模式、
+   忽略用户配置/规则、禁止审批且不加载 Pinned Skills。Codex 应以冻结的 Agent Workdir（如已配置）作为只读当前目录，Claude 不使用
+   Workdir 工具；绑定的 native Skills 记录为 `no_tools_context` 跳过且未被声明为已执行。普通问答、提炼、学习和质量重新评测都不得加载本机 Skill。
+5. 把 Agent 切换为 Codex 后确认普通 @ 问答正常；切换为 TRAE 后确认系统明确安全拒绝且不产生工具副作用。再运行一条显式研究任务，
+   确认只有该任务按冻结计划使用 Permission / Workdir / Pinned Skills。
+6. 临时修改 Pinned Skill 目录中的一个非 `SKILL.md` 资源文件，再运行先前已排队的显式任务；必须因完整目录树摘要变化而
+   fail-closed，不能只校验入口文件或静默使用新内容。恢复目录并重新创建 Run 后才允许执行。
+7. 在工作上下文中配置两个下一动作，手动续作第一个并确认 Task Run 成功后先生成“结果 / 检查 / 证据”验收报告；`read-only` 仅在 Raw 已落盘、输出未截断且 Provider 返回严格 JSON 报告（`outcome=completed`、无 blocker、全部检查通过）时自动验收。普通文本或畸形报告必须停在人工验收，结构化 `blocked` 必须形成 blocker 且不得消费动作；`write/full` 即使执行前已审批，执行后仍必须人工接受。接受后才写入 checkpoint、消费当前首个动作；驳回必须填写原因，保留动作和证据并允许从同一边界重试。修改计划后可显式放弃旧的受阻动作，确认系统 blocker 被清除且新的首个动作可继续。待验收时自动续跑暂停，旧 Run 页面不能决定新重试结果。失败应转为阻塞，取消不得消费动作；重启后排队动作按冻结计划恢复，已中断的运行中动作只转为阻塞、不得重放。
+8. 导出并恢复该空间，确认格式为 `homeagent.space v16`，Agent 发布历史、运行所引用的 revision、完整 Skill 证据、跳过原因、工作上下文、WorkAction/checkpoint/验收审计、自动续作策略及 Raw 准入状态保持不变；待验收动作必须阻止导出与删除。验收前 Raw 必须为 `held` 且不能被 Dream、强制重跑、隔离重试或人工重新提炼读取；接受后才变为 `ready`，驳回、取消或失败后必须为 `excluded`。
+
+这里验收的是当前 native Skill 冻结与执行链。`ManagedSkillStore` 仍是未接入 Provider 运行时的安全基础设施；不得把 Git/URL
+导入、Managed release 执行或 Skill 市场写成已发布能力。
+
+### 4.2 v10–v15 真实归档迁移验收
+
+从对应历史版本各准备一份脱敏的真实 `homeagent.space v10`、v11、v12、v13、v14、v15 归档；不得只修改 JSON 的 `version` 字段伪造。
+每份归档使用独立的全新数据目录执行以下步骤，避免同名空间相互覆盖：
+
+1. 先只读保存原归档、文件摘要和来源版本，再通过管理后台导入；导入失败时保留原文件和错误，不手改历史审计绕过校验。
+2. v10 确认冻结执行计划仍可查看；v11 确认 Agent 发布历史和已有审批审计仍在；v12 确认审批期限与通知审计仍在；
+   v13 确认用量、失败分类和自动重试关系仍在；v14 确认 Chat 评测 Trace 与已结束重评审计仍在；v15 确认工作上下文、WorkAction、checkpoint 与验收审计仍在，且历史 WorkAction Raw 按事实迁移为 `ready/excluded`，引用非准入来源的污染页被移除。旧版本本来没有的字段应保持 legacy/未知，不得补成虚假的成功、0 成本或已审批。
+3. 对缺少可验证审批或执行计划的历史 `write/full` 活动运行做负向检查：恢复必须 fail-closed，不能用当前 Agent 配置继续执行。
+4. 将迁移后的空间重新导出，确认版本为 `homeagent.space v16`；重启 HomeAgent 后再次导出，比对知识、Agent revision、Task/Chat Run、工作上下文、WorkAction/checkpoint、Raw 准入状态、自动续作策略、
+   审批/通知/重试/用量审计、提醒和学习数据的数量与关键 ID。
+5. 把该 v16 归档导入第二个全新数据目录，确认没有重复通知、自动续跑、重复动作 checkpoint、重复原始材料、悬空工作关联、未验收 Raw 污染 Wiki 或悬空质量 trace。把原归档摘要、两次 v16
+   导出摘要及逐项结果附到发布记录。
+
+### 4.3 用量与质量重新评测验收
+
+1. 分别打开一条 Chat Run、一条 Task Run 和一次质量 trace，确认调用次数、token 可见数、成本可见数和记账覆盖率一致。
+   CLI 未报告成本时必须显示“成本未知”，且持久化审计满足 `unknownCostCalls > 0`、`knownCostCalls < calls`；不能显示为 `$0`。
+   对应每日预算摘要必须为 `accountingComplete=false`，美元硬门禁只约束已知成本。
+2. 在一条已完成 Chat Run 的详情页执行“重新评测”，确认生成独立 candidate trace、记录本次用量，并且不向飞书再次发送回复。
+3. 确认重新评测使用原问题和冻结计划；若原引用空间已不存在则应 fail-closed。它是一次可审计的 re-evaluation，输出允许变化，
+   不得在发布记录中称为 deterministic replay。
 
 ## 5. 24–48 小时真实飞书 Soak
 
@@ -172,6 +227,7 @@ bun run soak:feishu -- \
   --data-dir ./data \
   --evidence ./artifacts/soak-evidence.jsonl \
   --monitor ./artifacts/soak-24h.jsonl \
+  --scenarios group_binding_lifecycle,message_capture,mention_answer,proactive_participation,attachment_extraction,research_notification,reminder_delivery,learning_interaction,distill_citation \
   --research-task "发布浸泡研究"
 ```
 
@@ -215,27 +271,109 @@ bun run soak:feishu -- \
 会给出明确的权限前置条件并失败，不得用 @ 消息伪装通过。只有确认企业已批准该敏感权限后，才能运行
 智能参与、普通群消息收录以及“响应所有消息”的验收。
 
-可先加 `--dry-run` 检查场景和路径而不发送消息。默认自动执行前十项；`network_recovery` 不接受
-自动伪造的接口失败，必须在明确获准中断测试机网络后受控执行，并继续使用 `--record-evidence`
-记录恢复后的真实消息或发布记录编号。
+可先加 `--dry-run` 检查场景和路径而不发送消息。必须显式传入本轮需要自动执行的 `--scenarios`；普通问答类场景使用
+Claude strict no-tools 或 Codex 临时只读路径。`network_recovery` 不接受自动伪造的接口失败，必须在明确获准中断测试机网络后受控执行，
+并继续使用 `--record-evidence` 记录恢复后的真实消息或发布记录编号。
 
 必须覆盖以下场景；失败的尝试使用 `--failed` 记录，修复后再记录新的成功证据：
 
 - `group_binding_lifecycle`：入群待确认、管理员启用、断开隐私、原空间重连和状态恢复；
 - `message_capture`：群消息静默收录；
-- `mention_answer`：@ 问答；
+- `mention_answer`：Claude strict no-tools 或 Codex 临时只读的 @ 问答；绑定的 native Skills 必须显示为跳过；
 - `proactive_participation`：一次主动参与；
-- `image_analysis`：图片回复分析；
+- `image_analysis`：绑定 Codex 时验证临时只读普通会话的原生图片输入；绑定不支持图片的 Provider 时必须明确拒绝，
+  不得猜测图片内容。自动驱动的正向识别断言只允许在本轮空间已绑定 Codex 时运行；
 - `attachment_extraction`：文本或 PDF 附件提取；
 - `research_notification`：研究任务及飞书通知；
 - `reminder_delivery`：提醒创建与送达；
 - `learning_interaction`：学习课程推送与回答；
-- `distill_citation`：手动提炼和引用问答；
+- `distill_citation`：Claude no-tools 或 Codex 临时只读的手动提炼和引用问答；
 - `network_recovery`：网络短暂中断后恢复。
 
 Soak 默认要求 `/healthz` 和 `/readyz` 同时成功，并记录延迟、失败、连续失败和进程替换次数。
 发布门禁只有在 runtime 指标和上述十一项最新证据都成功时才通过。两个 JSONL 文件不得包含消息
 正文或凭据。
+
+### 5.1 本轮三个真实飞书灰度场景
+
+以下三项必须在同一轮 24 小时 Soak 的真实测试群完成。仓库聚焦回归是自动验收基础，但不能替代飞书消息、真实 CLI
+进程、持久化重启和通知去重证据。每一步记录脱敏的 Agent revision、Task Run、父/子重试 Run、飞书消息和发布记录 ID。
+
+完成人工故障动作并取得真实 ID 后，用同一驱动做自动交叉校验：
+
+```bash
+HOMEAGENT_SOAK_ADMIN_TOKEN='<仅在后台启用认证时设置>' \
+bun run soak:feishu -- \
+  --chat-id oc_xxx \
+  --bot-open-id ou_xxx \
+  --admin-url http://127.0.0.1:3000 \
+  --sender ui \
+  --data-dir ./data \
+  --evidence ./artifacts/soak-evidence.jsonl \
+  --monitor ./artifacts/soak-24h.jsonl \
+  --window-started-at 2026-08-10T00:00:00Z \
+  --approval-expired-run-id run_expired_xxx \
+  --approval-idempotency-run-id run_approval_retry_xxx \
+  --retry-task-id task_retry_xxx \
+  --retry-business-marker F5-RETRY-UNIQUE-xxx \
+  --scenarios agent_revision_lifecycle,writable_task_approval,readonly_task_retry
+```
+
+`--window-started-at` 必须记录本轮灰度真正开始的时间（epoch 毫秒或 ISO 时间），不得沿用上轮值；monitor/evidence 文件即使采用 append，
+驱动也只接受该时间之后的 Run、消息和状态样本。`run_expired_xxx` 必须来自生产审批过期循环；`run_approval_retry_xxx` 必须已有至少两次审批通知投递尝试且飞书只保留一条可见消息；
+`task_retry_xxx` 必须已经发生一次真实的定时只读暂态失败，并把唯一业务标记同时写入重试输出和通知。驱动不得制造这些状态，
+缺少任一真实前置证据就必须在任何管理写入前失败。三项通过后会写入与主 evidence 同目录的
+`soak-evidence.agent-platform.jsonl`；这个 sidecar 只保存短 artifact ID，以及严格 allowlist 的 ID、状态、时间、计数和 SHA-256
+metadata，不得包含消息正文、Instruction、Prompt、凭据或完整模型输出。
+为稳定控制“运行中回滚”和审批时序，自动驱动通过受认证的公开 Web 管理表单创建/操作测试资源，并核验真实飞书出站通知；
+它不覆盖群内 `/task run` 的入站命令链。下面要求的两次飞书 `/task run` 仍需由群主/管理员手工执行并单独归档证据，
+不能用 Web 驱动 sidecar 替代。
+
+正常失败、`SIGINT` 与 `SIGTERM` 会触发有界清理：先禁用临时 Task，再按归属检查恢复 Space 绑定并删除无引用的临时资源。
+`SIGKILL` 或机器断电无法执行进程内清理；恢复后必须先把测试 Space 重新绑定到原 Agent，禁用并删除所有本轮 `F5-*` Task，
+确认没有 Run 活跃后再删除无绑定的 `F5-*` Agent，完成前不得重跑或把 sidecar 计为通过。
+
+#### `agent_revision_lifecycle`：Agent 发布、冻结与回滚
+
+1. 给测试群的 Team Agent 发布带唯一标记的 v1，再保存并发布带另一标记的 v2；确认仅保存草稿时群内线上行为不变化。
+2. 由群主或管理员在飞书执行 `/task run <测试任务>` 创建 v2 Run，并在运行详情记下冻结的 v2 revision ID。
+3. Run 创建后立即在 Agents 工作台回滚到 v1。确认回滚产生新的已发布 revision，而不是改写历史 v1/v2。
+4. 等待 v2 Run 完成并只收到一次研究通知；详情中的 revision、Provider、Model、Permission、Workdir 和 Skill 摘要仍为创建时的 v2 计划。
+5. 再从飞书创建一条新 Run，确认它引用回滚产生的新线上 revision；两条 Run 的原始材料和通知各一份，没有串用版本。
+
+自动验收以第 1 节的 `agents.test.ts`、`engine.test.ts`、`app.test.ts` 回归及两条真实 Run 详情字段为准；只观察最终回答文本，
+不能证明执行计划已冻结。
+
+#### `writable_task_approval`：`write/full` 审批、重启与过期
+
+1. 在一次性测试 Workdir 上发布 `write` Agent，并创建开启飞书通知的测试任务。由群主或管理员从飞书立即运行，确认 Run 进入
+   `awaiting_approval`，审批前没有 Provider 启动时间、输出、原始材料或 Workdir 变更，审批通知只出现一次。
+2. 保持待审批状态重启 HomeAgent；确认 Run 仍等待原冻结计划、没有重复审批通知。随后从后台批准，确认只执行一次并只产生一份
+   原始材料/完成通知。另建一条 Run 执行“拒绝”，确认 Provider 调用仍为 0。
+3. 另建一条审批 Run，在受控网络中断下让第一次审批通知投递失败，再恢复网络等待调度器重试；确认通知审计至少两次尝试、
+   飞书最终只有一条包含该 Run ID 的审批消息。随后批准并等待 Run 成功，把它作为 `--approval-idempotency-run-id`；无法安全制造
+   真实投递故障时，本项记为未覆盖，不得直接修改通知审计。
+4. 在 Soak 开始时各创建一条 `write` 与 `full` Run 并不作决定；到 24 小时截止后确认二者均转为 `expired`，过期审批不可再批准，
+   无 Provider 输出、文件副作用或重复通知。`full` 绕过 Provider 沙箱，灰度中不得批准，只验收等待与过期。
+5. 核对每条 Run 的申请时间、24 小时截止时间、决定人/过期 actor、通知尝试和冻结计划；审批后若 Workdir 已移动或被替换，
+   必须在 Provider 启动前 fail-closed。
+
+自动验收以 `task-runs.test.ts`、`task-scheduler.test.ts`、`engine.test.ts` 和 `app.test.ts` 中的审批、过期、重启及通知去重用例为准。
+
+#### `readonly_task_retry`：定时只读任务自动重试
+
+1. 创建启用通知的 `read-only` 定时任务，在主题中要求输出且通知原样包含一个不超过 120 字符的单行唯一标记，并记下下一次
+   触发时间；手动“立即运行”不符合自动重试条件，不能替代本场景。
+2. 经批准后，在任务到期前短暂断开测试机网络。只有首条 Run 的详情明确记录 Provider 阶段、`retryable=true` 的
+   `overloaded`、`rate_limited` 或 `transient_provider` 失败并进入等待重试，才算成功触发；认证、配置、预算、超时、Skill、
+   Workdir、取消或已有输出的失败都不得自动重试。
+3. 首条 Run 进入等待后立即恢复网络。约 60 秒后确认系统原子创建且只创建一条关联子 Run，子 Run 的 `trigger=retry`、
+   `retryOf=<父 Run ID>`、attempt 和冻结执行计划均正确。
+4. 确认子 Run 从头重新执行并最终只有一份业务原始材料和一条成功通知；禁用任务后不得继续等待或生成新的自动重试。
+
+这是一条使用冻结计划的新 Run，不是进程 checkpoint 或确定性续跑。若真实网络故障没有被 Provider 报告为上述可重试分类，
+本场景应记为未覆盖/失败，不能手改归档或运行状态伪造通过；自动状态机证据由 `task-runs.test.ts`、`engine.test.ts` 和
+`task-scheduler.test.ts` 提供。
 
 ## 6. 发布决定
 
@@ -246,5 +384,12 @@ Soak 默认要求 `/healthz` 和 `/readyz` 同时成功，并记录延迟、失�
 - 两个架构的签名、公证和 DMG smoke 全绿；
 - 至少一个全新用户环境完成无终端安装；
 - 自动与真实崩溃恢复均通过；
+- v10、v11、v12、v13、v14、v15 六份真实归档均完成独立迁移、v16 再导出、重启和二次恢复，比对记录已归档；
+- Agent 草稿/发布/回滚、`write/full` 审批与过期、定时只读自动重试三个真实飞书灰度场景全部通过；
+- 普通调用的 Claude strict no-tools 或 Codex 临时只读、native Skill `no_tools_context` 跳过、TRAE 安全拒绝和图片输入边界均有真实消息证据；
+- 用量页面没有把未知成本显示为 0，质量重新评测没有外发副作用且被标记为 re-evaluation 而非 deterministic replay；
 - 24 小时 soak 达标；公开 Beta 前完成 48 小时 soak；
 - 已记录仍由飞书管理员完成的权限、发布和外部共享步骤。
+
+全部证据归档后，由维护者在 GitHub Release 页面把该 Draft 发布为 Prerelease；公开前再次确认 tag、两个 DMG、
+`update-manifest.json` 与本清单记录属于同一版本。任何一项未通过都保留 Draft 或删除候选产物，不得提前公开。

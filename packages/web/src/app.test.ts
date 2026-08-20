@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Hono } from "hono";
@@ -250,7 +250,122 @@ describe("web backend (read-only)", () => {
     expect(detailBody).toContain("完整原始内容：Alice 负责结算系统");
     expect(detailBody).toContain("值班手册.md");
     expect(detailBody).toContain("Alice 与结算系统");
+    expect(detailBody).toContain("状态：待提炼");
     expect(detailBody).toContain("重新提炼这条记录");
+
+    engine.registry.store(SPACE).index().markIngested([rawId]);
+    const ingestedDetail = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/raw/${encodeURIComponent(rawId)}`,
+    );
+    const ingestedDetailBody = await ingestedDetail.text();
+    expect(ingestedDetailBody).toContain("状态：已提炼");
+    expect(ingestedDetailBody).toContain("重新提炼这条记录");
+  });
+
+  test("shows each Raw admission state in the Raw list", async () => {
+    const readyPendingId = await engine.remember({
+      space: SPACE,
+      source: "manual",
+      content: "列表状态：普通待提炼",
+    });
+    const readyIngestedId = await engine.remember({
+      space: SPACE,
+      source: "manual",
+      content: "列表状态：普通已提炼",
+    });
+    engine.registry.store(SPACE).index().markIngested([readyIngestedId]);
+    const heldId = await engine.remember({
+      space: SPACE,
+      source: "task",
+      admission: "held",
+      workActionId: "wa_web_held",
+      content: "列表状态：动作待验收",
+    });
+    const excludedId = await engine.remember({
+      space: SPACE,
+      source: "task",
+      admission: "held",
+      workActionId: "wa_web_excluded",
+      content: "列表状态：动作已排除",
+    });
+    engine.registry.store(SPACE).index().excludeRawAdmission(
+      excludedId,
+      "wa_web_excluded",
+    );
+
+    const response = await app.request(`/spaces/${encodeURIComponent(SPACE)}/raw`);
+    const body = await response.text();
+    const rowFor = (rawId: string) => {
+      const linkAt = body.indexOf(`/raw/${rawId}`);
+      expect(linkAt).toBeGreaterThan(-1);
+      return body.slice(body.lastIndexOf("<tr", linkAt), body.indexOf("</tr>", linkAt));
+    };
+
+    expect(rowFor(readyIngestedId)).toContain("已提炼");
+    expect(rowFor(readyPendingId)).toContain("待提炼");
+    expect(rowFor(heldId)).toContain("待动作验收");
+    expect(rowFor(excludedId)).toContain("已排除");
+  });
+
+  test("shows a held WorkAction Raw as awaiting acceptance and refuses redistillation", async () => {
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "task",
+      admission: "held",
+      workActionId: "wa_web_detail_held",
+      content: "候选动作产物，尚未验收。",
+    });
+
+    const response = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/raw/${encodeURIComponent(rawId)}`,
+    );
+    const body = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(body).toContain("状态：待动作验收");
+    expect(body).not.toContain("重新提炼这条记录");
+    expect(body).not.toContain(`/raw/${rawId}/redistill`);
+
+    const redistill = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/raw/${encodeURIComponent(rawId)}/redistill`,
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(redistill.status);
+    const location = decodeURIComponent(redistill.headers.get("location") ?? "");
+    expect(location).toContain("重新提炼失败");
+    expect(location).toContain("尚未通过动作验收");
+  });
+
+  test("shows an excluded WorkAction Raw as excluded and refuses a direct redistill post", async () => {
+    const actionId = "wa_web_detail_excluded";
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "task",
+      admission: "held",
+      workActionId: actionId,
+      content: "已拒绝的动作产物。",
+    });
+    engine.registry.store(SPACE).index().excludeRawAdmission(rawId, actionId);
+
+    const detail = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/raw/${encodeURIComponent(rawId)}`,
+    );
+    const body = await detail.text();
+    expect(body).toContain("状态：已排除");
+    expect(body).not.toContain("重新提炼这条记录");
+    expect(body).not.toContain(`/raw/${rawId}/redistill`);
+
+    const response = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/raw/${encodeURIComponent(rawId)}/redistill`,
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(response.status);
+    const location = decodeURIComponent(response.headers.get("location") ?? "");
+    expect(location).toContain("重新提炼失败");
+    expect(location).toContain("已被动作验收排除");
+    expect((await engine.getSpaceGovernance(SPACE)).audit).not.toContainEqual(
+      expect.objectContaining({ action: "raw_redistilled", target: rawId }),
+    );
   });
 
   test("shows the Agent response associated with a raw Chat message", async () => {
@@ -576,7 +691,34 @@ describe("web backend (read-only)", () => {
     expect(readSettings(dir).defaultModel).toBeUndefined();
   });
 
-  test("connects managed Codex without exposing installer or login output", async () => {
+  test("accepts Codex as the ordinary setup AI", async () => {
+    const codexSetup = createWebApp({
+      engine,
+      detectProviders: async () => [{
+        id: "codex",
+        name: "Codex",
+        bin: "codex",
+        available: true,
+        detail: "ready",
+      }],
+      providerModels: async () => ({ codex: ["gpt-5.4"] }),
+    });
+
+    const response = await codexSetup.request("/setup/ai", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "provider=codex&model=gpt-5.4",
+    });
+
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe("/setup");
+    expect(readSettings(dir)).toEqual(expect.objectContaining({
+      defaultProvider: "codex",
+      defaultModel: "gpt-5.4",
+    }));
+  });
+
+  test("connects managed Codex without changing the default until the user selects it", async () => {
     let installed = false;
     let installCalls = 0;
     let loginStarts = 0;
@@ -639,10 +781,7 @@ describe("web backend (read-only)", () => {
 
     session = { state: "ready", message: "ChatGPT 已连接" };
     expect((await managed.request("/setup/ai/codex/session")).status).toBe(200);
-    expect(readSettings(dir)).toEqual(expect.objectContaining({
-      defaultProvider: "codex",
-      defaultModel: "",
-    }));
+    expect(readSettings(dir).defaultProvider).not.toBe("codex");
   });
 
   test("sanitizes managed Codex installation failures", async () => {
@@ -1320,6 +1459,38 @@ describe("web backend (read-only)", () => {
     expect(body).toContain("同名引用，候选空间");
   });
 
+  test("quality workbench prefers exact retrieval provenance for an ambiguous slug", async () => {
+    const personal = "personal/ou_quality" as const;
+    await engine.upsertPage(
+      personal,
+      page("entities/alice", "Alice（个人）", "个人空间中的 Alice。"),
+    );
+    const trace = engine.quality.recordTrace({
+      spaces: [SPACE, personal],
+      question: "这里的 Alice 是谁？",
+      outcome: "succeeded",
+      source: "knowledge",
+      answer: "请查看个人空间中的 Alice。",
+      citations: [{ slug: "entities/alice", title: "Alice", space: personal }],
+      retrievalPages: [{
+        space: personal,
+        slug: "entities/alice",
+        contentHash: "personal-alice-hash",
+      }],
+      latencyMs: 60,
+    });
+    engine.recordAnswerFeedback(trace.id, SPACE, "citation_error", "核对精确来源");
+
+    const body = await (await app.request("/quality")).text();
+    expect(body).toContain(
+      `/spaces/${encodeURIComponent(personal)}/pages/${encodeURIComponent("entities/alice")}`,
+    );
+    expect(body).not.toContain(
+      `/spaces/${encodeURIComponent(SPACE)}/pages/${encodeURIComponent("entities/alice")}`,
+    );
+    expect(body).not.toContain("同名引用，候选空间");
+  });
+
   test("quality workbench exports calibration cases as local JSON", async () => {
     const trace = engine.quality.recordTrace({
       spaces: [SPACE],
@@ -1471,7 +1642,8 @@ describe("management backend (read-write)", () => {
     const governanceBody = await governance.text();
     expect(governanceBody).toContain("数据治理");
     expect(governanceBody).toContain("原始消息保留");
-    expect(governanceBody).toContain("homeagent.space v1–v8");
+    expect(governanceBody).toContain("homeagent.space v1–v16");
+    expect(governanceBody).toContain("v16 包含 WorkAction Raw");
 
     const exported = await app.request(`/spaces/${encodeURIComponent(SPACE)}/export`);
     expect(exported.status).toBe(200);
@@ -1480,11 +1652,13 @@ describe("management backend (read-write)", () => {
     expect(JSON.parse(archiveText)).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 9,
+        version: 16,
+        agentRevisions: [],
         learning: { plans: [], sources: [], sessions: [] },
         governanceAudit: [],
         taskRuns: [],
         chatRuns: [],
+        workItems: [],
       }),
     );
 
@@ -1621,6 +1795,177 @@ describe("management backend (read-write)", () => {
     expect(view).toContain("仅 Codex");
   });
 
+  test("Agent editor saves drafts, publishes explicitly, and rolls back as a new revision", async () => {
+    const created = engine.agents.create({
+      name: "Lifecycle Agent",
+      instruction: "release one",
+      provider: "claude",
+    });
+    const releaseOne = created.publishedRevisionId!;
+    const editorBody = new URLSearchParams({
+      name: created.name,
+      instruction: "release two",
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      visibility: "Team",
+      permission: "read-only",
+      expectedHeadRevisionId: releaseOne,
+    });
+    editorBody.set("agentAction", "draft");
+
+    const savedDraft = await app.request(`/agents/${encodeURIComponent(created.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: editorBody.toString(),
+    });
+    expect([302, 303]).toContain(savedDraft.status);
+    expect(engine.agents.get(created.id)).toEqual(expect.objectContaining({
+      instruction: "release one",
+      provider: "claude",
+      publishedRevisionId: releaseOne,
+    }));
+    expect(engine.agents.getDraft(created.id)?.snapshot).toEqual(expect.objectContaining({
+      instruction: "release two",
+      provider: "codex",
+    }));
+
+    const draftPage = await (await app.request(`/agents/${encodeURIComponent(created.id)}`)).text();
+    expect(draftPage).toContain("release two");
+    expect(draftPage).toContain("有未发布草稿");
+    expect(draftPage).toContain('name="agentAction" value="draft"');
+    expect(draftPage).toContain('name="agentAction"');
+    expect(draftPage).toContain('value="publish"');
+    const firstDraft = engine.agents.getDraft(created.id)!;
+    expect(draftPage).toContain(`name="expectedHeadRevisionId" value="${firstDraft.id}"`);
+
+    editorBody.set("agentAction", "publish");
+    editorBody.set("expectedHeadRevisionId", firstDraft.id);
+    const published = await app.request(`/agents/${encodeURIComponent(created.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: editorBody.toString(),
+    });
+    expect([302, 303]).toContain(published.status);
+    expect(engine.agents.get(created.id)).toEqual(expect.objectContaining({
+      instruction: "release two",
+      provider: "codex",
+    }));
+
+    const publishedHead = engine.agents.listRevisions(created.id)[0]!.id;
+    const publishedPage = await (
+      await app.request(`/agents/${encodeURIComponent(created.id)}`)
+    ).text();
+    for (const historicalDraft of engine.agents.listRevisions(created.id)
+      .filter((revision) => revision.source === "draft")) {
+      expect(publishedPage).not.toContain(
+        `/revisions/${encodeURIComponent(historicalDraft.id)}/rollback`,
+      );
+    }
+    const staleRollback = await app.request(
+      `/agents/${encodeURIComponent(created.id)}/revisions/${encodeURIComponent(releaseOne)}/rollback`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ expectedHeadRevisionId: firstDraft.id }).toString(),
+      },
+    );
+    expect(staleRollback.status).toBe(409);
+    const staleRollbackPage = await staleRollback.text();
+    expect(staleRollbackPage).toContain("Agent 版本已变化");
+    expect(staleRollbackPage).toContain(
+      `name="expectedHeadRevisionId" value="${firstDraft.id}"`,
+    );
+    expect(engine.agents.get(created.id)?.publishedRevisionId).toBe(publishedHead);
+
+    const rollback = await app.request(
+      `/agents/${encodeURIComponent(created.id)}/revisions/${encodeURIComponent(releaseOne)}/rollback`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ expectedHeadRevisionId: publishedHead }).toString(),
+      },
+    );
+    expect([302, 303]).toContain(rollback.status);
+    const rolledBack = engine.agents.get(created.id)!;
+    expect(rolledBack).toEqual(expect.objectContaining({
+      instruction: "release one",
+      provider: "claude",
+    }));
+    expect(engine.agents.listRevisions(created.id)[0]).toMatchObject({
+      source: "rollback",
+      basedOnRevisionId: releaseOne,
+      id: rolledBack.publishedRevisionId,
+    });
+  });
+
+  test("Agent lifecycle rejects stale browser mutations and draft rollback", async () => {
+    const created = engine.agents.create({
+      name: "Concurrent Agent",
+      instruction: "release one",
+    });
+    const releaseOne = created.publishedRevisionId!;
+    const bypass = await app.request(`/agents/${encodeURIComponent(created.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        name: created.name,
+        instruction: "direct publish bypass",
+        provider: created.provider,
+        visibility: created.visibility,
+        permission: created.permission,
+        expectedHeadRevisionId: releaseOne,
+      }).toString(),
+    });
+    expect(bypass.status).toBe(409);
+    expect(engine.agents.get(created.id)?.instruction).toBe("release one");
+
+    const first = new URLSearchParams({
+      name: created.name,
+      instruction: "draft A",
+      provider: created.provider,
+      visibility: created.visibility,
+      permission: created.permission,
+      agentAction: "draft",
+      expectedHeadRevisionId: releaseOne,
+    });
+    const saved = await app.request(`/agents/${encodeURIComponent(created.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: first.toString(),
+    });
+    expect([302, 303]).toContain(saved.status);
+    const draft = engine.agents.getDraft(created.id)!;
+
+    const stale = new URLSearchParams(first);
+    stale.set("instruction", "stale draft B");
+    const staleResponse = await app.request(`/agents/${encodeURIComponent(created.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: stale.toString(),
+    });
+    expect(staleResponse.status).toBe(409);
+    const stalePage = await staleResponse.text();
+    expect(stalePage).toContain("Agent 版本已变化");
+    expect(stalePage).toContain(
+      `name="expectedHeadRevisionId" value="${releaseOne}"`,
+    );
+    expect(stalePage).not.toContain(
+      `name="expectedHeadRevisionId" value="${draft.id}"`,
+    );
+    expect(engine.agents.getDraft(created.id)?.snapshot.instruction).toBe("draft A");
+
+    const draftRollback = await app.request(
+      `/agents/${encodeURIComponent(created.id)}/revisions/${encodeURIComponent(draft.id)}/rollback`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ expectedHeadRevisionId: draft.id }).toString(),
+      },
+    );
+    expect(draftRollback.status).toBe(404);
+    expect(engine.agents.get(created.id)?.publishedRevisionId).toBe(releaseOne);
+  });
+
   test("switching away from Codex clears the disabled reasoning field", async () => {
     const created = engine.agents.create({
       name: "切换 Provider",
@@ -1638,6 +1983,8 @@ describe("management backend (read-write)", () => {
         model: "sonnet",
         visibility: "Team",
         permission: "read-only",
+        agentAction: "publish",
+        expectedHeadRevisionId: created.publishedRevisionId!,
       }).toString(),
     });
 
@@ -1725,6 +2072,8 @@ describe("management backend (read-write)", () => {
         model: "codex-custom",
         visibility: "Team",
         permission: "read-only",
+        agentAction: "publish",
+        expectedHeadRevisionId: created.publishedRevisionId!,
       }).toString(),
     });
 
@@ -1801,12 +2150,13 @@ describe("management backend (read-write)", () => {
     expect(await page.text()).toContain("Skill 目录已刷新");
   });
 
-  test("agent editor explains the active task-execution boundaries", async () => {
+  test("agent editor explains ordinary Workdir and task-only permission boundaries", async () => {
     const body = await (await app.request("/agents/new")).text();
     expect(body).toContain("Workdir");
     expect(body).toContain("Permission");
     expect(body).toContain("Skills");
-    expect(body).toContain("仅影响研究任务");
+    expect(body).toContain("Permission 仅影响任务");
+    expect(body).toContain("Codex 普通会话只读使用 Workdir");
     expect(body).toContain("可写与完全访问权限必填");
     expect(body).not.toContain("Device");
     expect(body).not.toContain("Repositories");
@@ -1919,6 +2269,72 @@ describe("management backend (read-write)", () => {
     expect(retriedRunId).toBe(run.id);
   });
 
+  test("shows honest Chat usage and creates a durable evaluation rerun", async () => {
+    const sourceTrace = engine.quality.recordTrace({
+      spaces: [SPACE],
+      question: "What changed?",
+      outcome: "succeeded",
+      source: "general",
+      answer: "Original answer",
+      citations: [],
+      latencyMs: 10,
+    });
+    const run = engine.chatRuns.start({
+      space: SPACE,
+      chatId: "oc_web",
+      messageId: "om_evaluate",
+      author: "ou_evaluate",
+      input: "What changed?",
+      trigger: "message",
+      provider: "claude",
+      model: "sonnet",
+      skillEvidence: { requested: [], resolved: [], skipped: [] },
+      executionPlan: {
+        version: 1,
+        instruction: "Use the frozen evaluator persona.",
+        provider: "claude",
+        model: "sonnet",
+      },
+    });
+    engine.chatRuns.begin(run.id, run.startedAt);
+    engine.chatRuns.succeed(run.id, {
+      finishedAt: run.startedAt,
+      output: "Original answer",
+      traceId: sourceTrace.id,
+      usage: {
+        calls: 1,
+        knownTokenCalls: 1,
+        unknownTokenCalls: 0,
+        knownCostCalls: 1,
+        unknownCostCalls: 0,
+        inputTokens: 41,
+        outputTokens: 7,
+        costUsd: 0.006,
+        costBasis: "reported",
+        sources: ["claude-json"],
+      },
+    });
+    fake.onJSON(() => ({ slugs: [], relevant: false }));
+    fake.queueText("Candidate answer");
+
+    const detail = await app.request(`/chats/runs/${encodeURIComponent(run.id)}`);
+    const body = await detail.text();
+    expect(body).toContain("调用 1 次");
+    expect(body).toContain("$0.006000");
+    expect(body).toContain(`/chats/runs/${encodeURIComponent(run.id)}/evaluate`);
+
+    const response = await app.request(
+      `/chats/runs/${encodeURIComponent(run.id)}/evaluate`,
+      { method: "POST" },
+    );
+
+    expect([302, 303]).toContain(response.status);
+    expect(engine.quality.rerunsForChatRun(run.id)).toEqual([
+      expect.objectContaining({ status: "completed", candidateTraceId: expect.any(String) }),
+    ]);
+    expect(engine.chatRuns.list(SPACE)).toHaveLength(1);
+  });
+
   test("shows queued Chat position and delegates cancellation", async () => {
     const run = engine.chatRuns.start({
       space: SPACE,
@@ -2017,6 +2433,8 @@ describe("management backend (read-write)", () => {
         provider: "claude",
         visibility: "Personal",
         permission: "read-only",
+        agentAction: "publish",
+        expectedHeadRevisionId: created.publishedRevisionId!,
       }).toString(),
     });
 
@@ -2119,7 +2537,14 @@ describe("management backend (read-write)", () => {
 
   test("editing then deleting an agent works", async () => {
     const created = engine.agents.create({ name: "Temp", model: "" });
-    const edit = new URLSearchParams({ name: "Renamed", instruction: "x", model: "sonnet", visibility: "Team" });
+    const edit = new URLSearchParams({
+      name: "Renamed",
+      instruction: "x",
+      model: "sonnet",
+      visibility: "Team",
+      agentAction: "publish",
+      expectedHeadRevisionId: created.publishedRevisionId!,
+    });
     const r1 = await app.request(`/agents/${encodeURIComponent(created.id)}`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -3556,6 +3981,29 @@ describe("management backend (read-write)", () => {
     expect(view).toContain('aria-live="polite"');
   });
 
+  test("settings keeps task-only providers out of the ordinary default", async () => {
+    const view = await (await app.request("/settings")).text();
+    expect(view).toContain('value="trae-cli"  disabled');
+    expect(view).toContain("仅用于显式任务");
+
+    const response = await app.request("/settings", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        defaultProvider: "trae-cli",
+        defaultModel: "openrouter-3o",
+        dailyBudgetUsd: "5",
+        dreamHour: "3",
+        webPort: "3000",
+        rawRetentionDays: "90",
+      }).toString(),
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain("默认 Provider 必须支持安全的普通对话");
+    expect(readSettings(dir)).toEqual({});
+  });
+
   test("management shell exposes accessible narrow-screen navigation controls", async () => {
     const response = await app.request("/settings");
     expect(response.status).toBe(200);
@@ -3658,8 +4106,8 @@ describe("management backend (read-write)", () => {
 
   test("settings POST persists default provider/model + config and reflects it back", async () => {
     const form = new URLSearchParams({
-      defaultProvider: "trae-cli",
-      defaultModel: "openrouter-3o",
+      defaultProvider: "claude",
+      defaultModel: "sonnet",
       dailyBudgetUsd: "12",
       dreamHour: "5",
       webPort: "3000",
@@ -3673,12 +4121,419 @@ describe("management backend (read-write)", () => {
     expect([302, 303]).toContain(res.status);
     const view = await (await app.request("/settings")).text();
     // the saved default provider is selected and its model shows
-    expect(view).toContain("openrouter-3o");
-    expect(view).toContain('value="trae-cli" selected');
+    expect(view).toContain("sonnet");
+    expect(view).toContain('value="claude" selected');
     // dreamHour value is rendered in the number input
     expect(view).toContain('value="5"');
     expect(view).toContain('name="rawRetentionDays"');
     expect(view).toContain('value="30"');
+  });
+
+  test("work context: create, edit, and render the current item", async () => {
+    const create = new URLSearchParams({
+      title: "推进知识治理",
+      space: SPACE,
+      brief: "把验收证据集中到一个工作上下文。",
+      runbook: "1. 跑回归\n2. 检查归档",
+    });
+    const createdResponse = await app.request("/work", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: create.toString(),
+    });
+
+    expect([302, 303]).toContain(createdResponse.status);
+    const item = engine.workItems.list(SPACE)[0]!;
+    expect(item.active).toBe(true);
+
+    const update = new URLSearchParams({
+      title: item.title,
+      brief: item.brief,
+      runbook: item.runbook,
+      phase: "blocked",
+      summary: "回归完成，等待审批。",
+      blockers: "生产审批",
+      nextActions: "申请审批\n准备灰度",
+    });
+    const updatedResponse = await app.request(`/work/${encodeURIComponent(item.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: update.toString(),
+    });
+    expect([302, 303]).toContain(updatedResponse.status);
+
+    const view = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
+    expect(view).toContain("回归完成，等待审批");
+    expect(view).toContain("生产审批");
+    expect(view).toContain("当前工作项");
+  });
+
+  test("work context: opt in, continue, cancel, and retry controls are rendered", async () => {
+    const agent = engine.agents.create({
+      name: "工作续跑助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "推进灰度发布",
+      nextActions: ["更新灰度环境配置"],
+    });
+
+    const policyResponse = await app.request(`/work/${encodeURIComponent(item.id)}/continuation`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ autoContinue: "on" }).toString(),
+    });
+    expect([302, 303]).toContain(policyResponse.status);
+    expect(engine.workContinuations.policyFor(item.id, SPACE).autoContinue).toBe(true);
+
+    const continueResponse = await app.request(`/work/${encodeURIComponent(item.id)}/continue`, {
+      method: "POST",
+    });
+    expect([302, 303]).toContain(continueResponse.status);
+    const action = engine.workContinuations.list(item.id)[0]!;
+    let view = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
+    expect(view).toContain("更新灰度环境配置");
+    expect(view).toContain("等待审批");
+    expect(view).toContain(`/work/actions/${encodeURIComponent(action.id)}/cancel`);
+    expect(view).toContain(`name="runId" value="${action.taskRunIds.at(-1)}"`);
+    expect(view).toContain(`name="attempt" value="${action.attempt}"`);
+    expect(view).toContain('name="autoContinue" checked');
+
+    const cancelResponse = await app.request(`/work/actions/${encodeURIComponent(action.id)}/cancel`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        runId: action.taskRunIds.at(-1)!,
+        attempt: String(action.attempt),
+      }).toString(),
+    });
+    expect([302, 303]).toContain(cancelResponse.status);
+    view = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
+    expect(view).toContain("已取消");
+    expect(view).toContain(`/work/actions/${encodeURIComponent(action.id)}/retry`);
+    expect(view).toContain(`name="runId" value="${action.taskRunIds.at(-1)}"`);
+    expect(view).toContain(`name="attempt" value="${action.attempt}"`);
+  });
+
+  test("work context: stale retry and cancel forms cannot mutate a newer attempt", async () => {
+    const agent = engine.agents.create({
+      name: "旧表单防重放助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "拒绝旧动作表单",
+      nextActions: ["更新灰度环境配置"],
+    });
+    const first = engine.startWorkContinuation(item.id);
+    const actionId = first.run.workActionId!;
+    const firstAction = engine.workContinuations.get(actionId)!;
+    const staleState = {
+      runId: first.run.id,
+      attempt: String(firstAction.attempt),
+    };
+
+    const firstView = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
+    expect(firstView).toContain(`name="runId" value="${staleState.runId}"`);
+    expect(firstView).toContain(`name="attempt" value="${staleState.attempt}"`);
+    await app.request(`/work/actions/${encodeURIComponent(actionId)}/cancel`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(staleState).toString(),
+    });
+
+    const retryView = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
+    expect(retryView).toContain(`/work/actions/${encodeURIComponent(actionId)}/retry`);
+    expect(retryView).toContain(`name="runId" value="${staleState.runId}"`);
+    expect(retryView).toContain(`name="attempt" value="${staleState.attempt}"`);
+    await app.request(`/work/actions/${encodeURIComponent(actionId)}/retry`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(staleState).toString(),
+    });
+    const secondAction = engine.workContinuations.get(actionId)!;
+    const secondRunId = secondAction.taskRunIds.at(-1)!;
+    expect(secondAction).toEqual(expect.objectContaining({
+      status: "awaiting_approval",
+      attempt: 2,
+      taskRunIds: [first.run.id, secondRunId],
+    }));
+
+    const staleCancel = await app.request(`/work/actions/${encodeURIComponent(actionId)}/cancel`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(staleState).toString(),
+    });
+    expect(decodeURIComponent(staleCancel.headers.get("location") ?? "")).toContain("取消失败");
+    expect(engine.workContinuations.get(actionId)).toEqual(expect.objectContaining({
+      status: "awaiting_approval",
+      attempt: 2,
+      taskRunIds: [first.run.id, secondRunId],
+    }));
+    expect(engine.getTaskRun(secondRunId)?.status).toBe("awaiting_approval");
+
+    engine.rejectTaskRun(secondRunId, "operator", "结束第二次尝试");
+    expect(engine.workContinuations.get(actionId)?.status).toBe("cancelled");
+    const staleRetry = await app.request(`/work/actions/${encodeURIComponent(actionId)}/retry`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(staleState).toString(),
+    });
+    expect(decodeURIComponent(staleRetry.headers.get("location") ?? "")).toContain("重试失败");
+    expect(engine.workContinuations.get(actionId)).toEqual(expect.objectContaining({
+      status: "cancelled",
+      attempt: 2,
+      taskRunIds: [first.run.id, secondRunId],
+    }));
+  });
+
+  test("work action acceptance is visible on Work and Run pages and rejects stale forms", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => "配置已更新，并完成核对",
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "工作验收助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "验收灰度变更",
+      nextActions: ["更新灰度环境配置"],
+    });
+    app = createWebApp({ engine });
+    const pending = engine.startWorkContinuation(item.id);
+    const report = await engine.approveTaskRun(pending.run.id, "operator").completion;
+    const actionId = pending.run.workActionId!;
+
+    const workView = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
+    expect(workView).toContain("工作动作验收 · 待验收");
+    expect(workView).toContain("配置已更新，并完成核对");
+    expect(workView).toContain("执行输出已归档");
+    expect(workView).toContain(`/work/actions/${encodeURIComponent(actionId)}/accept`);
+    expect(workView).toContain(`/work/actions/${encodeURIComponent(actionId)}/reject`);
+    expect(workView).toContain(`name="runId" value="${pending.run.id}"`);
+    expect(workView).toContain("自动续跑已暂停在验收门");
+
+    const runView = await (await app.request(`/tasks/runs/${encodeURIComponent(pending.run.id)}`)).text();
+    expect(runView).toContain("工作动作验收 · 待验收");
+    expect(runView).toContain(`/work/${encodeURIComponent(item.id)}`);
+    expect(runView).not.toContain(`href="/tasks/${encodeURIComponent(actionId)}"`);
+
+    const stale = await app.request(`/work/actions/${encodeURIComponent(actionId)}/accept`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ runId: "run_stale" }).toString(),
+    });
+    expect([302, 303]).toContain(stale.status);
+    expect(engine.workContinuations.get(actionId)?.status).toBe("awaiting_acceptance");
+
+    const accepted = await app.request(`/work/actions/${encodeURIComponent(actionId)}/accept`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ runId: pending.run.id }).toString(),
+    });
+    expect([302, 303]).toContain(accepted.status);
+    expect(engine.workContinuations.get(actionId)).toEqual(expect.objectContaining({
+      status: "succeeded",
+      checkpoint: expect.objectContaining({ rawId: report.rawId, taskRunId: pending.run.id }),
+    }));
+    expect(engine.workItems.get(item.id)?.nextActions).toEqual([]);
+    const acceptedView = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
+    expect(acceptedView).toContain("工作动作验收 · 已接受");
+    expect(acceptedView).toContain("local-admin");
+  });
+
+  test("work action rejection requires a reason and exposes the retry boundary", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => "变更命令执行完成",
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "工作驳回助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "复核灰度变更",
+      nextActions: ["更新灰度环境配置"],
+    });
+    app = createWebApp({ engine });
+    const pending = engine.startWorkContinuation(item.id);
+    await engine.approveTaskRun(pending.run.id, "operator").completion;
+    const actionId = pending.run.workActionId!;
+
+    await app.request(`/work/actions/${encodeURIComponent(actionId)}/reject`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ runId: pending.run.id, reason: "" }).toString(),
+    });
+    expect(engine.workContinuations.get(actionId)?.status).toBe("awaiting_acceptance");
+
+    await app.request(`/work/actions/${encodeURIComponent(actionId)}/reject`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        runId: pending.run.id,
+        reason: "缺少变更后的环境截图",
+      }).toString(),
+    });
+    const view = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
+    expect(view).toContain("工作动作验收 · 已驳回");
+    expect(view).toContain("缺少变更后的环境截图");
+    expect(view).toContain(`/work/actions/${encodeURIComponent(actionId)}/retry`);
+    expect(engine.workItems.get(item.id)?.nextActions).toEqual(["更新灰度环境配置"]);
+  });
+
+  test("abandoning a stale blocked action exposes Continue and starts the new WorkItem head", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => "旧发布动作已经执行",
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "动作放弃表单助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "放弃受阻发布动作",
+      nextActions: ["更新灰度环境配置"],
+    });
+    app = createWebApp({ engine });
+    const pending = engine.startWorkContinuation(item.id);
+    await engine.approveTaskRun(pending.run.id, "operator").completion;
+    const actionId = pending.run.workActionId!;
+    const blocked = engine.rejectWorkAction(
+      actionId,
+      pending.run.id,
+      "local-admin",
+      "旧发布方案不再适用",
+    );
+    const staleToken = {
+      runId: pending.run.id,
+      attempt: String(blocked.attempt),
+    };
+    engine.workItems.update(item.id, { nextActions: ["执行新的发布步骤"] });
+
+    const blockedView = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
+    expect(blockedView).toContain(`/work/actions/${encodeURIComponent(actionId)}/abandon`);
+    expect(blockedView).toContain("放弃受阻动作");
+    expect(blockedView).toContain(`name="runId" value="${staleToken.runId}"`);
+    expect(blockedView).toContain(`name="attempt" value="${staleToken.attempt}"`);
+    expect(blockedView).not.toContain(`/work/actions/${encodeURIComponent(actionId)}/retry`);
+
+    const abandoned = await app.request(`/work/actions/${encodeURIComponent(actionId)}/abandon`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(staleToken).toString(),
+    });
+    expect([302, 303]).toContain(abandoned.status);
+    expect(decodeURIComponent(abandoned.headers.get("location") ?? "")).toContain("已放弃受阻动作");
+    expect(engine.workContinuations.get(actionId)?.status).toBe("cancelled");
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      actionBlockers: {},
+      nextActions: ["执行新的发布步骤"],
+    }));
+
+    const releasedView = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
+    expect(releasedView).toContain("继续一次");
+    expect(releasedView).toContain(`/work/${encodeURIComponent(item.id)}/continue`);
+    expect(releasedView).not.toContain(`/work/actions/${encodeURIComponent(actionId)}/retry`);
+
+    const continued = await app.request(`/work/${encodeURIComponent(item.id)}/continue`, {
+      method: "POST",
+    });
+    expect([302, 303]).toContain(continued.status);
+    const nextAction = engine.workContinuations.list(item.id)
+      .find((candidate) => candidate.id !== actionId)!;
+    expect(nextAction).toEqual(expect.objectContaining({
+      instruction: "执行新的发布步骤",
+      status: "awaiting_approval",
+    }));
+
+    const staleAbandon = await app.request(`/work/actions/${encodeURIComponent(actionId)}/abandon`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(staleToken).toString(),
+    });
+    expect(decodeURIComponent(staleAbandon.headers.get("location") ?? "")).toContain("放弃失败");
+    expect(engine.workContinuations.get(actionId)?.status).toBe("cancelled");
+    expect(engine.workContinuations.get(nextAction.id)).toEqual(expect.objectContaining({
+      status: "awaiting_approval",
+      instruction: "执行新的发布步骤",
+    }));
+    expect(engine.getTaskRun(nextAction.taskRunIds.at(-1)!)?.status).toBe("awaiting_approval");
+  });
+
+  test("a stale abandon token cannot mutate a newer attempt of the same WorkAction", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => "待复核的动作结果",
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "放弃防重放助手",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "拒绝旧放弃表单",
+      nextActions: ["更新灰度环境配置"],
+    });
+    app = createWebApp({ engine });
+    const first = engine.startWorkContinuation(item.id);
+    await engine.approveTaskRun(first.run.id, "operator").completion;
+    const actionId = first.run.workActionId!;
+    const rejected = engine.rejectWorkAction(
+      actionId,
+      first.run.id,
+      "local-admin",
+      "需要修正后重试",
+    );
+    const staleToken = {
+      runId: first.run.id,
+      attempt: String(rejected.attempt),
+    };
+    const retried = engine.retryWorkAction(actionId, {
+      runId: staleToken.runId,
+      attempt: Number(staleToken.attempt),
+    });
+
+    const staleAbandon = await app.request(`/work/actions/${encodeURIComponent(actionId)}/abandon`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(staleToken).toString(),
+    });
+
+    expect(decodeURIComponent(staleAbandon.headers.get("location") ?? "")).toContain("放弃失败");
+    expect(engine.workContinuations.get(actionId)).toEqual(expect.objectContaining({
+      status: "awaiting_approval",
+      attempt: 2,
+      taskRunIds: [first.run.id, retried.run.id],
+    }));
+    expect(engine.getTaskRun(retried.run.id)?.status).toBe("awaiting_approval");
   });
 
   test("tasks: nav + create + edit + list rendering", async () => {
@@ -3781,6 +4636,139 @@ describe("management backend (read-write)", () => {
     expect(engine.registry.store(SPACE).index().listRaw({}).some((r) => r.source === "task")).toBe(true);
   });
 
+  test("tasks: write execution shows its frozen approval request and runs once after approval", async () => {
+    let providerCalls = 0;
+    const isolatedDir = join(dir, "web-approval");
+    const isolatedEngine = new KnowledgeEngine({
+      dataDir: isolatedDir,
+      runProvider: async (_provider, input) => {
+        providerCalls += 1;
+        expect(input.prompt).toContain("dangerous original topic");
+        expect(input.prompt).not.toContain("harmless current topic");
+        return "approved web output";
+      },
+    });
+    isolatedEngine.ensureSpace(SPACE);
+    const agent = isolatedEngine.agents.create({
+      name: "Web Writer",
+      instruction: "frozen admin instruction",
+      provider: "claude",
+      permission: "write",
+      workdir: isolatedDir,
+    });
+    isolatedEngine.updateSpaceMeta(SPACE, { agentId: agent.id });
+    const task = isolatedEngine.tasks.create({
+      name: "approve-me",
+      space: SPACE,
+      topic: "dangerous original topic",
+      distillOnRun: false,
+    })!;
+    const isolatedApp = createWebApp({ engine: isolatedEngine });
+
+    const startResponse = await isolatedApp.request(
+      `/tasks/${encodeURIComponent(task.id)}/run`,
+      { method: "POST" },
+    );
+    const run = isolatedEngine.listTaskRuns(task.id)[0]!;
+    expect(run.status).toBe("awaiting_approval");
+    expect(providerCalls).toBe(0);
+    expect(decodeURIComponent(startResponse.headers.get("location") ?? ""))
+      .toContain("已提交审批");
+    const otherSpace: SpaceId = "team/oc_web_approval_other";
+    isolatedEngine.ensureSpace(otherSpace);
+    const moveResponse = await isolatedApp.request(
+      `/tasks/${encodeURIComponent(task.id)}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          name: task.name,
+          space: otherSpace,
+          topic: task.topic,
+          cadence: task.cadence,
+          hour: String(task.hour),
+          timeoutMinutes: String(task.timeoutMinutes),
+        }).toString(),
+      },
+    );
+    expect([302, 303]).toContain(moveResponse.status);
+    expect(decodeURIComponent(moveResponse.headers.get("location") ?? ""))
+      .toContain("已有运行历史");
+    expect(isolatedEngine.tasks.get(task.id)?.space).toBe(SPACE);
+    isolatedEngine.tasks.update(task.id, { topic: "harmless current topic" });
+
+    const detail = await (
+      await isolatedApp.request(`/tasks/runs/${encodeURIComponent(run.id)}`)
+    ).text();
+    expect(detail).toContain("待审批");
+    expect(detail).toContain("高权限执行审批");
+    expect(detail).toContain("write");
+    expect(detail).toContain(realpathSync(isolatedDir));
+    expect(detail).toContain("冻结任务主题");
+    expect(detail).toContain("dangerous original topic");
+    expect(detail).toContain("frozen admin instruction");
+    expect(detail).toContain("审批截止");
+    expect(detail).toContain(`/tasks/runs/${encodeURIComponent(run.id)}/approve`);
+    expect(detail).toContain(`/tasks/runs/${encodeURIComponent(run.id)}/reject`);
+
+    const approved = await isolatedApp.request(
+      `/tasks/runs/${encodeURIComponent(run.id)}/approve`,
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(approved.status);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (isolatedEngine.getTaskRun(run.id)?.status === "succeeded") break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(providerCalls).toBe(1);
+    expect(isolatedEngine.getTaskRun(run.id)).toEqual(expect.objectContaining({
+      status: "succeeded",
+      approval: expect.objectContaining({
+        status: "approved",
+        decidedBy: "local-admin",
+      }),
+    }));
+
+    await isolatedApp.request(
+      `/tasks/runs/${encodeURIComponent(run.id)}/approve`,
+      { method: "POST" },
+    );
+    expect(providerCalls).toBe(1);
+    isolatedEngine.close();
+  });
+
+  test("tasks: expired approval is explicit and no longer actionable", async () => {
+    engine.ensureSpace(SPACE);
+    const task = engine.tasks.create({
+      name: "expired web approval",
+      space: SPACE,
+      topic: "show the closed approval window",
+      distillOnRun: false,
+    })!;
+    const run = engine.taskRuns.start({
+      task,
+      trigger: "manual",
+      distill: false,
+      startedAt: 100,
+      approvalRequired: true,
+      executionPlan: {
+        version: 1,
+        instruction: "Expired request.",
+        provider: "codex",
+        execution: { permission: "write", workdir: dir, skills: [] },
+      },
+    });
+    engine.expireTaskRunApprovals(run.approval!.expiresAt!);
+
+    const body = await (
+      await app.request(`/tasks/runs/${encodeURIComponent(run.id)}`)
+    ).text();
+    expect(body).toContain("审批已过期");
+    expect(body).toContain("审批截止");
+    expect(body).not.toContain(`/tasks/runs/${encodeURIComponent(run.id)}/approve`);
+    expect(body).not.toContain(`/tasks/runs/${encodeURIComponent(run.id)}/reject`);
+  });
+
   test("tasks: failed run is visible in history and can be retried", async () => {
     let attempts = 0;
     fake.onText(() => {
@@ -3823,6 +4811,43 @@ describe("management backend (read-write)", () => {
     const retryPage = await (await app.request(retryLocation)).text();
     expect(retryPage).toContain("重试成功后的完整输出");
     expect(retryPage).toContain(failedRun.id);
+  });
+
+  test("tasks: automatic retry state is visible and can be cancelled", async () => {
+    const isolatedEngine = new KnowledgeEngine({
+      dataDir: join(dir, "automatic-retry-view"),
+      runProvider: async () => {
+        throw new Error("provider overloaded (503)");
+      },
+    });
+    isolatedEngine.ensureSpace(SPACE);
+    const task = isolatedEngine.tasks.create({
+      name: "visible automatic retry",
+      space: SPACE,
+      topic: "show the retry state",
+      distillOnRun: false,
+    })!;
+    const report = await isolatedEngine.runTask(task.id, { trigger: "scheduled" });
+    const run = isolatedEngine.getTaskRun(report.runId)!;
+    const isolatedApp = createWebApp({ engine: isolatedEngine });
+
+    const body = await (
+      await isolatedApp.request(`/tasks/runs/${encodeURIComponent(run.id)}`)
+    ).text();
+    expect(body).toContain("等待自动重试");
+    expect(body).toContain("Provider · overloaded");
+    expect(body).toContain("取消自动重试");
+    expect(body).toContain(`/tasks/runs/${encodeURIComponent(run.id)}/cancel`);
+
+    const cancelled = await isolatedApp.request(
+      `/tasks/runs/${encodeURIComponent(run.id)}/cancel`,
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(cancelled.status);
+    expect(decodeURIComponent(cancelled.headers.get("location") ?? ""))
+      .toContain("已取消自动重试");
+    expect(isolatedEngine.getTaskRun(run.id)?.retry?.status).toBe("exhausted");
+    isolatedEngine.close();
   });
 
   test("tasks: a duplicate manual run redirects to the active run", async () => {

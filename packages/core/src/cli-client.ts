@@ -11,22 +11,44 @@
  *     already quarantines bad output, and ask surfaces a graceful message.
  *
  * These CLIs are full coding agents: slower and heavier than an API call, and
- * they manage their own auth/model. Cost/usage isn't reliably available, so we
- * report zeros (the daily budget is not meaningful for CLI providers).
+ * they manage their own auth/model. Structured usage is preserved when a CLI
+ * reports it; unavailable counters and costs stay absent rather than becoming
+ * misleading zeroes.
  */
 import type {
   CodexReasoningEffort,
+  CallPurpose,
+  CompletionUsage,
   CompleteOptions,
   CompleteResult,
   JSONOptions,
+  ProviderRunResult,
   ProviderExecution,
   ProviderId,
 } from "@homeagent/llm";
-import { runProvider as realRunProvider } from "@homeagent/llm";
+import { runProviderDetailed as realRunProvider } from "@homeagent/llm";
+import {
+  BudgetExceededError,
+  ProviderRunError,
+  checkBudget,
+  recordCall,
+} from "@homeagent/llm";
 import { logger } from "@homeagent/shared";
 import type { LlmClient } from "./llm.ts";
 
 const log = logger.child("cli-client");
+
+/** A provider call completed, but its text could not satisfy the caller's JSON contract. */
+export class CliCompletionError extends Error {
+  constructor(
+    message: string,
+    readonly usage: CompletionUsage,
+    readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = "CliCompletionError";
+  }
+}
 
 export type RunProviderFn = (
   id: ProviderId,
@@ -36,19 +58,64 @@ export type RunProviderFn = (
     model?: string;
     reasoningEffort?: CodexReasoningEffort;
     images?: CompleteOptions["images"];
+    skills?: string[];
+    workdir?: string;
     execution?: ProviderExecution;
   },
   timeoutMs?: number,
   signal?: AbortSignal,
-) => Promise<string>;
+) => Promise<string | ProviderRunResult>;
 
-const zeroResult = (model: string): CompleteResult => ({
-  text: "",
-  model,
-  inputTokens: 0,
-  outputTokens: 0,
-  costUsd: 0,
+function normalizeProviderResult(
+  output: string | ProviderRunResult,
+  fallbackModel: string,
+): CompleteResult {
+  if (typeof output === "string") {
+    return {
+      text: output.trim(),
+      model: fallbackModel,
+      usage: { costBasis: "unavailable", source: "legacy-text" },
+    };
+  }
+  return {
+    text: output.text.trim(),
+    model: output.model ?? fallbackModel,
+    usage: { ...output.usage },
+  };
+}
+
+const unavailableUsage = (): CompletionUsage => ({
+  costBasis: "unavailable",
+  source: "legacy-text",
 });
+
+function recordCliCall(input: {
+  provider: ProviderId;
+  fallbackModel: string;
+  purpose: CallPurpose;
+  space?: string;
+  started: number;
+  ok: boolean;
+  result?: CompleteResult;
+  failure?: unknown;
+  dataDir?: string;
+}): void {
+  const usage = input.result?.usage
+    ?? (input.failure instanceof ProviderRunError ? input.failure.usage : unavailableUsage());
+  recordCall({
+    t: new Date().toISOString(),
+    model: input.result?.model ?? input.fallbackModel,
+    purpose: input.purpose,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    costUsd: usage.costUsd,
+    usage,
+    provider: input.provider,
+    space: input.space,
+    ok: input.ok,
+    ms: Date.now() - input.started,
+  }, input.dataDir);
+}
 
 /** Extract the first JSON object/array from CLI stdout (handles code fences + prose). */
 export function extractJson(raw: string): unknown {
@@ -85,7 +152,10 @@ function jsonInstruction(schema: Record<string, unknown>): string {
  * is the model passed to the CLI (empty => the CLI's own default). `run` is
  * injectable for tests (defaults to the real spawn-based runProvider).
  * `timeoutMs` (optional) overrides the per-call timeout — tasks pass a larger
- * value since research runs longer than Q&A.
+ * value since research runs longer than Q&A. Resolved native `skills` are only
+ * forwarded with an explicit task execution grant; no-tools calls record them
+ * as skipped instead of asking the provider to discover or execute them.
+ * `accountingDataDir` keeps usage logs colocated with the owning engine.
  */
 export function makeCliClient(
   provider: ProviderId,
@@ -95,6 +165,9 @@ export function makeCliClient(
   reasoningEffort?: CodexReasoningEffort,
   signal?: AbortSignal,
   execution?: ProviderExecution,
+  skills: string[] = execution?.skills ?? [],
+  accountingDataDir?: string,
+  workdir?: string,
 ): LlmClient {
   // The model is fixed at construction (the engine already resolved it from the
   // space's agent / global default). We deliberately IGNORE per-call opts.model:
@@ -112,47 +185,116 @@ export function makeCliClient(
     async complete(opts: CompleteOptions): Promise<CompleteResult> {
       const base = opts.prompt ?? (opts.messages ?? []).map((m) => m.content).join("\n\n");
       const prompt = withSystem(opts.system, base);
-      const out = await run(
-        provider,
-        {
-          prompt,
-          system: opts.system,
-          model: cliModel,
-          reasoningEffort,
-          images: opts.images,
-          execution,
-        },
-        timeoutMs,
-        signal,
-      );
-      return { ...zeroResult(cliModel ?? provider), text: out.trim() };
+      const purpose = opts.purpose ?? "other";
+      const decision = checkBudget(purpose, undefined, accountingDataDir);
+      if (!decision.allowed) throw new BudgetExceededError(decision);
+      const started = Date.now();
+      let result: CompleteResult | undefined;
+      let failure: unknown;
+      let ok = false;
+      try {
+        const out = await run(
+          provider,
+          {
+            prompt,
+            system: opts.system,
+            model: cliModel,
+            reasoningEffort,
+            images: opts.images,
+            skills: [...skills],
+            workdir,
+            execution,
+          },
+          timeoutMs,
+          signal,
+        );
+        result = normalizeProviderResult(out, cliModel ?? provider);
+        ok = true;
+        return result;
+      } catch (error) {
+        failure = error;
+        throw error;
+      } finally {
+        recordCliCall({
+          provider,
+          fallbackModel: cliModel ?? provider,
+          purpose,
+          space: opts.space,
+          started,
+          ok,
+          result,
+          failure,
+          dataDir: accountingDataDir,
+        });
+      }
     },
 
     async completeJSON<T>(opts: JSONOptions<T>): Promise<{ value: T; result: CompleteResult }> {
       const base = opts.prompt ?? (opts.messages ?? []).map((m) => m.content).join("\n\n");
       const prompt = withSystem(opts.system, base) + jsonInstruction(opts.schema);
-      const out = await run(
-        provider,
-        {
-          prompt,
-          system: opts.system,
-          model: cliModel,
-          reasoningEffort,
-          images: opts.images,
-          execution,
-        },
-        timeoutMs,
-        signal,
-      );
-      let parsed: unknown;
+      const purpose = opts.purpose ?? "other";
+      const decision = checkBudget(purpose, undefined, accountingDataDir);
+      if (!decision.allowed) throw new BudgetExceededError(decision);
+      const started = Date.now();
+      let result: CompleteResult | undefined;
+      let failure: unknown;
+      let ok = false;
       try {
-        parsed = extractJson(out);
-      } catch (err) {
-        log.warn("CLI JSON parse failed", { provider, err: String(err) });
-        throw new Error(`provider ${provider} did not return parseable JSON`);
+        const out = await run(
+          provider,
+          {
+            prompt,
+            system: opts.system,
+            model: cliModel,
+            reasoningEffort,
+            images: opts.images,
+            skills: [...skills],
+            workdir,
+            execution,
+          },
+          timeoutMs,
+          signal,
+        );
+        result = normalizeProviderResult(out, cliModel ?? provider);
+        let parsed: unknown;
+        try {
+          parsed = extractJson(result.text);
+        } catch (err) {
+          log.warn("CLI JSON parse failed", { provider, err: String(err) });
+          throw new CliCompletionError(
+            `provider ${provider} did not return parseable JSON`,
+            result.usage ?? unavailableUsage(),
+            err,
+          );
+        }
+        let value: T;
+        try {
+          value = opts.validate ? opts.validate(parsed) : (parsed as T);
+        } catch (err) {
+          throw new CliCompletionError(
+            err instanceof Error ? err.message : String(err),
+            result.usage ?? unavailableUsage(),
+            err,
+          );
+        }
+        ok = true;
+        return { value, result: { ...result, text: "" } };
+      } catch (error) {
+        failure = error;
+        throw error;
+      } finally {
+        recordCliCall({
+          provider,
+          fallbackModel: cliModel ?? provider,
+          purpose,
+          space: opts.space,
+          started,
+          ok,
+          result,
+          failure,
+          dataDir: accountingDataDir,
+        });
       }
-      const value = opts.validate ? opts.validate(parsed) : (parsed as T);
-      return { value, result: zeroResult(cliModel ?? provider) };
     },
   };
 }

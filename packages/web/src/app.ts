@@ -37,6 +37,7 @@ import {
 } from "@homeagent/shared";
 import {
   detectProviders,
+  providerSupportsOrdinaryCompletion,
   providerModels,
   type CodexLoginSession,
   type DetectedProvider,
@@ -52,6 +53,7 @@ import {
   type ChatRun,
   type KnowledgeEngine,
   type TaskRun,
+  type WorkItemPhase,
 } from "@homeagent/core";
 import { layout } from "./layout.ts";
 import { agentWorkbenchView } from "./agent-workbench-view.ts";
@@ -97,6 +99,7 @@ import {
   chatRunView,
   taskRunView,
   tasksView,
+  workItemsView,
 } from "./views.ts";
 
 const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
@@ -461,6 +464,7 @@ export function createWebApp(opts: WebOptions): Hono {
     flash?: string;
     formError?: string;
     runLimit?: number;
+    expectedHeadRevisionId?: string;
   }) => {
     const agents = engine.agents.list();
     const selected = input.selected ?? null;
@@ -496,6 +500,9 @@ export function createWebApp(opts: WebOptions): Hono {
       flash: input.flash,
       formError: input.formError,
       catalog,
+      revisions: selected ? engine.agents.listRevisions(selected.id) : [],
+      draft: selected ? engine.agents.getDraft(selected.id) : undefined,
+      expectedHeadRevisionId: input.expectedHeadRevisionId,
     }));
   };
   const idleCodexLogin = (): CodexLoginSession => ({
@@ -518,10 +525,8 @@ export function createWebApp(opts: WebOptions): Hono {
   };
   const persistReadyCodex = (session: CodexLoginSession): void => {
     if (session.state !== "ready") return;
-    const current = config();
-    if (current.defaultProvider !== "codex" || current.defaultModel) {
-      saveSettings({ defaultProvider: "codex", defaultModel: "" });
-    }
+    // Refresh provider discovery so first-run setup can offer the newly logged-in
+    // Codex for ordinary conversations and explicit Agent tasks.
     providerCache = null;
   };
   const startCodexLogin = (): void => {
@@ -755,7 +760,15 @@ export function createWebApp(opts: WebOptions): Hono {
       review,
       citations: await Promise.all(review.trace.citations.map(async (citation) => {
         const spaces: SpaceId[] = [];
-        for (const space of review.trace.spaces) {
+        const retrievalSpaces = review.trace.retrievalPages
+          ?.filter((page) => page.slug === citation.slug)
+          .map((page) => page.space) ?? [];
+        const candidates = citation.space
+          ? [citation.space]
+          : retrievalSpaces.length > 0
+            ? [...new Set(retrievalSpaces)]
+            : review.trace.spaces;
+        for (const space of candidates) {
           if (await engine.getPage(space, citation.slug)) spaces.push(space);
         }
         return { citation, spaces };
@@ -898,6 +911,9 @@ export function createWebApp(opts: WebOptions): Hono {
     if (!available) {
       return c.redirect(`/setup?ok=${encodeURIComponent("所选 AI 尚未安装或无法运行")}`);
     }
+    if (!providerSupportsOrdinaryCompletion(provider)) {
+      return c.redirect(`/setup?ok=${encodeURIComponent("所选 AI 无法安全关闭工具，只能用于显式任务")}`);
+    }
     const model = str(body, "model");
     const models = await getModels();
     if (model && !(models[provider] ?? []).includes(model)) {
@@ -1036,7 +1052,7 @@ export function createWebApp(opts: WebOptions): Hono {
     try {
       const result = await engine.deleteSpace(space);
       const message = result.status === "deleted"
-        ? `已删除 ${space}：${result.pagesDeleted} 个知识页、${result.rawDeleted} 条原始记录、${result.tasksDeleted} 个任务、${result.remindersDeleted} 个提醒、${result.learningPlansDeleted} 个学习计划`
+        ? `已删除 ${space}：${result.pagesDeleted} 个知识页、${result.rawDeleted} 条原始记录、${result.tasksDeleted} 个任务、${result.workItemsDeleted} 个工作项、${result.remindersDeleted} 个提醒、${result.learningPlansDeleted} 个学习计划`
         : `空间不存在：${space}`;
       return c.redirect(`/governance?ok=${encodeURIComponent(message)}`);
     } catch (err) {
@@ -1636,7 +1652,7 @@ export function createWebApp(opts: WebOptions): Hono {
           [{ label: "Agents", href: "/agents" }, { label: current.name }],
           await renderAgentWorkbench({
             mode: "edit",
-            selected: current,
+            selected: engine.agents.get(id) ?? current,
             values,
             errors: validation.errors,
             formError: "请修正标记的字段后再保存。",
@@ -1646,8 +1662,27 @@ export function createWebApp(opts: WebOptions): Hono {
         422,
       );
     }
+    const action = str(body, "agentAction");
+    const expectedHeadRevisionId = str(body, "expectedHeadRevisionId") || undefined;
+    let successMessage = "已保存并发布";
     try {
-      engine.updateAgent(id, agentInputForEditor(values, catalog, current));
+      const input = agentInputForEditor(values, catalog, current);
+      if (action !== "draft" && action !== "publish") {
+        throw new Error("未知的 Agent 生命周期操作，请刷新后重试");
+      }
+      if (!expectedHeadRevisionId) {
+        throw new Error("缺少 Agent 版本校验信息，请刷新后重试");
+      }
+      if (action === "draft") {
+        engine.saveAgentDraft(id, input, expectedHeadRevisionId);
+        successMessage = "草稿已保存，线上版本未变化";
+      } else if (action === "publish") {
+        const draft = engine.saveAgentDraft(id, input, expectedHeadRevisionId);
+        if (!draft || !engine.releaseAgent(id, draft.id, draft.id)) {
+          throw new Error("没有可发布的 Agent 草稿");
+        }
+        successMessage = "新版本已发布";
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "保存失败";
       const visibilityConflict = message.includes("解除") || message.includes("绑定");
@@ -1657,10 +1692,13 @@ export function createWebApp(opts: WebOptions): Hono {
           [{ label: "Agents", href: "/agents" }, { label: current.name }],
           await renderAgentWorkbench({
             mode: "edit",
-            selected: current,
+            selected: engine.agents.get(id) ?? current,
             values,
             errors: visibilityConflict ? { visibility: message } : {},
             formError: visibilityConflict ? "当前绑定与新的 Visibility 不兼容。" : message,
+            expectedHeadRevisionId: message.includes("版本已变化")
+              ? expectedHeadRevisionId
+              : undefined,
           }),
           "agents",
         ),
@@ -1668,8 +1706,45 @@ export function createWebApp(opts: WebOptions): Hono {
       );
     }
     return c.redirect(
-      `/agents/${encodeURIComponent(id)}?ok=${encodeURIComponent("已保存")}`,
+      `/agents/${encodeURIComponent(id)}?ok=${encodeURIComponent(successMessage)}`,
     );
+  });
+
+  app.post("/agents/:id/revisions/:revisionId/rollback", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    const revisionId = decodeURIComponent(c.req.param("revisionId"));
+    const current = engine.agents.get(id);
+    if (!current) return c.notFound();
+    const body = await c.req.parseBody({ all: true });
+    const expectedHeadRevisionId = str(body, "expectedHeadRevisionId") || undefined;
+    try {
+      if (!expectedHeadRevisionId) {
+        throw new Error("缺少 Agent 版本校验信息，请刷新后重试");
+      }
+      const rolledBack = engine.rollbackAgent(id, revisionId, expectedHeadRevisionId);
+      if (!rolledBack) return c.notFound();
+      return c.redirect(
+        `/agents/${encodeURIComponent(id)}?ok=${encodeURIComponent("历史版本已作为新版本发布")}`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "回滚失败";
+      return c.html(
+        await layout(
+          current.name,
+          [{ label: "Agents", href: "/agents" }, { label: current.name }],
+          await renderAgentWorkbench({
+            mode: "edit",
+            selected: engine.agents.get(id) ?? current,
+            formError: message,
+            expectedHeadRevisionId: message.includes("版本已变化")
+              ? expectedHeadRevisionId
+              : undefined,
+          }),
+          "agents",
+        ),
+        409,
+      );
+    }
   });
 
   app.post("/agents/:id/delete", async (c) => {
@@ -1682,7 +1757,10 @@ export function createWebApp(opts: WebOptions): Hono {
         ? `，已解除 ${result.bindings.length} 个空间绑定`
         : "";
       return c.redirect(`/agents?ok=${encodeURIComponent(`已删除${suffix}`)}`);
-    } catch {
+    } catch (error) {
+      const message = error instanceof Error && error.message.includes("awaiting approval")
+        ? "删除失败：此 Agent 仍有待审批任务，请先批准、拒绝或撤销申请。"
+        : "删除失败：配置暂时无法保存，Agent 已保留，请重试。";
       return c.html(
         await layout(
           current.name,
@@ -1690,7 +1768,7 @@ export function createWebApp(opts: WebOptions): Hono {
           await renderAgentWorkbench({
             mode: "edit",
             selected: current,
-            formError: "删除失败：配置暂时无法保存，Agent 已保留，请重试。",
+            formError: message,
           }),
           "agents",
         ),
@@ -1718,7 +1796,12 @@ export function createWebApp(opts: WebOptions): Hono {
             : []),
           { label: "Chat Run 详情" },
         ],
-        await chatRunView(run, ok, engine.runScheduler.queueInfo(run.id)),
+        await chatRunView(
+          run,
+          ok,
+          engine.runScheduler.queueInfo(run.id),
+          engine.quality.rerunsForChatRun(run.id),
+        ),
         "agents",
       ),
     );
@@ -1746,6 +1829,22 @@ export function createWebApp(opts: WebOptions): Hono {
     }
   });
 
+  app.post("/chats/runs/:runId/evaluate", async (c) => {
+    const runId = decodeURIComponent(c.req.param("runId"));
+    if (!engine.chatRuns.get(runId)) return c.notFound();
+    try {
+      const rerun = await engine.rerunChatRunForEvaluation(runId);
+      return c.redirect(
+        `/chats/runs/${encodeURIComponent(runId)}?ok=${encodeURIComponent(`重新评测已完成：${rerun.candidateTraceId}`)}`,
+      );
+    } catch (error) {
+      log.warn("chat evaluation rerun failed", { runId, err: String(error) });
+      return c.redirect(
+        `/chats/runs/${encodeURIComponent(runId)}?ok=${encodeURIComponent("重新评测失败，请查看运行状态后重试")}`,
+      );
+    }
+  });
+
   app.post("/chats/runs/:runId/cancel", async (c) => {
     const runId = decodeURIComponent(c.req.param("runId"));
     if (!engine.chatRuns.get(runId)) return c.notFound();
@@ -1754,6 +1853,227 @@ export function createWebApp(opts: WebOptions): Hono {
     return c.redirect(
       `/chats/runs/${encodeURIComponent(runId)}?ok=${encodeURIComponent(message)}`,
     );
+  });
+
+  // ---- Work context -------------------------------------------------------
+
+  const workList = (value: string): string[] => value
+    .split(/\r?\n/u)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  app.get("/work", async (c) => {
+    const ok = c.req.query("ok") ?? undefined;
+    return c.html(await layout(
+      "工作上下文",
+      [{ label: "工作上下文" }],
+      await workItemsView(engine.workItems.list(), null, engine.registry.list(), [], undefined, ok),
+      "work",
+    ));
+  });
+
+  app.get("/work/:id", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    const item = engine.workItems.get(id);
+    if (!item) return c.notFound();
+    const ok = c.req.query("ok") ?? undefined;
+    return c.html(await layout(
+      item.title,
+      [{ label: "工作上下文", href: "/work" }, { label: item.title }],
+      await workItemsView(
+        engine.workItems.list(),
+        item,
+        engine.registry.list(),
+        engine.workContinuations.list(item.id),
+        engine.workContinuations.policyFor(item.id, item.space),
+        ok,
+      ),
+      "work",
+    ));
+  });
+
+  app.post("/work", async (c) => {
+    const body = await c.req.parseBody();
+    const space = str(body, "space").trim();
+    if (!isSpaceId(space) || !engine.registry.has(space)) {
+      return c.redirect(`/work?ok=${encodeURIComponent("创建失败：请选择有效空间")}`);
+    }
+    try {
+      const item = engine.workItems.create({
+        title: str(body, "title"),
+        space,
+        brief: str(body, "brief"),
+        runbook: str(body, "runbook"),
+        phase: (str(body, "phase") || "active") as WorkItemPhase,
+      });
+      return c.redirect(`/work/${encodeURIComponent(item.id)}?ok=${encodeURIComponent("已创建并设为当前工作项")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "创建失败";
+      return c.redirect(`/work?ok=${encodeURIComponent(`创建失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/:id", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    if (!engine.workItems.get(id)) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      engine.workItems.update(id, {
+        title: str(body, "title"),
+        brief: str(body, "brief"),
+        runbook: str(body, "runbook"),
+        phase: str(body, "phase") as WorkItemPhase,
+        summary: str(body, "summary"),
+        blockers: workList(str(body, "blockers")),
+        nextActions: workList(str(body, "nextActions")),
+      });
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent("工作上下文已保存")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "保存失败";
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(`保存失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/:id/activate", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    if (!engine.workItems.get(id)) return c.notFound();
+    try {
+      engine.workItems.activate(id);
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent("已设为当前工作项")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "切换失败";
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(`切换失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/:id/continuation", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    if (!engine.workItems.get(id)) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      engine.configureWorkContinuation(id, str(body, "autoContinue") === "on");
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent("自动续跑设置已保存")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "保存失败";
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(`保存失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/:id/continue", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    if (!engine.workItems.get(id)) return c.notFound();
+    try {
+      const started = engine.startWorkContinuation(id);
+      const message = started.state === "awaiting_approval"
+        ? "动作已冻结，等待审批"
+        : "动作已进入执行队列";
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(message)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "继续失败";
+      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(`继续失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/actions/:actionId/cancel", async (c) => {
+    const actionId = decodeURIComponent(c.req.param("actionId"));
+    const action = engine.workContinuations.get(actionId);
+    if (!action) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      const attempt = Number(str(body, "attempt"));
+      if (!Number.isInteger(attempt) || attempt < 1) {
+        throw new Error("动作尝试次数无效");
+      }
+      const cancelled = engine.cancelWorkAction(actionId, {
+        runId: str(body, "runId") || null,
+        attempt,
+      });
+      const message = cancelled ? "当前动作已取消" : "动作已经结束，无法取消";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(message)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "取消失败";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(`取消失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/actions/:actionId/retry", async (c) => {
+    const actionId = decodeURIComponent(c.req.param("actionId"));
+    const action = engine.workContinuations.get(actionId);
+    if (!action) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      const attempt = Number(str(body, "attempt"));
+      if (!Number.isInteger(attempt) || attempt < 1) {
+        throw new Error("动作尝试次数无效");
+      }
+      const started = engine.retryWorkAction(actionId, {
+        runId: str(body, "runId") || null,
+        attempt,
+      });
+      const message = started.state === "awaiting_approval"
+        ? "重试已冻结，等待审批"
+        : "重试已进入执行队列";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(message)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "重试失败";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(`重试失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/actions/:actionId/abandon", async (c) => {
+    const actionId = decodeURIComponent(c.req.param("actionId"));
+    const action = engine.workContinuations.get(actionId);
+    if (!action) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      const attempt = Number(str(body, "attempt"));
+      if (!Number.isInteger(attempt) || attempt < 1) {
+        throw new Error("动作尝试次数无效");
+      }
+      engine.abandonWorkAction(actionId, {
+        runId: str(body, "runId") || null,
+        attempt,
+      });
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent("已放弃受阻动作，可按新的下一步继续")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "放弃失败";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(`放弃失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/actions/:actionId/accept", async (c) => {
+    const actionId = decodeURIComponent(c.req.param("actionId"));
+    const action = engine.workContinuations.get(actionId);
+    if (!action) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      const runId = str(body, "runId");
+      if (!runId) throw new Error("待验收 Run 不能为空");
+      engine.acceptWorkAction(actionId, runId, "local-admin");
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent("验收已接受，checkpoint 已写入")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "接受失败";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(`接受失败：${message}`)}`);
+    }
+  });
+
+  app.post("/work/actions/:actionId/reject", async (c) => {
+    const actionId = decodeURIComponent(c.req.param("actionId"));
+    const action = engine.workContinuations.get(actionId);
+    if (!action) return c.notFound();
+    const body = await c.req.parseBody();
+    try {
+      const runId = str(body, "runId");
+      const reason = str(body, "reason");
+      if (!runId) throw new Error("待验收 Run 不能为空");
+      if (!reason) throw new Error("驳回原因不能为空");
+      if (reason.length > 2_000) throw new Error("驳回原因不能超过 2000 个字符");
+      engine.rejectWorkAction(actionId, runId, "local-admin", reason);
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent("结果已驳回，动作边界已保留")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "驳回失败";
+      return c.redirect(`/work/${encodeURIComponent(action.workItemId)}?ok=${encodeURIComponent(`驳回失败：${message}`)}`);
+    }
   });
 
   // ---- Tasks ---------------------------------------------------------------
@@ -1765,6 +2085,22 @@ export function createWebApp(opts: WebOptions): Hono {
       runId,
       (run) => opts.onTaskRun!(run.taskId, run),
     );
+  };
+
+  const observeTaskRunCompletion = (started: ReturnType<KnowledgeEngine["startTaskRun"]>): void => {
+    if (started.state !== "scheduled") return;
+    void started.completion
+      .then(async (report) => {
+        if (report.ok && opts.onTaskRun) {
+          await deliverTaskRunNotification(report.runId);
+        }
+      })
+      .catch((err) => {
+        log.warn("task completion hook failed", {
+          runId: started.run.id,
+          err: String(err),
+        });
+      });
   };
 
   app.get("/tasks", async (c) => {
@@ -1779,21 +2115,38 @@ export function createWebApp(opts: WebOptions): Hono {
     const run = engine.getTaskRun(runId);
     if (!run) return c.notFound();
     const ok = c.req.query("ok") ?? undefined;
+    const action = run.workActionId
+      ? engine.workContinuations.get(run.workActionId)
+      : undefined;
+    const item = action && run.workItemId === action.workItemId
+      ? engine.workItems.get(action.workItemId)
+      : undefined;
+    const workContext = action && item && action.space === run.space
+      ? { action, item }
+      : undefined;
+    const managedTask = engine.tasks.get(run.taskId);
     return c.html(
       await layout(
         "运行详情",
-        [
-          { label: "任务", href: "/tasks" },
-          { label: run.taskName, href: `/tasks/${encodeURIComponent(run.taskId)}` },
-          { label: "运行详情" },
-        ],
+        workContext
+          ? [
+              { label: "工作上下文", href: "/work" },
+              { label: workContext.item.title, href: `/work/${encodeURIComponent(workContext.item.id)}` },
+              { label: "运行详情" },
+            ]
+          : [
+              { label: "任务", href: "/tasks" },
+              { label: run.taskName, href: `/tasks/${encodeURIComponent(run.taskId)}` },
+              { label: "运行详情" },
+            ],
         await taskRunView(
           run,
-          engine.tasks.get(run.taskId),
+          managedTask,
           ok,
           engine.runScheduler.queueInfo(run.id),
+          workContext,
         ),
-        "tasks",
+        workContext ? "work" : "tasks",
       ),
     );
   });
@@ -1836,17 +2189,24 @@ export function createWebApp(opts: WebOptions): Hono {
     if (!engine.tasks.has(id)) return c.notFound();
     const body = await c.req.parseBody();
     const timeoutMinutes = str(body, "timeoutMinutes");
-    engine.tasks.update(id, {
-      name: str(body, "name"),
-      space: str(body, "space"),
-      topic: str(body, "topic"),
-      cadence: str(body, "cadence"),
-      hour: Number(str(body, "hour")),
-      enabled: checkbox(body, "enabled"),
-      notify: checkbox(body, "notify"),
-      distillOnRun: checkbox(body, "distillOnRun"),
-      timeoutMinutes: timeoutMinutes ? Number(timeoutMinutes) : undefined,
-    });
+    try {
+      engine.updateTask(id, {
+        name: str(body, "name"),
+        space: str(body, "space"),
+        topic: str(body, "topic"),
+        cadence: str(body, "cadence"),
+        hour: Number(str(body, "hour")),
+        enabled: checkbox(body, "enabled"),
+        notify: checkbox(body, "notify"),
+        distillOnRun: checkbox(body, "distillOnRun"),
+        timeoutMinutes: timeoutMinutes ? Number(timeoutMinutes) : undefined,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "保存失败";
+      return c.redirect(
+        `/tasks/${encodeURIComponent(id)}?ok=${encodeURIComponent(`保存失败：${message}`)}`,
+      );
+    }
     return c.redirect(`/tasks/${encodeURIComponent(id)}?ok=${encodeURIComponent("已保存")}`);
   });
 
@@ -1869,19 +2229,11 @@ export function createWebApp(opts: WebOptions): Hono {
     if (!engine.tasks.has(id)) return c.notFound();
     try {
       const started = engine.startTaskRun(id, { trigger: "manual" });
-      void started.completion
-        .then(async (report) => {
-          if (report.ok && opts.onTaskRun) {
-            await deliverTaskRunNotification(report.runId);
-          }
-        })
-        .catch((err) => {
-          log.warn("manual task completion hook failed", {
-            runId: started.run.id,
-            err: String(err),
-          });
-        });
-      return c.redirect(`/tasks/runs/${encodeURIComponent(started.run.id)}?ok=${encodeURIComponent("任务已开始，可刷新查看最新状态")}`);
+      observeTaskRunCompletion(started);
+      const message = started.state === "awaiting_approval"
+        ? "高权限任务已提交审批"
+        : "任务已开始，可刷新查看最新状态";
+      return c.redirect(`/tasks/runs/${encodeURIComponent(started.run.id)}?ok=${encodeURIComponent(message)}`);
     } catch (err) {
       if (err instanceof TaskAlreadyRunningError) {
         return c.redirect(`/tasks/runs/${encodeURIComponent(err.runId)}?ok=${encodeURIComponent("任务正在运行")}`);
@@ -1897,19 +2249,11 @@ export function createWebApp(opts: WebOptions): Hono {
     if (!previous) return c.notFound();
     try {
       const started = engine.retryTaskRun(runId);
-      void started.completion
-        .then(async (report) => {
-          if (report.ok && opts.onTaskRun) {
-            await deliverTaskRunNotification(report.runId);
-          }
-        })
-        .catch((err) => {
-          log.warn("task retry completion hook failed", {
-            runId: started.run.id,
-            err: String(err),
-          });
-        });
-      return c.redirect(`/tasks/runs/${encodeURIComponent(started.run.id)}?ok=${encodeURIComponent("重试已开始")}`);
+      observeTaskRunCompletion(started);
+      const message = started.state === "awaiting_approval"
+        ? "重试已重新提交审批"
+        : "重试已开始";
+      return c.redirect(`/tasks/runs/${encodeURIComponent(started.run.id)}?ok=${encodeURIComponent(message)}`);
     } catch (err) {
       if (err instanceof TaskAlreadyRunningError) {
         return c.redirect(`/tasks/runs/${encodeURIComponent(err.runId)}?ok=${encodeURIComponent("任务正在运行")}`);
@@ -1924,8 +2268,47 @@ export function createWebApp(opts: WebOptions): Hono {
     const run = engine.getTaskRun(runId);
     if (!run) return c.notFound();
     const cancelled = engine.cancelTaskRun(runId);
-    const message = cancelled ? "已发送取消请求" : "该运行已结束，无法取消";
+    const message = cancelled
+      ? run.retry?.status === "waiting"
+        ? "已取消自动重试"
+        : run.status === "awaiting_approval"
+          ? "已撤销审批申请"
+          : "已发送取消请求"
+      : "该运行已结束，无法取消";
     return c.redirect(`/tasks/runs/${encodeURIComponent(runId)}?ok=${encodeURIComponent(message)}`);
+  });
+
+  app.post("/tasks/runs/:runId/approve", async (c) => {
+    const runId = decodeURIComponent(c.req.param("runId"));
+    if (!engine.getTaskRun(runId)) return c.notFound();
+    try {
+      const started = engine.approveTaskRun(runId, LOCAL_GOVERNANCE_ACTOR);
+      observeTaskRunCompletion(started);
+      return c.redirect(
+        `/tasks/runs/${encodeURIComponent(runId)}?ok=${encodeURIComponent("已批准，任务开始排队执行")}`,
+      );
+    } catch (err) {
+      log.warn("task approval failed", { runId, err: String(err) });
+      return c.redirect(
+        `/tasks/runs/${encodeURIComponent(runId)}?ok=${encodeURIComponent("审批状态已变化，请刷新确认")}`,
+      );
+    }
+  });
+
+  app.post("/tasks/runs/:runId/reject", async (c) => {
+    const runId = decodeURIComponent(c.req.param("runId"));
+    if (!engine.getTaskRun(runId)) return c.notFound();
+    try {
+      engine.rejectTaskRun(runId, LOCAL_GOVERNANCE_ACTOR);
+      return c.redirect(
+        `/tasks/runs/${encodeURIComponent(runId)}?ok=${encodeURIComponent("已拒绝高权限执行申请")}`,
+      );
+    } catch (err) {
+      log.warn("task rejection failed", { runId, err: String(err) });
+      return c.redirect(
+        `/tasks/runs/${encodeURIComponent(runId)}?ok=${encodeURIComponent("审批状态已变化，请刷新确认")}`,
+      );
+    }
   });
 
   app.post("/tasks/runs/:runId/notification/retry", async (c) => {
@@ -2410,6 +2793,19 @@ export function createWebApp(opts: WebOptions): Hono {
   app.post("/settings", async (c) => {
     const body = await c.req.parseBody();
     const parsed = parseSettingsForm(body);
+    const providers = await getProviders();
+    if (parsed.patch) {
+      const selectedProvider = providers.find(
+        (provider) => provider.id === parsed.values.defaultProvider,
+      );
+      if (!selectedProvider?.available) {
+        parsed.errors.defaultProvider = "默认 Provider 尚未安装或无法运行";
+        parsed.patch = undefined;
+      } else if (!providerSupportsOrdinaryCompletion(selectedProvider.id)) {
+        parsed.errors.defaultProvider = "默认 Provider 必须支持安全的普通对话；该 CLI 仅用于显式任务";
+        parsed.patch = undefined;
+      }
+    }
     if (!parsed.patch) {
       const cfg = config();
       return c.html(
@@ -2425,7 +2821,7 @@ export function createWebApp(opts: WebOptions): Hono {
               rawRetentionDays: cfg.rawRetentionDays,
               webPort: cfg.webPort,
             },
-            await getProviders(),
+            providers,
             await getModels(),
             undefined,
             parsed.values,

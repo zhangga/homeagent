@@ -22,6 +22,7 @@ import type {
   ConnectorHealth,
   DownloadedAttachment,
   InboundEvent,
+  NoticeOptions,
   OutboundReply,
   ReplyTarget,
 } from "./connector.ts";
@@ -450,7 +451,11 @@ export class FeishuConnector implements Connector {
     }
   }
 
-  async notice(chatId: string, markdown: string): Promise<void> {
+  async notice(
+    chatId: string,
+    markdown: string,
+    opts: NoticeOptions = {},
+  ): Promise<void> {
     // A notice is a standalone message to a chat (not a reply). Uses the
     // +messages-send shortcut with --chat-id.
     const cmd = [
@@ -464,6 +469,9 @@ export class FeishuConnector implements Connector {
       "--markdown",
       markdown,
     ];
+    if (opts.idempotencyKey) {
+      cmd.push("--idempotency-key", opts.idempotencyKey.slice(0, 50));
+    }
     try {
       await this.runCommand(cmd);
     } catch (err) {

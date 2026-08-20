@@ -15,6 +15,7 @@ const required = [
   ".github/workflows/ci.yml",
   ".github/workflows/release-macos.yml",
   "docs/beta-release-runbook.md",
+  "scripts/soak-feishu-e2e.ts",
   "quality/evaluation-cases.json",
   "assets/brand/homeagent-mark.svg",
   "assets/brand/homeagent-glyph.svg",
@@ -39,6 +40,37 @@ function repo(): string {
     name: "homeagent",
     version: "0.1.0-beta.1",
   }));
+  writeFileSync(
+    join(root, "docs", "beta-release-runbook.md"),
+    [
+      "Restore and verify `homeagent.space v14` before release.",
+      "Run agent_revision_lifecycle, writable_task_approval, and readonly_task_retry.",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    join(root, "scripts", "soak-feishu-e2e.ts"),
+    [
+      "export const AGENT_PLATFORM_SOAK_SCENARIOS = [",
+      "  'agent_revision_lifecycle',",
+      "  'writable_task_approval',",
+      "  'readonly_task_retry',",
+      "] as const;",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
+    join(root, ".github", "workflows", "release-macos.yml"),
+    [
+      "steps:",
+      "  - run: bun run evaluate:quality",
+      "  - run: bun run verify:crash-recovery",
+      "  - run: bun run verify:beta -- --checks-only",
+      "  draft: true",
+      "  prerelease: true",
+      "",
+    ].join("\n"),
+  );
   return root;
 }
 
@@ -113,6 +145,120 @@ describe("beta readiness verification", () => {
     })).rejects.toThrow(
       "missing beta release input: assets/brand/homeagent-mark.svg",
     );
+  });
+
+  test("rejects a release runbook that documents an obsolete Space Archive contract", async () => {
+    const root = repo();
+    writeFileSync(
+      join(root, "docs", "beta-release-runbook.md"),
+      "Restore and verify `homeagent.space v7` before release.\n",
+    );
+
+    await expect(verifyBetaReadiness({
+      repoRoot: root,
+      allowDirty: true,
+      checksOnly: true,
+    })).rejects.toThrow("homeagent.space v14");
+  });
+
+  test("requires the Agent platform soak gates in both the driver and release runbook", async () => {
+    const root = repo();
+    mkdirSync(join(root, "scripts"), { recursive: true });
+    writeFileSync(
+      join(root, "scripts", "soak-feishu-e2e.ts"),
+      "export const scenarios = ['mention_answer'];\n",
+    );
+
+    await expect(verifyBetaReadiness({
+      repoRoot: root,
+      allowDirty: true,
+      checksOnly: true,
+    })).rejects.toThrow("agent_revision_lifecycle");
+  });
+
+  test("requires tag releases to repeat the quality and crash-recovery gates", async () => {
+    const root = repo();
+    writeFileSync(
+      join(root, ".github", "workflows", "release-macos.yml"),
+      "steps:\n  - run: bun test\n  - run: bun run typecheck\n",
+    );
+
+    await expect(verifyBetaReadiness({
+      repoRoot: root,
+      allowDirty: true,
+      checksOnly: true,
+    })).rejects.toThrow("bun run evaluate:quality");
+
+    writeFileSync(
+      join(root, ".github", "workflows", "release-macos.yml"),
+      "steps:\n  - run: bun run evaluate:quality\n",
+    );
+    await expect(verifyBetaReadiness({
+      repoRoot: root,
+      allowDirty: true,
+      checksOnly: true,
+    })).rejects.toThrow("bun run verify:crash-recovery");
+  });
+
+  test("requires tag releases to execute the actual repository contract preflight", async () => {
+    const root = repo();
+    writeFileSync(
+      join(root, ".github", "workflows", "release-macos.yml"),
+      [
+        "steps:",
+        "  - run: bun run evaluate:quality",
+        "  - run: bun run verify:crash-recovery",
+        "",
+      ].join("\n"),
+    );
+
+    await expect(verifyBetaReadiness({
+      repoRoot: root,
+      allowDirty: true,
+      checksOnly: true,
+    })).rejects.toThrow("bun run verify:beta -- --checks-only");
+  });
+
+  test("keeps tag-built release assets in a draft prerelease until external gates pass", async () => {
+    const root = repo();
+    writeFileSync(
+      join(root, ".github", "workflows", "release-macos.yml"),
+      [
+        "steps:",
+        "  - run: bun run evaluate:quality",
+        "  - run: bun run verify:crash-recovery",
+        "  - run: bun run verify:beta -- --checks-only",
+        "",
+      ].join("\n"),
+    );
+
+    await expect(verifyBetaReadiness({
+      repoRoot: root,
+      allowDirty: true,
+      checksOnly: true,
+    })).rejects.toThrow("draft: true");
+  });
+
+  test("does not accept release gate commands that exist only in YAML comments", async () => {
+    const root = repo();
+    writeFileSync(
+      join(root, ".github", "workflows", "release-macos.yml"),
+      [
+        "steps:",
+        "  # - run: bun run evaluate:quality",
+        "  # - run: bun run verify:crash-recovery",
+        "  # - run: bun run verify:beta -- --checks-only",
+        "  draft: true",
+        "  prerelease: true",
+        "",
+      ].join("\n"),
+    );
+
+    await expect(verifyBetaReadiness({
+      repoRoot: root,
+      allowDirty: true,
+      checksOnly: true,
+    })).rejects.toThrow("bun run evaluate:quality");
   });
 
   test("preflights packaged icon, plist reference, and avatar in checks-only mode", async () => {

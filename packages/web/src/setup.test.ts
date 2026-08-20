@@ -2,6 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { buildSetupSnapshot } from "./setup.ts";
 
 const provider = {
+  id: "claude" as const,
+  name: "Claude Code",
+  bin: "claude",
+  available: true,
+  detail: "2.1.198",
+};
+
+const codexProvider = {
   id: "codex" as const,
   name: "Codex",
   bin: "codex",
@@ -10,9 +18,19 @@ const provider = {
 };
 
 describe("buildSetupSnapshot", () => {
-  test("moves directly from verified Bot identity to activation", () => {
+  test("treats an available Codex CLI as ready for ordinary HomeAgent conversations", () => {
     expect(buildSetupSnapshot({
       defaultProvider: "codex",
+      providers: [codexProvider],
+      lark: { state: "unconfigured", verified: false, message: "missing" },
+      runtime: { ready: false, consumers: [] },
+      restartRequired: false,
+    }).current).toBe("feishu");
+  });
+
+  test("moves directly from verified Bot identity to activation", () => {
+    expect(buildSetupSnapshot({
+      defaultProvider: "claude",
       providers: [provider],
       lark: {
         state: "ready",
@@ -28,7 +46,7 @@ describe("buildSetupSnapshot", () => {
 
   test("moves directly from an active runtime to done", () => {
     expect(buildSetupSnapshot({
-      defaultProvider: "codex",
+      defaultProvider: "claude",
       providers: [provider],
       lark: {
         state: "ready",
@@ -44,7 +62,7 @@ describe("buildSetupSnapshot", () => {
 
   test("starts at AI when the selected provider is unavailable", () => {
     expect(buildSetupSnapshot({
-      defaultProvider: "claude",
+      defaultProvider: "trae-cli",
       providers: [provider],
       lark: { state: "unconfigured", verified: false, message: "missing" },
       runtime: { ready: false, consumers: [] },
@@ -54,7 +72,7 @@ describe("buildSetupSnapshot", () => {
 
   test("finishes after activation without waiting for sharing or a group", () => {
     const base = {
-      defaultProvider: "codex",
+      defaultProvider: "claude",
       providers: [provider],
     };
     expect(buildSetupSnapshot({
@@ -115,7 +133,7 @@ describe("buildSetupSnapshot", () => {
 
   test("completed setups may skip a group but still reopen broken prerequisites", () => {
     const ready = {
-      defaultProvider: "codex",
+      defaultProvider: "claude",
       providers: [provider],
       lark: {
         state: "ready" as const,

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { SpaceId } from "@homeagent/shared";
 import { resetConfig } from "@homeagent/shared";
 import { SpaceStore } from "./space.ts";
-import { runDreamCycle, isCacheHit } from "./dream.ts";
+import { regeneratePageFromSources, runDreamCycle, isCacheHit } from "./dream.ts";
 import { FakeLlm } from "./testing.ts";
 import type { Page } from "@homeagent/shared";
 
@@ -33,6 +33,41 @@ function seedRaw(content: string): string {
 }
 
 describe("runDreamCycle", () => {
+  test("manual page regeneration rejects a held WorkAction Raw before calling the LLM", async () => {
+    const readyRawId = seedRaw("Alice 负责发布流程。");
+    const heldRawId = store.index().insertRaw({
+      space: SPACE,
+      source: "task",
+      content: "尚未验收的发布结果",
+      admission: "held",
+      workActionId: "action-held",
+    });
+    store.writePage({
+      slug: "entities/alice",
+      type: "entity",
+      title: "Alice",
+      summary: "负责发布流程。",
+      aliases: [],
+      tags: [],
+      sources: [readyRawId],
+      links: [],
+      content: "# Alice\n\nAlice 负责发布流程。\n",
+      updatedAt: 1,
+      contentHash: "existing",
+    });
+    const fake = new FakeLlm();
+
+    await expect(regeneratePageFromSources(
+      store,
+      "entities/alice",
+      [heldRawId],
+      {},
+      { client: fake },
+    )).rejects.toThrow("尚未通过动作验收");
+    expect(fake.calls).toEqual([]);
+    expect(store.index().getPage("entities/alice")?.sources).toEqual([readyRawId]);
+  });
+
   test("distills a worthwhile entry into a page with provenance", async () => {
     const id = seedRaw("Alice 是我们的后端负责人，主导服务端架构设计。");
     const fake = new FakeLlm();
@@ -61,8 +96,138 @@ describe("runDreamCycle", () => {
     expect(page).not.toBeNull();
     expect(page!.sources).toContain(id); // provenance recorded
     expect(page!.title).toBe("Alice");
+    const generationPrompt = fake.calls.filter((call) => call.kind === "json")[1]?.opts.prompt;
+    expect(generationPrompt).toContain("aliases 只填写来源或既有页面明确支持");
+    expect(generationPrompt).toContain("输出更新后的完整集合");
+    expect(generationPrompt).toContain("不要为了提高检索召回而臆造");
     // raw marked ingested
     expect(store.index().countRaw(true)).toBe(0);
+  });
+
+  test("source-grounded aliases survive Dream and become FTS candidates", async () => {
+    const id = seedRaw("Alice 是线上故障联系人，负责生产事故响应。");
+    const fake = new FakeLlm();
+    fake.queueJSON({
+      operations: [
+        { type: "entity", name: "alice", title: "Alice", rawIds: [id], reason: "owner" },
+      ],
+      skippedRawIds: [],
+    });
+    fake.queueJSON({
+      title: "Alice",
+      summary: "生产事故响应负责人。",
+      aliases: ["线上故障联系人"],
+      tags: ["生产事故"],
+      links: [],
+      content: "# Alice\n\nAlice 负责生产事故响应。\n",
+    });
+
+    await runDreamCycle(store, {}, { client: fake });
+
+    expect(store.index().search("线上故障该找哪位？", 10).map((hit) => hit.slug))
+      .toContain("entities/alice");
+  });
+
+  test("automatic updates preserve existing search aliases and tags", async () => {
+    store.writePage({
+      slug: "entities/alice",
+      type: "entity",
+      title: "Alice",
+      summary: "生产事故响应负责人。",
+      aliases: ["线上故障联系人"],
+      tags: ["生产事故", "应急响应"],
+      sources: [],
+      links: [],
+      content: "# Alice\n\nAlice 负责生产事故响应。\n",
+      updatedAt: 1,
+      contentHash: "existing",
+    });
+    const id = seedRaw("Alice 新增负责服务端应急演练。");
+    const fake = new FakeLlm();
+    fake.queueJSON({
+      operations: [
+        { type: "entity", name: "alice", title: "Alice", rawIds: [id], reason: "update" },
+      ],
+      skippedRawIds: [],
+    });
+    fake.queueJSON({
+      title: "Alice",
+      summary: "负责生产事故响应与服务端应急演练。",
+      links: [],
+      content: "# Alice\n\nAlice 负责生产事故响应与服务端应急演练。\n",
+    });
+
+    await runDreamCycle(store, {}, { client: fake });
+
+    expect(store.index().getPage("entities/alice")).toEqual(expect.objectContaining({
+      aliases: ["线上故障联系人"],
+      tags: ["生产事故", "应急响应"],
+    }));
+  });
+
+  test("automatic updates can replace stale search aliases and tags", async () => {
+    store.writePage({
+      slug: "entities/alice",
+      type: "entity",
+      title: "Alice",
+      summary: "生产事故响应负责人。",
+      aliases: ["线上故障联系人"],
+      tags: ["生产事故", "应急响应"],
+      sources: [],
+      links: [],
+      content: "# Alice\n\nAlice 负责生产事故响应。\n",
+      updatedAt: 1,
+      contentHash: "existing",
+    });
+    const id = seedRaw("Alice 已转任前端平台负责人，不再负责生产事故响应。");
+    const fake = new FakeLlm();
+    fake.queueJSON({
+      operations: [
+        { type: "entity", name: "alice", title: "Alice", rawIds: [id], reason: "update" },
+      ],
+      skippedRawIds: [],
+    });
+    fake.queueJSON({
+      title: "Alice",
+      summary: "前端平台负责人。",
+      aliases: ["前端平台负责人"],
+      tags: ["前端平台"],
+      links: [],
+      content: "# Alice\n\nAlice 已转任前端平台负责人，不再负责生产事故响应。\n",
+    });
+
+    await runDreamCycle(store, {}, { client: fake });
+
+    expect(store.index().getPage("entities/alice")).toEqual(expect.objectContaining({
+      aliases: ["前端平台负责人"],
+      tags: ["前端平台"],
+    }));
+  });
+
+  test("generated search metadata is bounded before indexing", async () => {
+    const id = seedRaw("Alice 负责生产事故响应。");
+    const fake = new FakeLlm();
+    fake.queueJSON({
+      operations: [
+        { type: "entity", name: "alice", title: "Alice", rawIds: [id], reason: "new" },
+      ],
+      skippedRawIds: [],
+    });
+    fake.queueJSON({
+      title: "Alice",
+      summary: "生产事故响应负责人。",
+      aliases: ["x".repeat(500), ...Array.from({ length: 100 }, (_, index) => `alias-${index}`)],
+      tags: Array.from({ length: 100 }, (_, index) => `tag-${index}`),
+      links: [],
+      content: "# Alice\n\nAlice 负责生产事故响应。\n",
+    });
+
+    await runDreamCycle(store, {}, { client: fake });
+
+    const generated = store.index().getPage("entities/alice")!;
+    expect(generated.aliases).toHaveLength(64);
+    expect(generated.tags).toHaveLength(64);
+    expect(generated.aliases.every((value) => value.length <= 200)).toBe(true);
   });
 
   test("skips noise entries without creating pages (Q7)", async () => {

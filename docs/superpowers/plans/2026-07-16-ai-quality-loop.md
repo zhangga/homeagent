@@ -102,7 +102,7 @@
 - [x] Write tests for category scoring, overall scoring, failure reporting, and retrieval recommendations.
 - [x] Use the existing fake LLM boundary so the suite is offline, repeatable, and free of provider credentials.
 - [x] Score retrieval coverage and citation correctness separately.
-- [x] Emit `improve_fts_retrieval` when FTS coverage is the bottleneck, recommend aliases/tags, query rewriting, and large-catalog routing, keep FTS while fixing grounding when routing/citations fail, and emit `insufficient_data` when the dataset is too small.
+- [x] Emit `improve_fts_retrieval` when FTS coverage is the bottleneck, recommend aliases/tags generation and bounded large-catalog routing, keep FTS while fixing grounding when routing/citations fail, and emit `insufficient_data` when the dataset is too small.
 - [x] Print a human-readable summary and machine-readable JSON when run from the command line.
 - [x] Add `evaluate:quality` to package scripts.
 - [x] Run `bun test scripts/ai-quality-evaluation.test.ts` and `bun run evaluate:quality`.

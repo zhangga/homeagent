@@ -29,6 +29,7 @@ interface RetrievalCase {
     title: string;
     summary: string;
     aliases: string[];
+    tags?: string[];
     content: string;
   }>;
   routeSlugs: string[];
@@ -111,6 +112,8 @@ export interface QualityEvaluationReport {
   };
 }
 
+const MIN_FTS_COVERAGE = 0.85;
+
 function rate(passed: number, total: number): number {
   return total === 0 ? 0 : passed / total;
 }
@@ -126,7 +129,7 @@ function category(
 function page(input: RetrievalCase["pages"][number]): Page {
   return {
     ...input,
-    tags: ["evaluation"],
+    tags: ["evaluation", ...(input.tags ?? [])],
     sources: ["evaluation"],
     links: [],
     updatedAt: 1,
@@ -180,7 +183,7 @@ async function evaluateRetrievalCases(
       if (ftsCovered) ftsPassed += 1;
       results.push({
         id: item.id,
-        passed: pipelineCorrect && citationCorrect,
+        passed: pipelineCorrect && citationCorrect && ftsCovered,
         checks: { pipelineCorrect, citationCorrect, ftsCovered },
         detail: `source=${answer.source}; citations=${actualCitations.join(",")}; fts=${[...hitSlugs].join(",")}`,
       });
@@ -278,12 +281,12 @@ export function recommendRetrieval(metrics: RetrievalMetrics): {
       ],
     };
   }
-  if (metrics.ftsCoverage < 0.85) {
+  if (metrics.ftsCoverage < MIN_FTS_COVERAGE) {
     return {
       decision: "improve_fts_retrieval",
       reasons: [
         "现有 FTS 在固定检索集上的覆盖率低于 85%",
-        `ftsCoverage=${metrics.ftsCoverage.toFixed(2)}，优先补强知识页 aliases/tags、查询改写与大目录路由`,
+        `ftsCoverage=${metrics.ftsCoverage.toFixed(2)}，优先补强知识页 aliases/tags 生成与大目录有界路由`,
       ],
     };
   }
@@ -312,6 +315,8 @@ export function buildQualityEvaluationReport(
   const categoryMap = new Map(categories.map((item) => [item.category, item]));
   const passed =
     [...requiredCategories].every((name) => categoryMap.get(name)?.rate === 1)
+    && retrieval.caseCount > 0
+    && retrieval.ftsCoverage >= MIN_FTS_COVERAGE
     && totalCases > 0;
   return {
     generatedAt,

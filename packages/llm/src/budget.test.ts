@@ -3,7 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetConfig } from "@homeagent/shared";
-import { checkBudget, recordCall, spentToday, localDay } from "./budget.ts";
+import {
+  checkBudget,
+  recordCall,
+  spentToday,
+  usageSpendToday,
+  localDay,
+} from "./budget.ts";
 
 let dir: string;
 
@@ -44,6 +50,48 @@ describe("budget", () => {
     seed(1.25);
     seed(0.75);
     expect(spentToday()).toBeCloseTo(2.0, 5);
+  });
+
+  test("reports unknown-cost calls instead of presenting them as complete zero spend", () => {
+    recordCall({
+      t: new Date().toISOString(),
+      model: "gpt-5.6-sol",
+      purpose: "distill",
+      usage: { costBasis: "unavailable", source: "codex-jsonl" },
+      provider: "codex",
+      ok: true,
+      ms: 1,
+    });
+
+    expect(usageSpendToday()).toEqual({
+      knownCostUsd: 0,
+      knownCostCalls: 0,
+      unknownCostCalls: 1,
+      totalCalls: 1,
+    });
+    expect(checkBudget("distill")).toEqual(expect.objectContaining({
+      allowed: true,
+      spent: 0,
+      unknownCostCalls: 1,
+      accountingComplete: false,
+      warning: expect.stringContaining("unknown cost"),
+    }));
+  });
+
+  test("explicit dataDir isolates recording and budget checks", () => {
+    const isolated = join(dir, "isolated");
+    recordCall({
+      t: new Date().toISOString(),
+      model: "claude-sonnet-5",
+      purpose: "distill",
+      costUsd: 1,
+      ok: true,
+      ms: 1,
+    }, isolated);
+
+    expect(spentToday()).toBe(0);
+    expect(spentToday(localDay(), isolated)).toBe(1);
+    expect(checkBudget("distill", 1, isolated).allowed).toBe(false);
   });
 
   test("distill is blocked at the cap", () => {

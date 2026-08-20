@@ -4,6 +4,12 @@
  */
 import type { ImageInput } from "@homeagent/llm";
 import type { DreamReport, SpaceId } from "@homeagent/shared";
+import type { AggregatedRunUsage } from "./usage.ts";
+
+export interface AskFailureTrace {
+  traceId: string;
+  usage?: AggregatedRunUsage;
+}
 
 export interface DreamOptions {
   /** cap on raw entries processed this run (cost control) */
@@ -29,8 +35,12 @@ export interface AskOptions {
   maxPages?: number;
   /** when true, never fall back to general knowledge (knowledge-only) */
   knowledgeOnly?: boolean;
+  /** Ordinary Codex may use the bound Agent directory as read-only fallback context. */
+  fallbackContext?: "agent-workdir";
   /** cancel the active provider call when the owning Run is cancelled. */
   signal?: AbortSignal;
+  /** Observe the durable quality trace recorded before a failed ask is rethrown. */
+  onFailureTrace?: (trace: AskFailureTrace) => void;
 }
 
 export interface SearchOptions {

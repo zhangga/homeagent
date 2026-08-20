@@ -15,16 +15,20 @@ import type {
   HealthReport,
   Page,
   PageRef,
+  RawAdmission,
   RawEntry,
   SkillWarningView,
   SpaceId,
 } from "@homeagent/shared";
+import { realpathSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { Serializer, canonicalModelId, config, logger } from "@homeagent/shared";
 import {
+  BudgetExceededError,
   isCliProvider,
   isCodexReasoningEffortSupported,
   isProviderTimeoutError,
-  runProvider as runLocalProvider,
+  runProviderDetailed as runLocalProvider,
   type CodexReasoningEffort,
   type ProviderExecution,
   type ProviderId,
@@ -56,13 +60,18 @@ import {
   removeQuarantineRecord,
 } from "./quarantine.ts";
 import { SpaceRegistry } from "./registry.ts";
+import { normalizeSearchLimit } from "./sqlite.ts";
 import { FeishuGroupBindingStore } from "./feishu-bindings.ts";
 import {
   AgentStore,
   agentVisibleInSpace,
+  isMaterializedLegacyAgentRevisionHistory,
   resolveAgentExecution,
+  resolveAgentWorkdir,
+  sameLegacyAgentSnapshot,
   type Agent,
   type AgentInput,
+  type AgentRevision,
 } from "./agents.ts";
 import {
   defaultSkillRoots,
@@ -71,18 +80,30 @@ import {
   type ResolvedAgentSkills,
 } from "./skill-catalog.ts";
 import {
+  isResolvedExecutionPlan,
+  type ResolvedExecutionPlan,
+} from "./execution-plan.ts";
+import {
   DEFAULT_TASK_TIMEOUT_MINUTES,
   TaskStore,
   type Task,
+  type TaskInput,
 } from "./tasks.ts";
 import {
+  AUTOMATIC_TASK_RUN_RETRY_DELAY_MS,
+  MAX_AUTOMATIC_TASK_RUN_ATTEMPTS,
   MAX_TASK_RUN_ERROR_CHARACTERS,
   TaskRunStore,
   type TaskRun,
+  type TaskRunFailure,
   type TaskRunSkillEvidence,
   type TaskRunTrigger,
 } from "./task-runs.ts";
-import { ChatRunStore, type ChatRun } from "./chat-runs.ts";
+import {
+  ChatRunStore,
+  isChatRunDeliveryInFlight,
+  type ChatRun,
+} from "./chat-runs.ts";
 import {
   RunQueueCancelledError,
   RunQueueTimeoutError,
@@ -90,6 +111,16 @@ import {
   type RunConcurrencyLayer,
 } from "./run-scheduler.ts";
 import { ReminderStore, type Reminder } from "./reminders.ts";
+import { WorkItemStore, type WorkItem } from "./work-items.ts";
+import {
+  MAX_WORK_ACTION_RUNS,
+  parseWorkActionProviderReport,
+  WorkContinuationStore,
+  type WorkAction,
+  type WorkActionAcceptance,
+  type WorkActionPermission,
+  type WorkActionProviderReport,
+} from "./work-continuation.ts";
 import {
   LearningPlanStore,
   type AdaptiveTopicUpdateInput,
@@ -110,7 +141,11 @@ import {
   type AnswerFeedbackKind,
   type AnswerFeedbackReview,
   type AnswerTrace,
+  type AnswerTraceExecution,
+  type AnswerTraceRetrievalPage,
   type QualityEvaluationCase,
+  type QualityArchiveRestoreReceipt,
+  type QualityRerun,
   type QualityReviewQuery,
   type QualitySnapshot,
 } from "./quality.ts";
@@ -130,6 +165,7 @@ import { refreshDigest } from "./digest.ts";
 import { ask as askImpl } from "./ask.ts";
 import type { LlmClient } from "./llm.ts";
 import { makeCliClient, type RunProviderFn } from "./cli-client.ts";
+import { observeLlmUsage, RunUsageAccumulator } from "./usage.ts";
 import { DEFAULT_PURPOSE, DEFAULT_SCHEMA } from "./space.ts";
 import {
   appendKnowledgeGovernanceAudit,
@@ -230,12 +266,21 @@ export interface RunTaskOptions {
 }
 
 export interface StartedTaskRun {
+  state: "scheduled" | "awaiting_approval";
   run: TaskRun;
   completion: Promise<TaskReport>;
 }
 
+const WORK_ACTION_BOUNDARY_CHANGED_ERROR =
+  "work action boundary changed: current WorkItem next action no longer matches the frozen action";
+
 export type TaskRunNotificationDelivery = (
   run: TaskRun,
+) => void | Promise<void>;
+
+export type TaskRunApprovalNotificationDelivery = (
+  run: TaskRun,
+  deliveryKey: string,
 ) => void | Promise<void>;
 
 export interface DeliverTaskRunNotificationOptions {
@@ -285,8 +330,20 @@ export type LearningDelivery = (
   skillWarnings?: SkillWarningView[],
 ) => void | Promise<void>;
 
+export type LearningFollowUpDelivery = (
+  plan: LearningPlan,
+  session: LearningSession,
+) => void | Promise<void>;
+
 /** How long a research task may run before the CLI is killed (much longer than Q&A). */
 const TASK_TIMEOUT_MS = DEFAULT_TASK_TIMEOUT_MINUTES * 60_000;
+/**
+ * CLI providers escalate SIGTERM to SIGKILL after two seconds. Keep admission
+ * occupied slightly longer so an abort cannot release a writable Run while
+ * that old process may still be mutating state, but never trust a custom
+ * provider to settle forever.
+ */
+const PROVIDER_ABORT_JOIN_TIMEOUT_MS = 2_500;
 
 function taskRunAbortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error
@@ -309,16 +366,35 @@ async function awaitTaskRunStep<T>(
 ): Promise<T> {
   throwIfTaskRunAborted(signal);
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(taskRunAbortReason(signal));
+    let abortError: Error | undefined;
+    let joinTimeout: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      signal.removeEventListener("abort", onAbort);
+      if (joinTimeout) clearTimeout(joinTimeout);
+    };
+    const rejectAbort = () => {
+      cleanup();
+      reject(abortError ?? taskRunAbortReason(signal));
+    };
+    const onAbort = () => {
+      abortError = taskRunAbortReason(signal);
+      // The provider promise keeps both handlers below, so a later rejection
+      // is observed even when this bounded join has already elapsed.
+      joinTimeout = setTimeout(rejectAbort, PROVIDER_ABORT_JOIN_TIMEOUT_MS);
+    };
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
       (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
+        const stopped = abortError ?? (signal.aborted ? taskRunAbortReason(signal) : undefined);
+        cleanup();
+        if (stopped) reject(stopped);
+        else resolve(value);
       },
       (err) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(err);
+        const stopped = abortError ?? (signal.aborted ? taskRunAbortReason(signal) : undefined);
+        cleanup();
+        if (stopped) reject(stopped);
+        else reject(err);
       },
     );
   });
@@ -867,6 +943,50 @@ export interface EngineOptions {
   skillCatalog?: SkillCatalog;
 }
 
+function classifyTaskRunFailure(
+  error: unknown,
+  phase: TaskRunFailure["phase"],
+): TaskRunFailure {
+  const message = String(error).toLowerCase();
+  if (error instanceof BudgetExceededError || /\bbudget\b/.test(message)) {
+    return { phase, kind: "budget", retryable: false };
+  }
+  if (/workdir|working directory|not a directory|realpath/.test(message)) {
+    return { phase, kind: "workdir", retryable: false };
+  }
+  if (/\bskill\b/.test(message)) {
+    return { phase, kind: "skill", retryable: false };
+  }
+  if (/\b(?:401|403)\b|unauthori[sz]ed|forbidden|auth(?:entication)?|log[ -]?in|credential|api[ _-]?key/.test(message)) {
+    return { phase, kind: "authentication", retryable: false };
+  }
+  if (/unknown provider|unknown model|model .*not found|unsupported|invalid (?:config|argument)|executable|\benoent\b|not installed|no runnable/.test(message)) {
+    return { phase, kind: "configuration", retryable: false };
+  }
+  if (/timed? out|timeout/.test(message)) {
+    return { phase, kind: "timeout", retryable: false };
+  }
+  if (phase === "capture") {
+    return { phase, kind: "capture", retryable: false };
+  }
+  if (phase === "admission") {
+    return { phase, kind: "admission", retryable: false };
+  }
+  if (/overload|\b503\b/.test(message)) {
+    return { phase, kind: "overloaded", retryable: true };
+  }
+  if (/rate.?limit|too many requests|\b429\b/.test(message)) {
+    return { phase, kind: "rate_limited", retryable: true };
+  }
+  if (/\b502\b|\b504\b|temporar|try again|econnreset|econnrefused|enetunreach|socket hang up|network (?:error|reset|unavailable)/.test(message)) {
+    return { phase, kind: "transient_provider", retryable: true };
+  }
+  if (/empty output/.test(message)) {
+    return { phase, kind: "invalid_output", retryable: false };
+  }
+  return { phase, kind: "provider_error", retryable: false };
+}
+
 /** Durable inbound Chat message shown in an Agent's activity timeline. */
 export interface AgentChatRecord {
   id: string;
@@ -905,7 +1025,7 @@ export interface SpaceAgentCallContext {
   agent?: Agent;
   client: LlmClient;
   skills: ResolvedAgentSkills;
-  execution: ProviderExecution;
+  execution?: ProviderExecution;
 }
 
 export interface AgentRunExecutionSnapshot {
@@ -914,7 +1034,84 @@ export interface AgentRunExecutionSnapshot {
   model?: string;
   reasoningEffort?: CodexReasoningEffort;
   skillEvidence: TaskRunSkillEvidence;
-  execution: ProviderExecution;
+  execution?: ProviderExecution;
+  executionPlan: ResolvedExecutionPlan;
+}
+
+function resolvedSkillsFromEvidence(
+  evidence?: TaskRunSkillEvidence,
+): ResolvedAgentSkills {
+  const requested = evidence?.requested.map((item) => ({ ...item })) ?? [];
+  const resolved = evidence?.resolved.map((item) => ({ ...item })) ?? [];
+  const skipped = evidence?.skipped.map((item) => ({ ...item })) ?? [];
+  return {
+    requested,
+    resolved,
+    skipped,
+    warnings: skipped.map((item) => ({ ...item })),
+  };
+}
+
+function skillsForProviderExecution(
+  resolution: ResolvedAgentSkills,
+  enabled: boolean,
+): ResolvedAgentSkills {
+  if (enabled || resolution.resolved.length === 0) return resolution;
+  const skipped = [
+    ...resolution.skipped.map((item) => ({ ...item })),
+    ...resolution.resolved.map((skill) => ({
+      sourceKey: skill.sourceKey,
+      name: skill.name,
+      code: "no_tools_context" as const,
+      message: "Native Skills are disabled for no-tools provider calls",
+    })),
+  ];
+  return {
+    requested: resolution.requested.map((item) => ({ ...item })),
+    resolved: [],
+    skipped,
+    warnings: skipped.map((item) => ({ ...item })),
+  };
+}
+
+function answerTraceExecution(
+  executionPlan: ResolvedExecutionPlan,
+  skillEvidence?: TaskRunSkillEvidence,
+  agentId?: string,
+): AnswerTraceExecution {
+  return {
+    agentId,
+    agentRevisionId: executionPlan.agentRevisionId,
+    provider: executionPlan.provider,
+    model: executionPlan.model,
+    promptVersion: "ask-v1",
+    instructionHash: createHash("sha256")
+      .update(executionPlan.instruction)
+      .digest("hex"),
+    skills: (skillEvidence?.resolved ?? []).map((skill) => ({
+      sourceKey: skill.sourceKey,
+      skillFileHash: skill.skillFileHash,
+    })),
+  };
+}
+
+function sameResolvedSkillSnapshots(
+  left: ResolvedAgentSkills["resolved"],
+  right: ResolvedAgentSkills["resolved"],
+): boolean {
+  return left.length === right.length && left.every((skill, index) => {
+    const other = right[index];
+    return other !== undefined
+      && skill.sourceKey === other.sourceKey
+      && skill.name === other.name
+      && skill.invocationName === other.invocationName
+      && skill.reference === other.reference
+      && skill.skillFileHash === other.skillFileHash;
+  });
+}
+
+function executionResolutionError(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).slice(0, 20_000);
 }
 
 export interface RunAdmissionContext {
@@ -955,6 +1152,8 @@ export class KnowledgeEngine implements Knowledge {
   readonly taskRuns: TaskRunStore;
   readonly chatRuns: ChatRunStore;
   readonly reminders: ReminderStore;
+  readonly workItems: WorkItemStore;
+  readonly workContinuations: WorkContinuationStore;
   readonly learning: LearningPlanStore;
   readonly quality: QualityStore;
   readonly serializer: Serializer;
@@ -968,13 +1167,17 @@ export class KnowledgeEngine implements Knowledge {
   private activeTaskRuns = new Map<string, string>();
   private taskRunControllers = new Map<string, AbortController>();
   private deliveringTaskRunNotifications = new Set<string>();
+  private deliveringTaskRunApprovalNotifications = new Set<string>();
   private deliveringReminderCounts = new Map<string, number>();
   private deliveringLearningCounts = new Map<string, number>();
+  private backgroundRunCounts = new Map<SpaceId, number>();
   private readonly runConcurrency: RunConcurrencyConfig;
 
   constructor(opts: EngineOptions = {}) {
     this.dataDir = opts.dataDir ?? config().dataDir;
     this.registry = new SpaceRegistry(this.dataDir);
+    this.workItems = new WorkItemStore(this.dataDir);
+    this.workContinuations = new WorkContinuationStore(this.dataDir);
     this.feishuBindings = new FeishuGroupBindingStore(this.dataDir);
     this.skillCatalog = opts.skillCatalog ?? new SkillCatalog({
       roots: defaultSkillRoots(),
@@ -995,6 +1198,7 @@ export class KnowledgeEngine implements Knowledge {
       recoverInterrupted: opts.recoverInterruptedChatRuns,
     });
     this.reconcileTaskRunHealth();
+    this.reconcileWorkContinuationState();
     this.reminders = new ReminderStore(this.dataDir);
     this.learning = new LearningPlanStore(this.dataDir);
     this.quality = new QualityStore(this.dataDir);
@@ -1058,8 +1262,745 @@ export class KnowledgeEngine implements Knowledge {
   private activeTaskRunId(taskId: string): string | undefined {
     return this.activeTaskRuns.get(taskId)
       ?? this.taskRuns.list(taskId).find(
-        (run) => run.status === "queued" || run.status === "running",
+        (run) => ["awaiting_approval", "queued", "running"].includes(run.status),
       )?.id;
+  }
+
+  private reconcileWorkContinuationState(): void {
+    this.reconcileTaskRunWorkActionRawEvidence();
+    for (const run of this.taskRuns.list().filter((candidate) => candidate.workActionId)) {
+      const action = this.workContinuations.get(run.workActionId!);
+      const item = run.workItemId ? this.workItems.get(run.workItemId) : undefined;
+      if (
+        !action
+        || !item
+        || action.workItemId !== item.id
+        || action.space !== run.space
+        || item.space !== run.space
+      ) continue;
+      if (
+        !action.taskRunIds.includes(run.id)
+        && ["queued", "awaiting_approval", "running"].includes(action.status)
+      ) {
+        this.workContinuations.attachRun(
+          action.id,
+          run.id,
+          run.status === "awaiting_approval" ? "awaiting_approval" : "queued",
+          Math.max(action.updatedAt, run.startedAt),
+        );
+      }
+      if (!item.taskRunIds.includes(run.id)) {
+        this.workItems.attachTaskRun(item.id, run.id, Math.max(item.updatedAt, run.startedAt));
+      }
+    }
+    for (const action of this.workContinuations.list()) {
+      this.reconcileWorkActionRawAdmissions(action);
+      if (action.status === "blocked" && action.error) {
+        const latestRunId = action.taskRunIds.at(-1);
+        this.excludeWorkActionRaws(
+          action,
+          latestRunId ? this.taskRuns.get(latestRunId)?.rawId : undefined,
+        );
+        this.workItems.applyActionBlocker(
+          action.workItemId,
+          action.id,
+          action.instruction,
+          action.error,
+          action.updatedAt,
+        );
+        continue;
+      }
+      const item = this.workItems.get(action.workItemId);
+      if (item?.actionBlockers?.[action.id]) {
+        this.workItems.clearActionBlocker(action.workItemId, action.id, action.updatedAt);
+      }
+      const runId = action.taskRunIds.at(-1);
+      if (!runId || !this.taskRuns.get(runId)) {
+        if (["queued", "awaiting_approval", "running", "awaiting_acceptance"]
+          .includes(action.status)) {
+          const error = "工作动作恢复失败：没有关联的 Task Run，已阻止自动重放";
+          const blocked = this.workContinuations.failClosed(action.id, error);
+          this.workItems.applyActionBlocker(
+            blocked.workItemId,
+            blocked.id,
+            blocked.instruction,
+            error,
+            blocked.updatedAt,
+          );
+        }
+        continue;
+      }
+      if (
+        ["queued", "awaiting_approval", "running", "awaiting_acceptance"]
+          .includes(action.status)
+        && action.taskRunIds.length < action.attempt
+      ) {
+        const error = "工作动作恢复失败：重试意图已保存，但缺少本次尝试的新 Task Run，已阻止自动重放";
+        const blocked = this.workContinuations.failClosed(action.id, error);
+        this.workItems.applyActionBlocker(
+          blocked.workItemId,
+          blocked.id,
+          blocked.instruction,
+          error,
+          blocked.updatedAt,
+        );
+        continue;
+      }
+      this.settleWorkActionFromTaskRun(runId);
+    }
+    this.reconcileAllWorkActionRawAdmissions();
+    this.removeNonAdmittedKnowledgePages();
+  }
+
+  private reconcileTaskRunWorkActionRawEvidence(): void {
+    const runs = this.taskRuns.list().filter((candidate) => candidate.workActionId);
+    const referencedRawIds = new Set(
+      runs.flatMap((run) => run.rawId ? [run.rawId] : []),
+    );
+    for (const run of runs) {
+      if (!this.registry.has(run.space)) continue;
+      const item = run.workItemId ? this.workItems.get(run.workItemId) : undefined;
+      if (!item || item.space !== run.space) {
+        throw new Error(`work action Task Run WorkItem evidence is inconsistent: ${run.id}`);
+      }
+      const index = this.registry.store(run.space).index();
+      const action = this.workContinuations.get(run.workActionId!);
+      let evidenceRawId = run.rawId;
+      let raw = evidenceRawId ? index.getRaw(evidenceRawId) : null;
+      if (!evidenceRawId) {
+        const prefix = `# 任务研究：${run.taskName}\n主题：${run.topic}\n\n`;
+        const nextRun = runs
+          .filter((candidate) => (
+            candidate.workActionId === run.workActionId
+            && candidate.startedAt > run.startedAt
+          ))
+          .sort((left, right) => left.startedAt - right.startedAt)[0];
+        const upperBound = run.finishedAt ?? nextRun?.startedAt ?? Date.now();
+        const candidates = index.listRaw({}).filter((candidate) =>
+          candidate.source === "task"
+          && candidate.workItemId === run.workItemId
+          && !referencedRawIds.has(candidate.id)
+          && candidate.createdAt >= run.startedAt
+          && candidate.createdAt <= upperBound
+          && (nextRun === undefined || candidate.createdAt < nextRun.startedAt)
+          && candidate.content.startsWith(prefix)
+        );
+        const conflictingOwner = candidates.find((candidate) => (
+          candidate.workActionId !== undefined
+          && candidate.workActionId !== run.workActionId
+        ));
+        if (conflictingOwner) {
+          throw new Error(`work action Raw belongs to another action: ${conflictingOwner.id}`);
+        }
+        if (candidates.length > 1) {
+          throw new Error(`work action Raw evidence is ambiguous: ${run.id}`);
+        }
+        const recovered = candidates[0];
+        if (recovered) {
+          const repairedRun = this.taskRuns.reconcileRawEvidence(run.id, recovered.id);
+          if (!repairedRun) {
+            throw new Error(`work action Task Run evidence cannot be reconciled: ${run.id}`);
+          }
+          evidenceRawId = recovered.id;
+          raw = recovered;
+          referencedRawIds.add(recovered.id);
+        }
+      }
+      if (!raw) {
+        if (
+          action
+          && evidenceRawId
+          && this.desiredWorkActionRawAdmission(action, evidenceRawId, run.status) === "ready"
+        ) {
+          throw new Error(`accepted WorkAction Raw evidence is missing: ${evidenceRawId}`);
+        }
+        continue;
+      }
+      if (
+        raw.space !== run.space
+        || raw.source !== "task"
+        || raw.workItemId !== item.id
+      ) {
+        throw new Error(`work action Task Run Raw evidence is inconsistent: ${run.id}`);
+      }
+      if (raw.workActionId !== undefined && raw.workActionId !== run.workActionId) {
+        throw new Error(`work action Raw belongs to another action: ${raw.id}`);
+      }
+      if (action && (
+        action.space !== run.space
+        || action.workItemId !== item.id
+        || (
+          !action.taskRunIds.includes(run.id)
+          && !["queued", "awaiting_approval", "running"].includes(action.status)
+        )
+      )) {
+        throw new Error(`work action Task Run evidence is inconsistent: ${run.id}`);
+      }
+      const admission = action
+        ? this.desiredWorkActionRawAdmission(action, raw.id, run.status)
+        : "excluded";
+      if (raw.workActionId !== run.workActionId || raw.admission !== admission) {
+        const reconciled = index.reconcileWorkActionRawAdmission(
+          raw.id,
+          run.workActionId!,
+          admission,
+        );
+        if (!reconciled) {
+          throw new Error(`work action Raw admission cannot be reconciled: ${raw.id}`);
+        }
+      }
+      if (admission !== "ready" && raw.ingested) index.markPending([raw.id]);
+      this.workItems.attachRaw(
+        item.id,
+        raw.id,
+        Math.max(
+          item.updatedAt,
+          raw.createdAt,
+          run.finishedAt ?? run.runStartedAt ?? run.startedAt,
+        ),
+      );
+    }
+  }
+
+  private desiredWorkActionRawAdmission(
+    action: WorkAction,
+    rawId: string,
+    inferredRunStatus?: TaskRun["status"],
+  ): RawAdmission {
+    const acceptance = action.acceptances?.find((candidate) => candidate.rawId === rawId);
+    if (acceptance?.status === "accepted") return "ready";
+    if (acceptance?.status === "rejected") return "excluded";
+    if (acceptance?.status === "pending") return "held";
+    if (action.checkpoint?.rawId === rawId) return "ready";
+    const run = action.taskRunIds
+      .map((runId) => this.taskRuns.get(runId))
+      .find((candidate) => candidate?.rawId === rawId);
+    const runStatus = run?.status ?? inferredRunStatus;
+    if (runStatus && ["failed", "timed_out", "cancelled"].includes(runStatus)) {
+      return "excluded";
+    }
+    if (action.status === "blocked" || action.status === "cancelled") return "excluded";
+    if (action.status === "succeeded") return "excluded";
+    return "held";
+  }
+
+  private reconcileWorkActionRawAdmissions(action: WorkAction): void {
+    if (!this.registry.has(action.space)) return;
+    const index = this.registry.store(action.space).index();
+    const raws = new Map(index.listRawsByWorkAction(action.id).map((raw) => [raw.id, raw]));
+    const inferredRunStatuses = new Map<string, TaskRun["status"]>();
+    const addRaw = (rawId: string | undefined): void => {
+      if (!rawId || raws.has(rawId)) return;
+      const raw = index.getRaw(rawId);
+      if (raw) raws.set(raw.id, raw);
+    };
+    addRaw(action.checkpoint?.rawId);
+    if (action.checkpoint?.rawId && !index.getRaw(action.checkpoint.rawId)) {
+      throw new Error(`accepted WorkAction Raw evidence is missing: ${action.checkpoint.rawId}`);
+    }
+    for (const acceptance of action.acceptances ?? []) {
+      addRaw(acceptance.rawId);
+      if (acceptance.status === "accepted" && acceptance.rawId && !index.getRaw(acceptance.rawId)) {
+        throw new Error(`accepted WorkAction Raw evidence is missing: ${acceptance.rawId}`);
+      }
+    }
+    const referencedRawIds = new Set(
+      this.taskRuns.list().flatMap((run) => run.rawId ? [run.rawId] : []),
+    );
+    for (const [runIndex, runId] of action.taskRunIds.entries()) {
+      const run = this.taskRuns.get(runId);
+      if (!run) continue;
+      if (run.rawId) {
+        addRaw(run.rawId);
+        continue;
+      }
+      const prefix = `# 任务研究：${run.taskName}\n主题：${run.topic}\n\n`;
+      const nextRun = this.taskRuns.get(action.taskRunIds[runIndex + 1] ?? "");
+      const legacyCandidates = index.listRaw({}).filter((raw) =>
+        raw.source === "task"
+        && (raw.workActionId === undefined || raw.workActionId === action.id)
+        && raw.workItemId === action.workItemId
+        && !referencedRawIds.has(raw.id)
+        && raw.createdAt >= run.startedAt
+        && (run.finishedAt === undefined || raw.createdAt <= run.finishedAt)
+        && (nextRun === undefined || raw.createdAt < nextRun.startedAt)
+        && raw.content.startsWith(prefix)
+      );
+      if (legacyCandidates.length > 1) {
+        throw new Error(`work action Raw evidence is ambiguous: ${run.id}`);
+      }
+      const recovered = legacyCandidates[0];
+      if (recovered) {
+        const repairedRun = this.taskRuns.reconcileRawEvidence(run.id, recovered.id);
+        if (!repairedRun) {
+          throw new Error(`work action Task Run evidence cannot be reconciled: ${run.id}`);
+        }
+        referencedRawIds.add(recovered.id);
+        raws.set(recovered.id, recovered);
+        inferredRunStatuses.set(recovered.id, run.status);
+      }
+    }
+    if (action.taskRunIds.some((runId) => !this.taskRuns.get(runId))) {
+      const item = this.workItems.get(action.workItemId);
+      if (!item || item.space !== action.space) {
+        throw new Error(`work action WorkItem evidence is inconsistent: ${action.id}`);
+      }
+      const survivingPrefixes = action.taskRunIds.flatMap((runId) => {
+        const run = this.taskRuns.get(runId);
+        return run ? [`# 任务研究：${run.taskName}\n主题：${run.topic}\n\n`] : [];
+      });
+      const prefixes = survivingPrefixes.length > 0
+        ? [...new Set(survivingPrefixes)]
+        : (() => {
+            const task = this.workActionTask(item, action);
+            return [`# 任务研究：${task.name}\n主题：${task.topic}\n\n`];
+          })();
+      const legacyHeader = [
+        `# 任务研究：继续：${item.title}`,
+        "主题：你正在继续一个已持久化的 HomeAgent 工作项。只执行本次动作，不要擅自展开后续动作。",
+        `# 工作项\n${item.title}`,
+      ].join("\n");
+      const actionMarker = `\n## 本次动作\n${action.instruction}\n`;
+      const legacyCandidates = index.listRaw({}).filter((raw) =>
+        raw.source === "task"
+        && raw.workItemId === action.workItemId
+        && !raws.has(raw.id)
+        && !referencedRawIds.has(raw.id)
+        && raw.createdAt >= action.createdAt
+        && raw.createdAt <= action.updatedAt
+        && (
+          prefixes.some((prefix) => raw.content.startsWith(prefix))
+          || (raw.content.startsWith(legacyHeader) && raw.content.includes(actionMarker))
+        )
+      );
+      const conflictingOwner = legacyCandidates.find(
+        (raw) => raw.workActionId !== undefined && raw.workActionId !== action.id,
+      );
+      if (conflictingOwner) {
+        throw new Error(`work action Raw belongs to another action: ${conflictingOwner.id}`);
+      }
+      if (legacyCandidates.length > 1) {
+        throw new Error(`work action Raw evidence is ambiguous: ${action.id}`);
+      }
+      const recovered = legacyCandidates[0];
+      if (recovered) raws.set(recovered.id, recovered);
+    }
+    for (const raw of raws.values()) {
+      const item = this.workItems.get(action.workItemId);
+      if (raw.source !== "task") {
+        throw new Error(`work action Raw is not task evidence: ${raw.id}`);
+      }
+      if (!item || item.space !== action.space || raw.workItemId !== item.id) {
+        throw new Error(`work action Raw WorkItem evidence is inconsistent: ${raw.id}`);
+      }
+      if (raw.workActionId !== undefined && raw.workActionId !== action.id) {
+        throw new Error(`work action Raw belongs to another action: ${raw.id}`);
+      }
+      const admission = this.desiredWorkActionRawAdmission(
+        action,
+        raw.id,
+        inferredRunStatuses.get(raw.id),
+      );
+      if (raw.workActionId !== action.id || raw.admission !== admission) {
+        const reconciled = index.reconcileWorkActionRawAdmission(raw.id, action.id, admission);
+        if (!reconciled) {
+          throw new Error(`work action Raw admission cannot be reconciled: ${raw.id}`);
+        }
+      }
+      if (admission !== "ready" && raw.ingested) index.markPending([raw.id]);
+      this.workItems.attachRaw(
+        item.id,
+        raw.id,
+        Math.max(item.updatedAt, raw.createdAt, action.updatedAt),
+      );
+    }
+  }
+
+  private reconcileAllWorkActionRawAdmissions(): void {
+    const actions = this.workContinuations.list();
+    const actionIds = new Set(actions.map((action) => action.id));
+    for (const action of actions) this.reconcileWorkActionRawAdmissions(action);
+    for (const space of this.registry.list()) {
+      const index = this.registry.store(space.id).index();
+      for (const raw of index.listRaw({})) {
+        if (!raw.workActionId || actionIds.has(raw.workActionId)) continue;
+        if (!index.reconcileWorkActionRawAdmission(raw.id, raw.workActionId, "excluded")) {
+          throw new Error(`orphan WorkAction Raw cannot be excluded: ${raw.id}`);
+        }
+        if (raw.ingested) index.markPending([raw.id]);
+      }
+    }
+  }
+
+  private deniedWorkActionRawIds(space: SpaceId): Set<string> {
+    const denied = new Set<string>();
+    for (const run of this.taskRuns.list().filter(
+      (candidate) => candidate.space === space && candidate.workActionId && candidate.rawId,
+    )) {
+      const action = this.workContinuations.get(run.workActionId!);
+      if (
+        !action
+        || this.desiredWorkActionRawAdmission(action, run.rawId!, run.status) !== "ready"
+      ) denied.add(run.rawId!);
+    }
+    for (const action of this.workContinuations.list().filter(
+      (candidate) => candidate.space === space,
+    )) {
+      for (const acceptance of action.acceptances ?? []) {
+        if (acceptance.rawId && acceptance.status !== "accepted") denied.add(acceptance.rawId);
+      }
+    }
+    return denied;
+  }
+
+  private removeNonAdmittedKnowledgePages(): void {
+    for (const space of this.registry.list()) {
+      const store = this.registry.store(space.id);
+      const index = store.index();
+      const deniedRawIds = this.deniedWorkActionRawIds(space.id);
+      const pages = index.allPages();
+      for (const slug of store.listPageFiles()) {
+        try {
+          const diskPage = store.readPageFile(slug);
+          if (diskPage) pages.push(diskPage);
+        } catch {
+          // Keep corrupt Markdown on the existing rebuild/quarantine path. It
+          // is never treated as admitted evidence by this reconciliation.
+        }
+      }
+      const affected = pages.filter((page) => page.sources.some((sourceId) => {
+        const raw = index.getRaw(sourceId);
+        return deniedRawIds.has(sourceId) || (raw !== null && raw.admission !== "ready");
+      }));
+      if (affected.length === 0) continue;
+      const readySources = new Set<string>();
+      const affectedSlugs = new Set(affected.map((page) => page.slug));
+      for (const page of affected) {
+        for (const sourceId of page.sources) {
+          if (index.getRaw(sourceId)?.admission === "ready") readySources.add(sourceId);
+        }
+      }
+      for (const slug of affectedSlugs) store.deletePage(slug);
+      for (const slug of ["index", "glossary", "overview"]) store.deletePage(slug);
+      index.markPending([...readySources]);
+      refreshDigest(store);
+      this.syncWorkItemPages(space.id);
+    }
+  }
+
+  private workActionPermission(run: TaskRun): WorkActionPermission {
+    const permission = run.executionPlan?.execution?.permission;
+    return permission === "read-only" || permission === "write" || permission === "full"
+      ? permission
+      : "unknown";
+  }
+
+  private canAutomaticallyAcceptWorkAction(
+    run: TaskRun,
+    action: WorkAction,
+    acceptance: WorkActionAcceptance,
+  ): boolean {
+    return acceptance.permission === "read-only"
+      && run.status === "succeeded"
+      && run.rawId !== undefined
+      && Boolean(run.summary?.trim())
+      && run.outputTruncated !== true
+      && acceptance.report.outcome === "completed"
+      && acceptance.report.checks.every((check) => check.status === "passed")
+      && this.workActionAcceptanceRawError(action, acceptance) === undefined;
+  }
+
+  private workActionAcceptanceRawError(
+    action: WorkAction,
+    acceptance: WorkActionAcceptance,
+  ): string | undefined {
+    if (!acceptance.rawId || !this.registry.has(action.space)) {
+      return `work action acceptance Raw is missing: ${acceptance.rawId ?? "unknown"}`;
+    }
+    const raw = this.registry.store(action.space).index().getRaw(acceptance.rawId);
+    if (!raw) return `work action acceptance Raw is missing: ${acceptance.rawId}`;
+    if (
+      raw.source !== "task"
+      || raw.workActionId !== action.id
+      || raw.admission !== "held"
+    ) {
+      return `work action acceptance Raw is not the held candidate: ${acceptance.rawId}`;
+    }
+    return undefined;
+  }
+
+  private assertWorkActionAcceptanceRaw(
+    action: WorkAction,
+    acceptance: WorkActionAcceptance | undefined,
+  ): asserts acceptance is WorkActionAcceptance {
+    if (!acceptance) throw new Error("work action acceptance candidate is missing");
+    const error = this.workActionAcceptanceRawError(action, acceptance);
+    if (error) throw new Error(error);
+  }
+
+  private projectAcceptedWorkAction(action: WorkAction): void {
+    if (!action.checkpoint) return;
+    if (action.checkpoint.rawId) {
+      if (!this.registry.has(action.space)) {
+        throw new Error(`work action Raw space is unavailable: ${action.space}`);
+      }
+      const index = this.registry.store(action.space).index();
+      const raw = index.getRaw(action.checkpoint.rawId);
+      if (!raw) {
+        throw new Error(`work action acceptance Raw is missing: ${action.checkpoint.rawId}`);
+      }
+      const promoted = raw.workActionId === undefined
+        ? index.reconcileWorkActionRawAdmission(raw.id, action.id, "ready")
+        : index.promoteRawAdmission(raw.id, action.id);
+      if (!promoted) {
+        throw new Error(`work action acceptance Raw cannot be promoted: ${raw.id}`);
+      }
+    }
+    this.workItems.applyActionCheckpoint(
+      action.workItemId,
+      action.id,
+      action.instruction,
+      action.checkpoint.summary,
+      action.checkpoint.completedAt,
+    );
+  }
+
+  private excludeWorkActionRaws(action: WorkAction, rawId?: string): void {
+    if (!this.registry.has(action.space)) return;
+    const index = this.registry.store(action.space).index();
+    const raws = index.listRawsByWorkAction(action.id);
+    if (rawId && !raws.some((raw) => raw.id === rawId)) {
+      const legacy = index.getRaw(rawId);
+      if (legacy) raws.push(legacy);
+    }
+    for (const raw of raws) {
+      if (raw.admission === "excluded") continue;
+      const excluded = raw.workActionId === undefined
+        ? index.reconcileWorkActionRawAdmission(raw.id, action.id, "excluded")
+        : index.excludeRawAdmission(raw.id, action.id);
+      if (!excluded) {
+        throw new Error(`work action Raw cannot be excluded: ${raw.id}`);
+      }
+    }
+  }
+
+  private isCurrentWorkActionBoundary(action: WorkAction): boolean {
+    const item = this.workItems.get(action.workItemId);
+    return item?.space === action.space && item.nextActions[0] === action.instruction;
+  }
+
+  private workActionExecutionBoundaryError(run: TaskRun): string | undefined {
+    if (!run.workActionId) return undefined;
+    const action = this.workContinuations.get(run.workActionId);
+    const item = run.workItemId ? this.workItems.get(run.workItemId) : undefined;
+    if (
+      !action
+      || !item
+      || action.workItemId !== item.id
+      || action.space !== run.space
+      || item.space !== run.space
+    ) {
+      return "work action execution boundary is invalid: Run, WorkAction, and WorkItem no longer agree";
+    }
+    if (action.taskRunIds.at(-1) !== run.id) {
+      return "work action execution boundary is stale: Run is not the current action attempt";
+    }
+    if (!["queued", "awaiting_approval", "running"].includes(action.status)) {
+      return "work action execution boundary is closed: action is no longer executable";
+    }
+    if (!item.active || item.phase !== "active" || item.blockers.length > 0) {
+      return "work action execution boundary is no longer admissible: WorkItem is inactive or blocked";
+    }
+    if (!this.isCurrentWorkActionBoundary(action)) {
+      return WORK_ACTION_BOUNDARY_CHANGED_ERROR;
+    }
+    return undefined;
+  }
+
+  private failClosedWorkActionRun(
+    run: TaskRun,
+    error: string,
+    now = Date.now(),
+  ): void {
+    if (!run.workActionId) return;
+    const action = this.workContinuations.get(run.workActionId);
+    if (
+      !action
+      || action.taskRunIds.at(-1) !== run.id
+      || !["queued", "awaiting_approval", "running", "awaiting_acceptance"]
+        .includes(action.status)
+    ) return;
+    const blocked = this.workContinuations.failClosed(action.id, error, now);
+    this.excludeWorkActionRaws(blocked, run.rawId);
+    this.workItems.applyActionBlocker(
+      blocked.workItemId,
+      blocked.id,
+      blocked.instruction,
+      error,
+      blocked.updatedAt,
+    );
+  }
+
+  private rejectReportedWorkActionBlocker(
+    action: WorkAction,
+    acceptance: WorkActionAcceptance,
+  ): boolean {
+    if (acceptance.status !== "pending" || acceptance.report.outcome !== "blocked") {
+      return false;
+    }
+    const reason = acceptance.report.blockers.join("；").slice(0, 20_000);
+    const rejected = this.workContinuations.reject(action.id, {
+      runId: acceptance.taskRunId,
+      decidedAt: Math.max(Date.now(), acceptance.requestedAt),
+      decidedBy: "homeagent.execution-report",
+      mode: "automatic",
+      reason,
+    });
+    this.excludeWorkActionRaws(rejected, acceptance.rawId);
+    this.workItems.applyActionBlocker(
+      rejected.workItemId,
+      rejected.id,
+      rejected.instruction,
+      reason,
+      rejected.updatedAt,
+    );
+    return true;
+  }
+
+  private settleWorkActionFromTaskRun(runId: string): void {
+    const run = this.taskRuns.get(runId);
+    if (!run?.workActionId || !run.workItemId || run.finishedAt === undefined) return;
+    const action = this.workContinuations.get(run.workActionId);
+    if (
+      !action
+      || action.workItemId !== run.workItemId
+      || !action.taskRunIds.includes(run.id)
+      || action.taskRunIds.at(-1) !== run.id
+    ) return;
+    // Cancellation is the durable user decision for this action attempt. A
+    // provider that ignores abort (or a restart that recovers its Run as
+    // failed) must not turn a cancelled action back into acceptance or block.
+    if (action.status === "cancelled") {
+      this.excludeWorkActionRaws(action, run.rawId);
+      return;
+    }
+    const latestAcceptance = action.acceptances?.at(-1);
+    if (action.status === "succeeded") {
+      this.projectAcceptedWorkAction(action);
+      return;
+    }
+    if (action.status === "blocked" && action.error) {
+      this.workItems.applyActionBlocker(
+        action.workItemId,
+        action.id,
+        action.instruction,
+        action.error,
+        latestAcceptance?.decidedAt ?? action.updatedAt,
+      );
+      return;
+    }
+    if (action.status === "awaiting_acceptance") {
+      if (
+        latestAcceptance?.taskRunId === run.id
+        && this.rejectReportedWorkActionBlocker(action, latestAcceptance)
+      ) return;
+      if (
+        latestAcceptance?.status === "pending"
+        && latestAcceptance.taskRunId === run.id
+        && this.canAutomaticallyAcceptWorkAction(run, action, latestAcceptance)
+        && this.isCurrentWorkActionBoundary(action)
+      ) {
+        const accepted = this.workContinuations.accept(action.id, {
+          runId: run.id,
+          decidedAt: Math.max(Date.now(), latestAcceptance.requestedAt),
+          decidedBy: "homeagent.auto-accept",
+          mode: "automatic",
+        });
+        this.projectAcceptedWorkAction(accepted);
+      }
+      return;
+    }
+    if (run.status === "succeeded") {
+      const parsedReport = parseWorkActionProviderReport(run.output ?? "");
+      const report: WorkActionProviderReport | undefined = parsedReport && run.summary
+        ? { ...parsedReport, result: run.summary }
+        : undefined;
+      const pending = this.workContinuations.submitForAcceptance(action.id, {
+        runId: run.id,
+        permission: this.workActionPermission(run),
+        summary: run.summary ?? "",
+        rawId: run.rawId,
+        finishedAt: run.finishedAt,
+        outputTruncated: run.outputTruncated,
+        report,
+      });
+      const acceptance = pending.acceptances?.at(-1);
+      if (acceptance && this.rejectReportedWorkActionBlocker(pending, acceptance)) return;
+      if (
+        acceptance
+        && this.canAutomaticallyAcceptWorkAction(run, pending, acceptance)
+        && this.isCurrentWorkActionBoundary(pending)
+      ) {
+        const accepted = this.workContinuations.accept(action.id, {
+          runId: run.id,
+          decidedAt: Math.max(Date.now(), acceptance.requestedAt),
+          decidedBy: "homeagent.auto-accept",
+          mode: "automatic",
+        });
+        this.projectAcceptedWorkAction(accepted);
+      }
+      return;
+    }
+    if (["failed", "timed_out"].includes(run.status) && run.error) {
+      if (run.retry?.status === "waiting") {
+        if (action.status !== "queued") {
+          this.workContinuations.waitForRetry(action.id, run.error, {
+            runId: run.id,
+            rawId: run.rawId,
+            finishedAt: run.finishedAt,
+          });
+        }
+        return;
+      }
+      const blocked = action.status === "blocked"
+        ? action
+        : this.workContinuations.block(action.id, run.error, {
+            runId: run.id,
+            rawId: run.rawId,
+            finishedAt: run.finishedAt,
+          });
+      this.excludeWorkActionRaws(blocked, run.rawId);
+      this.workItems.applyActionBlocker(
+        blocked.workItemId,
+        blocked.id,
+        blocked.instruction,
+        run.error,
+        run.finishedAt,
+      );
+      return;
+    }
+    if (run.status === "cancelled") {
+      if (run.approval?.status === "expired" && run.error) {
+        const blocked = action.status === "blocked"
+          ? action
+          : this.workContinuations.block(action.id, run.error, {
+              runId: run.id,
+              rawId: run.rawId,
+              finishedAt: run.finishedAt,
+            });
+        this.excludeWorkActionRaws(blocked, run.rawId);
+        this.workItems.applyActionBlocker(
+          blocked.workItemId,
+          blocked.id,
+          blocked.instruction,
+          run.error,
+          run.finishedAt,
+        );
+      } else {
+        const cancelled = this.workContinuations.cancel(action.id, run.finishedAt);
+        if (cancelled) this.excludeWorkActionRaws(cancelled, run.rawId);
+      }
+    }
   }
 
   /** Ensure a space exists (used by connectors when a group is joined). */
@@ -1186,7 +2127,13 @@ export class KnowledgeEngine implements Knowledge {
     const normalizedActor = normalizeGovernanceActor(actor);
     return this.serializer.run(space, async () => {
       const store = this.registry.store(space);
-      if (!store.index().getRaw(rawId)) throw new Error(`unknown raw record: ${rawId}`);
+      const raw = store.index().getRaw(rawId);
+      if (!raw) throw new Error(`unknown raw record: ${rawId}`);
+      if (raw.admission !== "ready") {
+        throw new Error(raw.admission === "held"
+          ? "原始记录尚未通过动作验收，不能进入知识提炼"
+          : "原始记录已被动作验收排除，不能进入知识提炼");
+      }
       try {
         const report = await this.executeDreamCycle(space, {
           rawIds: [rawId],
@@ -1239,6 +2186,7 @@ export class KnowledgeEngine implements Knowledge {
       store.deletePage(safeSlug);
       try {
         refreshDigest(store);
+        this.syncWorkItemPages(space);
         appendKnowledgeGovernanceAudit(store, {
           action: "page_deleted",
           actor: normalizedActor,
@@ -1417,21 +2365,83 @@ export class KnowledgeEngine implements Knowledge {
   updateAgent(id: string, input: AgentInput): Agent | undefined {
     const current = this.agents.get(id);
     if (!current) return undefined;
-    if (
-      input.visibility
-      && input.visibility !== current.visibility
-      && (input.visibility === "Team" || input.visibility === "Personal")
-    ) {
-      const candidate: Agent = { ...current, visibility: input.visibility };
-      const incompatible = this.registry.listByAgent(id)
-        .filter((space) => !agentVisibleInSpace(candidate, space.id));
-      if (incompatible.length > 0) {
-        throw new Error(
-          `请先解除不兼容的空间绑定：${incompatible.map((space) => space.name || space.id).join("、")}`,
-        );
-      }
-    }
+    const candidate: Agent = {
+      ...current,
+      ...(input.visibility === "Team" || input.visibility === "Personal"
+        ? { visibility: input.visibility }
+        : {}),
+    };
+    this.assertAgentReleaseCompatible(candidate);
     return this.agents.update(id, input);
+  }
+
+  saveAgentDraft(
+    id: string,
+    input: AgentInput,
+    expectedHeadRevisionId?: string,
+  ): AgentRevision | undefined {
+    return this.agents.saveDraft(id, input, expectedHeadRevisionId);
+  }
+
+  releaseAgent(
+    id: string,
+    draftRevisionId?: string,
+    expectedHeadRevisionId?: string,
+  ): Agent | undefined {
+    const current = this.agents.get(id);
+    if (!current) return undefined;
+    this.assertAgentLifecycleHead(id, expectedHeadRevisionId);
+    const draft = draftRevisionId
+      ? this.agents.listRevisions(id).find((revision) => revision.id === draftRevisionId)
+      : this.agents.getDraft(id);
+    if (!draft || draft.source !== "draft") return undefined;
+    this.assertAgentReleaseCompatible({
+      ...current,
+      ...draft.snapshot,
+      skills: draft.snapshot.skills.map((binding) => ({ ...binding })),
+    });
+    return this.agents.release(id, draft.id, expectedHeadRevisionId);
+  }
+
+  rollbackAgent(
+    id: string,
+    revisionId: string,
+    expectedHeadRevisionId?: string,
+  ): Agent | undefined {
+    const current = this.agents.get(id);
+    if (!current) return undefined;
+    this.assertAgentLifecycleHead(id, expectedHeadRevisionId);
+    const target = this.agents.listRevisions(id)
+      .find((revision) => revision.id === revisionId);
+    if (!target || target.source === "draft") return undefined;
+    this.assertAgentReleaseCompatible({
+      ...current,
+      ...target.snapshot,
+      skills: target.snapshot.skills.map((binding) => ({ ...binding })),
+    });
+    return this.agents.rollback(id, revisionId, expectedHeadRevisionId);
+  }
+
+  private assertAgentLifecycleHead(
+    id: string,
+    expectedHeadRevisionId?: string,
+  ): void {
+    if (
+      expectedHeadRevisionId !== undefined
+      && this.agents.listRevisions(id)[0]?.id !== expectedHeadRevisionId
+    ) {
+      throw new Error("Agent 版本已变化，请刷新后重试");
+    }
+  }
+
+  private assertAgentReleaseCompatible(candidate: Agent): void {
+    const incompatible = this.registry.listByAgent(candidate.id)
+      .filter((space) => !agentVisibleInSpace(candidate, space.id));
+    if (incompatible.length > 0) {
+      throw new Error(
+        `请先解除不兼容的空间绑定：${incompatible.map((space) => space.name || space.id).join("、")}`,
+      );
+    }
   }
 
   agentBindings(id: string): SpaceMeta[] {
@@ -1517,6 +2527,34 @@ export class KnowledgeEngine implements Knowledge {
   removeAgentAndUnbind(id: string): { agent: Agent; bindings: SpaceMeta[] } | undefined {
     const agent = this.agents.get(id);
     if (!agent) return undefined;
+    const attributedTaskRuns = this.taskRuns.list()
+      .filter((run) => run.agentId === id);
+    const pendingApproval = attributedTaskRuns
+      .find((run) => run.status === "awaiting_approval");
+    if (pendingApproval) {
+      throw new Error(
+        `Agent has a Task Run awaiting approval: ${pendingApproval.id}`,
+      );
+    }
+    const waitingRetry = attributedTaskRuns
+      .find((run) => run.retry?.status === "waiting");
+    if (waitingRetry) {
+      throw new Error(`Agent has a Task Run waiting retry: ${waitingRetry.id}`);
+    }
+    const activeTaskRun = attributedTaskRuns
+      .find((run) => run.status === "queued" || run.status === "running");
+    if (activeTaskRun) {
+      throw new Error(`Agent has an active Task Run: ${activeTaskRun.id}`);
+    }
+    const activeChatRun = this.chatRuns.list()
+      .find((run) => run.agentId === id && (
+        run.status === "queued"
+        || run.status === "running"
+        || isChatRunDeliveryInFlight(run)
+      ));
+    if (activeChatRun) {
+      throw new Error(`Agent has an active Chat Run: ${activeChatRun.id}`);
+    }
     const bindings = this.registry.clearAgentBindings(id);
     this.agents.remove(id);
     return { agent, bindings };
@@ -1559,24 +2597,33 @@ export class KnowledgeEngine implements Knowledge {
     const provider: ProviderId = isCliProvider(selectedProvider)
       ? selectedProvider
       : "gateway";
-    const skills = options.resolvedSkills ?? this.skillCatalog.resolveAgentBindings(
-      agent?.skills ?? [],
-      provider,
+    const skills = skillsForProviderExecution(
+      options.resolvedSkills ?? this.skillCatalog.resolveAgentBindings(
+        agent?.skills ?? [],
+        provider,
+      ),
+      options.taskExecution === true,
     );
-    const baseExecution = options.taskExecution
-      ? resolveAgentExecution(agent)
-      : { permission: "read-only" as const, skills: [] };
-    const execution: ProviderExecution = {
-      ...baseExecution,
-      skills: skills.resolved.map((skill) => skill.invocationName),
-      ...(options.webSearch ? { webSearch: true } : {}),
-    };
+    const skillNames = skills.resolved.map((skill) => skill.invocationName);
+    // Only tasks and explicit web research get ProviderExecution. Ask, dream,
+    // and ordinary learning keep it absent; their native Skills are recorded
+    // as skipped so the no-tools boundary and trace evidence stay aligned.
+    const execution: ProviderExecution | undefined = options.taskExecution || options.webSearch
+      ? {
+          ...(options.taskExecution
+            ? resolveAgentExecution(agent)
+            : { permission: "read-only" as const, skills: [] }),
+          skills: skillNames,
+          ...(options.webSearch ? { webSearch: true } : {}),
+        }
+      : undefined;
     const client = this.llm ?? this.makeSpaceCliClient(
       space,
       options.timeoutMs,
       options.signal,
       execution,
       agent,
+      skillNames,
     );
     return { agent, client, skills, execution };
   }
@@ -1607,28 +2654,152 @@ export class KnowledgeEngine implements Knowledge {
       && isCodexReasoningEffortSupported(model, agent.reasoningEffort)
         ? agent.reasoningEffort
         : undefined;
-    const skills = this.skillCatalog.resolveAgentBindings(
-      agent?.skills ?? [],
-      resolutionProvider,
+    const skills = skillsForProviderExecution(
+      this.skillCatalog.resolveAgentBindings(
+        agent?.skills ?? [],
+        resolutionProvider,
+      ),
+      taskExecution,
     );
-    const baseExecution = taskExecution
-      ? resolveAgentExecution(agent)
-      : { permission: "read-only" as const, skills: [] };
+    const skillEvidence: TaskRunSkillEvidence = {
+      requested: skills.requested.map((item) => ({ ...item })),
+      resolved: skills.resolved.map((item) => ({ ...item })),
+      skipped: skills.skipped.map((item) => ({ ...item })),
+    };
+    let execution: ProviderExecution | undefined;
+    let workdir: string | undefined;
+    let resolutionError: string | undefined;
+    try {
+      workdir = resolveAgentWorkdir(agent);
+      if (taskExecution) {
+        execution = {
+          ...resolveAgentExecution(agent),
+          skills: skills.resolved.map((skill) => skill.invocationName),
+        };
+      }
+    } catch (error) {
+      resolutionError = executionResolutionError(error);
+    }
+    const executionPlan: ResolvedExecutionPlan = {
+      version: 1,
+      agentRevisionId: agent?.publishedRevisionId,
+      instruction: agent?.instruction ?? "",
+      provider,
+      model,
+      reasoningEffort,
+      workdir,
+      execution,
+      resolutionError,
+    };
     return {
       agent,
       provider,
       model,
       reasoningEffort,
-      skillEvidence: {
-        requested: skills.requested.map((item) => ({ ...item })),
-        resolved: skills.resolved.map((item) => ({ ...item })),
-        skipped: skills.skipped.map((item) => ({ ...item })),
-      },
-      execution: {
-        ...baseExecution,
-        skills: skills.resolved.map((skill) => skill.invocationName),
-      },
+      skillEvidence,
+      execution,
+      executionPlan,
     };
+  }
+
+  private executionPlanCallContext(
+    space: SpaceId,
+    executionPlan: ResolvedExecutionPlan,
+    skillEvidence?: TaskRunSkillEvidence,
+    options: { timeoutMs?: number; signal?: AbortSignal } = {},
+  ): SpaceAgentCallContext {
+    if (!isResolvedExecutionPlan(executionPlan)) {
+      throw new Error("Resolved execution plan is invalid");
+    }
+    if (executionPlan.resolutionError !== undefined) {
+      throw new Error(executionPlan.resolutionError);
+    }
+    this.validateFrozenWorkdir(executionPlan.workdir);
+    const skills = this.validatedSkillsFromEvidence(executionPlan, skillEvidence);
+    const skillNames = skills.resolved.map((skill) => skill.invocationName);
+    let client = this.llm;
+    if (!client) {
+      if (!executionPlan.provider || !isCliProvider(executionPlan.provider)) {
+        throw new NoProviderError(space);
+      }
+      client = makeCliClient(
+        executionPlan.provider,
+        executionPlan.model,
+        this.runProvider,
+        options.timeoutMs,
+        executionPlan.reasoningEffort,
+        options.signal,
+        executionPlan.execution,
+        skillNames,
+        this.dataDir,
+        executionPlan.workdir,
+      );
+    }
+    return {
+      client,
+      skills,
+      execution: executionPlan.execution
+        ? {
+            ...executionPlan.execution,
+            skills: [...executionPlan.execution.skills],
+          }
+        : undefined,
+    };
+  }
+
+  private validatedSkillsFromEvidence(
+    executionPlan: ResolvedExecutionPlan,
+    skillEvidence?: TaskRunSkillEvidence,
+  ): ResolvedAgentSkills {
+    const frozen = resolvedSkillsFromEvidence(skillEvidence);
+    const frozenNames = frozen.resolved.map((skill) => skill.invocationName);
+    if (
+      executionPlan.execution
+      && (
+        executionPlan.execution.skills.length !== frozenNames.length
+        || executionPlan.execution.skills.some(
+          (name, index) => name !== frozenNames[index],
+        )
+      )
+    ) {
+      throw new Error("Resolved execution plan Skill names do not match its frozen evidence.");
+    }
+    if (frozen.resolved.length === 0) return frozen;
+    const provider = executionPlan.provider;
+    if (!provider) {
+      throw new Error("Resolved execution plan has frozen Skills but no Provider.");
+    }
+    // Refresh immediately before admission so a changed file, removed exact
+    // source, or new same-name shadow cannot silently change queued behavior.
+    this.skillCatalog.refresh();
+    const current = this.skillCatalog.resolveAgentBindings(
+      frozen.requested,
+      provider,
+    );
+    if (!sameResolvedSkillSnapshots(frozen.resolved, current.resolved)) {
+      throw new Error(
+        "Queued Run Skill snapshot changed after enqueue; refusing to execute mutable Skill content.",
+      );
+    }
+    return frozen;
+  }
+
+  private validateFrozenWorkdir(workdir?: string): void {
+    if (!workdir) return;
+    try {
+      const current = realpathSync(workdir);
+      if (!statSync(current).isDirectory() || current !== workdir) {
+        throw new Error("changed");
+      }
+    } catch {
+      throw new Error(
+        "Frozen Workdir is missing, no longer a directory, or resolves to a different location.",
+      );
+    }
+  }
+
+  private validateFrozenExecutionWorkdir(execution?: ProviderExecution): void {
+    this.validateFrozenWorkdir(execution?.workdir);
   }
 
   runConcurrencyLayers(context: RunAdmissionContext): RunConcurrencyLayer[] {
@@ -1657,18 +2828,33 @@ export class KnowledgeEngine implements Knowledge {
     queueTimeoutMs = 60 * 60_000,
   ): Promise<T> {
     const snapshot = this.agentRunExecutionSnapshot(space);
-    return this.runScheduler.schedule({
-      id,
-      priority: "background",
-      queueTimeoutMs,
-      layers: this.runConcurrencyLayers({
-        provider: snapshot.provider,
-        model: snapshot.model,
-        agentId: snapshot.agent?.id,
-        conversationId: space,
-      }),
-      execute,
-    });
+    this.backgroundRunCounts.set(
+      space,
+      (this.backgroundRunCounts.get(space) ?? 0) + 1,
+    );
+    try {
+      return this.runScheduler.schedule({
+        id,
+        priority: "background",
+        queueTimeoutMs,
+        layers: this.runConcurrencyLayers({
+          provider: snapshot.provider,
+          model: snapshot.model,
+          agentId: snapshot.agent?.id,
+          conversationId: space,
+        }),
+        execute,
+      }).finally(() => {
+        const remaining = (this.backgroundRunCounts.get(space) ?? 1) - 1;
+        if (remaining > 0) this.backgroundRunCounts.set(space, remaining);
+        else this.backgroundRunCounts.delete(space);
+      });
+    } catch (error) {
+      const remaining = (this.backgroundRunCounts.get(space) ?? 1) - 1;
+      if (remaining > 0) this.backgroundRunCounts.set(space, remaining);
+      else this.backgroundRunCounts.delete(space);
+      throw error;
+    }
   }
 
   skillWarningsForSpace(space: SpaceId): SkillWarningView[] {
@@ -1688,6 +2874,7 @@ export class KnowledgeEngine implements Knowledge {
     signal?: AbortSignal,
     execution?: ProviderExecution,
     resolvedAgent = this.agentForSpace(space),
+    skillNames: string[] = execution?.skills ?? [],
   ): LlmClient {
     const agent = resolvedAgent;
     const cfg = config();
@@ -1714,6 +2901,9 @@ export class KnowledgeEngine implements Knowledge {
       reasoningEffort,
       signal,
       execution,
+      skillNames,
+      this.dataDir,
+      resolveAgentWorkdir(agent),
     );
   }
 
@@ -1730,6 +2920,12 @@ export class KnowledgeEngine implements Knowledge {
   async remember(entry: RawEntry): Promise<string> {
     // Capture is a write; serialize per space so it never races distillation.
     return this.serializer.run(entry.space, async () => {
+      const requestedWorkItem = entry.workItemId
+        ? this.workItems.get(entry.workItemId)
+        : this.workItems.activeForSpace(entry.space);
+      if (entry.workItemId && (!requestedWorkItem || requestedWorkItem.space !== entry.space)) {
+        throw new Error(`work item does not belong to space: ${entry.workItemId}`);
+      }
       const store = this.registry.ensure(entry.space, { chatId: entry.chatId });
       const index = store.index();
       if (
@@ -1744,7 +2940,11 @@ export class KnowledgeEngine implements Knowledge {
         });
         return `retracted:${entry.messageId}`;
       }
-      const id = index.insertRaw(entry);
+      const normalizedEntry: RawEntry = requestedWorkItem
+        ? { ...entry, workItemId: requestedWorkItem.id }
+        : entry;
+      const id = index.insertRaw(normalizedEntry);
+      if (requestedWorkItem) this.workItems.attachRaw(requestedWorkItem.id, id);
       log.debug("remembered raw entry", { space: entry.space, source: entry.source, id });
       return id;
     });
@@ -2105,6 +3305,36 @@ export class KnowledgeEngine implements Knowledge {
     }
   }
 
+  /** Guard an awaiting-reply follow-up across transport and durable commit. */
+  async deliverLearningFollowUp(
+    planId: string,
+    sessionId: string,
+    followedUpAt: number,
+    deliver: LearningFollowUpDelivery,
+  ): Promise<boolean> {
+    const plan = this.learning.get(planId);
+    const session = this.learning.currentSession(planId);
+    if (
+      !plan
+      || plan.status !== "active"
+      || !session
+      || session.id !== sessionId
+      || session.status !== "awaiting_reply"
+    ) return false;
+    this.deliveringLearningCounts.set(
+      planId,
+      (this.deliveringLearningCounts.get(planId) ?? 0) + 1,
+    );
+    try {
+      await deliver({ ...plan }, { ...session });
+      return Boolean(this.learning.markFollowedUp(sessionId, followedUpAt));
+    } finally {
+      const remaining = (this.deliveringLearningCounts.get(planId) ?? 1) - 1;
+      if (remaining > 0) this.deliveringLearningCounts.set(planId, remaining);
+      else this.deliveringLearningCounts.delete(planId);
+    }
+  }
+
   async answerLearningSession(
     planId: string,
     actorId: string,
@@ -2287,6 +3517,7 @@ export class KnowledgeEngine implements Knowledge {
       for (const rawRecord of matchingRawRecords) index.deleteRaw(rawRecord.id);
       index.markPending([...survivingSourceIds]);
       if (affectedPages.length > 0) refreshDigest(store);
+      this.syncWorkItemPages(space);
       log.info("retracted raw message", {
         space,
         messageId: request.messageId,
@@ -2311,22 +3542,18 @@ export class KnowledgeEngine implements Knowledge {
   private async executeDreamCycle(
     space: SpaceId,
     opts: DreamOptions,
-    fixedContext?: {
-      resolvedAgent?: Agent;
-      resolvedSkills?: ResolvedAgentSkills;
-    },
+    fixedContext?: SpaceAgentCallContext,
   ): Promise<DreamReport> {
+    if (!this.registry.has(space)) throw new Error(`unknown space: ${space}`);
     const health = this.dreamCycles.get(space) ?? { space, running: false };
     health.running = true;
     health.lastStartedAt = Date.now();
     this.dreamCycles.set(space, health);
     try {
       throwIfTaskRunAborted(opts.signal);
-      const store = this.registry.ensure(space);
-      const context = this.agentCallContext(space, {
+      const store = this.registry.store(space);
+      const context = fixedContext ?? this.agentCallContext(space, {
         signal: opts.signal,
-        resolvedAgent: fixedContext?.resolvedAgent,
-        resolvedSkills: fixedContext?.resolvedSkills,
       });
       const baseReport = await distillSpace(store, opts, {
         client: context.client,
@@ -2336,6 +3563,7 @@ export class KnowledgeEngine implements Knowledge {
         ...baseReport,
         ...(skillWarnings.length > 0 ? { skillWarnings } : {}),
       };
+      this.syncWorkItemPages(space);
       throwIfTaskRunAborted(opts.signal);
       this.registry.setLastDream(space, report.finishedAt);
       health.lastExamined = report.examined;
@@ -2360,6 +3588,15 @@ export class KnowledgeEngine implements Knowledge {
     }
   }
 
+  private syncWorkItemPages(space: SpaceId): void {
+    if (!this.registry.has(space)) return;
+    const pages = this.registry.store(space).index().allPages().map((page) => ({
+      slug: page.slug,
+      sources: page.sources,
+    }));
+    this.workItems.syncPageLinks(space, pages);
+  }
+
   async listQuarantines(space: SpaceId): Promise<QuarantineRecord[]> {
     if (!this.registry.has(space)) return [];
     return listQuarantineRecords(this.registry.store(space));
@@ -2378,9 +3615,16 @@ export class KnowledgeEngine implements Knowledge {
       if (record.rawIds.length === 0) {
         return { status: "failed", id, reason: "隔离记录没有可重试的原始来源" };
       }
-      const available = store.index().listRawByIds(record.rawIds, { onlyPending: false });
+      const available = store.index().listRawByIds(record.rawIds, {
+        onlyPending: false,
+        onlyAdmitted: true,
+      });
       if (available.length !== record.rawIds.length) {
-        return { status: "failed", id, reason: "部分原始来源已不存在，无法安全重试" };
+        return {
+          status: "failed",
+          id,
+          reason: "部分原始来源尚未通过动作验收、已被排除或不存在，无法安全重试",
+        };
       }
       let report: DreamReport;
       try {
@@ -2438,14 +3682,49 @@ export class KnowledgeEngine implements Knowledge {
       const index = store.index();
       const agent = meta.agentId ? this.agents.get(meta.agentId) : undefined;
       const tasks = this.tasks.list().filter((task) => task.space === space);
+      const taskRuns = this.taskRuns.list().filter((run) => run.space === space);
       const chatRuns = this.chatRuns.list(space);
-      if (tasks.some((task) => this.activeTaskRunId(task.id) !== undefined)) {
-        throw new Error(`space has running tasks: ${space}`);
+      const workItems = this.workItems.list(space);
+      const workContinuation = this.workContinuations.exportBySpace(space);
+      const reminders = this.reminders.list().filter((reminder) => reminder.space === space);
+      const learning = this.learning.listBySpace(space);
+      if (taskRuns.some((run) =>
+        ["awaiting_approval", "queued", "running"].includes(run.status)
+        || run.retry?.status === "waiting"
+      )) {
+        throw new Error(`space has active task runs or waiting retries: ${space}`);
+      }
+      if (workContinuation.actions.some((action) =>
+        ["queued", "awaiting_approval", "running", "awaiting_acceptance"]
+          .includes(action.status)
+      )) {
+        throw new Error(`space has active work actions: ${space}`);
       }
       if (chatRuns.some((run) => run.status === "queued" || run.status === "running")) {
         throw new Error(`space has active chat runs: ${space}`);
       }
+      if (chatRuns.some(isChatRunDeliveryInFlight)) {
+        throw new Error(`space has delivering chat responses: ${space}`);
+      }
+      if (taskRuns.some((run) =>
+        this.deliveringTaskRunNotifications.has(run.id)
+        || this.deliveringTaskRunApprovalNotifications.has(run.id)
+      )) {
+        throw new Error(`space has delivering task run notifications: ${space}`);
+      }
+      if (reminders.some(
+        (reminder) => (this.deliveringReminderCounts.get(reminder.id) ?? 0) > 0,
+      )) {
+        throw new Error(`space has delivering reminders: ${space}`);
+      }
+      if (learning.some((plan) => (this.deliveringLearningCounts.get(plan.id) ?? 0) > 0)) {
+        throw new Error(`space has delivering learning sessions: ${space}`);
+      }
+      if ((this.backgroundRunCounts.get(space) ?? 0) > 0) {
+        throw new Error(`space has queued or running background work: ${space}`);
+      }
       const taskIds = new Set(tasks.map((task) => task.id));
+      const workActionIds = new Set(workContinuation.actions.map((action) => action.id));
       return {
         format: SPACE_ARCHIVE_FORMAT,
         version: SPACE_ARCHIVE_VERSION,
@@ -2457,17 +3736,23 @@ export class KnowledgeEngine implements Knowledge {
               skills: agent.skills.map((binding) => ({ ...binding })),
             }
           : undefined,
+        agentRevisions: agent ? this.agents.listRevisions(agent.id) : [],
         purpose: store.purpose(),
         schema: store.schema(),
         pages: store.listPagesFromDisk(),
         raw: index.listRaw({}),
         retractions: index.listMessageRetractions(),
         tasks,
-        taskRuns: this.taskRuns.list().filter(
-          (run) => run.space === space && taskIds.has(run.taskId),
+        taskRuns: taskRuns.filter((run) =>
+          taskIds.has(run.taskId)
+          || (run.workActionId !== undefined && workActionIds.has(run.workActionId))
         ),
         chatRuns,
-        reminders: this.reminders.list().filter((reminder) => reminder.space === space),
+        workItems,
+        workActions: workContinuation.actions,
+        workContinuationPolicies: workContinuation.policies,
+        quality: this.quality.exportArchive(chatRuns),
+        reminders,
         learning: this.learning.exportBySpace(space),
         governanceAudit: listKnowledgeGovernanceAudit(store),
       };
@@ -2500,9 +3785,54 @@ export class KnowledgeEngine implements Knowledge {
         throw new Error(`space already has learning data: ${space}`);
       }
       this.learning.assertCanRestore(archive.learning);
+      this.workItems.assertCanRestore(archive.workItems);
+      this.workContinuations.assertCanRestore({
+        actions: archive.workActions,
+        policies: archive.workContinuationPolicies,
+      });
+      this.quality.assertCanRestoreArchive(archive.quality);
       const existingAgent = archive.agent ? this.agents.get(archive.agent.id) : undefined;
-      if (existingAgent && JSON.stringify(existingAgent) !== JSON.stringify(archive.agent)) {
+      const existingAgentRevisions = existingAgent
+        ? this.agents.listRevisions(existingAgent.id)
+        : [];
+      const existingAgentIsMaterializedLegacy = Boolean(
+        existingAgent
+        && isMaterializedLegacyAgentRevisionHistory(
+          existingAgent,
+          existingAgentRevisions,
+        ),
+      );
+      const archiveAgentIsMaterializedLegacy = Boolean(
+        archive.agent
+        && isMaterializedLegacyAgentRevisionHistory(
+          archive.agent,
+          archive.agentRevisions,
+        ),
+      );
+      const legacyCompatible = Boolean(
+        existingAgent
+        && archive.agent
+        && sameLegacyAgentSnapshot(existingAgent, archive.agent)
+        && (existingAgentIsMaterializedLegacy || archiveAgentIsMaterializedLegacy),
+      );
+      const upgradeMaterializedLegacyAgent = Boolean(
+        legacyCompatible
+        && existingAgentIsMaterializedLegacy
+        && !archiveAgentIsMaterializedLegacy,
+      );
+      const existingAgentMatches = existingAgent && archive.agent
+        ? legacyCompatible || JSON.stringify(existingAgent) === JSON.stringify(archive.agent)
+        : true;
+      if (existingAgent && !existingAgentMatches) {
         throw new Error(`agent id already exists with different data: ${archive.agent!.id}`);
+      }
+      if (
+        existingAgent
+        && archive.agentRevisions.length > 0
+        && JSON.stringify(existingAgentRevisions) !== JSON.stringify(archive.agentRevisions)
+        && !legacyCompatible
+      ) {
+        throw new Error(`agent id already exists with different revision history: ${existingAgent.id}`);
       }
       const taskIdsBefore = new Set(this.tasks.list().map((task) => task.id));
       const taskRunIdsBefore = new Set(this.taskRuns.list().map((run) => run.id));
@@ -2510,8 +3840,16 @@ export class KnowledgeEngine implements Knowledge {
       const reminderIdsBefore = new Set(this.reminders.list().map((reminder) => reminder.id));
       const agentWasPresent = Boolean(existingAgent);
       let learningRestored = false;
+      let workItemsRestored = false;
+      let workContinuationRestored = false;
+      let qualityRestoreReceipt: QualityArchiveRestoreReceipt | undefined;
       try {
-        if (archive.agent) this.agents.restore(archive.agent);
+        if (archive.agent && !existingAgent) {
+          this.agents.restore(
+            archive.agent,
+            archive.agentRevisions.length > 0 ? archive.agentRevisions : undefined,
+          );
+        }
         const store = this.registry.ensure(space, { chatId: archive.space.chatId });
         store.setPurpose(archive.purpose);
         store.setSchema(archive.schema);
@@ -2519,17 +3857,33 @@ export class KnowledgeEngine implements Knowledge {
         for (const raw of archive.raw) index.restoreRaw(raw);
         for (const record of archive.retractions) index.restoreMessageRetraction(record);
         for (const page of archive.pages) store.writePage(page);
+        refreshDigest(store);
         this.tasks.restore(archive.tasks);
         this.taskRuns.restore(archive.taskRuns);
         this.chatRuns.restore(archive.chatRuns);
         this.reminders.restore(archive.reminders);
         this.learning.restore(archive.learning);
         learningRestored = archive.learning.plans.length > 0;
+        this.workItems.restore(archive.workItems);
+        workItemsRestored = archive.workItems.length > 0;
+        this.workContinuations.restore({
+          actions: archive.workActions,
+          policies: archive.workContinuationPolicies,
+        });
+        workContinuationRestored = archive.workActions.length > 0
+          || archive.workContinuationPolicies.length > 0;
+        qualityRestoreReceipt = this.quality.restoreArchive(archive.quality);
         restoreKnowledgeGovernanceAudit(store, archive.governanceAudit);
         this.registry.restoreMeta({
           ...archive.space,
           agentId: archive.space.agentId,
         });
+        if (upgradeMaterializedLegacyAgent) {
+          this.agents.upgradeMaterializedLegacyRestore(
+            archive.agent!,
+            archive.agentRevisions,
+          );
+        }
       } catch (err) {
         for (const run of this.taskRuns.list()) {
           if (run.space === space && !taskRunIdsBefore.has(run.id)) this.taskRuns.remove(run.id);
@@ -2546,6 +3900,8 @@ export class KnowledgeEngine implements Knowledge {
           }
         }
         if (learningRestored) this.learning.removeBySpace(space);
+        if (workContinuationRestored) this.workContinuations.removeBySpace(space);
+        if (workItemsRestored) this.workItems.removeBySpace(space);
         if (this.registry.has(space)) this.registry.remove(space);
         if (
           archive.agent
@@ -2553,6 +3909,16 @@ export class KnowledgeEngine implements Knowledge {
           && !this.registry.list().some((meta) => meta.agentId === archive.agent!.id)
         ) {
           this.agents.remove(archive.agent.id);
+        }
+        if (qualityRestoreReceipt) {
+          try {
+            this.quality.rollbackArchiveRestore(qualityRestoreReceipt);
+          } catch (rollbackError) {
+            throw new Error(
+              `space restore failed and quality rollback also failed: ${String(rollbackError)}`,
+              { cause: err },
+            );
+          }
         }
         throw err;
       }
@@ -2567,6 +3933,7 @@ export class KnowledgeEngine implements Knowledge {
       pagesDeleted: 0,
       rawDeleted: 0,
       tasksDeleted: 0,
+      workItemsDeleted: 0,
       remindersDeleted: 0,
       learningPlansDeleted: 0,
     });
@@ -2578,11 +3945,31 @@ export class KnowledgeEngine implements Knowledge {
       const chatRuns = this.chatRuns.list(space);
       const reminders = this.reminders.list().filter((reminder) => reminder.space === space);
       const learning = this.learning.listBySpace(space);
-      if (tasks.some((task) => this.activeTaskRunId(task.id) !== undefined)) {
-        throw new Error(`space has running tasks: ${space}`);
+      const workItems = this.workItems.list(space);
+      const workContinuation = this.workContinuations.exportBySpace(space);
+      if (taskRuns.some((run) =>
+        ["awaiting_approval", "queued", "running"].includes(run.status)
+        || run.retry?.status === "waiting"
+      )) {
+        throw new Error(`space has active task runs or waiting retries: ${space}`);
+      }
+      if (workContinuation.actions.some((action) =>
+        ["queued", "awaiting_approval", "running", "awaiting_acceptance"]
+          .includes(action.status)
+      )) {
+        throw new Error(`space has active work actions: ${space}`);
       }
       if (chatRuns.some((run) => run.status === "queued" || run.status === "running")) {
         throw new Error(`space has active chat runs: ${space}`);
+      }
+      if (chatRuns.some(isChatRunDeliveryInFlight)) {
+        throw new Error(`space has delivering chat responses: ${space}`);
+      }
+      if (taskRuns.some((run) =>
+        this.deliveringTaskRunNotifications.has(run.id)
+        || this.deliveringTaskRunApprovalNotifications.has(run.id)
+      )) {
+        throw new Error(`space has delivering task run notifications: ${space}`);
       }
       if (reminders.some(
         (reminder) => (this.deliveringReminderCounts.get(reminder.id) ?? 0) > 0,
@@ -2591,6 +3978,9 @@ export class KnowledgeEngine implements Knowledge {
       }
       if (learning.some((plan) => (this.deliveringLearningCounts.get(plan.id) ?? 0) > 0)) {
         throw new Error(`space has delivering learning sessions: ${space}`);
+      }
+      if ((this.backgroundRunCounts.get(space) ?? 0) > 0) {
+        throw new Error(`space has queued or running background work: ${space}`);
       }
       if (this.dreamCycles.get(space)?.running) {
         throw new Error(`space has a running dream cycle: ${space}`);
@@ -2601,6 +3991,7 @@ export class KnowledgeEngine implements Knowledge {
       let tasksDeleted = 0;
       let remindersDeleted = 0;
       let learningPlansDeleted = 0;
+      let workItemsDeleted = 0;
       const learningArchive = this.learning.exportBySpace(space);
       try {
         this.taskRuns.removeBySpace(space);
@@ -2608,6 +3999,8 @@ export class KnowledgeEngine implements Knowledge {
         tasksDeleted = this.tasks.removeBySpace(space);
         remindersDeleted = this.reminders.removeBySpace(space);
         learningPlansDeleted = this.learning.removeBySpace(space);
+        this.workContinuations.removeBySpace(space);
+        workItemsDeleted = this.workItems.removeBySpace(space).length;
         this.registry.remove(space);
       } catch (err) {
         const missingTaskRuns = taskRuns.filter((run) => !this.taskRuns.has(run.id));
@@ -2624,6 +4017,16 @@ export class KnowledgeEngine implements Knowledge {
         ) {
           this.learning.restore(learningArchive);
         }
+        const missingWorkItems = workItems.filter((item) => !this.workItems.get(item.id));
+        if (missingWorkItems.length > 0) this.workItems.restore(missingWorkItems);
+        if (
+          workContinuation.actions.some((action) => !this.workContinuations.get(action.id))
+          || workContinuation.policies.some((policy) =>
+            this.workContinuations.policyFor(policy.workItemId, policy.space).updatedAt === 0
+          )
+        ) {
+          this.workContinuations.restore(workContinuation);
+        }
         throw err;
       }
       this.dreamCycles.delete(space);
@@ -2633,6 +4036,7 @@ export class KnowledgeEngine implements Knowledge {
         pagesDeleted,
         rawDeleted,
         tasksDeleted,
+        workItemsDeleted,
         remindersDeleted,
         learningPlansDeleted,
       };
@@ -2717,12 +4121,94 @@ export class KnowledgeEngine implements Knowledge {
     return this.taskRuns.get(runId);
   }
 
+  /** Resolve either a managed Task or the synthetic Task snapshot of a WorkAction Run. */
+  taskForRun(runId: string): Task | undefined {
+    const run = this.taskRuns.get(runId);
+    if (!run) return undefined;
+    const managed = this.tasks.get(run.taskId);
+    if (managed) return managed;
+    if (!run.workActionId) return undefined;
+    const action = this.workContinuations.get(run.workActionId);
+    if (!action || action.workItemId !== run.workItemId || action.space !== run.space) {
+      return undefined;
+    }
+    return {
+      id: run.taskId,
+      name: run.taskName,
+      space: run.space,
+      topic: run.topic,
+      cadence: "daily",
+      hour: 0,
+      enabled: ["queued", "awaiting_approval", "running"].includes(action.status),
+      notify: run.notify ?? true,
+      distillOnRun: run.distill,
+      timeoutMinutes: Math.max(
+        1,
+        Math.ceil((run.timeoutMs ?? TASK_TIMEOUT_MS) / 60_000),
+      ),
+      createdAt: action.createdAt,
+      updatedAt: action.updatedAt,
+    };
+  }
+
   listTaskRuns(taskId?: string): TaskRun[] {
     return this.taskRuns.list(taskId);
   }
 
+  expireTaskRunApprovals(now = Date.now()): TaskRun[] {
+    const expired = this.taskRuns.expireApprovals(now);
+    for (const run of expired) {
+      this.tasks.setLastRun(run.taskId, {
+        at: run.finishedAt!,
+        status: "error",
+        error: run.error,
+      });
+      this.settleWorkActionFromTaskRun(run.id);
+    }
+    return expired;
+  }
+
   listTaskRunsNeedingNotification(now = Date.now()): TaskRun[] {
     return this.taskRuns.listNeedingNotification(now);
+  }
+
+  listTaskRunApprovalsNeedingNotification(now = Date.now()): TaskRun[] {
+    return this.taskRuns.listNeedingApprovalNotification(now);
+  }
+
+  async deliverTaskRunApprovalNotification(
+    runId: string,
+    deliver: TaskRunApprovalNotificationDelivery,
+    opts: DeliverTaskRunNotificationOptions = {},
+  ): Promise<TaskRun> {
+    const current = this.taskRuns.get(runId);
+    if (!current) throw new Error(`unknown task run: ${runId}`);
+    if (!current.approvalNotification) {
+      throw new Error(`task run has no pending approval notification: ${runId}`);
+    }
+    if (current.approvalNotification.status === "sent") return current;
+    if (this.deliveringTaskRunApprovalNotifications.has(runId)) {
+      throw new Error(`task run approval notification is already being delivered: ${runId}`);
+    }
+    const attemptedAt = opts.attemptedAt !== undefined
+      && Number.isFinite(opts.attemptedAt)
+      && opts.attemptedAt >= 0
+      ? Math.trunc(opts.attemptedAt)
+      : Date.now();
+    const attempting = this.taskRuns.startApprovalNotificationAttempt(runId, attemptedAt);
+    if (!attempting) {
+      throw new Error(`task run has no pending approval notification: ${runId}`);
+    }
+    this.deliveringTaskRunApprovalNotifications.add(runId);
+    try {
+      await deliver(attempting, `ha-appr-${runId}`);
+      return this.taskRuns.approvalNotificationSent(runId, attemptedAt) ?? attempting;
+    } catch (error) {
+      this.taskRuns.approvalNotificationFailed(runId, String(error));
+      throw error;
+    } finally {
+      this.deliveringTaskRunApprovalNotifications.delete(runId);
+    }
   }
 
   async deliverTaskRunNotification(
@@ -2766,6 +4252,29 @@ export class KnowledgeEngine implements Knowledge {
     return removed;
   }
 
+  updateTask(taskId: string, input: TaskInput): Task | undefined {
+    const current = this.tasks.get(taskId);
+    if (!current) return undefined;
+    const requestedSpace = input.space?.trim();
+    if (requestedSpace && requestedSpace !== current.space) {
+      if (!this.registry.has(requestedSpace as SpaceId)) {
+        throw new Error(`unknown space: ${requestedSpace}`);
+      }
+      if (this.taskRuns.list(taskId).length > 0) {
+        throw new Error(
+          "已有运行历史的任务不能更换空间；请在目标空间新建任务",
+        );
+      }
+    }
+    const updated = this.tasks.update(taskId, input);
+    if (updated && input.enabled === false) {
+      for (const run of this.taskRuns.list(taskId)) {
+        if (run.retry?.status === "waiting") this.taskRuns.exhaustRetry(run.id);
+      }
+    }
+    return updated;
+  }
+
   startTaskRun(taskId: string, opts: RunTaskOptions = {}): StartedTaskRun {
     const task = this.tasks.get(taskId);
     if (!task) throw new Error(`unknown task: ${taskId}`);
@@ -2781,13 +4290,39 @@ export class KnowledgeEngine implements Knowledge {
 
   cancelTaskRun(runId: string): boolean {
     const run = this.taskRuns.get(runId);
-    if (!run || !["queued", "running"].includes(run.status)) return false;
-    if (run.status === "queued") {
-      if (!this.runScheduler.cancel(runId)) return false;
-      this.taskRuns.cancel(runId, {
-        finishedAt: Date.now(),
+    if (run?.status === "failed" && run.retry?.status === "waiting") {
+      const exhausted = this.taskRuns.exhaustRetry(runId);
+      if (exhausted?.workActionId) {
+        const action = this.workContinuations.get(exhausted.workActionId);
+        if (action?.taskRunIds.at(-1) === exhausted.id) {
+          this.workContinuations.cancel(action.id, Date.now());
+        }
+      }
+      return exhausted !== undefined;
+    }
+    if (!run || !["awaiting_approval", "queued", "running"].includes(run.status)) return false;
+    if (run.status === "awaiting_approval") {
+      const cancelled = this.taskRuns.cancel(runId, {
+        finishedAt: Math.max(Date.now(), run.startedAt),
         error: new TaskRunCancelledError().message,
       });
+      if (cancelled?.finishedAt) {
+        this.tasks.setLastRun(cancelled.taskId, {
+          at: cancelled.finishedAt,
+          status: "error",
+          error: cancelled.error,
+        });
+      }
+      if (cancelled) this.settleWorkActionFromTaskRun(cancelled.id);
+      return cancelled?.status === "cancelled";
+    }
+    if (run.status === "queued") {
+      if (!this.runScheduler.cancel(runId)) return false;
+      const cancelled = this.taskRuns.cancel(runId, {
+        finishedAt: Math.max(Date.now(), run.startedAt),
+        error: new TaskRunCancelledError().message,
+      });
+      if (cancelled) this.settleWorkActionFromTaskRun(cancelled.id);
       return true;
     }
     const controller = this.taskRunControllers.get(runId);
@@ -2796,13 +4331,324 @@ export class KnowledgeEngine implements Knowledge {
     return true;
   }
 
+  configureWorkContinuation(workItemId: string, autoContinue: boolean) {
+    const item = this.workItems.get(workItemId);
+    if (!item) throw new Error(`work item not found: ${workItemId}`);
+    return this.workContinuations.configure(item, { autoContinue });
+  }
+
+  listDueWorkContinuations(): WorkItem[] {
+    return this.workContinuations.listPolicies()
+      .filter((policy) => policy.autoContinue)
+      .map((policy) => this.workItems.get(policy.workItemId))
+      .filter((item): item is WorkItem => item !== undefined)
+      .filter((item) => (
+        item.active
+        && item.phase === "active"
+        && item.blockers.length === 0
+        && item.nextActions.length > 0
+        && this.workContinuations.activeForWorkItem(item.id) === undefined
+      ));
+  }
+
+  startWorkContinuation(
+    workItemId: string,
+    opts: { trigger?: "manual" | "scheduled" } = {},
+  ): StartedTaskRun {
+    const item = this.workItems.get(workItemId);
+    if (!item) throw new Error(`work item not found: ${workItemId}`);
+    const action = this.workContinuations.claimNext(item);
+    if (action.taskRunIds.length > 0) {
+      throw new Error(`work action is already active: ${action.id}`);
+    }
+    const task = this.workActionTask(item, action);
+    try {
+      const started = this.launchTaskRun(
+        task,
+        opts.trigger ?? "manual",
+        false,
+        undefined,
+        task.timeoutMinutes * 60_000,
+        action.id,
+      );
+      return {
+        ...started,
+        run: this.taskRuns.get(started.run.id) ?? started.run,
+      };
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  retryWorkAction(
+    actionId: string,
+    expected: { runId?: string | null; attempt?: number } = {},
+  ): StartedTaskRun {
+    const previous = this.workContinuations.get(actionId);
+    if (!previous) throw new Error(`work action not found: ${actionId}`);
+    this.assertExpectedWorkActionState(previous, expected);
+    if (!this.isCurrentWorkActionBoundary(previous)) {
+      throw new Error(WORK_ACTION_BOUNDARY_CHANGED_ERROR);
+    }
+    const previousRunId = previous.taskRunIds.at(-1);
+    const item = this.workItems.get(previous.workItemId);
+    if (!item) throw new Error(`work item not found: ${previous.workItemId}`);
+    const action = this.workContinuations.retry(actionId);
+    this.workItems.clearActionBlocker(
+      action.workItemId,
+      action.id,
+      action.updatedAt,
+    );
+    const task = this.workActionTask(item, action);
+    return this.launchTaskRun(
+      task,
+      "retry",
+      false,
+      previousRunId,
+      task.timeoutMinutes * 60_000,
+      action.id,
+    );
+  }
+
+  acceptWorkAction(
+    actionId: string,
+    runId: string,
+    decidedBy: string,
+    note?: string,
+  ): WorkAction {
+    const pending = this.workContinuations.get(actionId);
+    if (!pending) throw new Error(`work action not found: ${actionId}`);
+    if (
+      pending.status === "awaiting_acceptance"
+      && !this.isCurrentWorkActionBoundary(pending)
+    ) {
+      throw new Error(WORK_ACTION_BOUNDARY_CHANGED_ERROR);
+    }
+    const acceptance = pending.acceptances?.at(-1);
+    this.assertWorkActionAcceptanceRaw(pending, acceptance);
+    const accepted = this.workContinuations.accept(actionId, {
+      runId,
+      decidedAt: Math.max(Date.now(), acceptance?.requestedAt ?? pending.updatedAt),
+      decidedBy,
+      mode: "human",
+      reason: note,
+    });
+    this.projectAcceptedWorkAction(accepted);
+    return accepted;
+  }
+
+  rejectWorkAction(
+    actionId: string,
+    runId: string,
+    decidedBy: string,
+    reason: string,
+  ): WorkAction {
+    const pending = this.workContinuations.get(actionId);
+    if (!pending) throw new Error(`work action not found: ${actionId}`);
+    const acceptance = pending.acceptances?.at(-1);
+    const rejected = this.workContinuations.reject(actionId, {
+      runId,
+      decidedAt: Math.max(Date.now(), acceptance?.requestedAt ?? pending.updatedAt),
+      decidedBy,
+      mode: "human",
+      reason,
+    });
+    this.excludeWorkActionRaws(rejected, acceptance?.rawId);
+    this.workItems.applyActionBlocker(
+      rejected.workItemId,
+      rejected.id,
+      rejected.instruction,
+      rejected.error ?? reason,
+      rejected.updatedAt,
+    );
+    return rejected;
+  }
+
+  cancelWorkAction(
+    actionId: string,
+    expected: { runId?: string | null; attempt?: number } = {},
+  ): boolean {
+    const action = this.workContinuations.get(actionId);
+    if (!action) return false;
+    this.assertExpectedWorkActionState(action, expected);
+    const runId = action.taskRunIds.at(-1);
+    if (!runId || !this.cancelTaskRun(runId)) return false;
+    const cancelled = this.workContinuations.cancel(actionId);
+    if (!cancelled) return false;
+    this.excludeWorkActionRaws(cancelled, this.taskRuns.get(runId)?.rawId);
+    return true;
+  }
+
+  abandonWorkAction(
+    actionId: string,
+    expected: { runId?: string | null; attempt?: number } = {},
+  ): WorkAction {
+    const action = this.workContinuations.get(actionId);
+    if (!action) throw new Error(`work action not found: ${actionId}`);
+    this.assertExpectedWorkActionState(action, expected);
+    const abandoned = this.workContinuations.abandon(actionId);
+    const runId = abandoned.taskRunIds.at(-1);
+    this.excludeWorkActionRaws(
+      abandoned,
+      runId ? this.taskRuns.get(runId)?.rawId : undefined,
+    );
+    this.workItems.clearActionBlocker(
+      abandoned.workItemId,
+      abandoned.id,
+      abandoned.updatedAt,
+    );
+    return abandoned;
+  }
+
+  private assertExpectedWorkActionState(
+    action: WorkAction,
+    expected: { runId?: string | null; attempt?: number },
+  ): void {
+    if (
+      (expected.runId !== undefined
+        && (action.taskRunIds.at(-1) ?? null) !== expected.runId)
+      || (expected.attempt !== undefined && action.attempt !== expected.attempt)
+    ) {
+      throw new Error("work action state changed: refresh before mutating the current attempt");
+    }
+  }
+
+  private workActionTask(item: WorkItem, action: WorkAction): Task {
+    const topic = [
+      "你正在继续一个已持久化的 HomeAgent 工作项。只执行本次动作，不要擅自展开后续动作。",
+      "",
+      `# 工作项\n${item.title}`,
+      item.brief ? `\n## Brief\n${item.brief}` : "",
+      item.runbook ? `\n## Runbook\n${item.runbook}` : "",
+      item.summary ? `\n## 当前进展\n${item.summary}` : "",
+      item.blockers.length > 0 ? `\n## 已知阻塞\n${item.blockers.join("\n")}` : "",
+      `\n## 本次动作\n${action.instruction}`,
+      "",
+      "只输出一个 JSON 对象，不要使用 Markdown 代码块或附加说明。格式：",
+      '{"version":1,"outcome":"completed","result":"结果摘要","blockers":[],"checks":[{"name":"实际执行的检查","status":"passed","detail":"可选说明"}]}',
+      "只有动作已完成时才使用 completed，且 blockers 必须为空；无法安全完成时使用 blocked，并至少给出一个 blocker。",
+      "每项检查的 status 只能是 passed、failed 或 not_run；不得把未执行的检查标为 passed。",
+    ].filter(Boolean).join("\n");
+    return {
+      id: action.id,
+      name: `继续：${item.title}`,
+      space: item.space,
+      topic,
+      cadence: "daily",
+      hour: 0,
+      enabled: false,
+      notify: true,
+      distillOnRun: false,
+      timeoutMinutes: DEFAULT_TASK_TIMEOUT_MINUTES,
+      createdAt: action.createdAt,
+      updatedAt: action.updatedAt,
+    };
+  }
+
+  approveTaskRun(runId: string, decidedBy: string): StartedTaskRun {
+    const pending = this.taskRuns.get(runId);
+    if (!pending) throw new Error(`unknown task run: ${runId}`);
+    if (pending.status !== "awaiting_approval") {
+      throw new Error(`task run is not awaiting approval: ${runId}`);
+    }
+    if (!pending.executionPlan) {
+      throw new Error(`task run has no immutable execution plan: ${runId}`);
+    }
+    const boundaryError = this.workActionExecutionBoundaryError(pending);
+    if (boundaryError) {
+      const decidedAt = Math.max(
+        Date.now(),
+        pending.approval?.requestedAt ?? pending.startedAt,
+      );
+      const rejected = this.taskRuns.reject(runId, {
+        decidedAt,
+        decidedBy: "homeagent.boundary-guard",
+        reason: boundaryError,
+      }) ?? this.taskRuns.get(runId);
+      this.failClosedWorkActionRun(pending, boundaryError, decidedAt);
+      if (rejected?.finishedAt) {
+        this.tasks.setLastRun(rejected.taskId, {
+          at: rejected.finishedAt,
+          status: "error",
+          error: rejected.error,
+        });
+      }
+      throw new Error(boundaryError);
+    }
+    const storedTask = this.taskForRun(pending.id);
+    if (!storedTask) throw new Error(`unknown task: ${pending.taskId}`);
+    const approved = this.taskRuns.approve(runId, {
+      decidedAt: Math.max(Date.now(), pending.approval?.requestedAt ?? pending.startedAt),
+      decidedBy,
+    });
+    if (!approved) {
+      const current = this.taskRuns.get(runId);
+      if (
+        current?.approval?.status === "expired"
+        && current.finishedAt !== undefined
+      ) {
+        this.tasks.setLastRun(current.taskId, {
+          at: current.finishedAt,
+          status: "error",
+          error: current.error,
+        });
+        throw new Error(`task run approval expired: ${runId}`);
+      }
+      throw new Error(`task run is not awaiting approval: ${runId}`);
+    }
+    const task: Task = {
+      ...storedTask,
+      name: approved.taskName,
+      space: approved.space,
+      topic: approved.topic,
+      notify: approved.notify ?? storedTask.notify,
+    };
+    return this.scheduleApprovedTaskRun(task, approved);
+  }
+
+  rejectTaskRun(runId: string, decidedBy: string, reason?: string): TaskRun {
+    const pending = this.taskRuns.get(runId);
+    if (!pending) throw new Error(`unknown task run: ${runId}`);
+    const rejected = this.taskRuns.reject(runId, {
+      decidedAt: Math.max(Date.now(), pending.approval?.requestedAt ?? pending.startedAt),
+      decidedBy,
+      reason,
+    });
+    if (!rejected) {
+      const current = this.taskRuns.get(runId);
+      if (current?.approval?.status === "expired" && current.finishedAt !== undefined) {
+        this.tasks.setLastRun(current.taskId, {
+          at: current.finishedAt,
+          status: "error",
+          error: current.error,
+        });
+        throw new Error(`task run approval expired: ${runId}`);
+      }
+      throw new Error(`task run is not awaiting approval: ${runId}`);
+    }
+    if (rejected.finishedAt) {
+      this.tasks.setLastRun(rejected.taskId, {
+        at: rejected.finishedAt,
+        status: "error",
+        error: rejected.error,
+      });
+    }
+    this.settleWorkActionFromTaskRun(rejected.id);
+    return rejected;
+  }
+
   retryTaskRun(runId: string): StartedTaskRun {
     const previous = this.taskRuns.get(runId);
     if (!previous) throw new Error(`unknown task run: ${runId}`);
+    if (previous.workActionId) {
+      throw new Error(
+        "WorkAction Task Runs must be retried through the WorkAction boundary",
+      );
+    }
     if (!["failed", "cancelled", "timed_out"].includes(previous.status)) {
       throw new Error(`task run is not retryable: ${runId}`);
     }
-    const task = this.tasks.get(previous.taskId);
+    const task = this.taskForRun(previous.id);
     if (!task) throw new Error(`unknown task: ${previous.taskId}`);
     return this.launchTaskRun({
       ...task,
@@ -2813,84 +4659,173 @@ export class KnowledgeEngine implements Knowledge {
     }, "retry", previous.distill, previous.id, task.timeoutMinutes * 60_000);
   }
 
+  /**
+   * Admit durable automatic retries whose backoff has elapsed. Each child is a
+   * fresh execution of the parent's frozen plan; no provider checkpoint exists.
+   */
+  retryDueTaskRuns(now = Date.now()): StartedTaskRun[] {
+    const scheduled: StartedTaskRun[] = [];
+    for (const parent of this.taskRuns.listDueRetries(now)) {
+      if (this.activeTaskRunId(parent.taskId)) continue;
+      const boundaryError = this.workActionExecutionBoundaryError(parent);
+      if (boundaryError) {
+        this.taskRuns.exhaustRetry(parent.id);
+        this.failClosedWorkActionRun(parent, boundaryError, now);
+        continue;
+      }
+      if (parent.workActionId) {
+        const action = this.workContinuations.get(parent.workActionId);
+        if (action && action.taskRunIds.length >= MAX_WORK_ACTION_RUNS) {
+          const error = "work action automatic retry limit reached";
+          this.taskRuns.exhaustRetry(parent.id);
+          this.failClosedWorkActionRun(parent, error, now);
+          continue;
+        }
+      }
+      const storedTask = this.taskForRun(parent.id);
+      if (!storedTask?.enabled) {
+        this.taskRuns.exhaustRetry(parent.id);
+        if (parent.workActionId) {
+          this.failClosedWorkActionRun(
+            parent,
+            "work action automatic retry is no longer enabled",
+            now,
+          );
+        }
+        continue;
+      }
+      const child = this.taskRuns.claimRetry(parent.id, now);
+      if (!child) continue;
+      if (child.workItemId) this.workItems.attachTaskRun(child.workItemId, child.id, now);
+      if (child.workActionId) {
+        this.workContinuations.claimAutomaticRetry(child.workActionId, now);
+        this.workContinuations.attachRun(child.workActionId, child.id, "queued", now);
+      }
+      const task: Task = {
+        ...storedTask,
+        name: child.taskName,
+        space: child.space,
+        topic: child.topic,
+        notify: child.notify ?? storedTask.notify,
+      };
+      scheduled.push(this.scheduleApprovedTaskRun(task, child));
+    }
+    return scheduled;
+  }
+
   private launchTaskRun(
     task: Task,
     trigger: TaskRunTrigger,
     distill: boolean,
     retryOf?: string,
     timeoutMs = TASK_TIMEOUT_MS,
+    workActionId?: string,
   ): StartedTaskRun {
     const taskId = task.id;
     const activeRunId = this.activeTaskRunId(taskId);
     if (activeRunId) {
       throw new TaskAlreadyRunningError(taskId, activeRunId);
     }
-    let executionAgent: Agent | undefined;
-    let provider: ProviderId | undefined;
-    let model: string | undefined;
-    let client: LlmClient | undefined;
-    let resolvedSkills: ResolvedAgentSkills | undefined;
-    let skillEvidence: TaskRunSkillEvidence = {
-      requested: [],
-      resolved: [],
-      skipped: [],
-    };
-    let setupError: unknown;
-    const controller = new AbortController();
+    let snapshot: AgentRunExecutionSnapshot;
     try {
-      const configuredAgent = this.agentForSpace(task.space);
-      const cfg = config();
-      const selectedProvider = configuredAgent?.provider || cfg.defaultProvider;
-      const inheritedModel = !configuredAgent || configuredAgent.provider === cfg.defaultProvider
-        ? cfg.defaultModel
-        : "";
-      const selectedModel = configuredAgent?.model || inheritedModel || undefined;
-      model = selectedProvider === "codex" && selectedModel
-        ? canonicalModelId(selectedModel)
-        : selectedModel;
-      provider = isCliProvider(selectedProvider) ? selectedProvider : undefined;
-      executionAgent = configuredAgent
-        ? { ...configuredAgent, model: model ?? "" }
-        : undefined;
-      const context = this.agentCallContext(task.space, {
-        timeoutMs,
-        signal: controller.signal,
-        taskExecution: true,
-        resolvedAgent: executionAgent,
-      });
-      client = context.client;
-      resolvedSkills = context.skills;
-      skillEvidence = {
-        requested: context.skills.requested.map((item) => ({ ...item })),
-        resolved: context.skills.resolved.map((item) => ({ ...item })),
-        skipped: context.skills.skipped.map((item) => ({ ...item })),
-      };
+      snapshot = this.agentRunExecutionSnapshot(task.space, true);
     } catch (error) {
-      setupError = error;
+      const resolutionError = executionResolutionError(error);
+      snapshot = {
+        skillEvidence: { requested: [], resolved: [], skipped: [] },
+        executionPlan: {
+          version: 1,
+          instruction: "",
+          resolutionError,
+        },
+      };
     }
+    const approvalRequired = snapshot.executionPlan.execution !== undefined
+      && snapshot.executionPlan.execution.permission !== "read-only";
+    const workItemId = (workActionId
+      ? this.workContinuations.get(workActionId)?.workItemId
+      : undefined)
+      ?? (retryOf ? this.taskRuns.get(retryOf)?.workItemId : undefined)
+      ?? this.workItems.activeForSpace(task.space)?.id;
     const run = this.taskRuns.start({
       task,
       trigger,
-      agentId: executionAgent?.id,
-      provider,
-      model,
-      skillEvidence,
+      workItemId,
+      workActionId,
+      agentId: snapshot.agent?.id,
+      provider: snapshot.provider,
+      model: snapshot.model,
+      executionPlan: snapshot.executionPlan,
+      skillEvidence: snapshot.skillEvidence,
       retryOf,
       distill,
       timeoutMs,
+      approvalRequired,
     });
+    if (workItemId) this.workItems.attachTaskRun(workItemId, run.id);
+    if (workActionId) {
+      this.workContinuations.attachRun(
+        workActionId,
+        run.id,
+        run.status === "awaiting_approval" ? "awaiting_approval" : "queued",
+      );
+    }
+    if (run.status === "awaiting_approval") {
+      const completion = Promise.resolve<TaskReport>({
+        runId: run.id,
+        taskId: run.taskId,
+        space: run.space,
+        ok: false,
+        status: run.status,
+        error: "Task Run is awaiting human approval",
+        startedAt: run.startedAt,
+        // Compatibility: callers historically receive a completion Promise.
+        // `state` distinguishes this admission result from a terminal report.
+        finishedAt: run.startedAt,
+      });
+      return {
+        state: "awaiting_approval",
+        run,
+        completion,
+      };
+    }
+    const scheduled = this.scheduleApprovedTaskRun(task, run);
+    return scheduled;
+  }
+
+  private scheduleApprovedTaskRun(task: Task, run: TaskRun): StartedTaskRun {
+    if (!run.executionPlan) {
+      throw new Error(`task run has no immutable execution plan: ${run.id}`);
+    }
+    const timeoutMs = run.timeoutMs ?? task.timeoutMinutes * 60_000;
+    const controller = new AbortController();
+    let callContext: SpaceAgentCallContext | undefined;
+    let setupError: unknown;
+    try {
+      callContext = this.executionPlanCallContext(
+        task.space,
+        run.executionPlan,
+        run.skillEvidence,
+        {
+          timeoutMs,
+          signal: controller.signal,
+        },
+      );
+    } catch (error) {
+      setupError = error;
+    }
     const completion = this.scheduleTaskRun({
       task,
       run,
-      distill,
+      distill: run.distill,
       timeoutMs,
       controller,
-      executionAgent,
-      client,
-      resolvedSkills,
+      executionPlan: run.executionPlan,
+      callContext,
       setupError,
     });
     return {
+      state: "scheduled",
       run: this.taskRuns.get(run.id) ?? run,
       completion,
     };
@@ -2902,9 +4837,8 @@ export class KnowledgeEngine implements Knowledge {
     distill: boolean;
     timeoutMs: number;
     controller: AbortController;
-    executionAgent?: Agent;
-    client?: LlmClient;
-    resolvedSkills?: ResolvedAgentSkills;
+    executionPlan: ResolvedExecutionPlan;
+    callContext?: SpaceAgentCallContext;
     setupError?: unknown;
   }): Promise<TaskReport> {
     const {
@@ -2913,9 +4847,8 @@ export class KnowledgeEngine implements Knowledge {
       distill,
       timeoutMs,
       controller,
-      executionAgent,
-      client,
-      resolvedSkills,
+      executionPlan,
+      callContext,
       setupError,
     } = input;
     const taskId = task.id;
@@ -2932,8 +4865,18 @@ export class KnowledgeEngine implements Knowledge {
         conversationId: run.space,
       }),
       execute: async () => {
+        const boundaryError = this.workActionExecutionBoundaryError(run);
+        if (boundaryError) {
+          const finishedAt = Math.max(Date.now(), run.startedAt);
+          this.failClosedWorkActionRun(run, boundaryError, finishedAt);
+          this.taskRuns.cancel(run.id, { finishedAt, error: boundaryError });
+          throw new Error(boundaryError);
+        }
         const running = this.taskRuns.begin(run.id);
         if (!running) throw new Error(`queued task run is no longer active: ${run.id}`);
+        if (running.workActionId) {
+          this.workContinuations.markRunning(running.workActionId, running.id);
+        }
         const timeout = setTimeout(() => {
           controller.abort(new TaskRunTimeoutError(timeoutMs));
         }, timeoutMs);
@@ -2943,9 +4886,8 @@ export class KnowledgeEngine implements Knowledge {
             running,
             distill,
             controller,
-            executionAgent,
-            client,
-            resolvedSkills,
+            executionPlan,
+            callContext,
             setupError,
           );
         } finally {
@@ -2973,6 +4915,16 @@ export class KnowledgeEngine implements Knowledge {
           });
         }
       }
+      if (
+        current?.finishedAt
+        && ["failed", "cancelled", "timed_out"].includes(current.status)
+      ) {
+        this.tasks.setLastRun(current.taskId, {
+          at: current.finishedAt,
+          status: "error",
+          error: current.error,
+        });
+      }
       const settled = current ?? this.taskRuns.get(run.id)!;
       return {
         runId: settled.id,
@@ -2984,12 +4936,36 @@ export class KnowledgeEngine implements Knowledge {
         startedAt: settled.startedAt,
         finishedAt: settled.finishedAt ?? Date.now(),
       };
+    }).then((report) => {
+      this.settleWorkActionFromTaskRun(report.runId);
+      return report;
     }).finally(() => {
       if (this.activeTaskRuns.get(taskId) === run.id) {
         this.activeTaskRuns.delete(taskId);
       }
       this.taskRunControllers.delete(run.id);
     });
+  }
+
+  private finishQueuedTaskRun(
+    run: TaskRun,
+    rawError: string,
+    status: "failed" | "cancelled" | "timed_out" = "failed",
+  ): TaskRun | undefined {
+    const error = rawError.slice(0, MAX_TASK_RUN_ERROR_CHARACTERS);
+    const finishedAt = Math.max(Date.now(), run.startedAt);
+    const result = { finishedAt, error };
+    const finished = status === "timed_out"
+      ? this.taskRuns.timeout(run.id, result)
+      : status === "cancelled"
+        ? this.taskRuns.cancel(run.id, result)
+        : this.taskRuns.fail(run.id, result);
+    this.tasks.setLastRun(run.taskId, {
+      at: finishedAt,
+      status: "error",
+      error,
+    });
+    return finished;
   }
 
   /** Re-enqueue durable Task Runs that had not started when the service stopped. */
@@ -2999,12 +4975,40 @@ export class KnowledgeEngine implements Knowledge {
       .filter((run) => run.status === "queued")
       .sort((a, b) => a.queuedAt - b.queuedAt || a.id.localeCompare(b.id));
     for (const run of queued) {
-      const storedTask = this.tasks.get(run.taskId);
+      const boundaryError = this.workActionExecutionBoundaryError(run);
+      if (boundaryError) {
+        this.failClosedWorkActionRun(run, boundaryError);
+        this.finishQueuedTaskRun(run, boundaryError, "cancelled");
+        continue;
+      }
+      if (!run.executionPlan) {
+        this.finishQueuedTaskRun(
+          run,
+          "Queued Task Run has no immutable execution plan; refusing to use live Agent state.",
+        );
+        continue;
+      }
+      if (!run.executionPlan.execution && !run.executionPlan.resolutionError) {
+        this.finishQueuedTaskRun(
+          run,
+          "Queued Task Run execution plan has no task execution grant.",
+        );
+        continue;
+      }
+      if (
+        run.executionPlan.execution?.permission !== undefined
+        && run.executionPlan.execution.permission !== "read-only"
+        && run.approval?.status !== "approved"
+      ) {
+        this.finishQueuedTaskRun(
+          run,
+          "Queued writable Task Run has no durable approval; refusing to execute.",
+        );
+        continue;
+      }
+      const storedTask = this.taskForRun(run.id);
       if (!storedTask) {
-        this.taskRuns.fail(run.id, {
-          finishedAt: Date.now(),
-          error: `Queued task no longer exists: ${run.taskId}`,
-        });
+        this.finishQueuedTaskRun(run, `Queued task no longer exists: ${run.taskId}`);
         continue;
       }
       const task: Task = {
@@ -3016,30 +5020,15 @@ export class KnowledgeEngine implements Knowledge {
       };
       const timeoutMs = run.timeoutMs ?? storedTask.timeoutMinutes * 60_000;
       const controller = new AbortController();
-      let executionAgent: Agent | undefined;
-      let client: LlmClient | undefined;
-      let resolvedSkills: ResolvedAgentSkills | undefined;
+      let callContext: SpaceAgentCallContext | undefined;
       let setupError: unknown;
       try {
-        const storedAgent = run.agentId ? this.agents.get(run.agentId) : undefined;
-        if (run.agentId && !storedAgent) {
-          throw new Error(`Queued run Agent no longer exists: ${run.agentId}`);
-        }
-        executionAgent = storedAgent
-          ? {
-              ...storedAgent,
-              provider: run.provider ?? storedAgent.provider,
-              model: run.model ?? storedAgent.model,
-            }
-          : undefined;
-        const context = this.agentCallContext(task.space, {
-          timeoutMs,
-          signal: controller.signal,
-          taskExecution: true,
-          resolvedAgent: executionAgent,
-        });
-        client = context.client;
-        resolvedSkills = context.skills;
+        callContext = this.executionPlanCallContext(
+          task.space,
+          run.executionPlan,
+          run.skillEvidence,
+          { timeoutMs, signal: controller.signal },
+        );
       } catch (error) {
         setupError = error;
       }
@@ -3049,12 +5038,12 @@ export class KnowledgeEngine implements Knowledge {
         distill: run.distill,
         timeoutMs,
         controller,
-        executionAgent,
-        client,
-        resolvedSkills,
+        executionPlan: run.executionPlan,
+        callContext,
         setupError,
       });
       resumed.push({
+        state: "scheduled",
         run: this.taskRuns.get(run.id) ?? run,
         completion,
       });
@@ -3076,27 +5065,38 @@ export class KnowledgeEngine implements Knowledge {
     run: TaskRun,
     distill: boolean,
     controller: AbortController,
-    resolvedAgent?: Agent,
-    resolvedClient?: LlmClient,
-    resolvedSkills?: ResolvedAgentSkills,
+    executionPlan: ResolvedExecutionPlan,
+    callContext?: SpaceAgentCallContext,
     setupError?: unknown,
   ): Promise<TaskReport> {
     const startedAt = run.startedAt;
+    const usage = new RunUsageAccumulator();
+    const observedCallContext = callContext
+      ? {
+          ...callContext,
+          client: observeLlmUsage(callContext.client, (item) => usage.record(item)),
+        }
+      : undefined;
     let output: string | undefined;
     let rawId: string | undefined;
+    let failurePhase: TaskRunFailure["phase"] = "admission";
     try {
       if (setupError) throw setupError;
       this.registry.ensure(task.space);
-      const agent = resolvedAgent;
       // The LLM call runs OUTSIDE the per-space serializer — research is
       // long-running and must not block captures/distillation. Only the write
       // (remember) is serialized, and it acquires the lock itself.
-      if (!resolvedClient) throw new Error("task Agent context is unavailable");
+      if (!observedCallContext) throw new Error("task execution plan context is unavailable");
+      this.validatedSkillsFromEvidence(executionPlan, run.skillEvidence);
+      // Re-resolve last, immediately before the provider call, so an approval
+      // cannot be replayed against a replaced symlink/junction or file.
+      this.validateFrozenExecutionWorkdir(executionPlan.execution);
+      failurePhase = "provider";
       const res = await awaitTaskRunStep(
-        resolvedClient.complete({
-          system: agent?.instruction || undefined,
-          prompt: researchPrompt(task.topic),
-          model: agent?.model || undefined,
+        observedCallContext.client.complete({
+          system: executionPlan.instruction || undefined,
+          prompt: run.workActionId ? task.topic : researchPrompt(task.topic),
+          model: executionPlan.model,
           purpose: "distill",
           space: task.space,
         }),
@@ -3106,10 +5106,15 @@ export class KnowledgeEngine implements Knowledge {
       const text = res.text.trim();
       if (!text) throw new Error("task produced empty output");
       output = text;
+      failurePhase = "capture";
       throwIfTaskRunAborted(controller.signal);
       rawId = await this.remember({
         space: task.space,
         source: "task",
+        workItemId: run.workItemId,
+        ...(run.workActionId
+          ? { workActionId: run.workActionId, admission: "held" as const }
+          : {}),
         content: `# 任务研究：${task.name}\n主题：${task.topic}\n\n${text}`,
       });
       throwIfTaskRunAborted(controller.signal);
@@ -3125,10 +5130,7 @@ export class KnowledgeEngine implements Knowledge {
             async () => this.executeDreamCycle(
               task.space,
               { signal: controller.signal },
-              {
-                resolvedAgent: agent,
-                resolvedSkills,
-              },
+              observedCallContext,
             ),
           );
           throwIfTaskRunAborted(controller.signal);
@@ -3138,7 +5140,10 @@ export class KnowledgeEngine implements Knowledge {
           log.warn("post-task distillation failed (raw kept for nightly)", { taskId: task.id, err: String(err) });
         }
       }
-      const summary = text.slice(0, 200);
+      const providerReport = run.workActionId
+        ? parseWorkActionProviderReport(text)
+        : undefined;
+      const summary = (providerReport?.result ?? text).slice(0, 200);
       const finishedAt = Math.max(Date.now(), startedAt);
       this.tasks.setLastRun(task.id, { at: finishedAt, status: "ok", summary });
       this.taskRuns.succeed(run.id, {
@@ -3147,6 +5152,7 @@ export class KnowledgeEngine implements Knowledge {
         summary,
         rawId,
         pagesWritten,
+        usage: usage.snapshot(),
       });
       log.info("task run ok", { runId: run.id, taskId: task.id, space: task.space, rawId, pagesWritten });
       return {
@@ -3168,13 +5174,53 @@ export class KnowledgeEngine implements Knowledge {
       const error = (timedOut || cancelled ? abortReason.message : String(err))
         .slice(0, MAX_TASK_RUN_ERROR_CHARACTERS);
       const finishedAt = Math.max(Date.now(), startedAt);
+      const failure: TaskRunFailure = timedOut
+        ? { phase: failurePhase, kind: "timeout", retryable: false }
+        : cancelled
+          ? { phase: failurePhase, kind: "cancelled", retryable: false }
+          : classifyTaskRunFailure(err, failurePhase);
+      const attempt = run.retry?.attempt ?? 1;
+      const retry = !timedOut
+        && !cancelled
+        && run.executionPlan?.execution?.permission === "read-only"
+        && (run.trigger === "scheduled" || run.retry !== undefined)
+        && failure.phase === "provider"
+        && failure.retryable
+        && output === undefined
+        && rawId === undefined
+        && attempt < MAX_AUTOMATIC_TASK_RUN_ATTEMPTS
+        ? {
+            attempt,
+            maxAttempts: MAX_AUTOMATIC_TASK_RUN_ATTEMPTS,
+            status: "waiting" as const,
+            nextAttemptAt: finishedAt + AUTOMATIC_TASK_RUN_RETRY_DELAY_MS,
+          }
+        : !timedOut
+          && !cancelled
+          && run.retry
+          && attempt >= MAX_AUTOMATIC_TASK_RUN_ATTEMPTS
+          ? {
+              attempt,
+              maxAttempts: MAX_AUTOMATIC_TASK_RUN_ATTEMPTS,
+              status: "exhausted" as const,
+            }
+          : undefined;
+      const terminal = {
+        finishedAt,
+        error,
+        output,
+        rawId,
+        failure,
+        retry,
+        usage: usage.snapshot(),
+      };
       this.tasks.setLastRun(task.id, { at: finishedAt, status: "error", error });
       if (timedOut) {
-        this.taskRuns.timeout(run.id, { finishedAt, error, output, rawId });
+        this.taskRuns.timeout(run.id, terminal);
       } else if (cancelled) {
-        this.taskRuns.cancel(run.id, { finishedAt, error, output, rawId });
+        this.taskRuns.cancel(run.id, terminal);
       } else {
-        this.taskRuns.fail(run.id, { finishedAt, error, output, rawId });
+        this.taskRuns.fail(run.id, terminal);
       }
       log.error("task run failed", { runId: run.id, taskId: task.id, space: task.space, err: error });
       return {
@@ -3203,11 +5249,88 @@ export class KnowledgeEngine implements Knowledge {
     const context = primary
       ? this.agentCallContext(primary, { signal: opts.signal })
       : this.agentCallContext(spaces[0]!, { signal: opts.signal });
-    const client = context.client;
+    const snapshot = primary ? this.agentRunExecutionSnapshot(primary) : undefined;
+    return this.executeAsk(
+      stores,
+      spaces,
+      question,
+      {
+        ...opts,
+        fallbackContext: snapshot?.executionPlan.provider === "codex"
+            && snapshot.executionPlan.workdir
+          ? "agent-workdir"
+          : undefined,
+      },
+      context,
+      snapshot
+        ? answerTraceExecution(
+            snapshot.executionPlan,
+            snapshot.skillEvidence,
+            snapshot.agent?.id,
+          )
+        : undefined,
+    );
+  }
+
+  /** Execute a durable Chat Run using only the configuration captured at enqueue time. */
+  async askWithExecutionPlan(
+    spaces: SpaceId[],
+    question: string,
+    executionPlan: ResolvedExecutionPlan,
+    skillEvidence?: TaskRunSkillEvidence,
+    opts: AskOptions = {},
+    traceAgentId?: string,
+  ): Promise<AskResult> {
+    if (executionPlan.execution !== undefined) {
+      throw new Error("Chat execution plan must not grant ProviderExecution");
+    }
+    const stores = spaces.filter((space) => this.registry.has(space))
+      .map((space) => this.registry.store(space));
+    const primary = spaces[0] ?? stores[0]?.space;
+    if (!primary) throw new Error("Chat Run requires at least one space");
+    const context = this.executionPlanCallContext(
+      primary,
+      executionPlan,
+      skillEvidence,
+      { signal: opts.signal },
+    );
+    return this.executeAsk(
+      stores,
+      spaces,
+      question,
+      {
+        ...opts,
+        model: executionPlan.model,
+        instruction: executionPlan.instruction || undefined,
+        fallbackContext: executionPlan.provider === "codex" && executionPlan.workdir
+          ? "agent-workdir"
+          : undefined,
+      },
+      context,
+      answerTraceExecution(executionPlan, skillEvidence, traceAgentId),
+    );
+  }
+
+  private async executeAsk(
+    stores: Parameters<typeof askImpl>[0],
+    spaces: SpaceId[],
+    question: string,
+    opts: AskOptions,
+    context: SpaceAgentCallContext,
+    traceExecution?: AnswerTraceExecution,
+  ): Promise<AskResult> {
+    const usage = new RunUsageAccumulator();
+    const client = observeLlmUsage(context.client, (item) => usage.record(item));
     const skillWarnings = skillWarningViews(context.skills);
     const startedAt = Date.now();
+    let retrievalPages: AnswerTraceRetrievalPage[] = [];
     try {
-      const asking = askImpl(stores, question, opts, { client });
+      const asking = askImpl(stores, question, opts, {
+        client,
+        onRetrieval: (evidence) => {
+          retrievalPages = evidence.pages.map((page) => ({ ...page }));
+        },
+      });
       const result = opts.signal
         ? await awaitTaskRunStep(asking, opts.signal)
         : await asking;
@@ -3219,6 +5342,9 @@ export class KnowledgeEngine implements Knowledge {
           source: result.source,
           answer: result.answer,
           citations: result.citations,
+          execution: traceExecution,
+          retrievalPages,
+          usage: usage.snapshot(),
           latencyMs: Date.now() - startedAt,
           createdAt: startedAt,
         });
@@ -3237,14 +5363,21 @@ export class KnowledgeEngine implements Knowledge {
     } catch (err) {
       try {
         const message = String(err);
-        this.quality.recordTrace({
+        const trace = this.quality.recordTrace({
           spaces,
           question,
           outcome: isProviderTimeoutError(err) ? "timed_out" : "failed",
           citations: [],
+          execution: traceExecution,
+          retrievalPages,
+          usage: usage.snapshot(),
           latencyMs: Date.now() - startedAt,
           error: message,
           createdAt: startedAt,
+        });
+        opts.onFailureTrace?.({
+          traceId: trace.id,
+          usage: trace.usage,
         });
       } catch (traceError) {
         log.warn("failed answer quality trace persistence failed", { err: String(traceError) });
@@ -3290,8 +5423,62 @@ export class KnowledgeEngine implements Knowledge {
     return this.quality.evaluationCases();
   }
 
+  /**
+   * Re-evaluate a completed Chat Run with its immutable Agent execution plan.
+   * This deliberately creates only a candidate quality trace: it does not
+   * create or deliver a Chat Run and does not capture another raw message.
+   */
+  async rerunChatRunForEvaluation(chatRunId: string): Promise<QualityRerun> {
+    const sourceRun = this.chatRuns.get(chatRunId);
+    if (!sourceRun) throw new Error(`unknown chat run: ${chatRunId}`);
+    if (
+      sourceRun.status !== "succeeded"
+      || !sourceRun.traceId
+      || !sourceRun.executionPlan
+    ) {
+      throw new Error(`chat run is not eligible for evaluation rerun: ${chatRunId}`);
+    }
+    const sourceTrace = this.quality.trace(sourceRun.traceId);
+    if (!sourceTrace) {
+      throw new Error(`chat run source trace is unavailable: ${sourceRun.traceId}`);
+    }
+    const audit = this.quality.startRerun({
+      sourceChatRunId: sourceRun.id,
+      sourceTraceId: sourceRun.traceId,
+    });
+    if (!audit) throw new Error(`could not start evaluation rerun: ${chatRunId}`);
+    try {
+      const missingSourceSpaces = sourceTrace.spaces.filter(
+        (space) => !this.registry.has(space),
+      );
+      if (missingSourceSpaces.length > 0) {
+        throw new Error(
+          `evaluation source trace spaces are unavailable (${missingSourceSpaces.length})`,
+        );
+      }
+      const candidate = await this.askWithExecutionPlan(
+        sourceTrace.spaces,
+        sourceTrace.question,
+        sourceRun.executionPlan,
+        sourceRun.skillEvidence,
+        {},
+        sourceRun.agentId,
+      );
+      if (!candidate.traceId) {
+        throw new Error("evaluation rerun did not produce a durable candidate trace");
+      }
+      const completed = this.quality.completeRerun(audit.id, candidate.traceId);
+      if (!completed) throw new Error("evaluation rerun audit could not be completed");
+      return completed;
+    } catch (error) {
+      this.quality.failRerun(audit.id, String(error));
+      throw error;
+    }
+  }
+
   async search(spaces: SpaceId[], keyword: string, opts: SearchOptions = {}): Promise<Hit[]> {
-    const limit = opts.limit ?? 10;
+    const limit = normalizeSearchLimit(opts.limit ?? 10);
+    if (limit === 0) return [];
     const hits: Hit[] = [];
     for (const space of spaces) {
       if (!this.registry.has(space)) continue;
@@ -3311,6 +5498,7 @@ export class KnowledgeEngine implements Knowledge {
     await this.serializer.run(space, async () => {
       const store = this.registry.ensure(space);
       store.writePage(page);
+      this.syncWorkItemPages(space);
     });
   }
 
@@ -3337,6 +5525,8 @@ export class KnowledgeEngine implements Knowledge {
           ok: true,
           pages: index.countPages(),
           pendingRaw: index.countRaw(true),
+          heldRaw: index.countRawByAdmission("held"),
+          excludedRaw: index.countRawByAdmission("excluded"),
           quarantined: listQuarantineRecords(this.registry.store(space.id)).length,
           lastDreamAt: space.lastDreamAt,
         };

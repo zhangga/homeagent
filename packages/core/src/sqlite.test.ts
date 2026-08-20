@@ -80,6 +80,25 @@ describe("SpaceIndex pages + search", () => {
     expect(idx.listPages("entity").map((r) => r.slug)).toEqual(["entities/a"]);
     expect(idx.listPages().length).toBe(2);
   });
+
+  test("page writes cannot cite held or excluded WorkAction Raw", () => {
+    const rawId = idx.insertRaw({
+      space: "team/oc_1",
+      source: "task",
+      workActionId: "action-page-admission",
+      admission: "held",
+      content: "candidate evidence",
+    });
+    const candidate = page("entities/candidate", "Candidate", "must stay hidden", {
+      sources: [rawId],
+    });
+
+    expect(() => idx.upsertPage(candidate)).toThrow("not admitted");
+    expect(idx.getPage(candidate.slug)).toBeNull();
+    expect(idx.excludeRawAdmission(rawId, "action-page-admission")).toBe(true);
+    expect(() => idx.upsertPage(candidate)).toThrow("not admitted");
+    expect(idx.getPage(candidate.slug)).toBeNull();
+  });
 });
 
 describe("SpaceIndex raw capture", () => {
@@ -98,6 +117,230 @@ describe("SpaceIndex raw capture", () => {
     expect(pending.length).toBe(1);
     expect(pending[0]!.content).toBe("hello");
     expect(pending[0]!.ingested).toBe(false);
+    expect(pending[0]!.admission).toBe("ready");
+  });
+
+  test("held WorkAction raw remains auditable but is not pending for distillation", () => {
+    const id = idx.insertRaw({
+      ...raw("candidate result"),
+      source: "task",
+      workActionId: "action-1",
+      admission: "held",
+    });
+
+    expect(idx.listRaw({ onlyPending: true })).toEqual([]);
+    expect(idx.getRaw(id)).toEqual(expect.objectContaining({
+      admission: "held",
+      workActionId: "action-1",
+    }));
+    expect(idx.listRaw()).toEqual([
+      expect.objectContaining({ id, admission: "held", workActionId: "action-1" }),
+    ]);
+  });
+
+  test("listRaw can require admission independently from ingestion", () => {
+    const readyId = idx.insertRaw(raw("already distilled"));
+    idx.markIngested([readyId]);
+    idx.insertRaw({
+      ...raw("held candidate"),
+      source: "task",
+      workActionId: "action-held-list",
+      admission: "held",
+    });
+
+    expect(idx.listRaw({ onlyAdmitted: true }).map((record) => record.id)).toEqual([readyId]);
+    expect(idx.listRaw({ onlyPending: true })).toEqual([]);
+  });
+
+  test("new WorkAction raw must start as a held task owned by an action", () => {
+    expect(() => idx.insertRaw({
+      ...raw("wrong source"),
+      workActionId: "action-invalid-source",
+      admission: "held",
+    })).toThrow();
+    expect(() => idx.insertRaw({
+      ...raw("already admitted"),
+      source: "task",
+      workActionId: "action-invalid-ready",
+      admission: "ready",
+    })).toThrow();
+    expect(() => idx.insertRaw({
+      ...raw("owner missing"),
+      source: "task",
+      admission: "held",
+    })).toThrow();
+    expect(() => idx.insertRaw({
+      ...raw("born excluded"),
+      source: "task",
+      workActionId: "action-invalid-excluded",
+      admission: "excluded",
+    })).toThrow();
+    expect(idx.countRaw()).toBe(0);
+  });
+
+  test("promoting held raw admits it exactly once and remains idempotent", () => {
+    const id = idx.insertRaw({
+      ...raw("accepted candidate"),
+      source: "task",
+      workActionId: "action-accept",
+      admission: "held",
+    });
+
+    expect(idx.promoteRawAdmission(id, "action-accept")).toBeTrue();
+    expect(idx.promoteRawAdmission(id, "action-accept")).toBeTrue();
+    expect(idx.excludeRawAdmission(id, "action-accept")).toBeFalse();
+    expect(idx.getRaw(id)?.admission).toBe("ready");
+    expect(idx.listRaw({ onlyPending: true }).map((record) => record.id)).toEqual([id]);
+  });
+
+  test("excluding held raw is owner-bound, idempotent, and terminal", () => {
+    const id = idx.insertRaw({
+      ...raw("rejected candidate"),
+      source: "task",
+      workActionId: "action-reject",
+      admission: "held",
+    });
+
+    expect(idx.excludeRawAdmission(id, "different-action")).toBeFalse();
+    expect(idx.getRaw(id)?.admission).toBe("held");
+    expect(idx.excludeRawAdmission(id, "action-reject")).toBeTrue();
+    expect(idx.excludeRawAdmission(id, "action-reject")).toBeTrue();
+    expect(idx.promoteRawAdmission(id, "action-reject")).toBeFalse();
+    expect(idx.getRaw(id)?.admission).toBe("excluded");
+    expect(idx.listRaw({ onlyPending: true })).toEqual([]);
+  });
+
+  test("listRawByIds can require admission independently from ingestion", () => {
+    const readyId = idx.insertRaw(raw("already distilled but admitted"));
+    idx.markIngested([readyId]);
+    const heldId = idx.insertRaw({
+      ...raw("held"),
+      source: "task",
+      workActionId: "action-held",
+      admission: "held",
+    });
+    const excludedId = idx.insertRaw({
+      ...raw("excluded"),
+      source: "task",
+      workActionId: "action-excluded",
+      admission: "held",
+    });
+    expect(idx.excludeRawAdmission(excludedId, "action-excluded")).toBeTrue();
+
+    const ids = [readyId, heldId, excludedId];
+    expect(idx.listRawByIds(ids).map((record) => record.id)).toEqual(ids);
+    expect(idx.listRawByIds(ids, { onlyAdmitted: true }).map((record) => record.id))
+      .toEqual([readyId]);
+    expect(idx.listRawByIds(ids, { onlyPending: true, onlyAdmitted: true })).toEqual([]);
+  });
+
+  test("pending and admission counts keep held and excluded raw distinct", () => {
+    idx.insertRaw(raw("ready"));
+    idx.insertRaw({
+      ...raw("held"),
+      source: "task",
+      workActionId: "action-held-count",
+      admission: "held",
+    });
+    const excludedId = idx.insertRaw({
+      ...raw("excluded"),
+      source: "task",
+      workActionId: "action-excluded-count",
+      admission: "held",
+    });
+    expect(idx.excludeRawAdmission(excludedId, "action-excluded-count")).toBeTrue();
+
+    expect(idx.countRaw(true)).toBe(1);
+    expect(idx.countRawByAdmission("ready")).toBe(1);
+    expect(idx.countRawByAdmission("held")).toBe(1);
+    expect(idx.countRawByAdmission("excluded")).toBe(1);
+  });
+
+  test("startup reconciliation can bind a legacy task raw to its WorkAction", () => {
+    const id = idx.insertRaw({ ...raw("legacy candidate"), source: "task" });
+
+    expect(idx.reconcileWorkActionRawAdmission(id, "action-legacy", "held")).toBeTrue();
+    expect(idx.reconcileWorkActionRawAdmission(id, "action-legacy", "held")).toBeTrue();
+    expect(idx.getRaw(id)).toEqual(expect.objectContaining({
+      workActionId: "action-legacy",
+      admission: "held",
+    }));
+    expect(idx.listRaw({ onlyPending: true })).toEqual([]);
+  });
+
+  test("startup reconciliation cannot steal another action or bind non-task raw", () => {
+    const taskId = idx.insertRaw({
+      ...raw("owned candidate"),
+      source: "task",
+      workActionId: "action-owner",
+      admission: "held",
+    });
+    const messageId = idx.insertRaw(raw("ordinary message"));
+
+    expect(idx.reconcileWorkActionRawAdmission(
+      taskId,
+      "action-intruder",
+      "excluded",
+    )).toBeFalse();
+    expect(idx.reconcileWorkActionRawAdmission(
+      messageId,
+      "action-intruder",
+      "held",
+    )).toBeFalse();
+    expect(idx.getRaw(taskId)).toEqual(expect.objectContaining({
+      workActionId: "action-owner",
+      admission: "held",
+    }));
+    expect(idx.getRaw(messageId)).toEqual(expect.objectContaining({ admission: "ready" }));
+  });
+
+  test("listRawsByWorkAction finds orphan candidates in stable order", () => {
+    const second = idx.insertRaw({
+      ...raw("second candidate"),
+      source: "task",
+      workActionId: "action-orphan",
+      admission: "held",
+      createdAt: 100,
+    });
+    const first = idx.insertRaw({
+      ...raw("first candidate"),
+      source: "task",
+      workActionId: "action-orphan",
+      admission: "held",
+      createdAt: 100,
+    });
+    idx.insertRaw({
+      ...raw("different action"),
+      source: "task",
+      workActionId: "action-other",
+      admission: "held",
+      createdAt: 50,
+    });
+
+    expect(idx.listRawsByWorkAction("action-orphan").map((record) => record.id))
+      .toEqual([first, second].sort());
+    expect(idx.listRawsByWorkAction("  ")).toEqual([]);
+  });
+
+  test("restoreRaw preserves WorkAction admission provenance", () => {
+    idx.restoreRaw({
+      id: "raw-archive-1",
+      space: "team/oc_1",
+      source: "task",
+      workItemId: "work-1",
+      workActionId: "action-archive-1",
+      content: "archived rejected result",
+      createdAt: 123,
+      ingested: false,
+      admission: "excluded",
+    });
+
+    expect(idx.getRaw("raw-archive-1")).toEqual(expect.objectContaining({
+      workItemId: "work-1",
+      workActionId: "action-archive-1",
+      admission: "excluded",
+    }));
+    expect(idx.listRaw({ onlyPending: true })).toEqual([]);
   });
 
   test("markIngested flips the flag", () => {
@@ -181,6 +424,12 @@ describe("SpaceIndex raw capture", () => {
       }),
     ]);
     expect(migrated.getRaw("legacy-message")?.agentResponse).toBeUndefined();
+    expect(migrated.getRaw("legacy-message")).toEqual(expect.objectContaining({
+      admission: "ready",
+    }));
+    expect(migrated.getRaw("legacy-message")?.workActionId).toBeUndefined();
+    expect(migrated.listRaw({ onlyPending: true }).map((record) => record.id))
+      .toEqual(["legacy-message"]);
     expect(migrated.recordAgentResponse(
       "oc_1",
       "om_legacy",

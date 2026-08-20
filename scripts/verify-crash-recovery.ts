@@ -67,9 +67,15 @@ async function seedThenCrash(dataDir: string, recordPath: string): Promise<never
     distillOnRun: false,
   });
   if (!task) throw new Error("failed to seed recovery task");
+  const snapshot = engine.agentRunExecutionSnapshot(SPACE, true);
   const run = engine.taskRuns.start({
     task,
     trigger: "manual",
+    agentId: snapshot.agent?.id,
+    provider: snapshot.provider,
+    model: snapshot.model,
+    executionPlan: snapshot.executionPlan,
+    skillEvidence: snapshot.skillEvidence,
     distill: false,
   });
   const reminder = engine.reminders.create({

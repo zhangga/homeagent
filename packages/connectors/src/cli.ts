@@ -18,6 +18,7 @@ import type {
   Connector,
   InboundEvent,
   InboundMessage,
+  NoticeOptions,
   OutboundReply,
 } from "./connector.ts";
 
@@ -77,7 +78,7 @@ export class CliConnector implements Connector {
     else if (this.opts.interactive) process.stdout.write(`\n🤖 ${out.markdown}\n\n`);
   }
 
-  async notice(chatId: string, markdown: string): Promise<void> {
+  async notice(chatId: string, markdown: string, _opts?: NoticeOptions): Promise<void> {
     this.notices.push({ chatId, markdown });
     if (this.opts.onReply) this.opts.onReply({ chatId, markdown });
     else if (this.opts.interactive) process.stdout.write(`\n📢 [${chatId}] ${markdown}\n\n`);

@@ -84,6 +84,7 @@ describe("buildCatalog", () => {
     const catalog = buildCatalog([store], "谁负责后端");
     expect(catalog.map((c) => c.ref.slug)).toEqual(["entities/alice"]);
   });
+
 });
 
 describe("expandGraph", () => {
@@ -127,6 +128,26 @@ describe("resolveCitations", () => {
     const loaded = [{ slug: "a", page: page("a", "A", "x") }];
     expect(resolveCitations(["missing"], loaded)).toEqual([]);
   });
+
+  test("resolves an opaque citation without guessing an ambiguous slug", () => {
+    const loaded = [
+      {
+        slug: "entities/alice",
+        key: "source-1",
+        page: page("entities/alice", "Team Alice", "x"),
+      },
+      {
+        slug: "entities/alice",
+        key: "source-2",
+        page: page("entities/alice", "Personal Alice", "x"),
+      },
+    ];
+
+    expect(resolveCitations(["source-2"], loaded)).toEqual([
+      { slug: "entities/alice", title: "Personal Alice" },
+    ]);
+    expect(resolveCitations(["entities/alice"], loaded)).toEqual([]);
+  });
 });
 
 describe("ask pipeline", () => {
@@ -145,6 +166,305 @@ describe("ask pipeline", () => {
     expect(res.answer).toContain("Alice");
   });
 
+  test("a large catalog routes bounded batches when literal FTS has no candidates", async () => {
+    for (let index = 0; index < 60; index += 1) {
+      store.writePage(page(
+        `concepts/filler-${index}`,
+        `普通条目 ${index}`,
+        `固定评测填充内容 ${index}。`,
+        { updatedAt: 100 + index },
+      ));
+    }
+    store.writePage(page(
+      "entities/alice-incident",
+      "Alice",
+      "Alice 负责生产事故响应。",
+      { updatedAt: 1 },
+    ));
+    const fake = scriptedLlm({
+      routeSlugs: ["entities/alice-incident"],
+      relevant: true,
+      answer: "线上故障应联系 Alice。",
+      grounded: true,
+      usedSlugs: ["entities/alice-incident"],
+    });
+
+    const result = await ask([store], "线上故障该找哪位？", {}, { client: fake });
+
+    expect(result).toEqual(expect.objectContaining({
+      source: "knowledge",
+      citations: [{ slug: "entities/alice-incident", title: "Alice" }],
+    }));
+    expect(fake.calls.filter((call) => call.kind === "json")).toHaveLength(3);
+  });
+
+  test("a large catalog retries bounded routing when literal candidates are irrelevant", async () => {
+    for (let index = 0; index < 59; index += 1) {
+      store.writePage(page(
+        `concepts/filler-${index}`,
+        `普通条目 ${index}`,
+        `固定评测填充内容 ${index}。`,
+        { updatedAt: 100 + index },
+      ));
+    }
+    store.writePage(page(
+      "concepts/incident-words",
+      "线上故障词汇",
+      "这个页面只解释线上故障这个短语。",
+      { updatedAt: 1_000 },
+    ));
+    store.writePage(page(
+      "entities/alice-incident",
+      "Alice",
+      "Alice 负责生产事故响应。",
+      { updatedAt: 1 },
+    ));
+    const fake = new FakeLlm();
+    fake.onJSON((call) => {
+      const properties = (call.schema as { properties?: Record<string, unknown> }).properties ?? {};
+      if ("relevant" in properties) {
+        return String(call.prompt).includes("entities/alice-incident")
+          ? { slugs: ["entities/alice-incident"], relevant: true }
+          : { slugs: [], relevant: false };
+      }
+      return {
+        answer: "线上故障应联系 Alice。",
+        grounded: true,
+        usedSlugs: ["entities/alice-incident"],
+        gaps: [],
+      };
+    });
+    fake.onText(() => "general fallback answer");
+
+    const result = await ask([store], "线上故障该找哪位？", {}, { client: fake });
+
+    expect(result).toEqual(expect.objectContaining({
+      source: "knowledge",
+      citations: [{ slug: "entities/alice-incident", title: "Alice" }],
+    }));
+    expect(fake.calls.filter((call) => call.kind === "json")).toHaveLength(4);
+  });
+
+  test("large-catalog fallback never exceeds four routing batches", async () => {
+    for (let index = 0; index < 241; index += 1) {
+      store.writePage(page(
+        `concepts/bounded-${index}`,
+        `普通条目 ${index}`,
+        `固定评测填充内容 ${index}。`,
+        { updatedAt: index },
+      ));
+    }
+    const fake = scriptedLlm({
+      routeSlugs: [],
+      relevant: false,
+      answer: "",
+      grounded: false,
+      generalText: "知识库没有相关记录。",
+    });
+
+    const result = await ask([store], "完全不相关的未知主题", {}, { client: fake });
+
+    expect(result.source).toBe("general");
+    expect(fake.calls.filter((call) => call.kind === "json")).toHaveLength(4);
+  });
+
+  test("large-catalog fallback gives later spaces a bounded routing batch", async () => {
+    const other = new SpaceStore("team/oc_ask_other", dir);
+    other.ensure();
+    try {
+      for (let index = 0; index < 240; index += 1) {
+        store.writePage(page(
+          `concepts/primary-${index}`,
+          `主空间条目 ${index}`,
+          `主空间固定填充内容 ${index}。`,
+          { updatedAt: index },
+        ));
+      }
+      for (let index = 0; index < 60; index += 1) {
+        other.writePage(page(
+          `concepts/secondary-${index}`,
+          `次空间条目 ${index}`,
+          `次空间固定填充内容 ${index}。`,
+          { updatedAt: 100 + index },
+        ));
+      }
+      other.writePage(page(
+        "entities/alice-incident",
+        "Alice",
+        "Alice 负责生产事故响应。",
+        { updatedAt: 1 },
+      ));
+      const fake = scriptedLlm({
+        routeSlugs: ["entities/alice-incident"],
+        relevant: true,
+        answer: "线上故障应联系 Alice。",
+        grounded: true,
+        usedSlugs: ["entities/alice-incident"],
+      });
+
+      const result = await ask(
+        [store, other],
+        "线上故障该找哪位？",
+        {},
+        { client: fake },
+      );
+
+      expect(result).toEqual(expect.objectContaining({
+        source: "knowledge",
+        citations: [{ slug: "entities/alice-incident", title: "Alice" }],
+      }));
+      expect(fake.calls.filter((call) => call.kind === "json")).toHaveLength(4);
+    } finally {
+      other.close();
+    }
+  });
+
+  test("bounded fallback represents every space before taking more from one", async () => {
+    const extras = Array.from({ length: 4 }, (_, index) => {
+      const candidate = new SpaceStore(`team/oc_fair_${index}` as SpaceId, dir);
+      candidate.ensure();
+      return candidate;
+    });
+    const stores = [store, ...extras];
+    try {
+      for (const [spaceIndex, candidate] of stores.entries()) {
+        for (let index = 0; index < 60; index += 1) {
+          candidate.writePage(page(
+            `concepts/fair-${spaceIndex}-${index}`,
+            `空间 ${spaceIndex} 条目 ${index}`,
+            `固定填充内容 ${spaceIndex}-${index}。`,
+            { updatedAt: index },
+          ));
+        }
+        candidate.writePage(page(
+          spaceIndex === stores.length - 1 ? "entities/alice-incident" : `concepts/fair-${spaceIndex}-60`,
+          spaceIndex === stores.length - 1 ? "Alice" : `空间 ${spaceIndex} 条目 60`,
+          spaceIndex === stores.length - 1
+            ? "Alice 负责生产事故响应。"
+            : `固定填充内容 ${spaceIndex}-60。`,
+          { updatedAt: 10_000 },
+        ));
+      }
+      const fake = scriptedLlm({
+        routeSlugs: ["entities/alice-incident"],
+        relevant: true,
+        answer: "线上故障应联系 Alice。",
+        grounded: true,
+        usedSlugs: ["entities/alice-incident"],
+      });
+
+      const result = await ask(
+        stores,
+        "线上故障该找哪位？",
+        {},
+        { client: fake },
+      );
+
+      expect(result).toEqual(expect.objectContaining({
+        source: "knowledge",
+        citations: [{ slug: "entities/alice-incident", title: "Alice" }],
+      }));
+    } finally {
+      for (const candidate of extras) candidate.close();
+    }
+  });
+
+  test("opaque routing does not expose spaces or mix pages that share a slug", async () => {
+    const personalSpace: SpaceId = "personal/ou_ask";
+    const personal = new SpaceStore(personalSpace, dir);
+    personal.ensure();
+    try {
+      store.writePage(page(
+        "entities/alice",
+        "Team Alice",
+        "This team-space page contains the wrong Alice record.",
+      ));
+      personal.writePage(page(
+        "entities/alice",
+        "Personal Alice",
+        "This personal-space page is the intended Alice record.",
+      ));
+      const fake = new FakeLlm();
+      fake.onJSON((call) => {
+        const properties = (call.schema as { properties?: Record<string, unknown> }).properties ?? {};
+        if ("relevant" in properties) {
+          const prompt = String(call.prompt);
+          expect(prompt).not.toContain(SPACE);
+          expect(prompt).not.toContain(personalSpace);
+          const personalLine = prompt.split("\n").find((line) => line.includes("Personal Alice"));
+          const candidateKey = personalLine?.match(/^- (page-\d+)/u)?.[1];
+          expect(candidateKey).toBeDefined();
+          return { slugs: [candidateKey!], relevant: true };
+        }
+        expect(String(call.prompt)).toContain("intended Alice record");
+        expect(String(call.prompt)).not.toContain("wrong Alice record");
+        return {
+          answer: "Use the personal Alice record.",
+          grounded: true,
+          usedSlugs: ["entities/alice"],
+          gaps: [],
+        };
+      });
+      fake.onText(() => "general fallback answer");
+      let evidence: unknown;
+
+      const result = await ask(
+        [store, personal],
+        "Resolve the ambiguous Alice reference.",
+        {},
+        {
+          client: fake,
+          onRetrieval: (value) => {
+            evidence = value;
+          },
+        },
+      );
+
+      expect(result).toEqual(expect.objectContaining({
+        source: "knowledge",
+        citations: [{ slug: "entities/alice", title: "Personal Alice", space: personalSpace }],
+      }));
+      expect(evidence).toEqual({
+        pages: [{
+          space: personalSpace,
+          slug: "entities/alice",
+          contentHash: "h",
+        }],
+      });
+    } finally {
+      personal.close();
+    }
+  });
+
+  test("reports the exact loaded page hashes used by the retrieval pipeline", async () => {
+    store.writePage(page("entities/alice", "Alice", "backend owner", {
+      contentHash: "sha256-source-alice",
+    }));
+    const fake = scriptedLlm({
+      routeSlugs: ["entities/alice"],
+      relevant: true,
+      answer: "Alice owns the backend.",
+      grounded: true,
+      usedSlugs: ["entities/alice"],
+    });
+    let evidence: unknown;
+
+    await ask([store], "Who owns the backend?", {}, {
+      client: fake,
+      onRetrieval: (value) => {
+        evidence = value;
+      },
+    });
+
+    expect(evidence).toEqual({
+      pages: [{
+        space: SPACE,
+        slug: "entities/alice",
+        contentHash: "sha256-source-alice",
+      }],
+    });
+  });
+
   test("out-of-KB question falls back to general (Q1)", async () => {
     store.writePage(page("entities/alice", "Alice", "Alice 负责后端服务。"));
     const fake = scriptedLlm({
@@ -158,6 +478,7 @@ describe("ask pipeline", () => {
     expect(res.source).toBe("general");
     expect(res.citations).toEqual([]);
     expect(res.answer).toContain("北京");
+    expect(fake.calls.filter((call) => call.kind === "json")).toHaveLength(1);
   });
 
   test("empty knowledge base uses general fallback (Q3 cold start)", async () => {
@@ -209,6 +530,29 @@ describe("ask pipeline", () => {
     expect(String(call?.opts.system)).toContain("意图或指代不清");
     expect(String(call?.opts.system)).toContain("只追问一个");
     expect(String(call?.opts.prompt)).toContain("帮我处理一下这个");
+  });
+
+  test("general fallback preserves that the bound Agent workdir was available", async () => {
+    const fake = scriptedLlm({
+      routeSlugs: [],
+      relevant: false,
+      answer: "",
+      grounded: false,
+      generalText: "后端由 Alice 负责。",
+    });
+
+    const res = await ask(
+      [store],
+      "谁负责后端？",
+      { fallbackContext: "agent-workdir" },
+      { client: fake },
+    );
+
+    expect(res.context).toBe("agent-workdir");
+    expect(res.answer).toBe("后端由 Alice 负责。");
+    const call = fake.calls.find((candidate) => candidate.kind === "complete");
+    expect(String(call?.opts.system)).toContain("绑定工作目录");
+    expect(String(call?.opts.system)).not.toContain("以下是我的一般性回答");
   });
 
   test("knowledgeOnly never falls back to general", async () => {

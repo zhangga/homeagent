@@ -8,6 +8,7 @@ import {
 } from "./agent-workbench.ts";
 
 const STATUS_LABELS = {
+  awaiting_approval: "待审批",
   queued: "排队中",
   running: "运行中",
   succeeded: "已完成",
@@ -1272,8 +1273,8 @@ export function agentWorkbenchView(
         <details class="agent-task-execution" ${taskExecutionOpen ? "open" : ""}>
           <summary>
             <span class="agent-task-summary-copy">
-              任务执行
-              <small>仅影响研究任务</small>
+              执行上下文
+              <small>Permission 仅影响任务；Codex 普通会话只读使用 Workdir</small>
             </span>
           </summary>
           <div class="agent-task-fields">
@@ -1299,7 +1300,7 @@ export function agentWorkbenchView(
             <div class="agent-field agent-create-field">
               <label class="agent-field-label" for="agent-workdir">
                 Workdir
-                <small>可写与完全访问权限必填</small>
+                <small>Codex 普通会话只读使用；可写与完全访问权限必填</small>
               </label>
               <div class="agent-field-control">
                 <input
@@ -1345,21 +1346,35 @@ export function agentWorkbenchView(
           ${errorFor(view.errors, "name")}
         </div>
         <span class="agent-save-state" id="agent-save-state">未保存</span>
+        ${isEditing && view.revision
+          ? html`<span class="agent-count">线上 v${view.revision.history.find((item) => item.published)?.number ?? "—"}</span>
+              ${view.revision.draftRevisionId ? html`<span class="badge general">有未发布草稿</span>` : ""}`
+          : ""}
       </div>
       <div class="agent-editor-actions">
         <button type="button" class="agent-secondary agent-inspector-toggle" data-inspector-toggle>
           详情
         </button>
         <a class="agent-secondary" href="${cancelHref}">取消</a>
-        <button class="agent-primary" type="submit" form="agent-editor-form">
-          ${isEditing ? "保存更改" : "创建 Agent"}
-        </button>
+        ${isEditing ? html`
+          <button class="agent-secondary" type="submit" form="agent-editor-form" name="agentAction" value="draft">保存草稿</button>
+          <button
+            class="agent-primary"
+            type="submit"
+            form="agent-editor-form"
+            name="agentAction"
+            value="publish"
+          >发布</button>
+        ` : html`<button class="agent-primary" type="submit" form="agent-editor-form">创建 Agent</button>`}
       </div>
     </div>
     <div class="agent-editor-scroll agent-editor-context">
       ${view.flash ? html`<div class="agent-flash" role="status">${view.flash}</div>` : ""}
       ${view.formError ? html`<div class="agent-form-alert" role="alert">${view.formError}</div>` : ""}
       <form method="post" action="${formAction}" id="agent-editor-form" class="agent-context-form">
+        ${isEditing && view.revision?.headRevisionId
+          ? html`<input type="hidden" name="expectedHeadRevisionId" value="${view.revision.headRevisionId}" />`
+          : ""}
         <section class="agent-context-section" aria-labelledby="agent-instruction-label">
           <div class="agent-context-heading">
             <label class="agent-context-label" id="agent-instruction-label" for="agent-instruction">Instruction</label>
@@ -1400,6 +1415,8 @@ export function agentWorkbenchView(
                     <span class="agent-run-icon" aria-hidden="true">
                       ${run.status === "recorded"
                         ? "◆"
+                        : run.status === "awaiting_approval"
+                        ? "?"
                         : run.status === "succeeded"
                         ? "✓"
                         : run.status === "running" || run.status === "queued"
@@ -1628,6 +1645,34 @@ export function agentWorkbenchView(
             `)
           : html`<div class="agent-inspector-empty">尚未绑定任何空间</div>`}
       </section>
+      ${isEditing && view.revision ? html`
+        <section class="agent-inspector-section">
+          <h3 class="agent-inspector-label">发布历史 <span>${view.revision.history.length}</span></h3>
+          ${view.revision.history.map((revision) => html`
+            <div class="agent-binding">
+              <div class="agent-binding-title">
+                v${revision.number} · ${revision.published ? "线上" : revision.draft ? "草稿" : revision.source}
+              </div>
+              <div class="agent-binding-meta">
+                ${revision.provider} / ${revision.model} · ${PERMISSION_LABELS[revision.permission] ?? revision.permission}
+                · ${formatTime(revision.createdAt)}
+              </div>
+              ${!revision.published && revision.source !== "draft" ? html`
+                <form
+                  method="post"
+                  action="/agents/${encodeURIComponent(view.selected!.id)}/revisions/${encodeURIComponent(revision.id)}/rollback"
+                  onsubmit="return confirm('将此历史版本重新发布为一个新版本？')"
+                >
+                  ${view.revision?.headRevisionId
+                    ? html`<input type="hidden" name="expectedHeadRevisionId" value="${view.revision.headRevisionId}" />`
+                    : ""}
+                  <button type="submit" class="agent-secondary">回滚到此版本</button>
+                </form>
+              ` : ""}
+            </div>
+          `)}
+        </section>
+      ` : ""}
       ${isEditing ? html`
         <section class="agent-inspector-section">
           <h3 class="agent-inspector-label">Danger zone</h3>

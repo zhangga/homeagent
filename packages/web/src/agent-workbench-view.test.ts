@@ -227,7 +227,11 @@ describe("Agent workbench view", () => {
     expect(body).toContain('role="separator"');
     expect(body).toContain('data-agent-name="运营研究员"');
     expect(body).toContain('data-binding-count="1"');
-    expect(body).toContain("保存更改");
+    expect(body).toContain("保存草稿");
+    expect(body).toContain(">发布<");
+    expect(body).toContain('name="agentAction"');
+    expect(body).toContain('value="draft"');
+    expect(body).toContain('value="publish"');
     const inspectorBody = body.slice(body.indexOf('data-pane="agent-inspector"'));
     expect(inspectorBody).toContain(">Agent 设置<");
     expect(inspectorBody).not.toContain("Recent task runs");

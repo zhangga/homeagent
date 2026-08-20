@@ -83,6 +83,43 @@ describe("runDoctor", () => {
     expect(JSON.stringify(report)).not.toContain(paths.larkBin);
   });
 
+  test("accepts an available Codex provider for restricted ordinary conversations", async () => {
+    const ordinaryProbes = probes();
+    delete (ordinaryProbes as Partial<DoctorProbeSet>).aiProvider;
+    const report = await runDoctor({
+      platform: "darwin",
+      paths,
+      port: 3000,
+      probes: ordinaryProbes,
+      detectProviders: async () => [
+        { id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" },
+      ],
+    });
+
+    expect(report.checks.find((check) => check.id === "ai-provider")?.status).toBe("pass");
+    expect(report.checks.find((check) => check.id === "ai-provider")?.message)
+      .toContain("安全普通对话");
+    expect(report.status).toBe("pass");
+  });
+
+  test("accepts an available Claude provider for ordinary conversations", async () => {
+    const ordinaryProbes = probes();
+    delete (ordinaryProbes as Partial<DoctorProbeSet>).aiProvider;
+    const report = await runDoctor({
+      platform: "darwin",
+      paths,
+      port: 3000,
+      probes: ordinaryProbes,
+      detectProviders: async () => [
+        { id: "claude", name: "Claude", bin: "claude", available: true, detail: "2.0" },
+        { id: "trae-cli", name: "TRAE", bin: "trae-cli", available: true, detail: "1.0" },
+      ],
+    });
+
+    expect(report.checks.find((check) => check.id === "ai-provider")?.status).toBe("pass");
+    expect(report.status).toBe("pass");
+  });
+
   test("doctor --json writes directly parseable, sanitized JSON", async () => {
     let output = "";
     const exitCode = await runDoctorCli({

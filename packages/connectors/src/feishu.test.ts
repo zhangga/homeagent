@@ -619,12 +619,16 @@ describe("FeishuConnector outbound", () => {
         return "{}";
       },
     });
-    await connector.notice("oc_group", "欢迎语");
+    await connector.notice("oc_group", "欢迎语", {
+      idempotencyKey: "ha-appr-run_approval",
+    });
     const cmd = commands[0]!;
     expect(cmd).toContain("+messages-send");
     expect(cmd).toContain("--chat-id");
     expect(cmd).toContain("oc_group");
     expect(cmd).toContain("欢迎语");
+    expect(cmd).toContain("--idempotency-key");
+    expect(cmd).toContain("ha-appr-run_approval");
   });
 
   test("notice propagates delivery failures so durable callers can retry", async () => {

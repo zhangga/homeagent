@@ -6,12 +6,14 @@
  * all CLI provider traffic — like gateway.ts is for the network gateway.
  *
  * Two responsibilities:
- *   - detectProviders(): probe each known CLI with `--version` (bounded), so the
- *     backend only offers providers that are actually installed AND runnable.
+ *   - detectProviders(): probe each known CLI with `--version` (bounded), and
+ *     verify Claude's no-tools argv and authenticated status with no-completion
+ *     probes, so the backend only offers providers that are runnable and ready.
  *     (A CLI can be on PATH yet broken — e.g. a Windows npm shim under WSL with
  *     no linux `node` — and must NOT be offered.)
- *   - runProvider(): spawn the CLI non-interactively with a prompt/system/model
- *     and return its stdout text.
+ *   - runProviderDetailed(): spawn the CLI non-interactively and normalize its
+ *     answer plus any structured usage it reports. runProvider() keeps the
+ *     legacy text-only boundary for external callers.
  *
  * The built-in "gateway" provider (the Anthropic network gateway) is handled by
  * gateway.ts, not here; it is always available and is the default.
@@ -24,6 +26,39 @@ const log = logger.child("providers");
 
 /** Stable provider ids. "gateway" is the built-in network provider (elsewhere). */
 export type ProviderId = "gateway" | "claude" | "codex" | "trae-cli";
+
+export type UsageCostBasis = "reported" | "estimated" | "unavailable";
+export type UsageSource = "claude-json" | "codex-jsonl" | "trae-text" | "gateway" | "legacy-text";
+
+/** Provider usage counters preserve provenance and leave unavailable values absent. */
+export interface CompletionUsage {
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  outputTokens?: number;
+  reasoningTokens?: number;
+  costUsd?: number;
+  costBasis: UsageCostBasis;
+  source: UsageSource;
+}
+
+/** Structured result returned by a local CLI adapter. */
+export interface ProviderRunResult {
+  text: string;
+  model?: string;
+  usage: CompletionUsage;
+}
+
+export class ProviderRunError extends Error {
+  constructor(
+    readonly provider: ProviderId,
+    message: string,
+    readonly usage: CompletionUsage,
+  ) {
+    super(message);
+    this.name = "ProviderRunError";
+  }
+}
 
 /** Reasoning levels currently exposed by the GPT-5.6 family in Codex. */
 export const CODEX_REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
@@ -98,7 +133,11 @@ export interface RunInput {
   reasoningEffort?: CodexReasoningEffort;
   /** local images attached to the current user turn */
   images?: ImageInput[];
-  /** Present only for an explicit task execution, never ordinary Q&A/distillation. */
+  /** Safe pinned-Skill identifiers supplied independently of ProviderExecution. */
+  skills?: string[];
+  /** Canonical Agent working directory used as read-only context for ordinary calls. */
+  workdir?: string;
+  /** Present only for an explicit task or web-research grant, never ordinary Q&A/distillation. */
   execution?: ProviderExecution;
 }
 
@@ -185,17 +224,29 @@ const KNOWN: CliSpec[] = [
     versionArgs: ["--version"],
     models: ["sonnet", "opus", "haiku", "claude-sonnet-4-6", "claude-opus-4-8"],
     buildRun: ({ prompt, system, model, execution }) => {
-      // Lean/read-only mode: --bare skips hooks/CLAUDE.md/memory/keychain and
-      // --allowedTools "" disables all tools. Measured ~2.6x faster and avoids
-      // permission prompts — right for Q&A/distillation (no side effects).
-      const args = ["-p", prompt, "--bare"];
+      // Safe mode preserves OAuth/keychain authentication while disabling
+      // ambient CLAUDE.md, hooks, plugins, MCP servers and custom commands.
+      // Explicitly pinned native Skills need Claude's Skill discovery, so those
+      // authorized task calls rely on the frozen tool grant plus strict MCP.
+      const args = ["-p", prompt];
+      if (!execution || execution.webSearch || execution.skills.length === 0) {
+        args.push("--safe-mode");
+      }
+      args.push(
+        "--no-session-persistence",
+        "--strict-mcp-config",
+        "--output-format",
+        "json",
+      );
       if (!execution) {
-        args.push("--allowedTools", "");
+        // --allowedTools only changes approval; --tools "" actually removes
+        // every built-in tool from the ordinary completion process.
+        args.push("--tools", "");
       } else if (execution.permission === "read-only") {
         args.push(
           "--tools",
           execution.webSearch
-            ? "Read,Glob,Grep,WebSearch,WebFetch"
+            ? "WebSearch,WebFetch"
             : "Read,Glob,Grep",
           "--permission-mode",
           "dontAsk",
@@ -235,15 +286,24 @@ const KNOWN: CliSpec[] = [
       "gpt-5.3-codex-spark",
     ],
     buildRun: ({ model, reasoningEffort, images, execution }) => {
-      // Ordinary LLM work stays read-only; task execution maps the Agent's
-      // permission tier to Codex's sandbox without interactive approvals.
-      const args: string[] = [];
+      // Only explicit task execution reaches this adapter. Ephemeral mode and
+      // ignored ambient config/rules isolate each one-shot from global state.
+      const args: string[] = ["-c", 'approval_policy="never"'];
       if (reasoningEffort) args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
-      if (execution) args.push("-c", 'approval_policy="never"');
       if (execution?.webSearch) args.push("--search");
       const sandbox = sandboxForPermission(execution?.permission);
-      args.push("exec", "--sandbox", sandbox);
-      if (execution) args.push("--skip-git-repo-check");
+      // Codex 0.147+ scopes these isolation flags to the `exec` subcommand.
+      // Keeping them before `exec` makes the CLI exit during argument parsing.
+      args.push(
+        "exec",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--json",
+        "--sandbox",
+        sandbox,
+      );
+      args.push("--skip-git-repo-check");
       if (model) args.push("-m", model);
       for (const image of images ?? []) args.push("--image", image.path);
       // Codex's --image accepts multiple values. Terminate option parsing
@@ -275,6 +335,40 @@ const KNOWN: CliSpec[] = [
 export const GATEWAY_MODELS = ["claude-sonnet-5", "claude-haiku-4-5-20251001", "claude-opus-4-8"];
 
 const specById = new Map<ProviderId, CliSpec>(KNOWN.map((s) => [s.id, s]));
+
+/** Every Claude flag used by ordinary Chat/dream/learning execution. */
+const CLAUDE_ORDINARY_REQUIRED_FLAGS = [
+  "-p",
+  "--safe-mode",
+  "--no-session-persistence",
+  "--strict-mcp-config",
+  "--output-format",
+  "--tools",
+  "--model",
+  "--append-system-prompt",
+] as const;
+const MAX_CLAUDE_AUTH_STATUS_BYTES = 16 * 1024;
+const CLAUDE_AUTH_UNAVAILABLE_DETAIL = "Claude 认证不可用";
+
+function missingClaudeOrdinaryFlags(help: string): string[] {
+  const flags = new Set(help.match(/--?[a-zA-Z][a-zA-Z0-9-]*/gu) ?? []);
+  return CLAUDE_ORDINARY_REQUIRED_FLAGS.filter((flag) => !flags.has(flag));
+}
+
+function claudeAuthIsLoggedIn(stdout: string): boolean {
+  if (Buffer.byteLength(stdout, "utf8") > MAX_CLAUDE_AUTH_STATUS_BYTES) return false;
+  try {
+    const value: unknown = JSON.parse(stdout);
+    return Boolean(
+      value
+      && typeof value === "object"
+      && !Array.isArray(value)
+      && (value as { loggedIn?: unknown }).loggedIn === true,
+    );
+  } catch {
+    return false;
+  }
+}
 
 /** Spawn a command with a hard timeout; resolve stdout/stderr/exit code. */
 async function runCmd(
@@ -339,8 +433,10 @@ async function runCmd(
 
 /**
  * Probe every known CLI once. A provider is "available" only if its version
- * command exits 0 and prints something (installed AND runnable). Bounded so a
- * hanging CLI can't stall the backend.
+ * command exits 0 and prints something (installed AND runnable). Claude also
+ * needs no-completion `--help` and `auth status --json` probes proving every
+ * ordinary no-tools flag exists and the CLI considers its current auth usable.
+ * Bounded so a hanging CLI can't stall the backend.
  */
 export async function detectProviders(timeoutMs = 6000): Promise<DetectedProvider[]> {
   const out: DetectedProvider[] = [];
@@ -352,6 +448,67 @@ export async function detectProviders(timeoutMs = 6000): Promise<DetectedProvide
       if (timedOut) {
         out.push({ ...base(spec, bin), available: false, detail: "探测超时" });
       } else if (code === 0 && version && !/not found|no such|cannot|error/i.test(version)) {
+        if (spec.id !== "claude") {
+          out.push({ ...base(spec, bin), available: true, detail: version });
+          continue;
+        }
+        let helpProbe: Awaited<ReturnType<typeof runCmd>>;
+        try {
+          helpProbe = await runCmd(bin, ["--help"], timeoutMs);
+        } catch (err) {
+          out.push({
+            ...base(spec, bin),
+            available: false,
+            detail: `普通对话能力探测失败（${String(err).slice(0, 40)}）`,
+          });
+          continue;
+        }
+        if (helpProbe.timedOut) {
+          out.push({ ...base(spec, bin), available: false, detail: "普通对话能力探测超时" });
+          continue;
+        }
+        if (helpProbe.code !== 0) {
+          out.push({
+            ...base(spec, bin),
+            available: false,
+            detail: `普通对话能力探测失败（退出码 ${helpProbe.code}）`,
+          });
+          continue;
+        }
+        const missingFlags = missingClaudeOrdinaryFlags(
+          `${helpProbe.stdout}\n${helpProbe.stderr}`,
+        );
+        if (missingFlags.length > 0) {
+          out.push({
+            ...base(spec, bin),
+            available: false,
+            detail: `普通对话不可用：缺少 ${missingFlags.join("、")}`,
+          });
+          continue;
+        }
+        let authProbe: Awaited<ReturnType<typeof runCmd>>;
+        try {
+          authProbe = await runCmd(bin, ["auth", "status", "--json"], timeoutMs);
+        } catch {
+          out.push({
+            ...base(spec, bin),
+            available: false,
+            detail: CLAUDE_AUTH_UNAVAILABLE_DETAIL,
+          });
+          continue;
+        }
+        if (
+          authProbe.timedOut
+          || authProbe.code !== 0
+          || !claudeAuthIsLoggedIn(authProbe.stdout)
+        ) {
+          out.push({
+            ...base(spec, bin),
+            available: false,
+            detail: CLAUDE_AUTH_UNAVAILABLE_DETAIL,
+          });
+          continue;
+        }
         out.push({ ...base(spec, bin), available: true, detail: version });
       } else {
         out.push({ ...base(spec, bin), available: false, detail: version || `退出码 ${code}` });
@@ -380,6 +537,11 @@ export function isCliProvider(id: string): id is ProviderId {
   return specById.has(id as ProviderId);
 }
 
+/** True when ordinary Chat/dream/learning can run in the provider's restricted mode. */
+export function providerSupportsOrdinaryCompletion(id: string): id is "claude" | "codex" {
+  return id === "claude" || id === "codex";
+}
+
 /**
  * Curated model ids per CLI provider id. Drives the provider-dependent Model
  * dropdown (mew shows different models per provider). Free-text is still
@@ -396,6 +558,16 @@ export function providerFailureDetail(stdout: string, stderr: string): string {
   return (stderr.trim() || stdout.trim() || "no output").slice(0, 300);
 }
 
+function structuredFailureDetail(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const detail = value
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
+    .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return detail ? detail.slice(0, 300) : undefined;
+}
+
 /** The curated CLI model catalog, keyed by provider id. */
 export function curatedProviderModels(): Record<string, string[]> {
   const map: Record<string, string[]> = {};
@@ -403,23 +575,34 @@ export function curatedProviderModels(): Record<string, string[]> {
   return map;
 }
 
-function injectExecutionSkills(id: ProviderId, input: RunInput): RunInput {
-  if (!input.execution) return input;
+function injectProviderSkills(id: ProviderId, input: RunInput): RunInput {
   const skills = normalizeProviderSkills(
-    Array.isArray(input.execution.skills) ? input.execution.skills : [],
+    Array.isArray(input.execution?.skills)
+      ? input.execution.skills
+      : Array.isArray(input.skills)
+        ? input.skills
+        : [],
   );
   const prepared = {
     ...input,
-    execution: {
-      permission: normalizeProviderPermission(input.execution.permission),
-      workdir: typeof input.execution.workdir === "string"
-        ? input.execution.workdir
-        : undefined,
-      skills,
-      webSearch: input.execution.webSearch === true,
-    },
+    skills,
+    ...(input.execution
+      ? {
+          execution: {
+            permission: normalizeProviderPermission(input.execution.permission),
+            workdir: typeof input.execution.workdir === "string"
+              ? input.execution.workdir
+              : undefined,
+            skills,
+            webSearch: input.execution.webSearch === true,
+          },
+        }
+      : {}),
   };
-  if (skills.length === 0) return prepared;
+  // Native Skill invocation is itself an agent capability. Ordinary
+  // completions are intentionally no-tools/no-customizations, so keep their
+  // evidence in the Run trace but do not tell the CLI to load a local Skill.
+  if (!prepared.execution || skills.length === 0) return prepared;
   const references = skills
     .map((skill) => providerSkillReference(id, skill))
     .filter((reference): reference is string => Boolean(reference));
@@ -435,18 +618,18 @@ function injectExecutionSkills(id: ProviderId, input: RunInput): RunInput {
 }
 
 /**
- * Run a one-shot completion via a local CLI provider. Returns trimmed stdout.
+ * Run a one-shot completion via a local CLI provider with normalized usage.
  * Throws on non-zero exit / timeout so callers can surface a bounded failure.
  * These CLIs are full coding agents: slower and heavier than the gateway, and
  * they manage their own auth — so this is best-effort "hand the question to the
  * local agent", not a lightweight completion.
  */
-export async function runProvider(
+export async function runProviderDetailed(
   id: ProviderId,
   input: RunInput,
   timeoutMs = 120_000,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<ProviderRunResult> {
   const spec = specById.get(id);
   if (!spec) throw new Error(`unknown provider: ${id}`);
   if ((input.images?.length ?? 0) > 4) {
@@ -455,12 +638,20 @@ export async function runProvider(
   if (input.images?.length && id !== "codex") {
     throw new UnsupportedImageInputError(id);
   }
-  const prepared = injectExecutionSkills(id, input);
+  const prepared = injectProviderSkills(id, input);
+  if (!prepared.execution && id === "trae-cli") {
+    throw new Error(`provider ${id} cannot provide a no-tools execution mode`);
+  }
   if (prepared.execution?.webSearch && prepared.execution.permission !== "read-only") {
     throw new Error("web search requires read-only provider execution");
   }
   if (prepared.execution?.webSearch && id === "trae-cli") {
     throw new Error("provider trae-cli does not support web search");
+  }
+  if (prepared.execution?.webSearch && id === "codex") {
+    throw new Error(
+      "provider codex cannot isolate web search from local file tools",
+    );
   }
   const args = spec.buildRun(prepared);
   if (id === "codex" && brandedEnv(process.env, "CODEX_BIN")?.trim()) {
@@ -473,13 +664,165 @@ export async function runProvider(
     args,
     timeoutMs,
     signal,
-    prepared.execution?.workdir,
+    prepared.execution?.workdir ?? prepared.workdir,
     id === "codex" ? prepared.prompt : undefined,
   );
   if (aborted) throw signal?.reason ?? new Error(`provider ${id} cancelled`);
   if (timedOut) throw new Error(`provider ${id} timed out after ${timeoutMs}ms`);
-  if (code !== 0) throw new Error(`provider ${id} exited ${code}: ${providerFailureDetail(stdout, stderr)}`);
-  return stdout.trim();
+  if (code !== 0) {
+    if (id === "claude") {
+      const parsed = parseClaudeResult(stdout);
+      if (parsed) {
+        throw new ProviderRunError(
+          id,
+          `provider ${id} exited ${code}: ${providerFailureDetail(stdout, stderr)}`,
+          parsed.usage,
+        );
+      }
+    }
+    if (id === "codex") {
+      const parsed = parseCodexResult(stdout);
+      if (parsed) {
+        throw new ProviderRunError(
+          id,
+          `provider ${id} exited ${code}: ${providerFailureDetail(stdout, stderr)}`,
+          parsed.usage,
+        );
+      }
+    }
+    throw new Error(`provider ${id} exited ${code}: ${providerFailureDetail(stdout, stderr)}`);
+  }
+  if (id === "claude") {
+    const parsed = parseClaudeResult(stdout);
+    if (parsed) return parsed;
+    return unavailableResult(stdout, "legacy-text");
+  }
+  if (id === "codex") {
+    const parsed = parseCodexResult(stdout);
+    if (parsed) return parsed;
+    return unavailableResult(stdout, "legacy-text");
+  }
+  return unavailableResult(stdout, "trae-text");
+}
+
+/** Backward-compatible text-only provider API. */
+export async function runProvider(
+  id: ProviderId,
+  input: RunInput,
+  timeoutMs = 120_000,
+  signal?: AbortSignal,
+): Promise<string> {
+  return (await runProviderDetailed(id, input, timeoutMs, signal)).text;
+}
+
+function unavailableResult(text: string, source: UsageSource): ProviderRunResult {
+  return {
+    text: text.trim(),
+    usage: { costBasis: "unavailable", source },
+  };
+}
+
+function nonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function parseClaudeResult(stdout: string): ProviderRunResult | undefined {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(stdout.trim());
+  } catch {
+    return undefined;
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const result = raw as Record<string, unknown>;
+  if (result.type !== "result") return undefined;
+  const rawUsage = result.usage && typeof result.usage === "object" && !Array.isArray(result.usage)
+    ? result.usage as Record<string, unknown>
+    : {};
+  const usage: CompletionUsage = {
+    inputTokens: nonNegativeNumber(rawUsage.input_tokens),
+    cachedInputTokens: nonNegativeNumber(rawUsage.cache_read_input_tokens),
+    cacheCreationInputTokens: nonNegativeNumber(rawUsage.cache_creation_input_tokens),
+    outputTokens: nonNegativeNumber(rawUsage.output_tokens),
+    costUsd: nonNegativeNumber(result.total_cost_usd),
+    costBasis: nonNegativeNumber(result.total_cost_usd) === undefined
+      ? "unavailable"
+      : "reported",
+    source: "claude-json",
+  };
+  for (const key of Object.keys(usage) as (keyof CompletionUsage)[]) {
+    if (usage[key] === undefined) delete usage[key];
+  }
+  if (
+    result.is_error === true
+    || (typeof result.subtype === "string" && result.subtype.startsWith("error"))
+  ) {
+    const subtype = typeof result.subtype === "string" ? result.subtype : "error";
+    const detail = structuredFailureDetail(result.result);
+    throw new ProviderRunError(
+      "claude",
+      `provider claude returned ${subtype}${detail ? `: ${detail}` : ""}`,
+      usage,
+    );
+  }
+  if (typeof result.result !== "string") return undefined;
+  return { text: result.result.trim(), usage };
+}
+
+function parseCodexResult(stdout: string): ProviderRunResult | undefined {
+  let text: string | undefined;
+  let failure: string | undefined;
+  let rawUsage: Record<string, unknown> | undefined;
+  for (const line of stdout.split(/\r?\n/u)) {
+    if (!line.trim()) continue;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const event = raw as Record<string, unknown>;
+    if (event.type === "item.completed" && event.item && typeof event.item === "object") {
+      const item = event.item as Record<string, unknown>;
+      if (item.type === "agent_message" && typeof item.text === "string") {
+        text = item.text;
+      }
+    }
+    if (
+      (event.type === "turn.completed" || event.type === "turn.failed")
+      && event.usage
+      && typeof event.usage === "object"
+      && !Array.isArray(event.usage)
+    ) {
+      rawUsage = event.usage as Record<string, unknown>;
+    }
+    if (event.type === "turn.failed") {
+      const error = event.error && typeof event.error === "object" && !Array.isArray(event.error)
+        ? event.error as Record<string, unknown>
+        : undefined;
+      failure = typeof error?.message === "string" ? error.message : "turn.failed";
+    }
+  }
+  const usage: CompletionUsage = {
+    inputTokens: nonNegativeNumber(rawUsage?.input_tokens),
+    cachedInputTokens: nonNegativeNumber(rawUsage?.cached_input_tokens),
+    cacheCreationInputTokens: nonNegativeNumber(rawUsage?.cache_write_input_tokens),
+    outputTokens: nonNegativeNumber(rawUsage?.output_tokens),
+    reasoningTokens: nonNegativeNumber(rawUsage?.reasoning_output_tokens),
+    costBasis: "unavailable",
+    source: "codex-jsonl",
+  };
+  for (const key of Object.keys(usage) as (keyof CompletionUsage)[]) {
+    if (usage[key] === undefined) delete usage[key];
+  }
+  if (failure !== undefined) {
+    throw new ProviderRunError("codex", `provider codex returned ${failure}`, usage);
+  }
+  if (text === undefined) return undefined;
+  return { text: text.trim(), usage };
 }
 
 /** Normalize provider timeout detection across traces, metrics, and user notices. */

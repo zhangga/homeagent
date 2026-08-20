@@ -14,9 +14,16 @@
  */
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import type { Hit, Page, PageRef, RawEntry, RawRecord } from "@homeagent/shared";
+import type { Hit, Page, PageRef, RawAdmission, RawEntry, RawRecord } from "@homeagent/shared";
 import type { MessageRetractionRecord } from "./governance.ts";
 import { toMatchQuery, toSearchText } from "./tokenize.ts";
+
+export const MAX_SEARCH_RESULTS = 100;
+
+export function normalizeSearchLimit(limit: number): number {
+  if (!Number.isSafeInteger(limit) || limit <= 0) return 0;
+  return Math.min(limit, MAX_SEARCH_RESULTS);
+}
 
 export class SpaceIndex {
   private db: Database;
@@ -58,6 +65,8 @@ export class SpaceIndex {
         id TEXT PRIMARY KEY,
         space TEXT NOT NULL,
         source TEXT NOT NULL,
+        work_item_id TEXT,
+        work_action_id TEXT,
         agent_id TEXT,
         agent_handled INTEGER,
         agent_response TEXT,
@@ -68,12 +77,20 @@ export class SpaceIndex {
         content TEXT NOT NULL,
         attachments_json TEXT NOT NULL DEFAULT '[]',
         created INTEGER NOT NULL,
-        ingested INTEGER NOT NULL DEFAULT 0
+        ingested INTEGER NOT NULL DEFAULT 0,
+        admission TEXT NOT NULL DEFAULT 'ready'
+          CHECK(admission IN ('ready', 'held', 'excluded'))
       )
     `);
     const rawColumns = this.db.query(`PRAGMA table_info(raw)`).all() as {
       name: string;
     }[];
+    if (!rawColumns.some((column) => column.name === "work_item_id")) {
+      this.db.run(`ALTER TABLE raw ADD COLUMN work_item_id TEXT`);
+    }
+    if (!rawColumns.some((column) => column.name === "work_action_id")) {
+      this.db.run(`ALTER TABLE raw ADD COLUMN work_action_id TEXT`);
+    }
     if (!rawColumns.some((column) => column.name === "agent_id")) {
       this.db.run(`ALTER TABLE raw ADD COLUMN agent_id TEXT`);
     }
@@ -85,6 +102,12 @@ export class SpaceIndex {
     }
     if (!rawColumns.some((column) => column.name === "agent_responded_at")) {
       this.db.run(`ALTER TABLE raw ADD COLUMN agent_responded_at INTEGER`);
+    }
+    if (!rawColumns.some((column) => column.name === "admission")) {
+      this.db.run(
+        `ALTER TABLE raw ADD COLUMN admission TEXT NOT NULL DEFAULT 'ready'
+         CHECK(admission IN ('ready', 'held', 'excluded'))`,
+      );
     }
     this.db.run(`
       CREATE TABLE IF NOT EXISTS message_retractions (
@@ -99,6 +122,12 @@ export class SpaceIndex {
     this.db.run(`CREATE INDEX IF NOT EXISTS raw_ingested ON raw(ingested, created)`);
     this.db.run(`CREATE INDEX IF NOT EXISTS raw_message ON raw(chat_id, message_id)`);
     this.db.run(`CREATE INDEX IF NOT EXISTS raw_chat_created ON raw(chat_id, created DESC)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS raw_work_item ON raw(work_item_id, created DESC)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS raw_work_action ON raw(work_action_id, created DESC)`);
+    this.db.run(
+      `CREATE INDEX IF NOT EXISTS raw_admission_pending
+       ON raw(admission, ingested, created)`,
+    );
     this.db.run(
       `CREATE INDEX IF NOT EXISTS raw_agent_created
        ON raw(agent_id, agent_handled, created DESC)`,
@@ -108,7 +137,17 @@ export class SpaceIndex {
 
   // ---- pages ---------------------------------------------------------------
 
+  assertPageSourcesAdmitted(page: Page): void {
+    for (const sourceId of page.sources) {
+      const source = this.getRaw(sourceId);
+      if (source && source.admission !== "ready") {
+        throw new Error(`page source Raw is not admitted: ${sourceId}`);
+      }
+    }
+  }
+
   upsertPage(page: Page): void {
+    this.assertPageSourcesAdmitted(page);
     this.db
       .query(
         `INSERT INTO pages (slug, type, title, summary, aliases_json, tags_json, sources_json, links_json, content, updated, content_hash)
@@ -184,6 +223,8 @@ export class SpaceIndex {
   // ---- search --------------------------------------------------------------
 
   search(query: string, limit = 10): Hit[] {
+    const safeLimit = normalizeSearchLimit(limit);
+    if (safeLimit === 0) return [];
     const match = toMatchQuery(query);
     if (!match) return [];
     try {
@@ -197,7 +238,7 @@ export class SpaceIndex {
            ORDER BY score
            LIMIT ?`,
         )
-        .all(match, limit) as Record<string, unknown>[];
+        .all(match, safeLimit) as Record<string, unknown>[];
       return rows.map((r) => ({
         slug: String(r.slug),
         title: String(r.title),
@@ -214,16 +255,28 @@ export class SpaceIndex {
   // ---- raw -----------------------------------------------------------------
 
   insertRaw(entry: RawEntry): string {
+    const admission = entry.admission ?? "ready";
+    const hasWorkAction = entry.workActionId !== undefined;
+    const validWorkActionCapture = hasWorkAction
+      && typeof entry.workActionId === "string"
+      && entry.workActionId.trim().length > 0
+      && entry.source === "task"
+      && admission === "held";
+    if ((hasWorkAction && !validWorkActionCapture) || (!hasWorkAction && admission !== "ready")) {
+      throw new Error("New WorkAction Raw must start as a held task owned by an action");
+    }
     const id = randomUUID();
     this.db
       .query(
-        `INSERT INTO raw (id, space, source, agent_id, agent_handled, agent_response, agent_responded_at, author, chat_id, message_id, content, attachments_json, created, ingested)
-         VALUES ($id, $space, $source, $agent, $handled, $response, $respondedAt, $author, $chat, $msg, $content, $att, $created, 0)`,
+        `INSERT INTO raw (id, space, source, work_item_id, work_action_id, agent_id, agent_handled, agent_response, agent_responded_at, author, chat_id, message_id, content, attachments_json, created, ingested, admission)
+         VALUES ($id, $space, $source, $workItem, $workAction, $agent, $handled, $response, $respondedAt, $author, $chat, $msg, $content, $att, $created, 0, $admission)`,
       )
       .run({
         $id: id,
         $space: entry.space,
         $source: entry.source,
+        $workItem: entry.workItemId ?? null,
+        $workAction: entry.workActionId ?? null,
         $agent: entry.agentId ?? null,
         $handled: entry.source === "message"
           ? (entry.agentHandled ?? Boolean(entry.agentId) ? 1 : 0)
@@ -236,6 +289,7 @@ export class SpaceIndex {
         $content: entry.content,
         $att: JSON.stringify(entry.attachments ?? []),
         $created: entry.createdAt ?? Date.now(),
+        $admission: admission,
       });
     return id;
   }
@@ -244,13 +298,15 @@ export class SpaceIndex {
   restoreRaw(record: RawRecord): void {
     this.db
       .query(
-        `INSERT INTO raw (id, space, source, agent_id, agent_handled, agent_response, agent_responded_at, author, chat_id, message_id, content, attachments_json, created, ingested)
-         VALUES ($id, $space, $source, $agent, $handled, $response, $respondedAt, $author, $chat, $msg, $content, $att, $created, $ingested)`,
+        `INSERT INTO raw (id, space, source, work_item_id, work_action_id, agent_id, agent_handled, agent_response, agent_responded_at, author, chat_id, message_id, content, attachments_json, created, ingested, admission)
+         VALUES ($id, $space, $source, $workItem, $workAction, $agent, $handled, $response, $respondedAt, $author, $chat, $msg, $content, $att, $created, $ingested, $admission)`,
       )
       .run({
         $id: record.id,
         $space: record.space,
         $source: record.source,
+        $workItem: record.workItemId ?? null,
+        $workAction: record.workActionId ?? null,
         $agent: record.agentId ?? null,
         $handled: record.agentHandled === undefined ? null : record.agentHandled ? 1 : 0,
         $response: record.agentResponse ?? null,
@@ -262,11 +318,17 @@ export class SpaceIndex {
         $att: JSON.stringify(record.attachments ?? []),
         $created: record.createdAt,
         $ingested: record.ingested ? 1 : 0,
+        $admission: record.admission,
       });
   }
 
-  listRaw(opts: { onlyPending?: boolean; limit?: number } = {}): RawRecord[] {
-    const where = opts.onlyPending ? `WHERE ingested = 0` : ``;
+  listRaw(
+    opts: { onlyPending?: boolean; onlyAdmitted?: boolean; limit?: number } = {},
+  ): RawRecord[] {
+    const filters: string[] = [];
+    if (opts.onlyPending) filters.push("ingested = 0");
+    if (opts.onlyPending || opts.onlyAdmitted) filters.push("admission = 'ready'");
+    const where = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : ``;
     const limit = opts.limit ? `LIMIT ${Math.max(0, Math.floor(opts.limit))}` : ``;
     const rows = this.db
       .query(`SELECT * FROM raw ${where} ORDER BY created ASC ${limit}`)
@@ -279,6 +341,57 @@ export class SpaceIndex {
       | Record<string, unknown>
       | null;
     return row ? rowToRaw(row) : null;
+  }
+
+  /** Admit one held WorkAction result; repeated calls for the same action are safe. */
+  promoteRawAdmission(id: string, workActionId: string): boolean {
+    return this.transitionRawAdmission(id, workActionId, "ready");
+  }
+
+  /** Exclude one held WorkAction result; terminal states cannot be reversed. */
+  excludeRawAdmission(id: string, workActionId: string): boolean {
+    return this.transitionRawAdmission(id, workActionId, "excluded");
+  }
+
+  private transitionRawAdmission(
+    id: string,
+    workActionId: string,
+    target: "ready" | "excluded",
+  ): boolean {
+    if (!workActionId.trim()) return false;
+    const result = this.db
+      .query(
+        `UPDATE raw SET admission = ?
+         WHERE id = ? AND work_action_id = ? AND admission = 'held'`,
+      )
+      .run(target, id, workActionId);
+    if (result.changes > 0) return true;
+    const row = this.db
+      .query(`SELECT admission FROM raw WHERE id = ? AND work_action_id = ?`)
+      .get(id, workActionId) as { admission: string } | null;
+    return row?.admission === target;
+  }
+
+  /**
+   * Repair pre-admission task captures from durable WorkAction state at startup.
+   * This is intentionally stronger than the normal terminal transition APIs.
+   */
+  reconcileWorkActionRawAdmission(
+    id: string,
+    workActionId: string,
+    admission: RawAdmission,
+  ): boolean {
+    if (!workActionId.trim()) return false;
+    const result = this.db
+      .query(
+        `UPDATE raw
+         SET work_action_id = ?, admission = ?
+         WHERE id = ?
+           AND source = 'task'
+           AND (work_action_id IS NULL OR work_action_id = ?)`,
+      )
+      .run(workActionId, admission, id, workActionId);
+    return result.changes > 0;
   }
 
   attributeRawToAgent(id: string, agentId: string): boolean {
@@ -317,6 +430,18 @@ export class SpaceIndex {
          ORDER BY created ASC`,
       )
       .all(messageId, chatId) as Record<string, unknown>[];
+    return rows.map(rowToRaw);
+  }
+
+  listRawsByWorkAction(workActionId: string): RawRecord[] {
+    if (!workActionId.trim()) return [];
+    const rows = this.db
+      .query(
+        `SELECT * FROM raw
+         WHERE work_action_id = ?
+         ORDER BY created ASC, id ASC`,
+      )
+      .all(workActionId) as Record<string, unknown>[];
     return rows.map(rowToRaw);
   }
 
@@ -360,17 +485,18 @@ export class SpaceIndex {
 
   listRawByIds(
     ids: string[],
-    opts: { onlyPending?: boolean; limit?: number } = {},
+    opts: { onlyPending?: boolean; onlyAdmitted?: boolean; limit?: number } = {},
   ): RawRecord[] {
     const uniqueIds = [...new Set(ids)];
     if (uniqueIds.length === 0) return [];
     const placeholders = uniqueIds.map(() => "?").join(", ");
     const pending = opts.onlyPending ? "AND ingested = 0" : "";
+    const admitted = opts.onlyAdmitted ? "AND admission = 'ready'" : "";
     const limit = opts.limit === undefined ? "" : `LIMIT ${Math.max(0, Math.floor(opts.limit))}`;
     const rows = this.db
       .query(
         `SELECT * FROM raw
-         WHERE id IN (${placeholders}) ${pending}
+         WHERE id IN (${placeholders}) ${pending} ${admitted}
          ORDER BY created ASC ${limit}`,
       )
       .all(...uniqueIds) as Record<string, unknown>[];
@@ -474,10 +600,17 @@ export class SpaceIndex {
 
   countRaw(onlyPending = false): number {
     const q = onlyPending
-      ? `SELECT COUNT(*) n FROM raw WHERE ingested = 0`
+      ? `SELECT COUNT(*) n FROM raw WHERE ingested = 0 AND admission = 'ready'`
       : `SELECT COUNT(*) n FROM raw`;
     const r = this.db.query(q).get() as { n: number };
     return r.n;
+  }
+
+  countRawByAdmission(admission: RawAdmission): number {
+    const row = this.db
+      .query(`SELECT COUNT(*) n FROM raw WHERE admission = ?`)
+      .get(admission) as { n: number };
+    return row.n;
   }
 
   /** Delete expired message bodies only after they have been distilled/handled. */
@@ -555,6 +688,8 @@ function rowToRaw(row: Record<string, unknown>): RawRecord {
     id: String(row.id),
     space: String(row.space) as RawRecord["space"],
     source: String(row.source) as RawRecord["source"],
+    ...(row.work_item_id == null ? {} : { workItemId: String(row.work_item_id) }),
+    ...(row.work_action_id == null ? {} : { workActionId: String(row.work_action_id) }),
     ...(row.agent_id == null ? {} : { agentId: String(row.agent_id) }),
     ...(row.agent_handled == null
       ? {}
@@ -576,5 +711,6 @@ function rowToRaw(row: Record<string, unknown>): RawRecord {
     })(),
     createdAt: Number(row.created ?? 0),
     ingested: Number(row.ingested ?? 0) === 1,
+    admission: String(row.admission ?? "ready") as RawRecord["admission"],
   };
 }
