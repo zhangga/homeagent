@@ -3,10 +3,16 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  SPACE_ARCHIVE_FORMAT,
+  SPACE_ARCHIVE_VERSION,
+} from "../packages/core/src/governance.ts";
+import {
   parseBetaReadinessArgs,
   verifyBetaReadiness,
   type BetaCommandRunner,
 } from "./verify-beta-readiness.ts";
+
+const currentArchiveContract = `${SPACE_ARCHIVE_FORMAT} v${SPACE_ARCHIVE_VERSION}`;
 
 const required = [
   "bun.lock",
@@ -43,7 +49,7 @@ function repo(): string {
   writeFileSync(
     join(root, "docs", "beta-release-runbook.md"),
     [
-      "Restore and verify `homeagent.space v14` before release.",
+      `Restore and verify \`${currentArchiveContract}\` before release.`,
       "Run agent_revision_lifecycle, writable_task_approval, and readonly_task_retry.",
       "",
     ].join("\n"),
@@ -158,7 +164,7 @@ describe("beta readiness verification", () => {
       repoRoot: root,
       allowDirty: true,
       checksOnly: true,
-    })).rejects.toThrow("homeagent.space v14");
+    })).rejects.toThrow(currentArchiveContract);
   });
 
   test("requires the Agent platform soak gates in both the driver and release runbook", async () => {

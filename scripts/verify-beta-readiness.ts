@@ -1,6 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
+  SPACE_ARCHIVE_FORMAT,
+  SPACE_ARCHIVE_VERSION,
+} from "../packages/core/src/governance.ts";
+import {
   inspectMacOSBundle,
   smokeMacOSBundle,
 } from "./smoke-macos-bundle.ts";
@@ -29,7 +33,7 @@ const SIGNING_ENVIRONMENT = [
   "APPLE_APP_PASSWORD",
 ] as const;
 
-const RELEASE_SPACE_ARCHIVE_CONTRACT = "homeagent.space v14";
+const RELEASE_SPACE_ARCHIVE_CONTRACT = `${SPACE_ARCHIVE_FORMAT} v${SPACE_ARCHIVE_VERSION}`;
 const RELEASE_AGENT_SOAK_SCENARIOS = [
   "agent_revision_lifecycle",
   "writable_task_approval",
