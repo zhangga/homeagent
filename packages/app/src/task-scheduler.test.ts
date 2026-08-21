@@ -17,9 +17,19 @@ import {
 } from "./task-scheduler.ts";
 
 const SPACE: SpaceId = "team/oc_tsched";
+const SECOND_SPACE: SpaceId = "team/oc_tsched_second";
 // Fixed instants in Asia/Shanghai.
 const T10 = new Date("2026-07-06T10:00:00+08:00");
 const T23 = new Date("2026-07-06T23:00:00+08:00");
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await Bun.sleep(10);
+  }
+  return predicate();
+}
 
 function task(over: Partial<Task>): Task {
   const value = {
@@ -199,6 +209,64 @@ describe("TaskScheduler.tick", () => {
     }));
   });
 
+  test("submits every independent due task before awaiting the first completion", async () => {
+    engine.close();
+    let finishFirst!: (value: string) => void;
+    const firstCompletion = new Promise<string>((resolve) => {
+      finishFirst = resolve;
+    });
+    let providerCalls = 0;
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return providerCalls === 1 ? firstCompletion : "第二个任务完成";
+      },
+    });
+    engine.ensureSpace(SPACE);
+    engine.ensureSpace(SECOND_SPACE);
+    const first = engine.tasks.create({
+      name: "慢任务",
+      space: SPACE,
+      topic: "first",
+      notify: true,
+      distillOnRun: false,
+    })!;
+    const second = engine.tasks.create({
+      name: "独立任务",
+      space: SECOND_SPACE,
+      topic: "second",
+      notify: true,
+      distillOnRun: false,
+    })!;
+    const notified: string[] = [];
+    const scheduler = new TaskScheduler(engine, {
+      notify: async (current) => {
+        notified.push(current.id);
+      },
+    });
+
+    const ticking = scheduler.tick("independent-due-tasks", T10);
+    const secondRunsBeforeFirstCompletion = engine.listTaskRuns(second.id).length;
+    const secondFinishedBeforeFirstCompletion = await waitFor(() => {
+      const run = engine.listTaskRuns(second.id)[0];
+      return run?.status === "succeeded" && run.notification?.status === "sent";
+    });
+    finishFirst("第一个任务完成");
+    const ran = await ticking;
+
+    expect(secondRunsBeforeFirstCompletion).toBe(1);
+    expect(secondFinishedBeforeFirstCompletion).toBeTrue();
+    expect(ran).toEqual([first.id, second.id]);
+    expect(notified.sort()).toEqual([first.id, second.id].sort());
+    expect(engine.listTaskRuns(first.id)[0]?.notification).toEqual(
+      expect.objectContaining({ status: "sent", attempts: 1 }),
+    );
+    expect(engine.listTaskRuns(second.id)[0]?.notification).toEqual(
+      expect.objectContaining({ status: "sent", attempts: 1 }),
+    );
+  });
+
   test("admits and waits for a due durable Task Run retry", async () => {
     engine.close();
     let providerCalls = 0;
@@ -256,6 +324,150 @@ describe("TaskScheduler.tick", () => {
       status: "succeeded",
       trigger: "retry",
       retryOf: failed.id,
+    }));
+  });
+
+  test("submits an independent due task before awaiting a slow durable retry", async () => {
+    engine.close();
+    let finishRetry!: (value: string) => void;
+    const retryCompletion = new Promise<string>((resolve) => {
+      finishRetry = resolve;
+    });
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async (_provider, input) => (
+        input.prompt.includes("slow retry topic")
+          ? retryCompletion
+          : "独立到期任务完成"
+      ),
+    });
+    engine.ensureSpace(SPACE);
+    engine.ensureSpace(SECOND_SPACE);
+    const retryTask = engine.tasks.create({
+      name: "slow retry",
+      space: SPACE,
+      topic: "slow retry topic",
+      cadence: "hourly",
+      notify: true,
+      distillOnRun: false,
+    })!;
+    const failed = engine.taskRuns.start({
+      task: retryTask,
+      trigger: "scheduled",
+      provider: "claude",
+      executionPlan: {
+        version: 1,
+        instruction: "Frozen slow retry.",
+        provider: "claude",
+        execution: { permission: "read-only", skills: [] },
+      },
+      distill: false,
+      startedAt: T10.getTime() - 3_700_000,
+    });
+    engine.taskRuns.begin(failed.id, T10.getTime() - 3_690_000);
+    engine.taskRuns.fail(failed.id, {
+      finishedAt: T10.getTime() - 3_600_000,
+      error: "Error: provider overloaded (503)",
+      failure: { phase: "provider", kind: "overloaded", retryable: true },
+      retry: {
+        attempt: 1,
+        maxAttempts: 2,
+        status: "waiting",
+        nextAttemptAt: T10.getTime(),
+      },
+    });
+    engine.tasks.setLastRun(retryTask.id, {
+      at: T10.getTime() - 3_600_000,
+      status: "error",
+      error: "Error: provider overloaded (503)",
+    });
+    const independent = engine.tasks.create({
+      name: "independent due task",
+      space: SECOND_SPACE,
+      topic: "independent due topic",
+      notify: true,
+      distillOnRun: false,
+    })!;
+    const notified: string[] = [];
+    const scheduler = new TaskScheduler(engine, {
+      notify: async (task) => {
+        notified.push(task.id);
+      },
+    });
+
+    const ticking = scheduler.tick("slow-due-retry", T10);
+    const independentRunsBeforeRetryCompletion = engine.listTaskRuns(independent.id).length;
+    const retryRunsBeforeRetryCompletion = engine.listTaskRuns(retryTask.id).length;
+    const independentFinishedBeforeRetryCompletion = await waitFor(() => {
+      const run = engine.listTaskRuns(independent.id)[0];
+      return run?.status === "succeeded" && run.notification?.status === "sent";
+    });
+    finishRetry("重试完成");
+    const ran = await ticking;
+
+    expect(independentRunsBeforeRetryCompletion).toBe(1);
+    expect(retryRunsBeforeRetryCompletion).toBe(2);
+    expect(independentFinishedBeforeRetryCompletion).toBeTrue();
+    expect(ran).toEqual([independent.id]);
+    expect(engine.listTaskRuns(retryTask.id)).toHaveLength(2);
+    expect(notified.sort()).toEqual([retryTask.id, independent.id].sort());
+    expect(engine.listTaskRuns(retryTask.id)[0]?.notification).toEqual(
+      expect.objectContaining({ status: "sent", attempts: 1 }),
+    );
+    expect(engine.listTaskRuns(independent.id)[0]?.notification).toEqual(
+      expect.objectContaining({ status: "sent", attempts: 1 }),
+    );
+  });
+
+  test("observes a retry rejection while an approval notification is still pending", async () => {
+    let finishApprovalNotification!: () => void;
+    const approvalNotification = new Promise<void>((resolve) => {
+      finishApprovalNotification = resolve;
+    });
+    let failRetry!: (error: Error) => void;
+    const retryCompletion = new Promise<void>((_resolve, reject) => {
+      failRetry = reject;
+    });
+    const retryTask = task({ id: "task-retry-rejection", notify: false });
+    const schedulerEngine = {
+      expireTaskRunApprovals: () => [],
+      retryDueTaskRuns: () => [{
+        run: { id: "run-retry-rejection", taskId: retryTask.id },
+        completion: retryCompletion,
+      }],
+      listTaskRunApprovalsNeedingNotification: () => [{ id: "run-slow-approval" }],
+      taskForRun: () => retryTask,
+      deliverTaskRunApprovalNotification: () => approvalNotification,
+      listTaskRunsNeedingNotification: () => [],
+      tasks: { list: () => [] },
+      listTaskRuns: () => [],
+    } as unknown as KnowledgeEngine;
+    const scheduler = new TaskScheduler(schedulerEngine, {
+      notifyApproval: async () => {},
+    });
+    const unhandled: string[] = [];
+    const recordUnhandled = (error: unknown) => {
+      unhandled.push(String(error));
+    };
+    process.on("unhandledRejection", recordUnhandled);
+
+    const ticking = scheduler.tick("retry-rejection", T10);
+    failRetry(new Error("retry completion failed early"));
+    await Bun.sleep(20);
+    const earlyUnhandled = [...unhandled];
+    finishApprovalNotification();
+    const outcome = await ticking.then(
+      (ran) => ({ ran }),
+      (error) => ({ error: String(error) }),
+    );
+    process.off("unhandledRejection", recordUnhandled);
+
+    expect(earlyUnhandled).toEqual([]);
+    expect(outcome).toEqual({ ran: [] });
+    expect(scheduler.health()).toEqual(expect.objectContaining({
+      running: false,
+      lastStatus: "error",
+      lastError: expect.stringContaining("retry completion failed early"),
     }));
   });
 

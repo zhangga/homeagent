@@ -190,6 +190,84 @@ describe("web backend (read-only)", () => {
     expect((await fresh.request("/setup")).status).toBe(200);
   });
 
+  test("fresh bundled setup makes managed Codex the zero-terminal primary path", async () => {
+    const fresh = createWebApp({
+      engine,
+      detectProviders: async () => [],
+      providerModels: async () => ({ codex: ["gpt-5.6-luna"] }),
+      codexSetup: {
+        canInstall: true,
+        isInstalled: () => false,
+        install: async () => {},
+        startDeviceLogin: async () => ({ state: "idle", message: "尚未连接" }),
+        deviceLoginStatus: () => ({ state: "idle", message: "尚未连接" }),
+        cancelDeviceLogin: () => ({ state: "cancelled", message: "已取消" }),
+      },
+    });
+
+    const response = await fresh.request("/setup");
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body).toContain("安装并连接 ChatGPT");
+    expect(body).toContain('action="/setup/ai/codex/install"');
+    expect(body).toContain("高级选项");
+    expect(body).toContain("Claude Code");
+    expect(body.indexOf("安装并连接 ChatGPT")).toBeLessThan(
+      body.indexOf("Claude Code"),
+    );
+    expect(body).not.toContain("先连接 Claude Code 或 Codex");
+    expect(body).not.toContain("npm install");
+  });
+
+  test("installed but disconnected Codex stays on the ChatGPT connection step", async () => {
+    let loginStarts = 0;
+    const installed = createWebApp({
+      engine,
+      detectProviders: async () => [{
+        id: "codex",
+        name: "Codex",
+        bin: "/managed/codex",
+        available: false,
+        detail: "ChatGPT 尚未连接",
+      }],
+      providerModels: async () => ({ codex: ["gpt-5.4"] }),
+      codexSetup: {
+        canInstall: true,
+        isInstalled: () => true,
+        install: async () => {},
+        startDeviceLogin: async () => {
+          loginStarts += 1;
+          return { state: "waiting_for_user", message: "等待确认" };
+        },
+        deviceLoginStatus: () => ({ state: "idle", message: "尚未连接" }),
+        cancelDeviceLogin: () => ({ state: "cancelled", message: "已取消" }),
+      },
+    });
+
+    const page = await installed.request("/setup");
+    expect(page.status).toBe(200);
+    const body = await page.text();
+    expect(body).toContain("Codex 已安装，尚未连接 ChatGPT");
+    expect(body).toContain('action="/setup/ai/codex/login"');
+    expect(body).toContain("连接 ChatGPT");
+    expect(body).not.toContain('<option value="codex"');
+    expect(body).not.toContain("安装并连接 ChatGPT");
+
+    const premature = await installed.request("/setup/ai", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "provider=codex&model=gpt-5.4",
+    });
+    expect(premature.status).toBe(302);
+    expect(decodeURIComponent(premature.headers.get("location") ?? ""))
+      .toContain("ChatGPT 尚未连接");
+    expect(readSettings(dir).defaultProvider).toBeUndefined();
+
+    const connect = await installed.request("/setup/ai/codex/login", { method: "POST" });
+    expect(connect.status).toBe(302);
+    expect(loginStarts).toBe(1);
+  });
+
   test("edits and resets space rules from the knowledge governance page", async () => {
     const initial = await app.request(`/spaces/${encodeURIComponent(SPACE)}/governance`);
     expect(initial.status).toBe(200);
@@ -4586,6 +4664,24 @@ describe("management backend (read-write)", () => {
     expect([302, 303]).toContain(res.status);
     expect(res.headers.get("location")).toContain("ok=");
     expect(engine.tasks.list().length).toBe(0);
+  });
+
+  test("tasks: create rejects a well-formed space missing from the registry", async () => {
+    const response = await app.request("/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        name: "orphan-space-task",
+        space: "team/oc_missing_registry",
+        topic: "must not be scheduled",
+      }).toString(),
+    });
+
+    expect([302, 303]).toContain(response.status);
+    expect(decodeURIComponent(response.headers.get("location") ?? ""))
+      .toContain("创建失败：请选择有效空间");
+    const tasksPage = await (await app.request("/tasks")).text();
+    expect(tasksPage).not.toContain("orphan-space-task");
   });
 
   test("tasks: manual run redirects to a durable run detail and fires onTaskRun", async () => {

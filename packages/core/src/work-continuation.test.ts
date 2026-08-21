@@ -154,6 +154,39 @@ describe("WorkContinuationStore", () => {
     expect(() => restarted.exportBySpace(SPACE)).not.toThrow();
   });
 
+  test("reconciles historical runs in stable order without reopening a blocked action", () => {
+    const items = new WorkItemStore(dir);
+    const item = items.create({
+      space: SPACE,
+      title: "repair continuation history",
+      nextActions: ["retry the durable action"],
+    }, NOW);
+    const continuation = new WorkContinuationStore(dir);
+    const action = continuation.claimNext(item, NOW + 1);
+    continuation.attachRun(action.id, "run_first", "queued", NOW + 2);
+    const blocked = continuation.failClosed(action.id, "association repair required", NOW + 3);
+
+    const reconciled = continuation.reconcileRunHistory(
+      action.id,
+      ["run_first", "run_second"],
+      NOW + 4,
+    );
+
+    expect(reconciled).toEqual(expect.objectContaining({
+      status: "blocked",
+      error: blocked.error,
+      attempt: 2,
+      taskRunIds: ["run_first", "run_second"],
+      updatedAt: blocked.updatedAt,
+    }));
+    expect(new WorkContinuationStore(dir).get(action.id)).toEqual(reconciled);
+    expect(() => continuation.reconcileRunHistory(
+      action.id,
+      ["run_second", "run_first"],
+      NOW + 5,
+    )).toThrow("cannot reorder or insert");
+  });
+
   test("records the checkpoint only after accepting the current run", () => {
     const items = new WorkItemStore(dir);
     const item = items.create({

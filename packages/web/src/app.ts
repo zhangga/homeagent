@@ -905,10 +905,15 @@ export function createWebApp(opts: WebOptions): Hono {
   app.post("/setup/ai", async (c) => {
     const body = await c.req.parseBody();
     const provider = str(body, "provider");
-    const available = (await getProviders()).some(
-      (candidate) => candidate.id === provider && candidate.available,
+    const selectedProvider = (await getProviders()).find(
+      (candidate) => candidate.id === provider,
     );
-    if (!available) {
+    if (!selectedProvider?.available) {
+      if (provider === "codex" && isCodexInstalled()) {
+        return c.redirect(
+          `/setup?ok=${encodeURIComponent("ChatGPT 尚未连接，请先完成登录")}`,
+        );
+      }
       return c.redirect(`/setup?ok=${encodeURIComponent("所选 AI 尚未安装或无法运行")}`);
     }
     if (!providerSupportsOrdinaryCompletion(provider)) {
@@ -2168,10 +2173,14 @@ export function createWebApp(opts: WebOptions): Hono {
 
   app.post("/tasks", async (c) => {
     const body = await c.req.parseBody();
+    const space = str(body, "space").trim();
+    if (!isSpaceId(space) || !engine.registry.has(space)) {
+      return c.redirect(`/tasks?ok=${encodeURIComponent("创建失败：请选择有效空间")}`);
+    }
     const timeoutMinutes = str(body, "timeoutMinutes");
     const task = engine.tasks.create({
       name: str(body, "name"),
-      space: str(body, "space"),
+      space,
       topic: str(body, "topic"),
       cadence: str(body, "cadence"),
       hour: Number(str(body, "hour")),

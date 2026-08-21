@@ -98,23 +98,30 @@ function recordCliCall(input: {
   ok: boolean;
   result?: CompleteResult;
   failure?: unknown;
-  dataDir?: string;
+  dataDir: string;
 }): void {
   const usage = input.result?.usage
     ?? (input.failure instanceof ProviderRunError ? input.failure.usage : unavailableUsage());
-  recordCall({
-    t: new Date().toISOString(),
-    model: input.result?.model ?? input.fallbackModel,
-    purpose: input.purpose,
-    inputTokens: usage.inputTokens,
-    outputTokens: usage.outputTokens,
-    costUsd: usage.costUsd,
-    usage,
-    provider: input.provider,
-    space: input.space,
-    ok: input.ok,
-    ms: Date.now() - input.started,
-  }, input.dataDir);
+  try {
+    recordCall({
+      t: new Date().toISOString(),
+      model: input.result?.model ?? input.fallbackModel,
+      purpose: input.purpose,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      costUsd: usage.costUsd,
+      usage,
+      provider: input.provider,
+      space: input.space,
+      ok: input.ok,
+      ms: Date.now() - input.started,
+    }, input.dataDir);
+  } catch (error) {
+    log.warn("CLI usage accounting persistence failed", {
+      provider: input.provider,
+      err: String(error),
+    });
+  }
 }
 
 /** Extract the first JSON object/array from CLI stdout (handles code fences + prose). */
@@ -155,20 +162,24 @@ function jsonInstruction(schema: Record<string, unknown>): string {
  * value since research runs longer than Q&A. Resolved native `skills` are only
  * forwarded with an explicit task execution grant; no-tools calls record them
  * as skipped instead of asking the provider to discover or execute them.
- * `accountingDataDir` keeps usage logs colocated with the owning engine.
+ * `accountingDataDir` is required so callers cannot silently write usage into
+ * the process-wide default data directory.
  */
 export function makeCliClient(
   provider: ProviderId,
   model: string | undefined,
+  accountingDataDir: string,
   run: RunProviderFn = realRunProvider,
   timeoutMs?: number,
   reasoningEffort?: CodexReasoningEffort,
   signal?: AbortSignal,
   execution?: ProviderExecution,
   skills: string[] = execution?.skills ?? [],
-  accountingDataDir?: string,
   workdir?: string,
 ): LlmClient {
+  if (typeof accountingDataDir !== "string" || !accountingDataDir.trim()) {
+    throw new Error("accounting data directory is required");
+  }
   // The model is fixed at construction (the engine already resolved it from the
   // space's agent / global default). We deliberately IGNORE per-call opts.model:
   // ask/dream pass network-gateway tier names (e.g. "claude-sonnet-5",

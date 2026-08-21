@@ -132,6 +132,10 @@ test("source native extraction retains temporary Swift compilation", async () =>
     "swiftc",
     join(import.meta.dir, "attachment-extract.swift"),
   ]);
+  expect(commands[0]?.slice(3, 5)).toEqual([
+    "-module-cache-path",
+    expect.stringContaining("homeagent-native-extract-"),
+  ]);
   expect(commands[1]?.[0]?.endsWith("/attachment-extract")).toBeTrue();
   expect(commands[1]?.slice(1)).toEqual(["pdf", "/tmp/brief.pdf"]);
 });
@@ -151,6 +155,8 @@ macOSOnly("Swift attachment helper limits", () => {
           "/usr/bin/xcrun",
           "swiftc",
           join(import.meta.dir, "attachment-extract.swift"),
+          "-module-cache-path",
+          join(helperDirectory, "module-cache"),
           "-o",
           helperBinary,
         ],

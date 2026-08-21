@@ -79,7 +79,7 @@ describe("guided setup view", () => {
     expect((body.match(/class="primary-action"/g) ?? []).length).toBe(1);
   });
 
-  test("managed Codex can become the ordinary AI after installation and login", () => {
+  test("managed Codex is the zero-terminal primary path for a fresh install", () => {
     const install = render("ai", {
       providers: [],
       codex: {
@@ -90,10 +90,14 @@ describe("guided setup view", () => {
         login: { state: "idle", message: "尚未连接" },
       },
     });
-    expect(install).toContain("先连接 Claude Code 或 Codex");
-    expect(install).toContain("安装 Codex");
+    expect(install).toContain("用 ChatGPT 唤醒 HomeAgent");
+    expect(install).toContain("无需打开终端");
+    expect(install).toContain("安装并连接 ChatGPT");
     expect(install).toContain("普通问答和显式任务");
     expect(install).toContain('name="consent"');
+    expect(install).toContain("高级选项：使用其他本机 Provider");
+    expect(install).toContain("Claude Code");
+    expect(install).not.toContain("npm install");
 
     const waiting = render("ai", {
       providers: [],

@@ -78,6 +78,8 @@ async function seedThenCrash(dataDir: string, recordPath: string): Promise<never
     skillEvidence: snapshot.skillEvidence,
     distill: false,
   });
+  const running = engine.taskRuns.begin(run.id);
+  if (!running) throw new Error("failed to begin recovery task run");
   const reminder = engine.reminders.create({
     title: "Beta 恢复提醒",
     space: SPACE,

@@ -43,6 +43,7 @@ export type TaskRunNotificationStatus = "pending" | "sent" | "failed";
 export type TaskRunApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "legacy";
 export type TaskRunFailurePhase = "admission" | "provider" | "capture";
 export type TaskRunRetryStatus = "waiting" | "claimed" | "exhausted";
+export type TaskRunLaunchAdmission = "pending" | "admitted";
 
 export interface TaskRunFailure {
   phase: TaskRunFailurePhase;
@@ -95,6 +96,12 @@ export interface TaskRun {
   notify?: boolean;
   timeoutMs?: number;
   priority: RunPriority;
+  /**
+   * Durable two-phase launch boundary. Engine-created Runs are persisted as
+   * pending until every cross-store ownership link is known durable. Missing
+   * values are retained only for backwards-compatible legacy records.
+   */
+  launchAdmission?: TaskRunLaunchAdmission;
   status: TaskRunStatus;
   approval?: TaskRunApproval;
   approvalNotification?: TaskRunNotification;
@@ -121,7 +128,7 @@ export interface TaskRunSkillEvidence {
 }
 
 interface TaskRunsFile {
-  version: 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11;
+  version: 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12;
   runs: Record<string, TaskRun>;
 }
 
@@ -141,6 +148,7 @@ export interface StartTaskRunInput {
   priority?: RunPriority;
   startedAt?: number;
   approvalRequired?: boolean;
+  launchAdmission?: TaskRunLaunchAdmission;
 }
 
 export interface DecideTaskRunApprovalInput {
@@ -190,6 +198,10 @@ const TASK_NOTIFICATION_RETRY_DELAYS_MS = [
 const LEGACY_UNAPPROVED_RUN_ERROR =
   "Legacy queued write/full Task Run had no durable approval; execution was refused.";
 const INTERRUPTED_RUN_ERROR = "应用在任务完成前停止，运行已标记为失败";
+
+export function isTaskRunLaunchAdmitted(run: Pick<TaskRun, "launchAdmission">): boolean {
+  return run.launchAdmission !== "pending";
+}
 
 function clone(run: TaskRun): TaskRun {
   return {
@@ -432,6 +444,9 @@ function validateAutomaticRetryFailure(
   result: FinishTaskRunInput,
 ): void {
   if (!result.retry) return;
+  if (!isTaskRunLaunchAdmitted(run)) {
+    throw new Error("Task Run launch was never admitted and cannot arm a retry");
+  }
   const expectedAttempt = run.retry?.attempt ?? 1;
   if (
     result.retry.attempt !== expectedAttempt
@@ -542,10 +557,20 @@ function isTaskRun(value: unknown): value is TaskRun {
     && (run.retry === undefined || isTaskRunRetry(run.retry))
     && (run.usage === undefined || isAggregatedRunUsage(run.usage))
     && typeof run.distill === "boolean"
+    && (
+      run.launchAdmission === undefined
+      || run.launchAdmission === "pending"
+      || run.launchAdmission === "admitted"
+    )
     && (run.notify === undefined || typeof run.notify === "boolean")
     && ["interactive", "manual", "scheduled", "background"].includes(String(run.priority))
     && ["awaiting_approval", "queued", "running", "succeeded", "failed", "cancelled", "timed_out"]
       .includes(String(run.status))
+    && (
+      run.launchAdmission !== "pending"
+      || ["awaiting_approval", "queued", "failed", "cancelled", "timed_out"]
+        .includes(String(run.status))
+    )
     && (run.approval === undefined || isTaskRunApproval(run.approval))
     && (run.status === "awaiting_approval"
       ? run.approval?.status === "pending"
@@ -672,7 +697,9 @@ export class TaskRunStore {
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<TaskRunsFile>;
       const version = parsed.version;
-      if (version === undefined || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(version)) return runs;
+      if (version === undefined || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].includes(version)) {
+        return runs;
+      }
       migratedUnapprovedRun = version < 9;
       for (const [id, value] of Object.entries(parsed.runs ?? {})) {
         const legacy = value as Partial<TaskRun>;
@@ -765,7 +792,7 @@ export class TaskRunStore {
     const configDir = dirname(this.configPath);
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const tempPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
-    const file: TaskRunsFile = { version: 11, runs: Object.fromEntries(runs) };
+    const file: TaskRunsFile = { version: 12, runs: Object.fromEntries(runs) };
     try {
       writeFileSync(tempPath, JSON.stringify(file, null, 2), { encoding: "utf8", mode: 0o600 });
       const fileDescriptor = openSync(tempPath, "r+");
@@ -876,6 +903,39 @@ export class TaskRunStore {
     });
   }
 
+  /**
+   * Remove a provably invalid plain WorkItem owner after the Run has been
+   * terminalized. WorkAction ownership is never rewritten by this repair.
+   */
+  detachInvalidPlainWorkItem(
+    id: string,
+    expectedWorkItemId: string,
+  ): TaskRun | undefined {
+    const existing = this.runs.get(id);
+    if (!existing) return undefined;
+    if (existing.workItemId !== expectedWorkItemId) {
+      throw new Error(`Task Run WorkItem ownership changed: ${id}`);
+    }
+    if (existing.workActionId !== undefined) {
+      throw new Error(`WorkAction Task Run ownership cannot be detached: ${id}`);
+    }
+    if (["awaiting_approval", "queued", "running"].includes(existing.status)) {
+      throw new Error(`active Task Run ownership cannot be detached: ${id}`);
+    }
+    return this.commit((candidate) => {
+      const run = candidate.get(id)!;
+      if (
+        run.workItemId !== expectedWorkItemId
+        || run.workActionId !== undefined
+        || ["awaiting_approval", "queued", "running"].includes(run.status)
+      ) {
+        throw new Error(`Task Run ownership changed during reconciliation: ${id}`);
+      }
+      run.workItemId = undefined;
+      return clone(run);
+    });
+  }
+
   start(input: StartTaskRunInput): TaskRun {
     if (input.executionPlan !== undefined && !isResolvedExecutionPlan(input.executionPlan)) {
       throw new Error("Resolved execution plan is invalid");
@@ -898,6 +958,13 @@ export class TaskRunStore {
       && !isTaskRunSkillEvidence(input.skillEvidence)
     ) {
       throw new Error("Skill evidence is invalid or exceeds persistence limits");
+    }
+    if (
+      input.launchAdmission !== undefined
+      && input.launchAdmission !== "pending"
+      && input.launchAdmission !== "admitted"
+    ) {
+      throw new Error("Task Run launch admission is invalid");
     }
     return this.commit((candidate, state) => {
       const requestedStartedAt = input.startedAt ?? Date.now();
@@ -937,6 +1004,7 @@ export class TaskRunStore {
               ? "interactive"
               : "manual"
         ),
+        launchAdmission: input.launchAdmission,
         status: input.approvalRequired ? "awaiting_approval" : "queued",
         approval: input.approvalRequired
           ? {
@@ -973,7 +1041,11 @@ export class TaskRunStore {
 
   succeed(id: string, result: FinishTaskRunInput): TaskRun | undefined {
     const existing = this.runs.get(id);
-    if (!existing || !["queued", "running"].includes(existing.status)) return undefined;
+    if (
+      !existing
+      || !isTaskRunLaunchAdmitted(existing)
+      || !["queued", "running"].includes(existing.status)
+    ) return undefined;
     validateFinishTaskRunInput(result);
     if (result.failure !== undefined || result.retry !== undefined) {
       throw new Error("Successful Task Run cannot persist failure or retry metadata");
@@ -1010,6 +1082,7 @@ export class TaskRunStore {
     const existing = this.runs.get(id);
     if (
       existing?.status !== "awaiting_approval"
+      || !isTaskRunLaunchAdmitted(existing)
       || existing.approval?.status !== "pending"
       || existing.approval.expiresAt === undefined
       || attemptedAt >= existing.approval.expiresAt
@@ -1211,6 +1284,7 @@ export class TaskRunStore {
     return [...this.runs.values()]
       .filter((run) => (
         run.status === "failed"
+        && isTaskRunLaunchAdmitted(run)
         && run.retry?.status === "waiting"
         && run.retry.nextAttemptAt !== undefined
         && run.retry.nextAttemptAt <= now
@@ -1254,6 +1328,7 @@ export class TaskRunStore {
     const existing = this.runs.get(id);
     if (
       existing?.status !== "failed"
+      || !isTaskRunLaunchAdmitted(existing)
       || existing.retry?.status !== "waiting"
       || existing.retry.nextAttemptAt === undefined
       || existing.retry.nextAttemptAt > claimedAt
@@ -1271,6 +1346,7 @@ export class TaskRunStore {
       const parent = candidate.get(id);
       if (
         parent?.status !== "failed"
+        || !isTaskRunLaunchAdmitted(parent)
         || parent.retry?.status !== "waiting"
         || parent.retry.nextAttemptAt === undefined
         || parent.retry.nextAttemptAt > claimedAt
@@ -1329,6 +1405,7 @@ export class TaskRunStore {
         notify: parent.notify,
         timeoutMs: parent.timeoutMs,
         priority: parent.priority,
+        launchAdmission: "pending",
         status: "queued",
         queuedAt: startedAt,
         startedAt,
@@ -1350,6 +1427,7 @@ export class TaskRunStore {
     const existing = this.runs.get(id);
     if (
       existing?.status !== "awaiting_approval"
+      || !isTaskRunLaunchAdmitted(existing)
       || existing.approval?.status !== "pending"
     ) {
       return undefined;
@@ -1498,7 +1576,10 @@ export class TaskRunStore {
   }
 
   begin(id: string, runStartedAt = Date.now()): TaskRun | undefined {
-    if (this.runs.get(id)?.status !== "queued") return undefined;
+    const existing = this.runs.get(id);
+    if (existing?.status !== "queued" || !isTaskRunLaunchAdmitted(existing)) {
+      return undefined;
+    }
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
       run.status = "running";
@@ -1540,6 +1621,7 @@ export class TaskRunStore {
     return [...this.runs.values()]
       .filter((run) => (
         run.status === "awaiting_approval"
+        && isTaskRunLaunchAdmitted(run)
         && run.approval?.status === "pending"
         && run.approval.expiresAt !== undefined
         && run.approval.expiresAt > now
@@ -1553,6 +1635,31 @@ export class TaskRunStore {
       ))
       .sort((left, right) => left.startedAt - right.startedAt || left.id.localeCompare(right.id))
       .map(clone);
+  }
+
+  /** Persist the final launch commit after every ownership association is durable. */
+  admitLaunch(id: string): TaskRun | undefined {
+    const existing = this.runs.get(id);
+    if (!existing) return undefined;
+    if (existing.launchAdmission === "admitted") return clone(existing);
+    if (existing.launchAdmission !== "pending") {
+      throw new Error(`legacy Task Run cannot be launch-admitted: ${id}`);
+    }
+    if (!["awaiting_approval", "queued"].includes(existing.status)) {
+      throw new Error(`inactive Task Run cannot be launch-admitted: ${id}`);
+    }
+    return this.commit((candidate) => {
+      const run = candidate.get(id)!;
+      if (run.launchAdmission === "admitted") return clone(run);
+      if (
+        run.launchAdmission !== "pending"
+        || !["awaiting_approval", "queued"].includes(run.status)
+      ) {
+        throw new Error(`Task Run launch admission changed: ${id}`);
+      }
+      run.launchAdmission = "admitted";
+      return clone(run);
+    });
   }
 
   restore(runs: TaskRun[]): TaskRun[] {

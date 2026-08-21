@@ -40,20 +40,23 @@ data/workspaces/<dir>/
 
 ## 普通用户安装（macOS 13+）
 
-目标的正式发布体验是：普通用户只需下载与 Mac 架构对应的 DMG，把 `HomeAgent.app` 拖入“应用程序”并双击。
-当前候选尚未满足下面第 2 步的无终端要求，因此不能按此标准对外放量：
+正式发布体验是：普通用户只需下载与 Mac 架构对应的 DMG，把 `HomeAgent.app` 拖入“应用程序”并双击。
+候选版本按下面的无终端主路径验收：
 
 1. HomeAgent 自动安装并启动当前用户的后台服务，然后在默认浏览器打开设置向导。
-2. 设置向导会检查可用于普通对话的 Claude 或 Codex CLI。Claude 使用严格 no-tools 模式；Codex 使用
-   `ephemeral + ignore config/rules + read-only` 限制模式，并以绑定 Agent 的 Workdir（如已配置）作为只读上下文根目录。Codex 可在向导中安装并登录，Claude 仍需预先安装并登录。
+2. 设置向导以“安装并连接 ChatGPT”为普通用户主路径：获得明确同意后，HomeAgent 下载并校验 OpenAI
+   官方 Codex，安装到 HomeAgent 专用数据目录，再打开 OpenAI 官方页面完成登录，全程不需要终端。
+   Codex 普通会话使用 `ephemeral + ignore config/rules + read-only` 限制模式，并以绑定 Agent 的
+   Workdir（如已配置）作为只读上下文根目录。已自行安装并登录的 Claude Code 是可选高级 Provider，
+   使用严格 no-tools 模式，但不会出现在首次安装主路径中要求普通用户手动安装。
 3. 点击“一键创建飞书机器人”，在飞书页面确认。HomeAgent 会自动申请运行权限、验证机器人身份，并引导完成消息监听。
 4. 消息监听就绪后首次设置即完成。之后把机器人加入企业内部群聊，群主或管理员按群内提示发送
    “@HomeAgent 启用群聊”；确认前 HomeAgent 不会读取或记录该群消息。
 5. 如需加入外部群，完成首次设置后在“飞书连接”的可选对外共享配置中打开当前应用；完成飞书版本发布和管理员审批后，用一条真实外部群消息验证。
 
 应用包已自带 Bun 运行时、`lark-cli` 和 macOS 附件提取助手，用户不需要安装 Git、Bun、Node、npm 或
-Homebrew。当前候选版仍需单独安装并登录 Claude；在 HomeAgent 提供受托管的 Claude 安装/登录路径前，
-“全新用户无终端安装”仍是发布阻塞项，不能以预装 Claude 的内部 Soak 代替。知识数据保存在
+Homebrew；首次设置通过受托管的 Codex 安装与 ChatGPT 登录完成 AI 连接，不依赖预装 Claude。
+Claude Code 和 TRAE CLI 仍是需要用户自行管理的可选高级 Provider。知识数据保存在
 `~/Library/Application Support/HomeAgent`，日志保存在
 `~/Library/Logs/HomeAgent`；替换应用版本不会覆盖知识数据。
 
@@ -281,9 +284,9 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 ### 首次启动与飞书连接
 
 1. 普通用户双击 `HomeAgent.app`；源码开发者运行 `bun start`。全新数据目录会自动进入 `/setup`。
-2. 向导要求检测到并登录可执行受限普通调用的 Claude 或 Codex CLI；当前 Claude 安装与登录仍需单独完成。
-   应用包用户可选“安装 Codex”，由 HomeAgent 下载、校验并进入 OpenAI 官方登录，登录后可将它选为普通问答
-   Provider，也可用于显式任务。TRAE 仍只用于显式任务。
+2. 打包应用以“安装并连接 ChatGPT”为主操作：HomeAgent 在用户确认后下载、校验并安装 OpenAI 官方
+   Codex，再进入官方登录；登录后 Codex 可用于普通问答和显式任务。已经自行安装并登录的 Claude Code
+   可从高级选项重新检测并选用；TRAE 仍只用于显式任务。源码运行则由开发者自行准备可用的 Claude 或 Codex CLI。
 3. 点击“一键创建飞书机器人”，在飞书官方页面确认。HomeAgent 通过官方 Node SDK 显式提交完整授权清单，
    一次申请私聊、群内 @、群内全部消息、消息读取/发送、附件、表情、群信息、机器人进群权限和两条事件订阅。
    App Secret 只通过 stdin 写入 `lark-cli` 的系统钥匙串，不进入 HomeAgent 设置、页面或日志。

@@ -197,6 +197,8 @@ describe("ManagedSkillStore", () => {
       `120000,${objectId},${linkPath}`,
     );
     git(source.repository, "commit", "--quiet", "-m", "add linked file");
+    rmSync(workingTreeLink);
+    symlinkSync(linkTarget, workingTreeLink);
 
     expect(() => new ManagedSkillStore(
       temporaryDirectory("ha-managed-skill-data-"),

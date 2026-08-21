@@ -100,6 +100,37 @@ function writeVersionAndHelpProvider(
   return bin;
 }
 
+function writeCodexStatusProvider(
+  directory: string,
+  name: string,
+  statusExitCode: number,
+): string {
+  const script = join(directory, `${name}.js`);
+  const calls = join(directory, `${name}.calls.jsonl`);
+  const bin = join(directory, process.platform === "win32" ? `${name}.cmd` : name);
+  writeFileSync(
+    script,
+    [
+      'const { appendFileSync } = require("node:fs");',
+      "const args = process.argv.slice(2);",
+      `appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");`,
+      `if (args.length === 1 && args[0] === "--version") process.stdout.write(${JSON.stringify(`${name} 1.0\n`)});`,
+      `else if (JSON.stringify(args) === ${JSON.stringify(JSON.stringify(["-c", 'cli_auth_credentials_store="keyring"', "login", "status"]))}) { process.stdout.write("${statusExitCode === 0 ? "Logged in using ChatGPT" : "Not logged in"}\\n"); process.exitCode = ${statusExitCode}; }`,
+      "else process.exitCode = 42;",
+    ].join("\n"),
+    "utf8",
+  );
+  writeFileSync(
+    bin,
+    process.platform === "win32"
+      ? `@echo off\r\n"${process.execPath}" "%~dp0\\${name}.js" %*\r\n`
+      : `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/${name}.js" "$@"\n`,
+    "utf8",
+  );
+  if (process.platform !== "win32") chmodSync(bin, 0o755);
+  return bin;
+}
+
 const COMPLETE_CLAUDE_HELP = [
   "Usage: claude [options]",
   "-p, --print",
@@ -942,6 +973,29 @@ describe("provider detection", () => {
     } finally {
       if (previous === undefined) delete process.env.HOMEAGENT_CLAUDE_BIN;
       else process.env.HOMEAGENT_CLAUDE_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("does not advertise Codex when ChatGPT is not connected", async () => {
+    const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-codex-auth-logged-out-"));
+    const name = "codex-auth-logged-out";
+    try {
+      process.env.HOMEAGENT_CODEX_BIN = writeCodexStatusProvider(directory, name, 1);
+
+      const codex = (await detectProviders(500)).find((provider) => provider.id === "codex");
+      expect(codex).toEqual(expect.objectContaining({
+        available: false,
+        detail: "ChatGPT 尚未连接",
+      }));
+      expect(providerProbeCalls(directory, name)).toEqual([
+        ["--version"],
+        ["-c", 'cli_auth_credentials_store="keyring"', "login", "status"],
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+      else process.env.HOMEAGENT_CODEX_BIN = previous;
       rmSync(directory, { recursive: true, force: true });
     }
   });

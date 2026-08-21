@@ -254,6 +254,902 @@ describe("Knowledge seam contract", () => {
     }));
   });
 
+  test("a Task Run persistence failure fails a newly claimed work action closed without restart", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("恢复后检查通过"),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "保护首次续作启动",
+      nextActions: ["执行发布前检查"],
+    });
+    const taskRunPath = join(dir, "config", "task-runs.json");
+    mkdirSync(taskRunPath);
+
+    expect(() => engine.startWorkContinuation(item.id))
+      .toThrow();
+
+    const action = engine.workContinuations.list(item.id)[0]!;
+    expect(action).toEqual(expect.objectContaining({
+      status: "blocked",
+      attempt: 1,
+      taskRunIds: [],
+      error: expect.stringContaining("Task Run"),
+    }));
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      blockers: [expect.stringContaining("Task Run")],
+      actionBlockers: {
+        [action.id]: expect.stringContaining("Task Run"),
+      },
+      nextActions: ["执行发布前检查"],
+    }));
+
+    rmSync(taskRunPath, { recursive: true, force: true });
+    const retried = engine.retryWorkAction(action.id);
+    expect((await retried.completion).status).toBe("succeeded");
+    expect(engine.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "succeeded",
+      attempt: 1,
+      taskRunIds: [retried.run.id],
+    }));
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      nextActions: [],
+    }));
+  });
+
+  test("a cross-store Task Run association failure cancels the persisted run before retry", async () => {
+    for (const failedAssociation of ["work item", "work action"] as const) {
+      engine.close();
+      engine = new KnowledgeEngine({
+        dataDir: join(dir, failedAssociation.replace(" ", "-")),
+        runProvider: async () => completedWorkActionOutput("恢复关联存储后检查通过"),
+      });
+      engine.ensureSpace(SPACE);
+      const item = engine.workItems.create({
+        space: SPACE,
+        title: `保护${failedAssociation}关联写入`,
+        nextActions: ["执行跨存储关联检查"],
+      });
+      const injectedError = `injected ${failedAssociation} association persistence failure`;
+      const associationFailure = failedAssociation === "work item"
+        ? spyOn(engine.workItems, "attachTaskRun").mockImplementationOnce(() => {
+            throw new Error(injectedError);
+          })
+        : spyOn(engine.workContinuations, "attachRun").mockImplementationOnce(() => {
+            throw new Error(injectedError);
+          });
+
+      expect(() => engine.startWorkContinuation(item.id)).toThrow(injectedError);
+      associationFailure.mockRestore();
+
+      const action = engine.workContinuations.list(item.id)[0]!;
+      const failedRuns = engine.listTaskRuns(action.id);
+      expect(failedRuns).toHaveLength(1);
+      expect(failedRuns[0]).toEqual(expect.objectContaining({
+        status: "cancelled",
+        workItemId: item.id,
+        workActionId: action.id,
+        error: expect.stringContaining("关联"),
+      }));
+      expect(failedRuns.filter((run) =>
+        ["awaiting_approval", "queued", "running"].includes(run.status)
+      )).toEqual([]);
+      expect(engine.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+        status: "blocked",
+        attempt: 1,
+        taskRunIds: [failedRuns[0]!.id],
+        error: expect.stringContaining("Task Run"),
+      }));
+      expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+        phase: "blocked",
+        taskRunIds: [failedRuns[0]!.id],
+        actionBlockers: {
+          [action.id]: expect.stringContaining("Task Run"),
+        },
+      }));
+
+      const retried = engine.retryWorkAction(action.id);
+      expect((await retried.completion).status).toBe("succeeded");
+      expect(engine.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+        status: "succeeded",
+        attempt: 2,
+        taskRunIds: [failedRuns[0]!.id, retried.run.id],
+      }));
+      expect(engine.listTaskRuns(action.id).filter((run) =>
+        ["awaiting_approval", "queued", "running"].includes(run.status)
+      )).toEqual([]);
+      const archive = await engine.exportSpace(SPACE);
+      expect(() => parseSpaceArchive(archive)).not.toThrow();
+    }
+  });
+
+  test("Task Run association compensation preserves the primary error and repairs historical ownership before retry", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return completedWorkActionOutput("recovered after association repair");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "protect association compensation",
+      nextActions: ["associate the run"],
+    });
+    const primaryError = new Error("primary work item association failure");
+    let associationAttempts = 0;
+    const associationFailure = spyOn(engine.workItems, "attachTaskRun")
+      .mockImplementation(() => {
+        associationAttempts += 1;
+        throw associationAttempts === 1
+          ? primaryError
+          : new Error("work item repair failure");
+      });
+    const cancellationFailure = spyOn(engine.taskRuns, "cancel")
+      .mockImplementationOnce(() => {
+        throw new Error("run cancellation failure");
+      });
+
+    let thrown: unknown;
+    try {
+      engine.startWorkContinuation(item.id);
+    } catch (error) {
+      thrown = error;
+    }
+    associationFailure.mockRestore();
+    cancellationFailure.mockRestore();
+
+    expect(thrown).toBe(primaryError);
+    expect(associationAttempts).toBe(2);
+    const action = engine.workContinuations.list(item.id)[0]!;
+    const runs = engine.listTaskRuns(action.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toEqual(expect.objectContaining({
+      status: "failed",
+      error: expect.stringContaining("关联"),
+    }));
+    expect(runs.filter((run) =>
+      ["awaiting_approval", "queued", "running"].includes(run.status)
+    )).toEqual([]);
+    expect(action).toEqual(expect.objectContaining({
+      status: "blocked",
+      taskRunIds: [runs[0]!.id],
+    }));
+    expect(providerCalls).toBe(0);
+
+    const retried = engine.retryWorkAction(action.id);
+    expect((await retried.completion).status).toBe("succeeded");
+    expect(providerCalls).toBe(1);
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      taskRunIds: [runs[0]!.id, retried.run.id],
+      actionBlockers: {},
+    }));
+    const archive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+  });
+
+  test("association compensation terminalizes an approval run after cancellation fails", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "must not execute";
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "approval compensation agent",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "protect approval association",
+      nextActions: ["write after approval"],
+    });
+    const primaryError = new Error("primary approval association failure");
+    const associationFailure = spyOn(engine.workItems, "attachTaskRun")
+      .mockImplementationOnce(() => {
+        throw primaryError;
+      });
+    const cancellationFailure = spyOn(engine.taskRuns, "cancel")
+      .mockImplementationOnce(() => {
+        throw new Error("approval cancellation failure");
+      });
+
+    let thrown: unknown;
+    try {
+      engine.startWorkContinuation(item.id);
+    } catch (error) {
+      thrown = error;
+    }
+    associationFailure.mockRestore();
+    cancellationFailure.mockRestore();
+
+    expect(thrown).toBe(primaryError);
+    expect(providerCalls).toBe(0);
+    const action = engine.workContinuations.list(item.id)[0]!;
+    const runs = engine.listTaskRuns(action.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.status).toBe("cancelled");
+    expect(runs.filter((run) =>
+      ["awaiting_approval", "queued", "running"].includes(run.status)
+    )).toEqual([]);
+    expect(action.status).toBe("blocked");
+    expect(engine.workItems.get(item.id)?.phase).toBe("blocked");
+    const archive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+  });
+
+  test("a persistent Task Run compensation outage blocks execution until storage recovers", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return completedWorkActionOutput("recovered safely");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "bound persistent compensation failure",
+      nextActions: ["run after recovery"],
+    });
+    const primaryError = new Error("persistent work action association failure");
+    const associationFailure = spyOn(engine.workContinuations, "attachRun")
+      .mockImplementation(() => {
+        throw primaryError;
+      });
+    const cancellationFailure = spyOn(engine.taskRuns, "cancel")
+      .mockImplementation(() => {
+        throw new Error("persistent Task Run cancellation failure");
+      });
+    const terminalFailure = spyOn(engine.taskRuns, "fail")
+      .mockImplementation(() => {
+        throw new Error("persistent Task Run terminalization failure");
+      });
+
+    let thrown: unknown;
+    try {
+      engine.startWorkContinuation(item.id);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBe(primaryError);
+    expect(providerCalls).toBe(0);
+    expect(() => engine.resumeQueuedTaskRuns())
+      .toThrow("persistent Task Run cancellation failure");
+    expect(providerCalls).toBe(0);
+    associationFailure.mockRestore();
+    cancellationFailure.mockRestore();
+    terminalFailure.mockRestore();
+
+    const action = engine.workContinuations.list(item.id)[0]!;
+    const orphan = engine.listTaskRuns(action.id)[0]!;
+    expect(orphan.status).toBe("queued");
+    expect(action).toEqual(expect.objectContaining({
+      status: "blocked",
+      taskRunIds: [],
+    }));
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      taskRunIds: [orphan.id],
+      actionBlockers: {
+        [action.id]: expect.stringContaining("Task Run"),
+      },
+    }));
+
+    const resumed = engine.resumeQueuedTaskRuns();
+    expect(resumed).toEqual([]);
+    expect(engine.taskRuns.get(orphan.id)?.status).toBe("cancelled");
+    expect(providerCalls).toBe(0);
+    expect(engine.workContinuations.get(action.id)?.taskRunIds).toEqual([orphan.id]);
+    expect(engine.listTaskRuns(action.id).filter((run) =>
+      ["awaiting_approval", "queued", "running"].includes(run.status)
+    )).toEqual([]);
+
+    const retried = engine.retryWorkAction(action.id);
+    expect((await retried.completion).status).toBe("succeeded");
+    expect(providerCalls).toBe(1);
+    expect(engine.workContinuations.get(action.id)?.taskRunIds).toEqual([
+      orphan.id,
+      retried.run.id,
+    ]);
+    const archive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+  });
+
+  test("a plain Task Run with an incomplete durable association is cancelled before resume", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "must not execute";
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "protect a managed task association boundary",
+    });
+    const task = engine.tasks.create({
+      space: SPACE,
+      name: "managed association recovery",
+      topic: "do not execute an incompletely admitted run",
+      distillOnRun: false,
+    })!;
+    const primaryError = new Error("persistent managed Task association failure");
+    const associationFailure = spyOn(engine.workItems, "attachTaskRun")
+      .mockImplementation(() => {
+        throw primaryError;
+      });
+    const cancellationFailure = spyOn(engine.taskRuns, "cancel")
+      .mockImplementation(() => {
+        throw new Error("persistent managed Task cancellation failure");
+      });
+    const terminalFailure = spyOn(engine.taskRuns, "fail")
+      .mockImplementation(() => {
+        throw new Error("persistent managed Task terminalization failure");
+      });
+
+    let thrown: unknown;
+    try {
+      engine.startTaskRun(task.id, { distill: false });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBe(primaryError);
+    expect(providerCalls).toBe(0);
+    expect(() => engine.resumeQueuedTaskRuns())
+      .toThrow("persistent managed Task cancellation failure");
+    expect(providerCalls).toBe(0);
+    associationFailure.mockRestore();
+    cancellationFailure.mockRestore();
+    terminalFailure.mockRestore();
+
+    const orphan = engine.listTaskRuns(task.id)[0]!;
+    expect(orphan).toEqual(expect.objectContaining({
+      status: "queued",
+      workItemId: item.id,
+      workActionId: undefined,
+    }));
+
+    expect(engine.resumeQueuedTaskRuns()).toEqual([]);
+    expect(providerCalls).toBe(0);
+    expect(engine.taskRuns.get(orphan.id)?.status).toBe("cancelled");
+    expect(engine.workItems.get(item.id)?.taskRunIds).toEqual([orphan.id]);
+    const archive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+  });
+
+  test("post-commit association and admission ACK loss is proven by read-back", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "durable launch completed";
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "prove launch ACK loss",
+    });
+    const task = engine.tasks.create({
+      space: SPACE,
+      name: "read back launch admission",
+      topic: "execute once after committed ACK loss",
+      distillOnRun: false,
+    })!;
+    const attach = engine.workItems.attachTaskRun.bind(engine.workItems);
+    const attachAckLoss = spyOn(engine.workItems, "attachTaskRun")
+      .mockImplementationOnce((id, runId, now) => {
+        attach(id, runId, now);
+        throw new Error("post-commit WorkItem ACK lost");
+      });
+    const admit = engine.taskRuns.admitLaunch.bind(engine.taskRuns);
+    const admitAckLoss = spyOn(engine.taskRuns, "admitLaunch")
+      .mockImplementationOnce((id) => {
+        admit(id);
+        throw new Error("post-commit launch admission ACK lost");
+      });
+
+    const started = engine.startTaskRun(task.id, { distill: false });
+    expect((await started.completion).status).toBe("succeeded");
+    attachAckLoss.mockRestore();
+    admitAckLoss.mockRestore();
+
+    expect(providerCalls).toBe(1);
+    expect(engine.taskRuns.get(started.run.id)).toEqual(expect.objectContaining({
+      launchAdmission: "admitted",
+      status: "succeeded",
+      workItemId: item.id,
+    }));
+    expect(engine.workItems.get(item.id)?.taskRunIds).toContain(started.run.id);
+  });
+
+  test("an unproven post-commit ordinary launch stays pending and cannot replay", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "must not execute";
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "bound an unproven ordinary launch",
+    });
+    const task = engine.tasks.create({
+      space: SPACE,
+      name: "pending ordinary launch",
+      topic: "never replay after the caller observed failure",
+      distillOnRun: false,
+    })!;
+    const primaryError = new Error("post-commit WorkItem ACK outcome unknown");
+    const attach = engine.workItems.attachTaskRun.bind(engine.workItems);
+    const attachAckLoss = spyOn(engine.workItems, "attachTaskRun")
+      .mockImplementationOnce((id, runId, now) => {
+        attach(id, runId, now);
+        throw primaryError;
+      });
+    const get = engine.workItems.get.bind(engine.workItems);
+    let denyReadBack = true;
+    const unavailableReadBack = spyOn(engine.workItems, "get")
+      .mockImplementation((id) => {
+        if (id === item.id && denyReadBack) {
+          denyReadBack = false;
+          throw new Error("WorkItem read-back unavailable");
+        }
+        return get(id);
+      });
+    const cancelOutage = spyOn(engine.taskRuns, "cancel")
+      .mockImplementation(() => {
+        throw new Error("TaskRun cancellation unavailable");
+      });
+    const failOutage = spyOn(engine.taskRuns, "fail")
+      .mockImplementation(() => {
+        throw new Error("TaskRun failure persistence unavailable");
+      });
+
+    expect(() => engine.startTaskRun(task.id, { distill: false })).toThrow(primaryError);
+    attachAckLoss.mockRestore();
+    unavailableReadBack.mockRestore();
+    cancelOutage.mockRestore();
+    failOutage.mockRestore();
+
+    const orphan = engine.listTaskRuns(task.id)[0]!;
+    expect(orphan).toEqual(expect.objectContaining({
+      status: "queued",
+      launchAdmission: "pending",
+      workItemId: item.id,
+    }));
+    expect(engine.workItems.get(item.id)?.taskRunIds).toContain(orphan.id);
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "must not execute after restart";
+      },
+    });
+    expect(engine.resumeQueuedTaskRuns()).toEqual([]);
+    expect(providerCalls).toBe(0);
+    expect(engine.taskRuns.get(orphan.id)).toEqual(expect.objectContaining({
+      status: "cancelled",
+      launchAdmission: "pending",
+    }));
+    const archive = parseSpaceArchive(await engine.exportSpace(SPACE));
+    expect(archive.taskRuns.find((run) => run.id === orphan.id)?.launchAdmission)
+      .toBe("pending");
+  });
+
+  test("pending writable admission is hidden and terminalized before approval", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "must not execute";
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "pending approval guard",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "hide incomplete approval",
+    });
+    const task = engine.tasks.create({
+      space: SPACE,
+      name: "unadmitted approval",
+      topic: "never expose incomplete writable launch",
+      distillOnRun: false,
+    })!;
+    const primaryError = new Error("WorkItem association unavailable");
+    const associationOutage = spyOn(engine.workItems, "attachTaskRun")
+      .mockImplementation(() => {
+        throw primaryError;
+      });
+    const cancelOutage = spyOn(engine.taskRuns, "cancel")
+      .mockImplementation(() => {
+        throw new Error("approval cancellation unavailable");
+      });
+    const rejectOutage = spyOn(engine.taskRuns, "reject")
+      .mockImplementation(() => {
+        throw new Error("approval rejection unavailable");
+      });
+
+    expect(() => engine.startTaskRun(task.id, { distill: false })).toThrow(primaryError);
+    associationOutage.mockRestore();
+    cancelOutage.mockRestore();
+    rejectOutage.mockRestore();
+
+    const orphan = engine.listTaskRuns(task.id)[0]!;
+    expect(orphan).toEqual(expect.objectContaining({
+      status: "awaiting_approval",
+      launchAdmission: "pending",
+    }));
+    expect(engine.listTaskRunApprovalsNeedingNotification()).toEqual([]);
+    expect(() => engine.approveTaskRun(orphan.id, "reviewer"))
+      .toThrow("launch is not admitted");
+    expect(providerCalls).toBe(0);
+    expect(engine.taskRuns.get(orphan.id)?.status).toBe("cancelled");
+    expect(engine.workItems.get(item.id)?.taskRunIds).toContain(orphan.id);
+    const archive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+  });
+
+  test("pending WorkAction ACK loss recovers blocked and retryable without provider replay", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return completedWorkActionOutput("retry after launch recovery");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "recover WorkAction ACK loss",
+      nextActions: ["execute only after explicit retry"],
+    });
+    const primaryError = new Error("post-commit WorkAction ACK outcome unknown");
+    const attach = engine.workContinuations.attachRun.bind(engine.workContinuations);
+    let denyReadBack = false;
+    const attachAckLoss = spyOn(engine.workContinuations, "attachRun")
+      .mockImplementationOnce((id, runId, status, now) => {
+        attach(id, runId, status, now);
+        denyReadBack = true;
+        throw primaryError;
+      });
+    const get = engine.workContinuations.get.bind(engine.workContinuations);
+    const unavailableReadBack = spyOn(engine.workContinuations, "get")
+      .mockImplementation((id) => {
+        if (denyReadBack) {
+          denyReadBack = false;
+          throw new Error("WorkAction read-back unavailable");
+        }
+        return get(id);
+      });
+    const cancelOutage = spyOn(engine.taskRuns, "cancel")
+      .mockImplementation(() => {
+        throw new Error("TaskRun cancellation unavailable");
+      });
+    const failOutage = spyOn(engine.taskRuns, "fail")
+      .mockImplementation(() => {
+        throw new Error("TaskRun failure persistence unavailable");
+      });
+    const blockerOutage = spyOn(engine.workContinuations, "failClosed")
+      .mockImplementation(() => {
+        throw new Error("WorkAction blocker persistence unavailable");
+      });
+
+    expect(() => engine.startWorkContinuation(item.id)).toThrow(primaryError);
+    attachAckLoss.mockRestore();
+    unavailableReadBack.mockRestore();
+    cancelOutage.mockRestore();
+    failOutage.mockRestore();
+    blockerOutage.mockRestore();
+
+    const action = engine.workContinuations.list(item.id)[0]!;
+    const orphan = engine.listTaskRuns(action.id)[0]!;
+    expect(orphan).toEqual(expect.objectContaining({
+      status: "queued",
+      launchAdmission: "pending",
+    }));
+    expect(action.taskRunIds).toEqual([orphan.id]);
+    expect(providerCalls).toBe(0);
+
+    expect(engine.resumeQueuedTaskRuns()).toEqual([]);
+    expect(providerCalls).toBe(0);
+    expect(engine.taskRuns.get(orphan.id)?.status).toBe("cancelled");
+    expect(engine.workContinuations.get(action.id)).toEqual(expect.objectContaining({
+      status: "blocked",
+      taskRunIds: [orphan.id],
+    }));
+    const retried = engine.retryWorkAction(action.id);
+    expect((await retried.completion).status).toBe("succeeded");
+    expect(providerCalls).toBe(1);
+    const archive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+  });
+
+  test("export refuses an unsettled WorkAction without accepting or advancing it", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("captured before settlement"),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "keep export observational",
+      nextActions: ["preserve the active boundary"],
+    });
+    const settlement = spyOn(
+      engine as unknown as { settleWorkActionFromTaskRun(runId: string): void },
+      "settleWorkActionFromTaskRun",
+    ).mockImplementation(() => undefined);
+    const started = engine.startWorkContinuation(item.id);
+    const report = await started.completion;
+    settlement.mockRestore();
+
+    const beforeAction = engine.workContinuations.get(started.run.workActionId!)!;
+    const beforeItem = engine.workItems.get(item.id)!;
+    const beforeRaw = engine.registry.store(SPACE).index().getRaw(report.rawId!)!;
+    expect(beforeAction.status).toBe("running");
+    expect(beforeItem.nextActions).toEqual(["preserve the active boundary"]);
+    expect(beforeRaw.admission).toBe("held");
+
+    await expect(engine.exportSpace(SPACE)).rejects.toThrow("active work actions");
+    expect(engine.workContinuations.get(beforeAction.id)).toEqual(beforeAction);
+    expect(engine.workItems.get(item.id)).toEqual(beforeItem);
+    expect(engine.registry.store(SPACE).index().getRaw(beforeRaw.id)).toEqual(beforeRaw);
+  });
+
+  test("export repairs a durable blocked action projection without settling work", async () => {
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "repair archive blocker projection",
+      nextActions: ["remain visibly blocked"],
+    });
+    const action = engine.workContinuations.claimNext(item);
+    const blocked = engine.workContinuations.failClosed(
+      action.id,
+      "durable action blocker",
+    );
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      actionBlockers: {},
+    }));
+
+    const archive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+    expect(engine.workContinuations.get(action.id)).toEqual(blocked);
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      nextActions: ["remain visibly blocked"],
+      actionBlockers: {
+        [action.id]: expect.stringContaining("durable action blocker"),
+      },
+    }));
+  });
+
+  test("export replays an already accepted terminal projection without creating acceptance", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("durably accepted result"),
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "repair accepted archive projection",
+      nextActions: ["project the accepted result"],
+    });
+    const projection = spyOn(
+      engine as unknown as { projectAcceptedWorkAction(action: unknown): void },
+      "projectAcceptedWorkAction",
+    ).mockImplementation(() => undefined);
+    const started = engine.startWorkContinuation(item.id);
+    const report = await started.completion;
+    projection.mockRestore();
+
+    const accepted = engine.workContinuations.get(started.run.workActionId!)!;
+    const held = engine.registry.store(SPACE).index().getRaw(report.rawId!)!;
+    expect(accepted).toEqual(expect.objectContaining({
+      status: "succeeded",
+      acceptances: [expect.objectContaining({ status: "accepted" })],
+    }));
+    expect(engine.workItems.get(item.id)?.completedActionIds).toEqual([]);
+    expect(held.admission).toBe("held");
+
+    const archive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+    expect(engine.workContinuations.get(accepted.id)?.acceptances)
+      .toEqual(accepted.acceptances);
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      nextActions: [],
+      completedActionIds: [accepted.id],
+    }));
+    expect(engine.registry.store(SPACE).index().getRaw(held.id)?.admission).toBe("ready");
+  });
+
+  test("restart preserves authoritative WorkAction attempt order when Run creation times are inverted", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => completedWorkActionOutput("audited writable result"),
+    });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({
+      name: "immutable attempt audit",
+      permission: "write",
+      workdir: dir,
+    });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "preserve retry chronology",
+      nextActions: ["write with audited attempts"],
+    });
+    const first = engine.startWorkContinuation(item.id);
+    await engine.approveTaskRun(first.run.id, "reviewer").completion;
+    const actionId = first.run.workActionId!;
+    engine.rejectWorkAction(
+      actionId,
+      first.run.id,
+      "reviewer",
+      "retry with corrected evidence",
+    );
+    const second = engine.retryWorkAction(actionId);
+    await engine.approveTaskRun(second.run.id, "reviewer").completion;
+    engine.acceptWorkAction(actionId, second.run.id, "reviewer");
+    const authoritative = engine.workContinuations.get(actionId)!;
+    expect(authoritative.taskRunIds).toEqual([first.run.id, second.run.id]);
+    expect(authoritative.acceptances?.map((acceptance) => acceptance.attempt)).toEqual([1, 2]);
+    engine.close();
+
+    const taskRunsPath = join(dir, "config", "task-runs.json");
+    const taskRunsFile = JSON.parse(readFileSync(taskRunsPath, "utf8"));
+    const retime = (runId: string, startedAt: number) => {
+      const run = taskRunsFile.runs[runId];
+      run.startedAt = startedAt;
+      run.queuedAt = startedAt;
+      run.approval.requestedAt = startedAt;
+      run.approval.expiresAt = startedAt + 1_000;
+      run.approval.decidedAt = startedAt + 10;
+      run.runStartedAt = startedAt + 10;
+      run.finishedAt = startedAt + 20;
+      return run.finishedAt;
+    };
+    const firstFinishedAt = retime(first.run.id, 2_000);
+    const secondFinishedAt = retime(second.run.id, 1_000);
+    writeFileSync(taskRunsPath, JSON.stringify(taskRunsFile, null, 2), "utf8");
+
+    const continuationPath = join(dir, "config", "work-continuation.json");
+    const continuationFile = JSON.parse(readFileSync(continuationPath, "utf8"));
+    const persistedAction = continuationFile.actions[actionId];
+    persistedAction.acceptances[0].requestedAt = firstFinishedAt;
+    persistedAction.acceptances[0].decidedAt = firstFinishedAt + 1;
+    persistedAction.acceptances[1].requestedAt = secondFinishedAt;
+    persistedAction.acceptances[1].decidedAt = secondFinishedAt + 1;
+    persistedAction.checkpoint.completedAt = secondFinishedAt + 1;
+    writeFileSync(continuationPath, JSON.stringify(continuationFile, null, 2), "utf8");
+
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        throw new Error("startup must not replay an accepted attempt");
+      },
+    });
+    expect(engine.workContinuations.get(actionId)).toEqual(expect.objectContaining({
+      status: "succeeded",
+      taskRunIds: [first.run.id, second.run.id],
+      acceptances: [
+        expect.objectContaining({ taskRunId: first.run.id, attempt: 1, status: "rejected" }),
+        expect.objectContaining({ taskRunId: second.run.id, attempt: 2, status: "accepted" }),
+      ],
+    }));
+  });
+
+  test("legacy active plain Runs with invalid explicit owners fail closed without hiding cross-space links", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "must not execute";
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const foreignSpace: SpaceId = "team/foreign_owner";
+    engine.ensureSpace(foreignSpace);
+    const foreignItem = engine.workItems.create({
+      space: foreignSpace,
+      title: "foreign work item",
+    });
+    const task = engine.tasks.create({
+      space: SPACE,
+      name: "legacy invalid owner",
+      topic: "never execute with an invalid explicit owner",
+      distillOnRun: false,
+    })!;
+    const runs = ["work_missing_owner", foreignItem.id].map((workItemId, index) =>
+      engine.taskRuns.start({
+        task,
+        trigger: "manual",
+        workItemId,
+        distill: false,
+        startedAt: 40_000 + index,
+        executionPlan: {
+          version: 1,
+          instruction: "Legacy admitted execution plan.",
+          execution: { permission: "read-only", skills: [] },
+        },
+      })
+    );
+    engine.workItems.attachTaskRun(foreignItem.id, runs[1]!.id);
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        return "must not execute";
+      },
+    });
+
+    expect(engine.resumeQueuedTaskRuns()).toEqual([]);
+    expect(providerCalls).toBe(0);
+    expect(engine.taskRuns.get(runs[0]!.id)).toEqual(expect.objectContaining({
+      status: "cancelled",
+      workItemId: undefined,
+    }));
+    expect(engine.taskRuns.get(runs[0]!.id)?.launchAdmission).toBeUndefined();
+    expect(engine.taskRuns.get(runs[1]!.id)).toEqual(expect.objectContaining({
+      status: "cancelled",
+      workItemId: foreignItem.id,
+    }));
+    expect(engine.taskRuns.get(runs[1]!.id)?.launchAdmission).toBeUndefined();
+    await expect(engine.exportSpace(SPACE)).rejects.toThrow("cross-space WorkItem owner");
+    await expect(engine.exportSpace(foreignSpace)).rejects.toThrow(
+      "WorkItem linked to a cross-space Task Run",
+    );
+  });
+
   test("plain read-only output that reports a blocker is never auto-accepted", async () => {
     engine.close();
     engine = new KnowledgeEngine({
@@ -1708,6 +2604,194 @@ describe("Knowledge seam contract", () => {
     }));
   });
 
+  test("a Task Run persistence failure fails a retried work action closed without restart", async () => {
+    let shouldFail = true;
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        if (shouldFail) throw new Error("初次检查失败");
+        return completedWorkActionOutput("恢复后重试通过");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "保护续作重试启动",
+      nextActions: ["重试发布前检查"],
+    });
+    const first = engine.startWorkContinuation(item.id);
+    expect((await first.completion).status).toBe("failed");
+    expect(providerCalls).toBe(1);
+    const actionId = first.run.workActionId!;
+    const actionBeforeRetry = engine.workContinuations.get(actionId)!;
+    const itemBeforeRetry = engine.workItems.get(item.id)!;
+    const blockerBeforeRetry = itemBeforeRetry.actionBlockers?.[actionId]!;
+    shouldFail = false;
+    const taskRunPath = join(dir, "config", "task-runs.json");
+    rmSync(taskRunPath, { force: true });
+    mkdirSync(taskRunPath);
+
+    expect(() => engine.retryWorkAction(actionId))
+      .toThrow();
+    expect(providerCalls).toBe(1);
+
+    expect(engine.workContinuations.get(actionId)).toEqual(expect.objectContaining({
+      status: "blocked",
+      attempt: 2,
+      taskRunIds: [first.run.id],
+      error: actionBeforeRetry.error,
+    }));
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "blocked",
+      blockers: [blockerBeforeRetry],
+      actionBlockers: {
+        [actionId]: blockerBeforeRetry,
+      },
+      nextActions: ["重试发布前检查"],
+    }));
+    const failedArchive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(failedArchive)).not.toThrow();
+
+    rmSync(taskRunPath, { recursive: true, force: true });
+    const recovered = engine.retryWorkAction(actionId);
+    expect((await recovered.completion).status).toBe("succeeded");
+    expect(providerCalls).toBe(2);
+    expect(engine.workContinuations.get(actionId)).toEqual(expect.objectContaining({
+      status: "succeeded",
+      attempt: 2,
+      taskRunIds: [first.run.id, recovered.run.id],
+    }));
+    expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
+      phase: "active",
+      blockers: [],
+      nextActions: [],
+    }));
+    const recoveredArchive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(recoveredArchive)).not.toThrow();
+  });
+
+  test("a WorkItem persistence failure during retry leaves the action blocked and retryable without restart", async () => {
+    let shouldFail = true;
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        if (shouldFail) throw new Error("initial provider failure");
+        return completedWorkActionOutput("retry recovered");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "protect retry blocker persistence",
+      nextActions: ["retry the check"],
+    });
+    const first = engine.startWorkContinuation(item.id);
+    expect((await first.completion).status).toBe("failed");
+    expect(providerCalls).toBe(1);
+    const actionId = first.run.workActionId!;
+    const actionBeforeRetry = engine.workContinuations.get(actionId)!;
+    const itemBeforeRetry = engine.workItems.get(item.id)!;
+    const blockerBeforeRetry = itemBeforeRetry.actionBlockers?.[actionId]!;
+    shouldFail = false;
+
+    const workItemPath = join(dir, "config", "work-items.json");
+    rmSync(workItemPath, { force: true });
+    mkdirSync(workItemPath);
+
+    expect(() => engine.retryWorkAction(actionId)).toThrow();
+    expect(providerCalls).toBe(1);
+    const failedAction = engine.workContinuations.get(actionId)!;
+    const failedItem = engine.workItems.get(item.id)!;
+    expect(failedAction).toEqual(expect.objectContaining({
+      status: "blocked",
+      attempt: 2,
+      taskRunIds: [first.run.id],
+      error: actionBeforeRetry.error,
+    }));
+    expect(failedItem).toEqual(expect.objectContaining({
+      phase: "blocked",
+      nextActions: ["retry the check"],
+      actionBlockers: {
+        [actionId]: blockerBeforeRetry,
+      },
+    }));
+    expect(failedItem.blockers).toContain(blockerBeforeRetry);
+    const failedArchive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(failedArchive)).not.toThrow();
+
+    rmSync(workItemPath, { recursive: true, force: true });
+    const recovered = engine.retryWorkAction(actionId);
+    expect((await recovered.completion).status).toBe("succeeded");
+    expect(providerCalls).toBe(2);
+    expect(engine.workContinuations.get(actionId)).toEqual(expect.objectContaining({
+      status: "succeeded",
+      attempt: 2,
+      taskRunIds: [first.run.id, recovered.run.id],
+    }));
+    const recoveredArchive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(recoveredArchive)).not.toThrow();
+  });
+
+  test("retry reconciles a durable retry intent that failed closed without creating a Run", async () => {
+    let shouldFail = true;
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        if (shouldFail) throw new Error("initial retry-intent provider failure");
+        return completedWorkActionOutput("retry intent recovered in-process");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "recover a stranded retry intent",
+      nextActions: ["retry without restarting"],
+    });
+    const first = engine.startWorkContinuation(item.id);
+    expect((await first.completion).status).toBe("failed");
+    expect(providerCalls).toBe(1);
+    const actionId = first.run.workActionId!;
+    shouldFail = false;
+    const blockerFailure = spyOn(engine.workItems, "clearActionBlocker")
+      .mockImplementation(() => {
+        throw new Error("temporary WorkItem blocker outage");
+      });
+    const failClosedFailure = spyOn(engine.workContinuations, "failClosed")
+      .mockImplementation(() => {
+        throw new Error("temporary WorkAction fail-close outage");
+      });
+
+    expect(() => engine.retryWorkAction(actionId)).toThrow("temporary WorkItem blocker outage");
+    blockerFailure.mockRestore();
+    failClosedFailure.mockRestore();
+    expect(providerCalls).toBe(1);
+    expect(engine.workContinuations.get(actionId)).toEqual(expect.objectContaining({
+      status: "queued",
+      attempt: 2,
+      taskRunIds: [first.run.id],
+    }));
+
+    const recovered = engine.retryWorkAction(actionId);
+    expect((await recovered.completion).status).toBe("succeeded");
+    expect(providerCalls).toBe(2);
+    expect(engine.workContinuations.get(actionId)).toEqual(expect.objectContaining({
+      status: "succeeded",
+      attempt: 2,
+      taskRunIds: [first.run.id, recovered.run.id],
+    }));
+    const archive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
+  });
+
   test("cancelling a work action preserves its next action without creating a blocker", () => {
     engine.ensureSpace(SPACE);
     const agent = engine.agents.create({
@@ -1779,6 +2863,73 @@ describe("Knowledge seam contract", () => {
       expect.objectContaining({ status: "succeeded", attempt: 2 }),
     );
     expect(engine.workItems.get(item.id)?.nextActions).toEqual([]);
+  });
+
+  test("an unadmitted automatic WorkAction retry self-heals before de-duplication", async () => {
+    let providerCalls = 0;
+    engine.close();
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        providerCalls += 1;
+        if (providerCalls === 1) {
+          throw new ProviderRunError("claude", "API Error: 429 Too Many Requests", {
+            inputTokens: 1,
+            outputTokens: 0,
+            costBasis: "unavailable",
+            source: "claude-json",
+          });
+        }
+        return completedWorkActionOutput("manual retry after admission recovery");
+      },
+    });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({
+      space: SPACE,
+      title: "recover automatic retry admission",
+      nextActions: ["execute after recovery"],
+    });
+    const first = engine.startWorkContinuation(item.id, { trigger: "scheduled" });
+    await first.completion;
+    const parent = engine.taskRuns.get(first.run.id)!;
+    const primaryError = new Error("automatic WorkAction association unavailable");
+    const associationOutage = spyOn(engine.workContinuations, "attachRun")
+      .mockImplementationOnce(() => {
+        throw primaryError;
+      });
+    const cancellationOutage = spyOn(engine.taskRuns, "cancel")
+      .mockImplementation(() => {
+        throw new Error("automatic retry cancellation unavailable");
+      });
+
+    expect(() => engine.retryDueTaskRuns(parent.retry!.nextAttemptAt!)).toThrow(primaryError);
+    associationOutage.mockRestore();
+    cancellationOutage.mockRestore();
+
+    const child = engine.listTaskRuns(first.run.taskId)
+      .find((run) => run.retryOf === parent.id)!;
+    expect(child).toEqual(expect.objectContaining({
+      status: "queued",
+      launchAdmission: "pending",
+    }));
+    expect(providerCalls).toBe(1);
+    expect(engine.workContinuations.get(first.run.workActionId!)).toEqual(
+      expect.objectContaining({ status: "blocked" }),
+    );
+    expect(engine.workItems.get(item.id)?.actionBlockers?.[first.run.workActionId!])
+      .toContain("自动重试准入失败");
+
+    expect(engine.retryDueTaskRuns(parent.retry!.nextAttemptAt!)).toEqual([]);
+    expect(engine.taskRuns.get(child.id)?.status).toBe("cancelled");
+    expect(providerCalls).toBe(1);
+    expect(engine.workContinuations.get(first.run.workActionId!)?.taskRunIds)
+      .toEqual([parent.id, child.id]);
+
+    const retried = engine.retryWorkAction(first.run.workActionId!);
+    expect((await retried.completion).status).toBe("succeeded");
+    expect(providerCalls).toBe(2);
+    const archive = await engine.exportSpace(SPACE);
+    expect(() => parseSpaceArchive(archive)).not.toThrow();
   });
 
   test("cancelling a waiting automatic WorkAction retry closes the action without replay", async () => {
@@ -1855,6 +3006,11 @@ describe("Knowledge seam contract", () => {
       expect.objectContaining({ attempt: 1, taskRunIds: [parent.id] }),
     );
     first.close();
+    const taskRunsPath = join(recoveryDir, "config", "task-runs.json");
+    const legacyTaskRuns = JSON.parse(readFileSync(taskRunsPath, "utf8"));
+    legacyTaskRuns.version = 11;
+    delete legacyTaskRuns.runs[child.id].launchAdmission;
+    writeFileSync(taskRunsPath, JSON.stringify(legacyTaskRuns, null, 2), "utf8");
 
     let providerCalls = 0;
     const reopened = new KnowledgeEngine({

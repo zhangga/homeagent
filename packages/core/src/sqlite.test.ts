@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SpaceIndex } from "./sqlite.ts";
-import type { Page, RawEntry } from "@homeagent/shared";
+import type { Page, RawEntry, RawRecord } from "@homeagent/shared";
 
 let dir: string;
 let idx: SpaceIndex;
@@ -120,6 +120,44 @@ describe("SpaceIndex raw capture", () => {
     expect(pending[0]!.admission).toBe("ready");
   });
 
+  test("raw listings order equal creation times by durable id", () => {
+    const records = [
+      { id: "raw-c", content: "third by id" },
+      { id: "raw-a", content: "first by id" },
+      { id: "raw-b", content: "second by id" },
+    ].map(({ id, content }) => ({
+      ...raw(content),
+      id,
+      createdAt: 100,
+      ingested: false,
+      admission: "ready" as const,
+    } satisfies RawRecord));
+    for (const record of records) idx.restoreRaw(record);
+
+    expect(idx.listRaw().map((record) => record.id)).toEqual([
+      "raw-a",
+      "raw-b",
+      "raw-c",
+    ]);
+    expect(idx.listRaw({ limit: 2 }).map((record) => record.id)).toEqual([
+      "raw-a",
+      "raw-b",
+    ]);
+    expect(idx.listRawByIds(["raw-c", "raw-a", "raw-b"]).map((record) => record.id))
+      .toEqual(["raw-a", "raw-b", "raw-c"]);
+    expect(idx.listRawByIds(
+      ["raw-c", "raw-a", "raw-b"],
+      { limit: 2 },
+    ).map((record) => record.id)).toEqual(["raw-a", "raw-b"]);
+  });
+
+  test("raw listing limit zero returns no records consistently", () => {
+    const ids = [idx.insertRaw(raw("first")), idx.insertRaw(raw("second"))];
+
+    expect(idx.listRaw({ limit: 0 })).toEqual([]);
+    expect(idx.listRawByIds(ids, { limit: 0 })).toEqual([]);
+  });
+
   test("held WorkAction raw remains auditable but is not pending for distillation", () => {
     const id = idx.insertRaw({
       ...raw("candidate result"),
@@ -211,19 +249,24 @@ describe("SpaceIndex raw capture", () => {
   });
 
   test("listRawByIds can require admission independently from ingestion", () => {
-    const readyId = idx.insertRaw(raw("already distilled but admitted"));
+    const readyId = idx.insertRaw({
+      ...raw("already distilled but admitted"),
+      createdAt: 100,
+    });
     idx.markIngested([readyId]);
     const heldId = idx.insertRaw({
       ...raw("held"),
       source: "task",
       workActionId: "action-held",
       admission: "held",
+      createdAt: 200,
     });
     const excludedId = idx.insertRaw({
       ...raw("excluded"),
       source: "task",
       workActionId: "action-excluded",
       admission: "held",
+      createdAt: 300,
     });
     expect(idx.excludeRawAdmission(excludedId, "action-excluded")).toBeTrue();
 
