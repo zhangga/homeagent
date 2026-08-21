@@ -14,12 +14,12 @@ import { join } from "node:path";
 import type { Knowledge } from "./knowledge.ts";
 import { KnowledgeEngine } from "./engine.ts";
 import { FakeLlm } from "./testing.ts";
-import { config, type Page, type SpaceId } from "@homeagent/shared";
+import { config, type Page, type RawRecord, type SpaceId } from "@homeagent/shared";
 import { BudgetExceededError, localDay, ProviderRunError } from "@homeagent/llm";
-import { Database } from "bun:sqlite";
 import { SkillCatalog } from "./skill-catalog.ts";
 import type { AggregatedRunUsage } from "./usage.ts";
 import { parseSpaceArchive } from "./governance.ts";
+import { RawJournal } from "./raw-journal.ts";
 
 let dir: string;
 let engine: KnowledgeEngine;
@@ -39,6 +39,22 @@ function page(slug: string, title: string, content: string): Page {
     updatedAt: Date.now(),
     contentHash: "h",
   };
+}
+
+function tamperAuthoritativeRaw(
+  workspaceRoot: string,
+  ids: readonly string[],
+  mutate: (record: RawRecord) => RawRecord,
+): void {
+  const journal = new RawJournal(join(workspaceRoot, "raw"), SPACE);
+  const selected = journal.listRaw().filter((record) => ids.includes(record.id));
+  expect(selected.map((record) => record.id).sort()).toEqual([...ids].sort());
+  journal.replaceMany(selected.map(mutate));
+}
+
+function deleteAuthoritativeRaw(workspaceRoot: string, ids: readonly string[]): void {
+  const journal = new RawJournal(join(workspaceRoot, "raw"), SPACE);
+  expect(journal.deleteMany(ids)).toBe(new Set(ids).size);
 }
 
 function completedWorkActionOutput(result: string): string {
@@ -1825,15 +1841,12 @@ describe("Knowledge seam contract", () => {
     for (const slug of ["index", "glossary", "overview"]) {
       store.writePage(page(slug, slug, "未验收秘密的派生摘要"));
     }
-    const dbPath = store.dbPath;
-
     engine.close();
-    const database = new Database(dbPath);
-    database.run(
-      "UPDATE raw SET admission = 'ready', work_action_id = NULL WHERE id = ?",
-      [report.rawId!],
-    );
-    database.close();
+    tamperAuthoritativeRaw(store.root, [report.rawId!], (record) => ({
+      ...record,
+      admission: "ready",
+      workActionId: undefined,
+    }));
 
     engine = new KnowledgeEngine({ dataDir: dir });
     const migrated = engine.registry.store(SPACE);
@@ -1869,6 +1882,7 @@ describe("Knowledge seam contract", () => {
       topic: action.instruction,
       cadence: "daily" as const,
       hour: 0,
+      dayOfWeek: 1,
       enabled: false,
       notify: true,
       distillOnRun: false,
@@ -1980,6 +1994,7 @@ describe("Knowledge seam contract", () => {
       topic: action.instruction,
       cadence: "daily" as const,
       hour: 0,
+      dayOfWeek: 1,
       enabled: false,
       notify: true,
       distillOnRun: false,
@@ -2081,12 +2096,12 @@ describe("Knowledge seam contract", () => {
     }));
 
     engine.close();
-    const database = new Database(store.dbPath);
-    database.run(
-      "UPDATE raw SET admission = 'ready', work_action_id = NULL, ingested = 1 WHERE id = ?",
-      [rawId],
-    );
-    database.close();
+    tamperAuthoritativeRaw(store.root, [rawId], (record) => ({
+      ...record,
+      admission: "ready",
+      workActionId: undefined,
+      ingested: true,
+    }));
     writeFileSync(join(dir, "config", "work-continuation.json"), "{broken", "utf8");
 
     engine = new KnowledgeEngine({ dataDir: dir });
@@ -2143,12 +2158,12 @@ describe("Knowledge seam contract", () => {
     expect(store.index().getPage(pollutedSlug)).toBeNull();
 
     engine.close();
-    const database = new Database(store.dbPath);
-    database.run(
-      "UPDATE raw SET admission = 'ready', work_action_id = NULL, ingested = 1 WHERE id = ?",
-      [rawId!],
-    );
-    database.close();
+    tamperAuthoritativeRaw(store.root, [rawId!], (record) => ({
+      ...record,
+      admission: "ready",
+      workActionId: undefined,
+      ingested: true,
+    }));
     const taskRunPath = join(dir, "config", "task-runs.json");
     const taskRunFile = JSON.parse(readFileSync(taskRunPath, "utf8")) as {
       version: number;
@@ -2210,12 +2225,11 @@ describe("Knowledge seam contract", () => {
       .toBe(true);
 
     engine.close();
-    const database = new Database(store.dbPath);
-    database.run(
-      "UPDATE raw SET admission = 'ready', work_action_id = NULL WHERE id IN (?, ?)",
-      rawIds,
-    );
-    database.close();
+    tamperAuthoritativeRaw(store.root, rawIds, (record) => ({
+      ...record,
+      admission: "ready",
+      workActionId: undefined,
+    }));
     const taskRunPath = join(dir, "config", "task-runs.json");
     const taskRunFile = JSON.parse(readFileSync(taskRunPath, "utf8")) as {
       version: number;
@@ -2248,12 +2262,11 @@ describe("Knowledge seam contract", () => {
     const store = engine.registry.store(SPACE);
 
     engine.close();
-    const database = new Database(store.dbPath);
-    database.run(
-      "UPDATE raw SET admission = 'ready', work_action_id = ? WHERE id = ?",
-      [conflictingActionId, rawId],
-    );
-    database.close();
+    tamperAuthoritativeRaw(store.root, [rawId], (record) => ({
+      ...record,
+      admission: "ready",
+      workActionId: conflictingActionId,
+    }));
 
     expect(() => new KnowledgeEngine({ dataDir: dir }))
       .toThrow(`work action Raw belongs to another action: ${rawId}`);
@@ -2296,9 +2309,7 @@ describe("Knowledge seam contract", () => {
     expect(store.index().getPage(pollutedSlug)).not.toBeNull();
 
     engine.close();
-    const database = new Database(store.dbPath);
-    database.run("DELETE FROM raw WHERE id = ?", [rawId]);
-    database.close();
+    deleteAuthoritativeRaw(store.root, [rawId]);
 
     engine = new KnowledgeEngine({ dataDir: dir });
     const recovered = engine.registry.store(SPACE);
@@ -2333,9 +2344,7 @@ describe("Knowledge seam contract", () => {
     const store = engine.registry.store(SPACE);
 
     engine.close();
-    const database = new Database(store.dbPath);
-    database.run("DELETE FROM raw WHERE id = ?", [rawId]);
-    database.close();
+    deleteAuthoritativeRaw(store.root, [rawId]);
 
     expect(() => new KnowledgeEngine({ dataDir: dir }))
       .toThrow(`accepted WorkAction Raw evidence is missing: ${rawId}`);
@@ -2387,12 +2396,12 @@ describe("Knowledge seam contract", () => {
     const pollutedPath = join(store.wikiDir, `${pollutedSlug}.md`);
 
     engine.close();
-    const database = new Database(store.dbPath);
-    database.run(
-      "UPDATE raw SET admission = 'ready', work_action_id = NULL, ingested = 1 WHERE id = ?",
-      [earlyRawId],
-    );
-    database.close();
+    tamperAuthoritativeRaw(store.root, [earlyRawId], (record) => ({
+      ...record,
+      admission: "ready",
+      workActionId: undefined,
+      ingested: true,
+    }));
     const taskRunPath = join(dir, "config", "task-runs.json");
     const taskRunFile = JSON.parse(readFileSync(taskRunPath, "utf8")) as {
       version: number;
@@ -3426,6 +3435,7 @@ describe("Knowledge seam contract", () => {
       topic: "执行自动重试动作",
       cadence: "daily" as const,
       hour: 0,
+      dayOfWeek: 1,
       enabled: false,
       notify: true,
       distillOnRun: false,
@@ -4796,6 +4806,7 @@ describe("Knowledge seam contract", () => {
       permission: "write",
       workdir: realpathSync(workdir),
       skills: ["code-review", "github-yeet"],
+      skillMode: "all",
     });
     expect(storedRun?.skillEvidence).toEqual({
       requested: [
@@ -4826,6 +4837,117 @@ describe("Knowledge seam contract", () => {
       ],
       skipped: [],
     });
+  });
+
+  test("runTask automatically loads every compatible Skill without Agent bindings", async () => {
+    const skillRoot = join(dir, "all-task-skills");
+    for (const name of ["code-review", "lark-doc"]) {
+      mkdirSync(join(skillRoot, name), { recursive: true });
+      writeFileSync(
+        join(skillRoot, name, "SKILL.md"),
+        ["---", `name: ${name}`, `description: ${name}.`, "---"].join("\n"),
+        "utf8",
+      );
+    }
+    let execution: unknown;
+    const taskEngine = new KnowledgeEngine({
+      dataDir: dir,
+      skillCatalog: new SkillCatalog({
+        roots: [{
+          kind: "shared-agents",
+          path: skillRoot,
+          providerIds: ["claude", "codex", "trae-cli"],
+        }],
+      }),
+      runProvider: async (_id, input) => {
+        execution = input.execution;
+        return "已使用全部 Skill";
+      },
+    });
+    taskEngine.ensureSpace(SPACE);
+    const agent = taskEngine.agents.create({
+      name: "全能力任务助手",
+      provider: "codex",
+      skills: [],
+    });
+    taskEngine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const task = taskEngine.tasks.create({
+      name: "自动加载全部能力",
+      space: SPACE,
+      topic: "读取飞书文档并总结",
+      distillOnRun: false,
+    })!;
+
+    const report = await taskEngine.runTask(task.id);
+    const storedRun = taskEngine.getTaskRun(report.runId);
+    taskEngine.close();
+
+    expect(report.status).toBe("succeeded");
+    expect(execution).toEqual({
+      permission: "read-only",
+      workdir: undefined,
+      skills: ["code-review", "lark-doc"],
+      skillMode: "all",
+    });
+    expect(storedRun?.skillEvidence?.requested).toEqual([
+      {
+        kind: "source",
+        sourceKey: "shared-agents:code-review",
+        name: "code-review",
+      },
+      {
+        kind: "source",
+        sourceKey: "shared-agents:lark-doc",
+        name: "lark-doc",
+      },
+    ]);
+    expect(storedRun?.skillEvidence?.resolved.map((skill) => skill.name)).toEqual([
+      "code-review",
+      "lark-doc",
+    ]);
+  });
+
+  test("runTask persists the complete catalog when more than fifty Skills are available", async () => {
+    const skillRoot = join(dir, "large-task-skill-catalog");
+    const names = Array.from({ length: 55 }, (_value, index) =>
+      `skill-${String(index + 1).padStart(2, "0")}`
+    );
+    for (const name of names) {
+      mkdirSync(join(skillRoot, name), { recursive: true });
+      writeFileSync(
+        join(skillRoot, name, "SKILL.md"),
+        ["---", `name: ${name}`, `description: ${name}.`, "---"].join("\n"),
+        "utf8",
+      );
+    }
+    let providerSkills: string[] | undefined;
+    const taskEngine = new KnowledgeEngine({
+      dataDir: dir,
+      skillCatalog: new SkillCatalog({
+        roots: [{ kind: "shared-agents", path: skillRoot, providerIds: ["codex"] }],
+      }),
+      runProvider: async (_id, input) => {
+        providerSkills = input.execution?.skills;
+        return "全部能力已加载";
+      },
+    });
+    taskEngine.ensureSpace(SPACE);
+    const agent = taskEngine.agents.create({ name: "大目录助手", provider: "codex" });
+    taskEngine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const task = taskEngine.tasks.create({
+      name: "大目录任务",
+      space: SPACE,
+      topic: "使用完整能力目录",
+      distillOnRun: false,
+    })!;
+
+    const report = await taskEngine.runTask(task.id);
+    const storedRun = taskEngine.getTaskRun(report.runId);
+    taskEngine.close();
+
+    expect(report.status).toBe("succeeded");
+    expect(providerSkills).toEqual(names);
+    expect(storedRun?.skillEvidence?.resolved.map((skill) => skill.name)).toEqual(names);
   });
 
   test("ordinary Agent calls mark pinned native Skills skipped in the no-tools context", async () => {
@@ -4903,32 +5025,69 @@ describe("Knowledge seam contract", () => {
     });
   });
 
-  test("durable Chat execution rejects a ProviderExecution grant", async () => {
-    let providerCalls = 0;
+  test("durable Chat automatically loads every compatible Skill with Agent tools", async () => {
+    const chatDir = join(dir, "chat-all-skills");
+    const workdir = join(chatDir, "agent-workspace");
+    mkdirSync(workdir, { recursive: true });
+    const skillRoot = join(chatDir, "skills");
+    for (const name of ["code-review", "lark-doc"]) {
+      mkdirSync(join(skillRoot, name), { recursive: true });
+      writeFileSync(
+        join(skillRoot, name, "SKILL.md"),
+        ["---", `name: ${name}`, `description: ${name}.`, "---"].join("\n"),
+        "utf8",
+      );
+    }
+    let providerInput: unknown;
     const chatEngine = new KnowledgeEngine({
-      dataDir: join(dir, "chat-plan-no-execution"),
-      runProvider: async () => {
-        providerCalls += 1;
-        return "must not execute";
+      dataDir: chatDir,
+      skillCatalog: new SkillCatalog({
+        roots: [{ kind: "shared-agents", path: skillRoot, providerIds: ["codex"] }],
+      }),
+      runProvider: async (_id, input) => {
+        providerInput = input;
+        return "已读取飞书文档";
       },
     });
     chatEngine.ensureSpace(SPACE);
+    const agent = chatEngine.agents.create({
+      name: "全能力聊天助手",
+      provider: "codex",
+      permission: "full",
+      workdir,
+      skills: [],
+    });
+    chatEngine.registry.updateMeta(SPACE, { agentId: agent.id });
 
-    await expect(chatEngine.askWithExecutionPlan(
+    const snapshot = chatEngine.agentRunExecutionSnapshot(SPACE);
+    const result = await chatEngine.askWithExecutionPlan(
       [SPACE],
-      "ordinary chat",
-      {
-        version: 1,
-        instruction: "Answer only.",
-        provider: "claude",
-        execution: { permission: "read-only", skills: [] },
-      },
-    )).rejects.toThrow("must not grant ProviderExecution");
-    expect(providerCalls).toBe(0);
+      "读取飞书文档",
+      snapshot.executionPlan,
+      snapshot.skillEvidence,
+    );
     chatEngine.close();
+
+    expect(result.answer).toBe("已读取飞书文档");
+    expect(snapshot.executionPlan.execution).toEqual({
+      permission: "full",
+      workdir: realpathSync(workdir),
+      skills: ["code-review", "lark-doc"],
+      skillMode: "all",
+    });
+    expect(snapshot.executionPlan.skillMode).toBe("all");
+    expect(snapshot.skillEvidence.resolved.map((skill) => skill.name)).toEqual([
+      "code-review",
+      "lark-doc",
+    ]);
+    expect(providerInput).toEqual(expect.objectContaining({
+      execution: snapshot.executionPlan.execution,
+      skills: ["code-review", "lark-doc"],
+      workdir: realpathSync(workdir),
+    }));
   });
 
-  test("durable no-tools Chat records native Skills as skipped instead of claiming execution", async () => {
+  test("durable all-Skill Chat keeps its frozen catalog when Skill content changes", async () => {
     const chatDir = join(dir, "chat-plan-skill-change");
     const workdir = join(chatDir, "agent-workspace");
     mkdirSync(workdir, { recursive: true });
@@ -4969,11 +5128,12 @@ describe("Knowledge seam contract", () => {
     chatEngine.registry.updateMeta(SPACE, { agentId: agent.id });
     const snapshot = chatEngine.agentRunExecutionSnapshot(SPACE);
     expect(snapshot.executionPlan.workdir).toBe(realpathSync(workdir));
-    expect(snapshot.skillEvidence.resolved).toEqual([]);
-    expect(snapshot.skillEvidence.skipped).toEqual([expect.objectContaining({
+    expect(snapshot.executionPlan.skillMode).toBe("all");
+    expect(snapshot.skillEvidence.resolved).toEqual([expect.objectContaining({
       sourceKey: "codex-user:review",
-      code: "no_tools_context",
+      name: "review",
     })]);
+    expect(snapshot.skillEvidence.skipped).toEqual([]);
     writeFileSync(
       skillFile,
       ["---", "name: review", "description: Changed.", "---", "Changed behavior."].join("\n"),
@@ -4990,13 +5150,19 @@ describe("Knowledge seam contract", () => {
     expect(result.context).toBe("agent-workdir");
     expect(providerCalls).toBe(1);
     expect(providerInput).toEqual(expect.objectContaining({
-      execution: undefined,
+      execution: {
+        permission: "read-only",
+        workdir: realpathSync(workdir),
+        skills: ["review"],
+        skillMode: "all",
+      },
+      skills: ["review"],
       workdir: realpathSync(workdir),
     }));
     chatEngine.close();
   });
 
-  test("ask continues with the base Agent and returns a safe warning when a Skill disappears", async () => {
+  test("ask forwards the all-Skill snapshot without a per-call file preflight", async () => {
     const skillRoot = join(dir, "warning-skills");
     const skillDir = join(skillRoot, "review");
     mkdirSync(skillDir, { recursive: true });
@@ -5006,12 +5172,16 @@ describe("Knowledge seam contract", () => {
       ["---", "name: review", "description: Review.", "---"].join("\n"),
       "utf8",
     );
+    let providerSkills: string[] | undefined;
     const taskEngine = new KnowledgeEngine({
       dataDir: dir,
       skillCatalog: new SkillCatalog({
         roots: [{ kind: "codex-user", path: skillRoot, providerIds: ["codex"] }],
       }),
-      runProvider: async () => "base answer",
+      runProvider: async (_provider, input) => {
+        providerSkills = input.skills;
+        return "base answer";
+      },
     });
     taskEngine.ensureSpace(SPACE);
     const agent = taskEngine.agents.create({
@@ -5030,11 +5200,8 @@ describe("Knowledge seam contract", () => {
     taskEngine.close();
 
     expect(result.answer).toBe("base answer");
-    expect(result.skillWarnings).toEqual([{
-      name: "review",
-      code: "missing_source",
-      message: "Skill 当前不可用，已跳过",
-    }]);
+    expect(result.skillWarnings).toBeUndefined();
+    expect(providerSkills).toEqual(["review"]);
   });
 
   test("runTask records the Agent provider and model used for execution", async () => {
@@ -6506,7 +6673,7 @@ describe("Knowledge seam contract", () => {
     });
   });
 
-  test("a queued task fails closed when any pinned Skill resource changes before execution", async () => {
+  test("a queued all-Skill task keeps its frozen catalog when Skill resources change", async () => {
     const recoveryDir = join(dir, "queued-task-skill-recovery");
     const workdir = join(recoveryDir, "workdir");
     const skillRoot = join(recoveryDir, "skills");
@@ -6581,7 +6748,7 @@ describe("Knowledge seam contract", () => {
       skillCatalog: new SkillCatalog(catalogOptions),
       runProvider: async () => {
         providerCalls += 1;
-        return "must not execute";
+        return "executed with the frozen catalog";
       },
       recoverInterruptedTaskRuns: true,
     });
@@ -6590,11 +6757,11 @@ describe("Knowledge seam contract", () => {
     const recoveredRun = reopened.getTaskRun(queued.id);
     reopened.close();
 
-    expect(providerCalls).toBe(0);
-    expect(report.ok).toBe(false);
+    expect(providerCalls).toBe(1);
+    expect(report.ok).toBe(true);
     expect(recoveredRun).toEqual(expect.objectContaining({
-      status: "failed",
-      error: expect.stringMatching(/Skill.*changed/i),
+      status: "succeeded",
+      output: "executed with the frozen catalog",
     }));
   });
 
@@ -6845,6 +7012,7 @@ describe("Knowledge seam contract", () => {
       topic: "执行只读检查",
       cadence: "daily" as const,
       hour: 0,
+      dayOfWeek: 1,
       enabled: false,
       notify: true,
       distillOnRun: false,
@@ -6943,6 +7111,7 @@ describe("Knowledge seam contract", () => {
       topic: "冻结工作上下文\n本次动作：恢复后执行检查",
       cadence: "daily" as const,
       hour: 0,
+      dayOfWeek: 1,
       enabled: false,
       notify: true,
       distillOnRun: false,
@@ -7005,6 +7174,7 @@ describe("Knowledge seam contract", () => {
       topic: "修改灰度配置",
       cadence: "daily" as const,
       hour: 0,
+      dayOfWeek: 1,
       enabled: false,
       notify: true,
       distillOnRun: false,
@@ -7071,6 +7241,7 @@ describe("Knowledge seam contract", () => {
       topic: "执行可取消动作",
       cadence: "daily" as const,
       hour: 0,
+      dayOfWeek: 1,
       enabled: false,
       notify: true,
       distillOnRun: false,
@@ -7142,6 +7313,7 @@ describe("Knowledge seam contract", () => {
       topic: "执行可取消检查",
       cadence: "daily" as const,
       hour: 0,
+      dayOfWeek: 1,
       enabled: false,
       notify: true,
       distillOnRun: false,

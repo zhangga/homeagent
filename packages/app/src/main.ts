@@ -9,6 +9,7 @@
  */
 import {
   assertSafeWebBinding,
+  brandedEnv,
   config,
   logger,
   saveSettings,
@@ -42,6 +43,14 @@ import {
 } from "./runtime-paths.ts";
 import { launchDesktop } from "./desktop.ts";
 import { createDefaultService, runServiceCli } from "./service-cli.ts";
+import {
+  applyPendingDataDirectoryMigration,
+  dataDirectoryIsGitRepository,
+  gitIsAvailable,
+  readRuntimeDataSettings,
+  runtimeDataSettingsPath,
+  scheduleDataDirectoryMigration,
+} from "./runtime-data.ts";
 import {
   acquireProcessLock,
   runtimeServiceStatus,
@@ -81,6 +90,10 @@ export async function prepareFeishuStartup(
     engine.registry.list(),
     currentAppId,
   );
+  // Older development builds persisted this fake chat alongside real Feishu
+  // bindings. Exact `oc_demo` can never identify a real Feishu group, so remove
+  // it from whichever runtime data directory is active during startup.
+  engine.feishuBindings.removeByChatId("oc_demo");
   if (currentAppId) {
     engine.feishuBindings.markMismatchedAppNeedsReconnect(currentAppId);
   }
@@ -113,6 +126,10 @@ function teamBindingIsInactive(
 
 async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Promise<void> {
   const runtimePaths = resolveRuntimePaths();
+  const runtimeSettingsPath = runtimeDataSettingsPath({
+    bundled: runtimePaths.bundled,
+    appRoot: runtimePaths.appRoot,
+  });
   const stopLogMaintenance = startServiceLogMaintenance(cfg.dataDir);
   log.info("starting homeagent", {
     dataDir: cfg.dataDir,
@@ -317,6 +334,51 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
       return orchestrator.retryChatRun(runId);
     },
     onChatRunCancel: (runId) => orchestrator.cancelChatRun(runId),
+    dataDirectory: {
+      status: () => {
+        const runtimeSettings = readRuntimeDataSettings(runtimeSettingsPath);
+        const lastMigration = runtimeSettings.lastMigration;
+        const pendingMigration = runtimeSettings.pendingMigration;
+        return {
+          currentPath: cfg.dataDir,
+          available: true,
+          lockedByEnvironment: process.env.HOMEAGENT_DATA_DIR_LOCKED === "1",
+          gitAvailable: gitIsAvailable(),
+          gitRepository: dataDirectoryIsGitRepository(cfg.dataDir),
+          restartable: process.env.HOMEAGENT_SERVICE_MANAGED === "1",
+          migrationError: runtimeSettings.migrationError,
+          pendingMigration: pendingMigration
+            ? {
+                destination: pendingMigration.destination,
+                initializeGit: pendingMigration.initializeGit,
+                requestedAt: pendingMigration.requestedAt,
+              }
+            : undefined,
+          lastMigration: lastMigration
+            ? {
+                source: lastMigration.source,
+                destination: lastMigration.destination,
+                completedAt: lastMigration.completedAt,
+                gitInitialized: lastMigration.initializeGit,
+              }
+            : undefined,
+        };
+      },
+      scheduleMigration: ({ destination, initializeGit }) => {
+        if (process.env.HOMEAGENT_DATA_DIR_LOCKED === "1") {
+          throw new Error("当前目录由 HOMEAGENT_DATA_DIR 环境变量固定");
+        }
+        if (initializeGit && !gitIsAvailable()) {
+          throw new Error("当前系统未找到 Git，无法初始化仓库");
+        }
+        scheduleDataDirectoryMigration({
+          settingsPath: runtimeSettingsPath,
+          currentDataDir: cfg.dataDir,
+          destinationDir: destination,
+          initializeGit,
+        });
+      },
+    },
     onServiceRestart: () => {
       setTimeout(() => process.kill(process.pid, "SIGTERM"), 250);
     },
@@ -439,13 +501,37 @@ export function selectAppCommand(args: string[], bundled: boolean): AppCommand {
 }
 
 export async function runEntrypoint(args = process.argv.slice(2)): Promise<number> {
-  const paths = resolveRuntimePaths();
+  let paths = resolveRuntimePaths();
+  const command = selectAppCommand(args, paths.bundled);
+  const externalDataDirectory = brandedEnv(process.env, "DATA_DIR") !== undefined
+    && process.env.HOMEAGENT_SERVICE_MANAGED !== "1";
+  if (command === "serve" && !externalDataDirectory) {
+    const settingsPath = runtimeDataSettingsPath({
+      bundled: paths.bundled,
+      appRoot: paths.appRoot,
+    });
+    const migration = applyPendingDataDirectoryMigration({ settingsPath });
+    if (migration.state === "completed") {
+      log.info("data directory migration completed", {
+        source: migration.source,
+        destination: migration.destination,
+        gitInitialized: migration.gitInitialized,
+      });
+    } else if (migration.state === "failed") {
+      log.error("data directory migration failed; keeping the previous directory", {
+        source: migration.source,
+        destination: migration.destination,
+        error: migration.error,
+      });
+    }
+    paths = resolveRuntimePaths();
+  }
+  process.env.HOMEAGENT_DATA_DIR_LOCKED = externalDataDirectory ? "1" : "0";
+  process.env.HOMEAGENT_DATA_DIR = paths.dataDir;
   if (paths.bundled) {
-    process.env.HOMEAGENT_DATA_DIR ??= paths.dataDir;
     process.env.HOMEAGENT_LOG_DIR ??= paths.logDir;
     process.env.HOMEAGENT_CODEX_BIN ??= join(paths.dataDir, "bin", "codex");
   }
-  const command = selectAppCommand(args, paths.bundled);
   if (command === "serve") {
     await serve();
     return 0;

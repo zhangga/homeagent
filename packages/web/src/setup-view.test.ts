@@ -54,11 +54,11 @@ function render(current: SetupStep, overrides: Partial<Parameters<typeof setupVi
 }
 
 describe("guided setup view", () => {
-  test("offers Codex for ordinary conversations with its restricted-mode boundary", () => {
+  test("offers Codex for ordinary conversations with automatic Skills", () => {
     const body = render("ai");
 
     expect(body).toContain('<option value="codex"');
-    expect(body).toContain("Codex 普通会话使用临时只读模式");
+    expect(body).toContain("Codex 普通聊天和任务会自动获得全部兼容 Skills");
     expect(body).not.toContain("Codex 只能用于显式任务");
   });
 
@@ -93,7 +93,8 @@ describe("guided setup view", () => {
     expect(install).toContain("用 ChatGPT 唤醒 HomeAgent");
     expect(install).toContain("无需打开终端");
     expect(install).toContain("安装并连接 ChatGPT");
-    expect(install).toContain("普通问答和显式任务");
+    expect(install).toContain("普通聊天和任务");
+    expect(install).toContain("自动获得全部兼容 Skills");
     expect(install).toContain('name="consent"');
     expect(install).toContain("高级选项：使用其他本机 Provider");
     expect(install).toContain("Claude Code");
@@ -118,7 +119,8 @@ describe("guided setup view", () => {
     expect(waiting).toContain("SAFE-CODE");
     expect(waiting).toContain("/setup/ai/codex/session");
     expect(waiting).toContain("正在准备 Codex");
-    expect(waiting).toContain("登录后可用于普通问答和显式任务");
+    expect(waiting).toContain("登录后可用于普通聊天和任务");
+    expect(waiting).toContain("自动获得全部兼容 Skills");
 
     const repair = render("ai", {
       providers: [],

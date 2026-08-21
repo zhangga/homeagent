@@ -65,7 +65,7 @@ describe("Agent workbench view", () => {
     expect(body).toContain("/chats/runs/chat_run_delivery/retry");
   });
 
-  test("renders an inline searchable Skill selector outside Task execution", async () => {
+  test("explains that Chat and Task automatically receive every compatible Skill", async () => {
     const source = {
       sourceKey: "shared-agents:review",
       rootKind: "shared-agents" as const,
@@ -108,7 +108,7 @@ describe("Agent workbench view", () => {
     });
 
     const body = String(await agentWorkbenchView(view));
-    const capabilitiesAt = body.indexOf("共享 Skills");
+    const capabilitiesAt = body.indexOf("Skills 自动加载");
     const taskAt = body.indexOf('data-pane="agent-inspector"');
 
     expect(capabilitiesAt).toBeGreaterThan(-1);
@@ -116,8 +116,9 @@ describe("Agent workbench view", () => {
     expect(body).toContain('<details class="agent-skill-selector"');
     expect(body).not.toContain('<details class="agent-skill-selector" open');
     expect(body).toContain('<summary class="agent-skill-summary"');
-    expect(body).toContain("0 个已固定");
-    expect(body).toContain("当前 Provider 自带的 Skills 无需再次固定");
+    expect(body).toContain("0 个历史固定项");
+    expect(body).toContain("普通聊天和任务会自动获得当前 Provider 兼容的全部本机 Skills");
+    expect(body).toContain("无需逐个固定");
     expect(body).toContain('id="agent-skill-search"');
     expect(body).toContain('name="skillSourceKeys"');
     expect(body).toContain('value="shared-agents:review"');

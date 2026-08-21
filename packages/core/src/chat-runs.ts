@@ -19,11 +19,11 @@ import { isSpaceId, type SpaceId } from "@homeagent/shared";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 import {
   cloneResolvedExecutionPlan,
+  isProviderExecution,
   isResolvedExecutionPlan,
   type ResolvedExecutionPlan,
 } from "./execution-plan.ts";
 import {
-  MAX_TASK_RUN_SKILLS,
   isTaskRunSkillEvidence,
   type TaskRunSkillEvidence,
 } from "./task-runs.ts";
@@ -83,6 +83,8 @@ export interface ChatRun {
   skillEvidence?: TaskRunSkillEvidence;
   execution?: ProviderExecution;
   executionPlan?: ResolvedExecutionPlan;
+  /** provider runtime limit frozen when this Chat Run is queued */
+  timeoutMs?: number;
   retryOf?: string;
   priority: RunPriority;
   status: ChatRunStatus;
@@ -123,6 +125,7 @@ export interface StartChatRunInput {
   skillEvidence?: TaskRunSkillEvidence;
   execution?: ProviderExecution;
   executionPlan?: ResolvedExecutionPlan;
+  timeoutMs?: number;
   retryOf?: string;
   priority?: RunPriority;
   startedAt?: number;
@@ -186,22 +189,6 @@ function isRunPriority(value: unknown): value is RunPriority {
   return ["interactive", "manual", "scheduled", "background"].includes(String(value));
 }
 
-function isExecution(value: unknown): value is ProviderExecution {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const execution = value as Partial<ProviderExecution>;
-  return (
-    execution.permission === "read-only"
-    && Array.isArray(execution.skills)
-    && execution.skills.length <= MAX_TASK_RUN_SKILLS
-    && execution.skills.every((skill) =>
-      typeof skill === "string"
-      && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,79}$/.test(skill)
-    )
-    && execution.workdir === undefined
-    && (execution.webSearch === undefined || typeof execution.webSearch === "boolean")
-  );
-}
-
 export function isChatRun(value: unknown): value is ChatRun {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const run = value as Partial<ChatRun>;
@@ -240,10 +227,11 @@ export function isChatRun(value: unknown): value is ChatRun {
     && (run.reasoningEffort === undefined
       || CODEX_REASONING_EFFORTS.includes(run.reasoningEffort))
     && (run.skillEvidence === undefined || isTaskRunSkillEvidence(run.skillEvidence))
-    && (run.execution === undefined || isExecution(run.execution))
-    && (run.executionPlan === undefined || (
-      isResolvedExecutionPlan(run.executionPlan)
-      && run.executionPlan.execution === undefined
+    && (run.execution === undefined || isProviderExecution(run.execution))
+    && (run.executionPlan === undefined || isResolvedExecutionPlan(run.executionPlan))
+    && (run.timeoutMs === undefined || (
+      Number.isInteger(run.timeoutMs)
+      && run.timeoutMs > 0
     ))
     && (run.usage === undefined || isAggregatedRunUsage(run.usage))
     && (run.error === undefined || (
@@ -412,16 +400,19 @@ export class ChatRunStore {
   }
 
   start(input: StartChatRunInput): ChatRun {
+    if (
+      input.timeoutMs !== undefined
+      && (!Number.isInteger(input.timeoutMs) || input.timeoutMs <= 0)
+    ) {
+      throw new Error("Chat timeout must be a positive integer");
+    }
     if (input.executionPlan !== undefined && !isResolvedExecutionPlan(input.executionPlan)) {
       throw new Error("Resolved execution plan is invalid");
-    }
-    if (input.executionPlan?.execution !== undefined) {
-      throw new Error("Chat execution plan must not grant provider execution");
     }
     if (input.skillEvidence !== undefined && !isTaskRunSkillEvidence(input.skillEvidence)) {
       throw new Error("Skill evidence is invalid or exceeds persistence limits");
     }
-    if (input.execution !== undefined && !isExecution(input.execution)) {
+    if (input.execution !== undefined && !isProviderExecution(input.execution)) {
       throw new Error("Chat execution snapshot is invalid");
     }
     return this.commit((candidate, state) => {

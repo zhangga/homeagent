@@ -2,7 +2,7 @@
 
 深度绑定飞书的团队/家庭 AI 知识库 Agent。定位是「最了解我们的 agent」：它常驻飞书群与私聊，
 默默收录大家分享的知识，夜间提炼成 wiki 知识页，并在被 @ 或私聊时基于知识库作答（带引用）；也能按天带读一本书，提问、反馈并记录进度。
-图片仍会作为受治理的消息附件保存；Codex 普通会话可通过临时只读模式接收原生图片输入，其他不支持图片的 Provider 会明确提示能力边界。
+图片仍会作为受治理的消息附件保存；Codex 普通会话可接收原生图片输入，并按 Agent 的 Permission / Workdir 与 Skills 执行，其他不支持图片的 Provider 会明确提示能力边界。
 
 知识引擎借鉴 [`nashsu/llm_wiki`](https://github.com/nashsu/llm_wiki) 的设计（项目明确采用无 embedding 路线：
 中文 CJK bigram、整页范式、成熟的 ingest/检索思路）与 `gbrain` 的 dream cycle 思路，
@@ -33,10 +33,20 @@ Bun workspaces monorepo，依赖严格单向：`web/app → orchestrator → cor
 ```
 data/workspaces/<dir>/
   purpose.md schema.md        # 空间意图 + 页类型规则（团队可编辑）
-  raw/sources/                # 预留：不可变原始来源
+  raw/records/YYYY/MM/DD.jsonl # Raw 当前状态，按 UTC 创建日期分区、可直接阅读
+  raw/retractions.jsonl       # 消息撤回标记
+  raw/sources/                # 不可变原始来源
   wiki/{index,overview,log,glossary}.md + {entities,concepts,sources,analysis}/*.md
-  .index.db                   # SQLite，可从 wiki/*.md 重建
+  .index.db                   # SQLite 查询投影，可从 raw/**/*.jsonl + wiki/*.md 重建
 ```
+
+Raw JSONL 与知识 Markdown 是权威数据源，SQLite 只负责结构化查询与 FTS。每条 JSONL 记录额外包含
+`createdAtIso`，方便直接查看和 Git diff；Raw 状态改变时会原子替换对应日期文件。升级旧数据目录时，
+首次打开空间会自动把 SQLite-only Raw 回填到 JSONL；后续启动则以 JSONL 校准 SQLite，因此删除
+`.index.db*` 不会丢失原始消息。可在 HomeAgent 停止运行时检查或备份这些文件，不应在运行中手工编辑。
+
+`raw/sources/` 当前不是文件监听目录，手动复制文件进去不会自动入库。需要从空间详情页使用「导入本地资料」，
+或把文件发送到对应的飞书群/私聊，资料先登记为 Raw 后才会进入自动提炼流程。
 
 ## 普通用户安装（macOS 13+）
 
@@ -69,8 +79,7 @@ HomeAgent 不会自动修改任何已有飞书应用；上传后请在飞书的�
 ## 从源码运行的环境要求
 
 - **Bun**（`curl -fsSL https://bun.sh/install | bash`），Node v22 仅作参考。
-- **Agent CLI**：普通问答、提炼和学习可使用已登录的 `claude` 或 `codex`。Claude 使用 strict no-tools
-  completion；Codex 使用临时、忽略用户配置与规则的只读执行，并从绑定 Agent 的 Workdir（如已配置）检索上下文。`trae-cli` 仅用于显式任务。旧 LLM 网关仅用于兼容测试，生产主流程不依赖它。
+- **Agent CLI**：普通聊天和任务可使用已登录的 `claude` 或 `codex`，并自动获得当前 Provider 兼容的全部本机 Skills；Agent 会按请求选择相关 Skill。提炼和后台学习仍使用 no-tools 调用。`trae-cli` 仅用于显式任务。旧 LLM 网关仅用于兼容测试，生产主流程不依赖它。
 - **飞书 `lark-cli`**：需已安装并可执行。首次启动可在浏览器里一键创建并验证飞书应用；
   附件下载使用 bot 身份，应用需开通 `im:message:readonly` 权限。读取用户文档时的 user 授权仍由
   `lark-cli auth login` 管理。
@@ -97,6 +106,7 @@ export HOMEAGENT_FEISHU_BOT_OPEN_ID=ou_xxx
 
 改名前的 `HOMEBRAIN_*` 环境变量仍可读取；若新旧变量同时存在，以 `HOMEAGENT_*` 为准。
 打包应用首次启动时也会在确认后复制旧版 Homebrain 数据，并保留旧目录不变。
+如果显式设置了 `HOMEAGENT_DATA_DIR`，它会固定数据目录；需要先移除该变量，才能从设置页迁移。
 
 > 后台「设置 / Agents / Integrations」里改的配置会写入
 > `data/config/{settings,agents,spaces,feishu-group-bindings}.json`
@@ -149,6 +159,15 @@ bun run packages/web/src/dev.ts        # http://localhost:3000（启动日志：
 
 能测**全部界面**：空间/知识、Agents、任务、学习、提醒、Integrations、运行状态、数据治理、设置——增删改、开关、落盘、任务「立即运行」都可验证。
 问答框与任务运行返回**固定假答案**（不 spawn 真 CLI，秒回），看不到真实模型效果。数据写 `./data`（或 `HOMEAGENT_DATA_DIR`）。
+默认不会创建虚假的飞书群或 `oc_demo` 连接；飞书连接测试应使用用户自己创建或选择的真实群聊。
+
+仅需查看带示例内容的界面时，可显式开启隔离的演示数据：
+
+```bash
+HOMEAGENT_SEED_DEMO=1 bun run packages/web/src/dev.ts
+```
+
+未指定 `HOMEAGENT_DATA_DIR` 时，演示数据写入 `./data/dev-demo`，不会混入正常运行数据。
 
 ### 3. 后台真跑本机 CLI（能看到真实效果 · 慢）
 
@@ -183,29 +202,29 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 
 左侧导航包含：
 
-- **空间 / 知识**：空间列表、知识页、原始条目、问答测试、手动触发提炼，以及提炼失败记录的单条/批量恢复。支持编辑 `purpose.md` / `schema.md`、查看完整原始记录及其关联知识页、单条重新提炼、固定目标重新生成、删除知识页和提交可追溯的人工纠错；所有人工治理操作都会写入审计记录。
-- **Agents**（三栏工作台）：左侧选择 Agent，中间编辑配置，右侧查看真实的 CLI 状态、当前空间/飞书群绑定和该 Agent 最近处理的 Chat / 研究任务运行。Chat 记录会固定归属到实际处理它的 Agent，并可从 Recent runs 进入对应的原始消息详情。支持新建 / 删除，以及配置 **名称、Provider、Instruction（人格，会注入到回答）、Model、推理强度、Visibility、Permission、Workdir、Pinned Skills**；编辑先保存为草稿，显式发布后才影响未来运行，发布历史不可变并支持通过新版本回滚，避免在途运行被原地改写。
+- **空间 / 知识**：空间列表、知识页、原始条目、问答测试、手动触发提炼，以及提炼失败记录的单条/批量恢复。空间详情页可一次导入最多 20 份本地 UTF-8 文本、Markdown、CSV、JSON 或日志文件；每份不超过 20 MiB，正文最多保留 200,000 字符，文件名与原始内容 SHA-256 会进入可追溯的 `source=manual` Raw。可只登记后等待夜间提炼，也可立即且仅提炼本批资料。支持编辑 `purpose.md` / `schema.md`、查看完整原始记录及其关联知识页、单条重新提炼、固定目标重新生成、删除知识页和提交可追溯的人工纠错；所有人工治理操作都会写入审计记录。
+- **Agents**（三栏工作台）：左侧选择 Agent，中间编辑配置，右侧查看真实的 CLI 状态、当前空间/飞书群绑定和该 Agent 最近处理的 Chat / 研究任务运行。Chat 记录会固定归属到实际处理它的 Agent，并可从 Recent runs 进入对应的原始消息详情。支持新建 / 删除，以及配置 **名称、Provider、Instruction（人格，会注入到回答）、Model、推理强度、Visibility、Permission、Workdir**；旧版 Pinned Skill 绑定会保留兼容，但不再限制运行时能力。编辑先保存为草稿，显式发布后才影响未来运行，发布历史不可变并支持通过新版本回滚，避免在途运行被原地改写。
   - 桌面端保持三栏并可拖拽或用方向键调整栏宽；窄屏把右侧信息收进详情抽屉，手机端在 Agent 列表和详情之间切换。页面不显示 HomeAgent 没有实现的 Mew Device、Repository、Environment、Concurrency 或独立 Chats 模块。
-  - **Provider = 本机已安装的 agent CLI**（`claude` / `codex` / `trae-cli`）。所有 LLM 工作都通过当前空间配置的本机 CLI 子进程执行，homeagent 不直连网络 API。普通问答、提炼和学习使用受限调用：Claude 使用 safe mode、禁用全部工具且不保存会话；Codex 使用 ephemeral、忽略用户配置/规则、禁止审批并启用 read-only sandbox，同时以绑定 Agent 的 Workdir（如已配置）作为当前目录；TRAE 当前仍只用于显式任务。后台会探测本机 CLI 的安装和可运行状态。
-  - **Pinned Skill 绑定属于 Agent，不属于群聊**：飞书群绑定团队空间，空间再绑定 Team Agent；个人空间绑定 Personal Agent。因此不同群可以使用不同 Agent，并自然获得各自的 Instruction、Provider、Model 与显式固定能力。Agent 编辑器只扫描并选择 `~/.agents/skills` 中的共享 Skill，不接受 Git URL 或任意路径输入。
-  - **不继承隐式能力**：普通受限调用不会加载用户级规则、Hooks、Plugins、MCP 或全局 Skills，也不会把 Provider 会话写入全局历史。只有显式任务才会按冻结的执行计划启用工具；固定的 Pinned Skills 会在任务执行前重新核验。
-  - **本机 Skill 目录**：共享 Skill 来自 `~/.agents/skills`，选择器按来源保存精确绑定；同名同内容合并展示，同名不同内容标出冲突。后端仍识别 Codex、Claude 和 TRAE 的原生 Skill 目录，用于运行时解析、优先级和遮蔽判断，但 Provider 专属 Skill 不在普通清单或选择器中重复展示。页面不暴露绝对路径或 `SKILL.md` 正文。
-  - **Pinned Skill 执行边界**：研究任务加载冻结的 Pinned Skills，并使用 Agent 的 Permission / Workdir。每次真正执行前都会重新核对来源、名称及完整目录树的路径、文件模式与内容摘要；缺失、损坏、不兼容、资源超限或被遮蔽时 fail-closed，不会静默换成同名的新内容。普通问答/提炼为保持受限执行，暂不执行本机 Skill。
+  - **Provider = 本机已安装的 agent CLI**（`claude` / `codex` / `trae-cli`）。所有 LLM 工作都通过当前空间配置的本机 CLI 子进程执行，homeagent 不直连网络 API。普通聊天和研究任务使用绑定 Agent 的 Permission / Workdir，并显式传入全部兼容 Skill；提炼和后台学习继续使用受限 no-tools 调用。Provider 会话仍是一次性的，不写入全局历史；TRAE 当前仍只用于显式任务。后台会探测本机 CLI 的安装和可运行状态。
+  - **Skills 自动加载**：飞书群绑定团队空间，空间再绑定 Team Agent；个人空间绑定 Personal Agent。每次普通聊天或任务启动时，HomeAgent 都会扫描当前 Provider 可用的本机 Skill 目录，把完整兼容目录交给 Agent，再由 Agent 按当前请求加载相关 Skill，无需逐个固定。旧 Agent 的 Pinned Skill 仅作为兼容配置保留，不再形成能力白名单。
+  - **仍隔离环境规则**：运行不会继承用户级规则、Hooks、Plugins 或 Provider 会话历史；Skill 来源由 HomeAgent 自己的目录扫描结果明确传入。任务和 Chat Run 会冻结并记录实际可见的 Skill 列表，方便审计本次运行获得了哪些能力。
+  - **本机 Skill 目录**：共享 Skill 来自 `~/.agents/skills`；后端同时识别 Codex、Claude 和 TRAE 的原生 Skill 目录，并按 Provider 兼容性、来源优先级和同名遮蔽规则生成有效目录。同名同内容合并展示，同名不同内容标出冲突；页面不暴露绝对路径或 `SKILL.md` 正文。
+  - **当前全量模式边界**：普通聊天和研究任务都会冻结全部兼容 Skill 的名称、来源与 `SKILL.md` 摘要，但不会在每次调用前重新散列整个 Skill 目录树。若 Agent 实际选择的 Skill 无法加载，Provider 必须明确报告失败，不得假装已使用。提炼和后台学习不执行本机 Skill。
   - **图片输入的安全边界**：Codex 临时只读普通会话支持原生图片参数（每次最多 4 张）；其他不支持图片输入的 Provider 会明确失败，不会假装已经看过图片。
   - **Model 随 Provider 变化**：切 Provider 时 Model 下拉自动换成该 provider 的维护清单（CLI 无“列模型”接口）；Codex 当前提供 `gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna / gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex-spark`。其中 `gpt-5.6-sol` 是 GPT-5.6 Sol 的完整模型 ID；HomeAgent 日常问答优先选择较快、成本更低的 `gpt-5.6-luna`，复杂研究可选择 `gpt-5.6-terra` 或 `gpt-5.6-sol`。
-  - **推理强度按 Agent 配置**：Codex Agent 可选择继承默认值，或从当前模型支持的档位中选择；GPT-5.6 系列支持 `none / low / medium / high / xhigh / max`，旧模型不会显示不支持的档位。此配置当前用于显式 Codex 任务；其他 Provider 暂不传递。
+  - **推理强度按 Agent 配置**：Codex Agent 可选择继承默认值，或从当前模型支持的档位中选择；GPT-5.6 系列支持 `none / low / medium / high / xhigh / max`，旧模型不会显示不支持的档位。此配置用于普通 Chat 和显式 Codex 任务；其他 Provider 暂不传递。
   - **Visibility 会限制空间绑定**：Team Agent 只能绑定群空间；Personal Agent 只能绑定个人空间。群设置只展示 Team Agent，个人空间详情页只展示 Personal Agent，后端也会拒绝类型不匹配的绑定。已有不兼容绑定时不能直接切换 Visibility，必须先解除绑定；显式删除 Agent 则会先一次性清除所有绑定，让这些空间回退到默认 AI。
-  - **任务权限会真实映射到 CLI 沙箱**：`read-only` 开启只读工具并禁止写入，`write` 以 Workdir 为工作根目录并启用 Provider 的工作区写入模式，`full` 会绕过 Provider 沙箱。`write/full` 必须配置存在的 Workdir；高权限运行还必须经过持久化人工审批。Permission 与 Skills 只作用于显式任务；Workdir 还会作为普通 Codex 受限调用的只读上下文目录，但不会因此获得 Agent 配置的写入权限。
-- **Skills**（共享能力清单）：只读展示 `~/.agents/skills` 中可跨 Provider 分配的共享 Skills、同名冲突/无效配置，以及反向的 **Used by Agents**。Codex、Claude 和 TRAE 的 Provider 专属 Skills 仍由各自 CLI 自动发现，HomeAgent 后端保留扫描用于运行时解析和冲突诊断，但不在普通清单和 Agent 选择器中重复展示。支持本地搜索、状态筛选和手动刷新；安装与更新仍由本机 CLI/Skill 管理工具负责。
+  - **Chat / 任务权限会真实映射到 CLI 沙箱**：`read-only` 开启只读工具并禁止写入，`write` 以 Workdir 为工作根目录并启用 Provider 的工作区写入模式，`full` 会绕过 Provider 沙箱。`write/full` 必须配置存在的 Workdir；高权限任务仍需持久化人工审批，普通 Chat 则直接使用已发布 Agent 的权限配置。
+- **Skills**（能力清单）：只读展示 `~/.agents/skills` 中的共享 Skills、同名冲突和无效配置；运行时还会合并当前 Provider 的原生 Skill 目录。普通聊天和任务自动获得有效的完整目录，不需要在 Agent 上逐个分配。支持本地搜索、状态筛选和手动刷新；安装与更新仍由本机 CLI/Skill 管理工具负责。
 - **任务**（研究任务执行）：新建定期任务，让某空间的 Agent CLI 定期研究一个主题；产出**存为该空间的原始材料**（`source=task`），**运行结束立即触发一次本空间提炼**（当场变成 wiki 知识页，而非等夜间），并可**推送摘要到该空间绑定的飞书群/私聊**。
-  - 字段：名称、目标空间、研究主题、周期（每天几点 / 每小时）、最长运行时间、启用开关、推送开关、完成后立即提炼开关。
-  - **定时**（TaskScheduler，每任务独立周期，启动即 catch-up）+ **后台「立即运行」**。每次启动会立即生成持久化运行编号，并冻结当时的 Agent 发布版本、Instruction、Provider、Model、Permission、Workdir 与完整 Skill 证据；之后即使空间重新绑定、Agent 发布新版本或本机 Skill 变化，当次计划也不会被替换。任务详情页可查看状态、触发来源、耗时、用量/成本覆盖、完整输出或错误，并可重试失败、取消或超时的运行；Agent 工作台按准确归属展示最近记录。
-  - `write/full` 运行先进入持久化人工审批，页面展示真正被冻结的主题、权限、Workdir、Provider、Model、Agent 版本和计划摘要；审批 24 小时过期，批准、拒绝、过期、通知尝试均留审计。`read-only` 保持直接排队，但仍使用冻结计划并在执行前重新核验 Workdir 与 Skill。
+  - 字段：名称、目标空间、研究主题、周期（每小时 / 每天几点 / 每周星期几几点）、最长运行时间、启用开关、推送开关、完成后立即提炼开关。
+  - **定时**（TaskScheduler，每任务独立周期，启动即 catch-up）+ **后台「立即运行」**。每次启动会立即生成持久化运行编号，并冻结当时的 Agent 发布版本、Instruction、Provider、Model、Permission、Workdir 与完整兼容 Skill 目录证据；之后即使空间重新绑定、Agent 发布新版本或本机 Skill 变化，当次计划也不会被替换。任务详情页可查看状态、触发来源、耗时、用量/成本覆盖、完整输出或错误，并可重试失败、取消或超时的运行；Agent 工作台按准确归属展示最近记录。
+  - `write/full` 运行先进入持久化人工审批，页面展示真正被冻结的主题、权限、Workdir、Provider、Model、Agent 版本和计划摘要；审批 24 小时过期，批准、拒绝、过期、通知尝试均留审计。`read-only` 保持直接排队；两者都使用冻结计划，执行前仍重新核验 Workdir。
   - 同一任务只允许一个活动运行；后台、定时调度和飞书命令共享互斥保护，不会重复执行。任务可配置 1–60 分钟的运行上限，后台可取消活动运行，超时或取消都会等待本机 CLI 退出或达到安全上限后再释放并发位。排队项在重启后按冻结计划恢复；已经运行的项会标记为失败，不会拿当前 Agent 配置偷偷续跑。
   - 仅定时触发、`read-only`、尚未产生输出且属于可重试 Provider 故障的运行会在 60 秒后自动再尝试一次；这是创建一条关联的新运行，不是进程 checkpoint。工作续作的 Task Run 成功只会提交带“结果 / 检查 / 证据”的验收候选；自动验收还要求冻结权限为 `read-only`、Raw 已落盘、输出未截断，并收到严格 JSON 执行报告（`outcome=completed`、无 blocker、全部检查通过）。普通文本或畸形报告统一停在人工验收，结构化 `blocked` 结果则保留动作边界并形成 blocker；`write/full/unknown` 必须人工接受后才记录动作边界 checkpoint。手动重试、禁用任务、取消或高权限运行都会终结/替代等待中的自动重试，避免重复执行。
   - Provider 报告的 token 与成本会按调用聚合到 Chat / Task / 质量 trace；无法从 CLI 获得的字段保持“未知”，不会伪装成 0。每日美元预算只会按已知成本执行硬门禁，并同时展示未知成本调用与记账覆盖率。
   - 飞书推送采用持久化通知状态：发送失败会记录错误、尝试次数和退避时间，TaskScheduler 后续自动重试，运行详情页也可手动重试；任务本身的成功结果不会因通知通道暂时故障而丢失。
-  - 研究按空间 Agent 的 Permission / Workdir / Skills 执行；未指定 Agent 时默认 `read-only`。任务写入是异步的，不占用空间写锁；即时提炼始终回到普通受限模式并尽力而为——失败不影响任务成功，原始材料仍会被夜间提炼兜底。
+  - 研究按空间 Agent 的 Permission / Workdir 执行，并自动获得当前 Provider 兼容的全部 Skills；未指定 Agent 时默认 `read-only`。任务写入是异步的，不占用空间写锁；即时提炼始终回到普通受限模式并尽力而为——失败不影响任务成功，原始材料仍会被夜间提炼兜底。
   - **飞书里也能管任务**（`/task` 命令；群聊仅群主/管理员可执行，私聊由本人管理；控制消息不会被当成知识收录）：
     - `/task` 或 `/task list` — 查看本空间任务
     - `/task new <主题>` — 新建每日研究任务（写入本空间）
@@ -255,7 +274,26 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 - **运行状态**：集中展示后台托管方式、PID、启动时间、两条飞书事件消费者的详细状态、必需 CLI、知识存储、任务、提醒、学习、Dream Cycle 与五个调度器；同时展示 AI 回答延迟、失败/超时、主动参与结果和事件队列积压。质量或积压告警会标为 degraded，但不会把仍可服务的实例误判为未就绪。LaunchAgent 托管时可从页面安全重启。
 - **工作上下文**：为每个空间维护目标、Brief、Runbook、当前进展、阻塞项与下一步；新 Raw、Chat Run、Task Run 和由 Raw 生成的 Wiki 页会自动关联到当前工作项，并投影为 `work/<id>/{brief.md,runbook.md,status.json}`。可手动执行下一动作，也可对单个工作项显式开启自动续作；每轮最多领取一个动作，复用 Task Run 的冻结计划、权限审批、通知、超时与一次安全重试。Task Run 成功后先进入动作验收门：后台展示结构化结果、确定性检查和 Run/Raw 证据，只有验收通过才消费当前首个下一步并记录 checkpoint；驳回会保留动作边界和证据、形成可见 blocker，并允许从同一动作重试。计划改变时可显式放弃受阻动作并清除其系统 blocker，再继续新的首个动作。待验收期间自动续作暂停；重启只恢复尚未执行的排队动作，绝不重放已中断的运行中动作。
 - **数据治理**：按空间导出 `homeagent.space v16` JSON 完整备份（知识页、原始记录及其动作验收准入状态、工作上下文、续作动作/checkpoint/验收审计/策略及其证据关联、人工治理审计、撤回标记、任务及 Chat 运行历史、冻结执行计划、Agent 发布历史、审批/重试/通知/用量审计、Skill 证据、相关质量 trace 与封闭的重评记录、提醒、学习计划、主题路线、多来源材料及课程历史、空间元数据），兼容恢复 v1–v16 备份；WorkAction 输出在验收前保持 `held`、接受后才进入待提炼队列，驳回/取消/失败后永久 `excluded`。旧版缺失的高权限审批与执行计划会 fail-closed，legacy Skill 不会被静默绑定到错误来源；升级时会重新派生 WorkAction Raw 状态并清理引用未准入来源的旧 Wiki 页。导出、恢复和删除会阻止仍在运行、等待审批/验收/重试或正在外发的工作，恢复会校验 WorkItem、WorkAction、Task Run、验收证据、Raw 准入与 checkpoint 的双向关联，避免删除后继续副作用、恢复后重复执行、污染知识或重复通知。
-- **设置**：**默认 Provider + 默认 Model**（群未指定 Agent 时用它）、每日预算、提炼时刻、原始消息保留周期、端口。
+- **设置**：**默认 Provider + 默认 Model**（群未指定 Agent 时用它）、聊天最长回答时间（默认 10 分钟，可设 1–60 分钟）、每日预算、提炼时刻、原始消息保留周期、端口，以及安全的数据目录迁移与可选 Git 初始化。最长回答时间会冻结到新建 Chat Run，复杂任务可按需延长，进行中的回答仍可随时取消。
+
+### 数据目录迁移与 Git
+
+在「设置 → 数据目录」输入绝对路径，确认后安排迁移。目标可以不存在、为空，或仅包含受支持的仓库元数据：
+`.git/`、`.obsidian/`、`.gitignore`、`.gitattributes` 和 `.DS_Store`；这些内容会保留并合并到新数据树。
+若目标还有其他文件，或源数据中存在同名根目录项，迁移会拒绝执行，避免覆盖。`.git` 必须是目录，不接管
+以 `.git` 文件表示的 worktree。LaunchAgent 托管的应用会自动优雅重启；源码直接运行时需停止并重新执行
+`bun start`。复制发生在知识引擎、SQLite、调度器和进程锁打开
+之前，并先写入目标同级的临时目录，完整复制成功后再原子切换。旧目录不会自动删除；请在新实例中核验空间、
+任务和设置后再自行处理旧目录。目标不能与旧目录相同，也不能是旧目录的父目录或子目录。
+
+勾选「在新目录初始化 Git 仓库」会对新目录运行 `git init`；若目标已有 `.git/`，则直接沿用仓库，不需要
+勾选。已有 `.gitignore` 会保留并追加 HomeAgent 规则，但不会执行 `git add`、提交、配置远端或推送。
+`.gitignore` 默认排除 `run/`、`logs/`、`bin/` 和可重建的 `.index.db*`，其余配置、运行历史、
+原始来源与知识 Markdown 可由用户自行决定是否提交。数据中可能包含群消息、附件提取内容和内部知识；配置
+远端前应先检查 `git status`，并只使用访问受控的私有仓库。
+
+无页面可用时，手动迁移遵循同一顺序：停止 HomeAgent，复制 `data` 到空目标，核对文件，再设置
+`HOMEAGENT_DATA_DIR` 并重启。不要在服务运行时直接移动目录，也不要先删除旧目录。
 
 后台默认只监听 `127.0.0.1`，无需登录。若通过 `HOMEAGENT_WEB_HOST` 开放到非回环地址，启动时会强制要求
 `HOMEAGENT_WEB_ADMIN_TOKEN`；除 `/healthz`、`/readyz` 外的所有页面与操作都需要认证。
@@ -341,7 +379,7 @@ bun run smoke:macos --app dist/HomeAgent.app
 都会覆盖这些派生记录。macOS 使用系统自带的 Vision/PDFKit；其他平台仍可提取上述 UTF-8 文本文件，
 但会安全跳过图片 OCR 和 PDF 文本提取。音频转写、Office 文件、视频理解和 `post` 消息内嵌资源暂不支持。
 
-> **CLI-only 的代价（务必知悉）**：这些本机 CLI 单次调用**慢、开销大**，dream 批量提炼会明显变慢；它们**自带鉴权和模型选择**，不一定尊重 HomeAgent 里选择的 model。普通问答/提炼/学习可使用严格 no-tools 的 Claude 或临时只读的 Codex；TRAE 仅用于显式任务。dream 的结构化抽取靠“让 CLI 只输出 JSON + 解析校验 + 失败隔离（quarantine）”，偶有条目建不出页。失败记录会持续显示在对应空间的“提炼失败”页，并让知识健康状态降级但不阻断 `/readyz`；可单条或批量重试，且每次只处理该记录关联的原始来源，不会连带重跑无关消息。恢复所需来源不会被原始消息保留策略清理；若来源被撤回，旧失败记录会移除，仍有效的其他来源会重新进入待提炼队列。CLI 未报告的成本会明确记为未知，因此无法仅靠美元预算对这部分调用执行硬限制。
+> **CLI-only 的代价（务必知悉）**：这些本机 CLI 单次调用**慢、开销大**，dream 批量提炼会明显变慢；它们**自带鉴权和模型选择**，不一定尊重 HomeAgent 里选择的 model。普通聊天和任务会获得完整兼容 Skill 目录；提炼与后台学习仍使用严格 no-tools 调用，TRAE 仅用于显式任务。dream 的结构化抽取靠“让 CLI 只输出 JSON + 解析校验 + 失败隔离（quarantine）”，偶有条目建不出页。失败记录会持续显示在对应空间的“提炼失败”页，并让知识健康状态降级但不阻断 `/readyz`；可单条或批量重试，且每次只处理该记录关联的原始来源，不会连带重跑无关消息。恢复所需来源不会被原始消息保留策略清理；若来源被撤回，旧失败记录会移除，仍有效的其他来源会重新进入待提炼队列。CLI 未报告的成本会明确记为未知，因此无法仅靠美元预算对这部分调用执行硬限制。
 
 ### 生产启动（接真实飞书）
 

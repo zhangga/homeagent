@@ -4,7 +4,7 @@
  * and runs any enabled task whose cadence is due. The run/skip decision is a
  * pure function (shouldRunTask) so the policy is unit-tested without timers.
  *
- * Each task has its own cadence (hourly / daily-at-hour); unlike the dream
+ * Each task has its own cadence (hourly / daily-at-hour / weekly-at-day-and-hour); unlike the dream
  * scheduler's single global hour, cadence is per task. On success, if the task
  * opts in and its space is bound to a feishu chat, a summary is pushed via the
  * optional notify callback (wired to connector.notice in main.ts).
@@ -34,22 +34,48 @@ export const DEFAULT_TASK_SCHEDULE: TaskScheduleConfig = {
 
 /**
  * Decide whether a task should run now. Runs when enabled AND:
- *   - never run before, OR
+ *   - hourly/daily and never run before, OR
  *   - hourly: last run >= ~1h ago, OR
- *   - daily: at/after its hour and not yet run today.
+ *   - daily: at/after its hour and not yet run today, OR
+ *   - weekly: this week's configured weekday/hour has passed, the task already
+ *     existed at that time, and it has not run since.
  */
 export function shouldRunTask(task: Task, now: Date): boolean {
   if (!task.enabled) return false;
-  if (task.lastRunAt === undefined) return true;
 
   if (task.cadence === "hourly") {
+    if (task.lastRunAt === undefined) return true;
     return now.getTime() - task.lastRunAt >= 3600_000;
   }
-  // daily
-  if (localHour(now) >= task.hour) {
-    return dayKey(new Date(task.lastRunAt)) !== dayKey(now);
+
+  if (task.cadence === "daily") {
+    if (task.lastRunAt === undefined) return true;
+    if (localHour(now) >= task.hour) {
+      return dayKey(new Date(task.lastRunAt)) !== dayKey(now);
+    }
+    return false;
   }
-  return false;
+
+  const scheduledAt = weeklyScheduleAt(now, task.dayOfWeek, task.hour);
+  return now.getTime() >= scheduledAt
+    && task.createdAt <= scheduledAt
+    && (task.lastRunAt === undefined || task.lastRunAt < scheduledAt);
+}
+
+/** This week's configured weekly occurrence as an instant in Asia/Shanghai. */
+function weeklyScheduleAt(now: Date, dayOfWeek: number, hour: number): number {
+  const localDate = new Date(`${dayKey(now)}T00:00:00Z`);
+  const jsWeekday = localDate.getUTCDay();
+  const isoWeekday = jsWeekday === 0 ? 7 : jsWeekday;
+  localDate.setUTCDate(
+    localDate.getUTCDate() - (isoWeekday - 1) + (dayOfWeek - 1),
+  );
+  return Date.UTC(
+    localDate.getUTCFullYear(),
+    localDate.getUTCMonth(),
+    localDate.getUTCDate(),
+    hour - 8,
+  );
 }
 
 /** Called after a successful run when the task opts into notifications. */

@@ -3,15 +3,17 @@
  *
  *   data/workspaces/<dir>/
  *     purpose.md schema.md          space intent + page-type rules
- *     raw/sources/                  (reserved for immutable original sources)
+ *     raw/records/YYYY/MM/DD.jsonl  authoritative, human-readable Raw records
+ *     raw/sources/                  immutable imported source files
  *     wiki/<type>/<name>.md         distilled pages, foldered by type
  *     wiki/{index,overview,log,glossary}.md   top-level singletons
- *     .index.db                     SQLite projection (rebuildable from wiki/*)
+ *     .index.db                     SQLite projection (rebuildable from raw + wiki)
  *
- * The markdown files are the source of truth; SpaceIndex is the queryable
+ * Markdown and Raw JSONL are the source of truth; SpaceIndex is the queryable
  * mirror. Writing a page writes the .md file and upserts the index together.
- * Because a slug like "entities/alice" encodes its own subfolder, page files
- * live at wiki/<slug>.md.
+ * Raw mutations atomically replace the affected daily JSONL before updating
+ * SQLite. Because a slug like "entities/alice" encodes its own subfolder, page
+ * files live at wiki/<slug>.md.
  */
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -71,7 +73,23 @@ export class SpaceStore {
   index(): SpaceIndex {
     if (!this._index) {
       mkdirSync(this.root, { recursive: true });
-      this._index = new SpaceIndex(this.dbPath);
+      const projectionExisted = existsSync(this.dbPath);
+      try {
+        this._index = new SpaceIndex(this.dbPath, {
+          rawDir: join(this.root, "raw"),
+          space: this.space,
+        });
+        if (!projectionExisted) {
+          // A Git restore or deliberate index deletion must be enough to
+          // recover a working space. Raw has already been projected by the
+          // SpaceIndex constructor; rebuild pages from authoritative Markdown.
+          this._index.rebuildFromPages(this.listPagesFromDisk());
+        }
+      } catch (error) {
+        this._index?.close();
+        this._index = null;
+        throw error;
+      }
     }
     return this._index;
   }

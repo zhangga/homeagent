@@ -10,7 +10,7 @@ export const MAX_EXECUTION_PLAN_INSTRUCTION_CHARACTERS = 20_000;
 export const MAX_EXECUTION_PLAN_MODEL_CHARACTERS = 200;
 export const MAX_EXECUTION_PLAN_ERROR_CHARACTERS = 20_000;
 export const MAX_EXECUTION_PLAN_WORKDIR_CHARACTERS = 2_048;
-export const MAX_EXECUTION_PLAN_SKILLS = 50;
+export const MAX_EXECUTION_PLAN_SKILLS = 2_000;
 
 /** Immutable provider choices captured before a Chat or Task Run is queued. */
 export interface ResolvedExecutionPlan {
@@ -21,8 +21,10 @@ export interface ResolvedExecutionPlan {
   provider?: ProviderId;
   model?: string;
   reasoningEffort?: CodexReasoningEffort;
-  /** Canonical Agent directory available as read-only context to ordinary calls. */
+  /** Canonical Agent directory used by the frozen Chat/Task execution. */
   workdir?: string;
+  /** Automatically load every compatible Skill discovered for the Provider. */
+  skillMode?: "all";
   execution?: ProviderExecution;
   resolutionError?: string;
 }
@@ -36,7 +38,7 @@ export function isAgentRevisionId(value: unknown): value is string {
     && /^agent_revision_[a-zA-Z0-9-]{1,160}$/.test(value);
 }
 
-function isExecution(value: unknown): value is ProviderExecution {
+export function isProviderExecution(value: unknown): value is ProviderExecution {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const execution = value as Partial<ProviderExecution>;
   const validWorkdir = execution.workdir === undefined || (
@@ -54,6 +56,7 @@ function isExecution(value: unknown): value is ProviderExecution {
       typeof skill === "string"
       && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,79}$/.test(skill)
     )
+    && (execution.skillMode === undefined || execution.skillMode === "all")
     && (execution.webSearch === undefined || typeof execution.webSearch === "boolean")
   );
 }
@@ -78,7 +81,8 @@ export function isResolvedExecutionPlan(value: unknown): value is ResolvedExecut
       && plan.workdir.length > 0
       && plan.workdir.length <= MAX_EXECUTION_PLAN_WORKDIR_CHARACTERS
     ))
-    && (plan.execution === undefined || isExecution(plan.execution))
+    && (plan.skillMode === undefined || plan.skillMode === "all")
+    && (plan.execution === undefined || isProviderExecution(plan.execution))
     && (plan.resolutionError === undefined || (
       typeof plan.resolutionError === "string"
       && plan.resolutionError.length <= MAX_EXECUTION_PLAN_ERROR_CHARACTERS
@@ -101,6 +105,7 @@ export function cloneResolvedExecutionPlan(
       ? {}
       : { reasoningEffort: plan.reasoningEffort }),
     ...(plan.workdir === undefined ? {} : { workdir: plan.workdir }),
+    ...(plan.skillMode === undefined ? {} : { skillMode: plan.skillMode }),
     ...(plan.execution === undefined
       ? {}
       : {

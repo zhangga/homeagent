@@ -26,6 +26,8 @@ import {
   config,
   logger,
   saveSettings,
+  MAX_CHAT_TIMEOUT_MINUTES,
+  MIN_CHAT_TIMEOUT_MINUTES,
   isSpaceId,
   isLoopbackHost,
   type LarkBotIdentity,
@@ -71,6 +73,7 @@ import type { CodexSetupPort, FeishuRuntimeStatus, LarkSetupPort } from "./integ
 import type { FeishuIntegrationService } from "./feishu-integration-service.ts";
 import { FeishuIntegrationError } from "./feishu-integration-service.ts";
 import { buildSetupSnapshot } from "./setup.ts";
+import { localMaterialRawContent, prepareLocalMaterials } from "./local-materials.ts";
 import { restartingView, setupLayout, setupView } from "./setup-view.ts";
 import {
   resolveExternalSharingState,
@@ -141,6 +144,37 @@ export interface WebOptions {
   onChatRunCancel?: (runId: string) => boolean;
   /** Gracefully terminate a launchd-managed process so KeepAlive can restart it. */
   onServiceRestart?: () => void;
+  /** Persistent bootstrap storage used to move the data root on a safe restart. */
+  dataDirectory?: DataDirectoryPort;
+}
+
+export interface DataDirectoryStatus {
+  currentPath: string;
+  available: boolean;
+  lockedByEnvironment: boolean;
+  gitAvailable: boolean;
+  gitRepository: boolean;
+  restartable: boolean;
+  migrationError?: string;
+  pendingMigration?: {
+    destination: string;
+    initializeGit: boolean;
+    requestedAt: number;
+  };
+  lastMigration?: {
+    source: string;
+    destination: string;
+    completedAt: number;
+    gitInitialized: boolean;
+  };
+}
+
+export interface DataDirectoryPort {
+  status: () => DataDirectoryStatus | Promise<DataDirectoryStatus>;
+  scheduleMigration: (input: {
+    destination: string;
+    initializeGit: boolean;
+  }) => void | Promise<void>;
 }
 
 /** Read a checkbox from a parsed form body (present => true). */
@@ -163,6 +197,8 @@ function parseSettingsForm(body: Record<string, unknown>): {
     defaultProvider: str(body, "defaultProvider"),
     defaultModel: str(body, "defaultModel"),
     dailyBudgetUsd: str(body, "dailyBudgetUsd"),
+    chatTimeoutMinutes:
+      str(body, "chatTimeoutMinutes") || String(config().chatTimeoutMinutes),
     dreamHour: str(body, "dreamHour"),
     rawRetentionDays: str(body, "rawRetentionDays"),
     webPort: str(body, "webPort"),
@@ -173,6 +209,15 @@ function parseSettingsForm(body: Record<string, unknown>): {
     errors.dailyBudgetUsd = "每日预算必须是有效数字";
   } else if (budget < 0) {
     errors.dailyBudgetUsd = "每日预算不能小于 0";
+  }
+  const chatTimeoutMinutes = Number(values.chatTimeoutMinutes);
+  if (
+    values.chatTimeoutMinutes.trim() === ""
+    || !Number.isInteger(chatTimeoutMinutes)
+    || chatTimeoutMinutes < MIN_CHAT_TIMEOUT_MINUTES
+    || chatTimeoutMinutes > MAX_CHAT_TIMEOUT_MINUTES
+  ) {
+    errors.chatTimeoutMinutes = `聊天最长回答时间必须是 ${MIN_CHAT_TIMEOUT_MINUTES} 到 ${MAX_CHAT_TIMEOUT_MINUTES} 的整数`;
   }
   const hour = Number(values.dreamHour);
   if (
@@ -207,6 +252,7 @@ function parseSettingsForm(body: Record<string, unknown>): {
     defaultProvider: values.defaultProvider,
     defaultModel: values.defaultModel,
     dailyBudgetUsd: budget,
+    chatTimeoutMinutes,
     dreamHour: hour,
     rawRetentionDays: retentionDays,
     webPort: port,
@@ -1144,6 +1190,56 @@ export function createWebApp(opts: WebOptions): Hono {
       return c.redirect(`/spaces/${encodeURIComponent(space)}?ok=${encodeURIComponent("保存失败：Agent Visibility 与空间类型不匹配")}`);
     }
     return c.redirect(`/spaces/${encodeURIComponent(space)}?ok=${encodeURIComponent("已保存空间 Agent")}`);
+  });
+
+  app.post("/spaces/:space/materials", async (c) => {
+    const space = parseSpace(c.req.param("space"));
+    if (!space || !engine.registry.has(space)) return c.notFound();
+    const body = await c.req.parseBody({ all: true });
+    let materials;
+    try {
+      materials = await prepareLocalMaterials(body.material);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "无法读取资料文件";
+      return c.redirect(
+        `/spaces/${encodeURIComponent(space)}?ok=${encodeURIComponent(`导入失败：${reason}`)}`,
+      );
+    }
+    const rawIds: string[] = [];
+    for (const material of materials) {
+      rawIds.push(await engine.remember({
+        space,
+        source: "manual",
+        author: LOCAL_GOVERNANCE_ACTOR,
+        content: localMaterialRawContent(material),
+        attachments: [{
+          kind: "file",
+          ref: `sha256:${material.digest}`,
+          name: material.name,
+        }],
+      }));
+    }
+    let message = rawIds.length === 1
+      ? "资料已导入，等待提炼"
+      : `已导入 ${rawIds.length} 份资料，等待提炼`;
+    if (checkbox(body, "distillNow")) {
+      try {
+        const model = engine.agentForSpace(space)?.model || undefined;
+        const report = await engine.runDreamCycle(space, { rawIds, model });
+        message = report.errors.length === 0
+          ? `${rawIds.length === 1 ? "资料" : `${rawIds.length} 份资料`}已导入并完成提炼：写入 ${report.pagesWritten} 个知识页`
+          : `${rawIds.length === 1 ? "资料" : `${rawIds.length} 份资料`}已导入，但立即提炼未完成：${report.errors.join("; ")}`;
+      } catch (error) {
+        const reason = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+        message = `${rawIds.length === 1 ? "资料" : `${rawIds.length} 份资料`}已导入，但立即提炼失败：${reason}`;
+      }
+    }
+    const destination = rawIds.length === 1
+      ? `/spaces/${encodeURIComponent(space)}/raw/${encodeURIComponent(rawIds[0]!)}`
+      : `/spaces/${encodeURIComponent(space)}`;
+    return c.redirect(
+      `${destination}?ok=${encodeURIComponent(message)}`,
+    );
   });
 
   app.get("/spaces/:space/governance", async (c) => {
@@ -2184,6 +2280,7 @@ export function createWebApp(opts: WebOptions): Hono {
       topic: str(body, "topic"),
       cadence: str(body, "cadence"),
       hour: Number(str(body, "hour")),
+      dayOfWeek: Number(str(body, "dayOfWeek")),
       enabled: checkbox(body, "enabled"),
       notify: checkbox(body, "notify"),
       distillOnRun: checkbox(body, "distillOnRun"),
@@ -2205,6 +2302,7 @@ export function createWebApp(opts: WebOptions): Hono {
         topic: str(body, "topic"),
         cadence: str(body, "cadence"),
         hour: Number(str(body, "hour")),
+        dayOfWeek: Number(str(body, "dayOfWeek")),
         enabled: checkbox(body, "enabled"),
         notify: checkbox(body, "notify"),
         distillOnRun: checkbox(body, "distillOnRun"),
@@ -2777,6 +2875,16 @@ export function createWebApp(opts: WebOptions): Hono {
   app.get("/settings", async (c) => {
     const cfg = config();
     const ok = c.req.query("ok") ?? undefined;
+    const dataDirectory = opts.dataDirectory
+      ? await opts.dataDirectory.status()
+      : {
+          currentPath: cfg.dataDir,
+          available: false,
+          lockedByEnvironment: false,
+          gitAvailable: false,
+          gitRepository: false,
+          restartable: false,
+        };
     return c.html(
       await layout(
         "设置",
@@ -2786,13 +2894,18 @@ export function createWebApp(opts: WebOptions): Hono {
             defaultProvider: cfg.defaultProvider,
             defaultModel: cfg.defaultModel,
             dailyBudgetUsd: cfg.dailyBudgetUsd,
+            chatTimeoutMinutes: cfg.chatTimeoutMinutes,
             dreamHour: cfg.dreamHour,
             rawRetentionDays: cfg.rawRetentionDays,
             webPort: cfg.webPort,
+            dataDir: cfg.dataDir,
           },
           await getProviders(),
           await getModels(),
           ok,
+          undefined,
+          {},
+          dataDirectory,
         ),
         "settings",
       ),
@@ -2826,15 +2939,27 @@ export function createWebApp(opts: WebOptions): Hono {
               defaultProvider: cfg.defaultProvider,
               defaultModel: cfg.defaultModel,
               dailyBudgetUsd: cfg.dailyBudgetUsd,
+              chatTimeoutMinutes: cfg.chatTimeoutMinutes,
               dreamHour: cfg.dreamHour,
               rawRetentionDays: cfg.rawRetentionDays,
               webPort: cfg.webPort,
+              dataDir: cfg.dataDir,
             },
             providers,
             await getModels(),
             undefined,
             parsed.values,
             parsed.errors,
+            opts.dataDirectory
+              ? await opts.dataDirectory.status()
+              : {
+                  currentPath: cfg.dataDir,
+                  available: false,
+                  lockedByEnvironment: false,
+                  gitAvailable: false,
+                  gitRepository: false,
+                  restartable: false,
+                },
           ),
           "settings",
         ),
@@ -2843,6 +2968,33 @@ export function createWebApp(opts: WebOptions): Hono {
     }
     saveSettings(parsed.patch);
     return c.redirect(`/settings?ok=${encodeURIComponent("已保存设置")}`);
+  });
+
+  app.post("/settings/data-directory", async (c) => {
+    if (!opts.dataDirectory) return c.text("Data directory migration unavailable", 409);
+    const body = await c.req.parseBody();
+    if (!checkbox(body, "confirmMigration")) {
+      return c.redirect(`/settings?ok=${encodeURIComponent("迁移未安排：请确认旧目录会被保留")}`);
+    }
+    try {
+      await opts.dataDirectory.scheduleMigration({
+        destination: str(body, "dataDirectory"),
+        initializeGit: checkbox(body, "initializeGit"),
+      });
+      const status = await opts.dataDirectory.status();
+      if (status.restartable && opts.onServiceRestart) {
+        opts.onServiceRestart();
+        return c.html(await restartingView(instanceId, {
+          destination: "/settings",
+          title: "正在迁移数据目录",
+          message: "服务会安全停止，在重新启动时复制并校验数据，然后自动回到设置页。",
+        }));
+      }
+      return c.redirect(`/settings?ok=${encodeURIComponent("迁移已安排；请停止并重新启动 HomeAgent 以完成迁移")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return c.redirect(`/settings?ok=${encodeURIComponent(`迁移未安排：${message}`)}`);
+    }
   });
 
   // ---- logs ----------------------------------------------------------------

@@ -198,7 +198,7 @@ function managedCodexSetup(
       <span>允许 HomeAgent 下载并校验 OpenAI 官方 Codex，将它安装在本机 HomeAgent 专用目录。不会修改系统级软件。</span></label>` : ""}
     <div class="actions"><button class="${primary ? "primary-action" : "secondary-action"}">${needsInstall ? "安装并连接 ChatGPT" : "连接 ChatGPT"}</button></div>
   </form>`;
-  const content = html`<p class="muted">HomeAgent 会使用 OpenAI 官方 Codex 连接 ChatGPT。连接后可用于普通问答和显式任务；普通会话使用临时只读模式，并从绑定 Agent 的 Workdir 读取上下文。</p>
+  const content = html`<p class="muted">HomeAgent 会使用 OpenAI 官方 Codex 连接 ChatGPT。连接后可用于普通聊天和任务；两者会按 Agent 的 Permission / Workdir 执行，并自动获得全部兼容 Skills。提炼与后台学习仍保持 no-tools。</p>
     ${error ? html`<div class="flash">${error}</div>` : ""}
     ${action}
     ${repair}
@@ -210,7 +210,7 @@ function managedCodexSetup(
 
 function advancedProviderSetup(taskOnlyAvailable: DetectedProvider[]): HtmlEscapedString | Promise<HtmlEscapedString> {
   return html`<details><summary>高级选项：使用其他本机 Provider</summary>
-    <p class="muted">如果你已经自行安装并登录 Claude Code，可以重新检测并把它用于普通问答、提炼和学习；HomeAgent 不会在首次设置中代为安装 Claude。</p>
+    <p class="muted">如果你已经自行安装并登录 Claude Code，可以重新检测并用于普通聊天和任务；它会按 Agent 配置使用兼容 Skills，提炼与后台学习保持 no-tools。HomeAgent 不会在首次设置中代为安装 Claude。</p>
     ${taskOnlyAvailable.length > 0 ? html`<p class="muted">已检测到 ${taskOnlyAvailable.map((provider) => provider.name).join("、")}，但它目前只能用于显式任务。</p>` : ""}
     <form method="post" action="/setup/providers/refresh" class="actions"><button class="secondary-action">重新检测本机 Provider</button></form>
   </details>`;
@@ -233,7 +233,7 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
         ? "正在确认 ChatGPT 登录…"
         : "请在浏览器中确认登录";
     return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">正在准备 Codex</h1>
-      <p class="lede">登录授权由 OpenAI 页面处理，HomeAgent 不会接触你的密码。登录后可用于普通问答和显式任务。</p>
+      <p class="lede">登录授权由 OpenAI 页面处理，HomeAgent 不会接触你的密码。登录后可用于普通聊天和任务，并自动获得全部兼容 Skills。</p>
       <div class="waiting"><strong>${title}</strong>
         <span class="muted">${input.codex.installing ? "正在下载并校验 OpenAI 官方 Codex" : input.codex.login.message}</span>
         ${input.codex.login.userCode ? html`<div class="command">${input.codex.login.userCode}</div>` : ""}
@@ -250,8 +250,8 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
         ${advancedProviderSetup(taskOnlyAvailable)}`;
     }
     return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">先连接 Claude Code 或 Codex</h1>
-      <p class="lede">安装并登录任一可用 AI 后回来重新检测。Claude 使用严格 no-tools 模式；Codex 普通会话使用临时只读模式。</p>
-      <div class="choice-grid"><div class="choice"><strong>Claude Code</strong><small>普通问答、提炼和学习使用严格 no-tools 模式</small><div class="command">npm install -g @anthropic-ai/claude-code && claude auth login</div></div></div>
+      <p class="lede">安装并登录任一可用 AI 后回来重新检测。普通聊天和任务可按 Agent 配置使用完整兼容 Skills；提炼与后台学习保持 no-tools。</p>
+      <div class="choice-grid"><div class="choice"><strong>Claude Code</strong><small>普通聊天和任务可使用 Skills，提炼与后台学习使用 no-tools 模式</small><div class="command">npm install -g @anthropic-ai/claude-code && claude auth login</div></div></div>
       ${taskOnlyAvailable.length > 0 ? html`<p class="muted">已检测到 ${taskOnlyAvailable.map((provider) => provider.name).join("、")}，但它目前只能用于显式任务。</p>` : ""}
       <form method="post" action="/setup/providers/refresh" class="actions"><button class="primary-action">重新检测</button></form>
       ${managedCodexSetup(input)}`;
@@ -259,7 +259,7 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
   return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">先连接一个 AI</h1>
     <p class="lede">检测到本机已有可用的 AI。它负责理解消息、整理知识和回答问题，账号仍由你自己掌控。</p>
     ${available.some((provider) => provider.id === "codex")
-      ? html`<p class="muted">Codex 普通会话使用临时只读模式，以绑定 Agent 的 Workdir 作为上下文目录，不加载本机 Skills、用户配置或规则。</p>`
+      ? html`<p class="muted">Codex 普通聊天和任务会自动获得全部兼容 Skills，并按绑定 Agent 的 Permission / Workdir 执行；提炼与后台学习仍保持 no-tools。</p>`
       : ""}
     ${providerChoice(input, available)}`;
 }
@@ -400,18 +400,24 @@ export function setupView(input: SetupViewInput): HtmlEscapedString | Promise<Ht
   </div>`;
 }
 
-export function restartingView(instanceId: string): HtmlEscapedString | Promise<HtmlEscapedString> {
+export function restartingView(
+  instanceId: string,
+  options: { destination?: string; title?: string; message?: string } = {},
+): HtmlEscapedString | Promise<HtmlEscapedString> {
+  const destination = options.destination ?? "/setup";
   return setupLayout(html`<div class="shell">${setupBrand()}
     <aside class="progress"><div class="progress-kicker">Applying connection</div></aside>
-    <main class="stage"><div class="eyebrow">03 · Activate</div><h1 class="setup-title">正在唤醒机器人</h1>
-      <p class="lede">服务会短暂离线，然后自动回到这里。请不要关闭这个页面。</p><div id="restart-status" data-instance="${instanceId}" class="waiting"><strong>重新连接中…</strong></div>
+    <main class="stage"><div class="eyebrow">03 · Activate</div><h1 class="setup-title">${options.title ?? "正在唤醒机器人"}</h1>
+      <p class="lede">${options.message ?? "服务会短暂离线，然后自动回到这里。请不要关闭这个页面。"}</p><div id="restart-status" data-instance="${instanceId}" data-destination="${destination}" class="waiting"><strong>重新连接中…</strong></div>
     </main></div><script>
       (function () {
-        var oldInstance = document.getElementById("restart-status").dataset.instance;
+        var status = document.getElementById("restart-status");
+        var oldInstance = status.dataset.instance;
+        var destination = status.dataset.destination || "/setup";
         function poll() { fetch("/healthz", { cache:"no-store" }).then(function (r) {
           return r.ok ? r.json() : null;
         }).then(function (health) {
-          if (health && health.instanceId && health.instanceId !== oldInstance) location.href="/setup";
+          if (health && health.instanceId && health.instanceId !== oldInstance) location.href=destination;
           else setTimeout(poll,1000);
         }).catch(function () { setTimeout(poll,1000); }); }
         setTimeout(poll,500);

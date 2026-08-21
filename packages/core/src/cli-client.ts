@@ -159,9 +159,9 @@ function jsonInstruction(schema: Record<string, unknown>): string {
  * is the model passed to the CLI (empty => the CLI's own default). `run` is
  * injectable for tests (defaults to the real spawn-based runProvider).
  * `timeoutMs` (optional) overrides the per-call timeout — tasks pass a larger
- * value since research runs longer than Q&A. Resolved native `skills` are only
- * forwarded with an explicit task execution grant; no-tools calls record them
- * as skipped instead of asking the provider to discover or execute them.
+ * value since research runs longer than Q&A. Resolved native `skills` are
+ * forwarded with Chat/Task execution grants; background no-tools calls record
+ * them as skipped instead of asking the provider to execute them.
  * `accountingDataDir` is required so callers cannot silently write usage into
  * the process-wide default data directory.
  */

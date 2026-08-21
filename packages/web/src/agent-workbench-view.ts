@@ -991,11 +991,11 @@ export function agentWorkbenchView(
     <details class="agent-skill-selector" ${view.errors.skills ? "open" : ""}>
       <summary class="agent-skill-summary">
         <div class="agent-skill-summary-copy">
-          <h3 id="agent-skills-heading">共享 Skills</h3>
-          <p>只列出可跨 Provider 分配的共享能力；当前 Provider 自带的 Skills 无需再次固定。</p>
+          <h3 id="agent-skills-heading">Skills 自动加载</h3>
+          <p>普通聊天和任务会自动获得当前 Provider 兼容的全部本机 Skills，无需逐个固定；下方选择仅用于保留旧 Agent 配置。</p>
         </div>
         <span class="agent-skill-pinned-count" id="agent-skill-pinned-count">
-          ${view.skillCatalog.selected.length} 个已固定
+          ${view.skillCatalog.selected.length} 个历史固定项
         </span>
       </summary>
       <div class="agent-skill-panel">
@@ -1008,7 +1008,7 @@ export function agentWorkbenchView(
             placeholder="搜索共享 Skill"
             autocomplete="off"
           />
-          <span>${view.skillCatalog.rows.length} 个共享能力</span>
+          <span>${view.skillCatalog.rows.length} 个共享能力（均自动可用）</span>
           <button
             class="agent-skill-refresh"
             type="submit"
@@ -1018,7 +1018,7 @@ export function agentWorkbenchView(
       <div
         class="agent-skill-chips"
         id="agent-skill-chips"
-        aria-label="已固定的 Skills"
+        aria-label="历史固定的 Skills"
         ${view.skillCatalog.selected.length === 0 ? "hidden" : ""}
       >
           ${view.skillCatalog.selected.map((selection) => html`
@@ -1056,7 +1056,7 @@ export function agentWorkbenchView(
         class="agent-skill-empty-selection"
         id="agent-skill-empty-selection"
         ${view.skillCatalog.selected.length > 0 ? "hidden" : ""}
-      >未固定共享 Skill；当前 Provider 自带的能力仍可按其默认规则使用。</p>
+      >无需固定；运行时会从共享目录和 Provider 原生目录中按需选择。</p>
       <div
         class="agent-skill-list"
         id="agent-skills"
@@ -1274,7 +1274,7 @@ export function agentWorkbenchView(
           <summary>
             <span class="agent-task-summary-copy">
               执行上下文
-              <small>Permission 仅影响任务；Codex 普通会话只读使用 Workdir</small>
+              <small>Permission 同时影响普通聊天和任务；提炼和后台学习不启用 Skills</small>
             </span>
           </summary>
           <div class="agent-task-fields">
@@ -1300,7 +1300,7 @@ export function agentWorkbenchView(
             <div class="agent-field agent-create-field">
               <label class="agent-field-label" for="agent-workdir">
                 Workdir
-                <small>Codex 普通会话只读使用；可写与完全访问权限必填</small>
+                <small>Chat 和任务使用；可写与完全访问权限必填</small>
               </label>
               <div class="agent-field-control">
                 <input
@@ -1880,7 +1880,7 @@ export function agentWorkbenchView(
       var name = document.createElement('span');
       name.textContent = row.dataset.skillName || checkbox.value;
       var status = document.createElement('small');
-      status.textContent = '已固定';
+      status.textContent = '历史固定';
       var remove = document.createElement('button');
       remove.type = 'button';
       remove.setAttribute('aria-label', '移除 ' + name.textContent);
@@ -1891,7 +1891,7 @@ export function agentWorkbenchView(
     });
     skillChips.hidden = activeCount === 0;
     emptySkillSelection.hidden = activeCount > 0;
-    if (skillPinnedCount) skillPinnedCount.textContent = activeCount + ' 个已固定';
+    if (skillPinnedCount) skillPinnedCount.textContent = activeCount + ' 个历史固定项';
   }
   if (skillChips) {
     skillChips.addEventListener('click', function (event) {

@@ -176,7 +176,7 @@ export interface TaskRunStoreOptions {
 export const MAX_TASK_RUN_OUTPUT_CHARACTERS = 100_000;
 export const MAX_TASK_RUN_ERROR_CHARACTERS = 20_000;
 export const MAX_TASK_RUN_HISTORY_PER_TASK = 100;
-export const MAX_TASK_RUN_SKILLS = 50;
+export const MAX_TASK_RUN_SKILLS = 2_000;
 export const MAX_TASK_RUN_SKILL_MESSAGE_CHARACTERS = 300;
 export const MAX_TASK_RUN_APPROVER_CHARACTERS = 300;
 export const MAX_AUTOMATIC_TASK_RUN_ATTEMPTS = 2;

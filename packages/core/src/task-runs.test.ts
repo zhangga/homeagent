@@ -10,6 +10,7 @@ import {
   MAX_TASK_RUN_ERROR_CHARACTERS,
   MAX_TASK_RUN_HISTORY_PER_TASK,
   MAX_TASK_RUN_OUTPUT_CHARACTERS,
+  MAX_TASK_RUN_SKILLS,
   TaskRunStore,
 } from "./task-runs.ts";
 
@@ -22,6 +23,7 @@ const TASK: Task = {
   topic: "记录运行历史",
   cadence: "daily",
   hour: 8,
+  dayOfWeek: 1,
   enabled: true,
   notify: false,
   distillOnRun: false,
@@ -1373,7 +1375,7 @@ describe("TaskRunStore", () => {
       trigger: "manual",
       distill: false,
       skillEvidence: {
-        requested: Array.from({ length: 51 }, (_, index) => ({
+        requested: Array.from({ length: MAX_TASK_RUN_SKILLS + 1 }, (_, index) => ({
           kind: "legacy-name" as const,
           name: `skill-${index}`,
         })),

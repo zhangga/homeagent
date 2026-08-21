@@ -39,6 +39,8 @@ export interface AskOptions {
   fallbackContext?: "agent-workdir";
   /** cancel the active provider call when the owning Run is cancelled. */
   signal?: AbortSignal;
+  /** maximum runtime for each provider call in this answer */
+  timeoutMs?: number;
   /** Observe the durable quality trace recorded before a failed ask is rethrown. */
   onFailureTrace?: (trace: AskFailureTrace) => void;
 }

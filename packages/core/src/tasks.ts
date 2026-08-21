@@ -25,8 +25,8 @@ import { isSpaceId } from "@homeagent/shared";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 
 /** How often a task runs. */
-export type TaskCadence = "hourly" | "daily";
-export const TASK_CADENCES: TaskCadence[] = ["hourly", "daily"];
+export type TaskCadence = "hourly" | "daily" | "weekly";
+export const TASK_CADENCES: TaskCadence[] = ["hourly", "daily", "weekly"];
 export const DEFAULT_TASK_TIMEOUT_MINUTES = 12;
 export const MIN_TASK_TIMEOUT_MINUTES = 1;
 export const MAX_TASK_TIMEOUT_MINUTES = 60;
@@ -43,8 +43,10 @@ export interface Task {
   /** research topic / prompt handed to the agent */
   topic: string;
   cadence: TaskCadence;
-  /** local hour (0-23, Asia/Shanghai) for daily cadence */
+  /** local hour (0-23, Asia/Shanghai) for daily and weekly cadences */
   hour: number;
+  /** ISO weekday (1=Monday ... 7=Sunday) for weekly cadence */
+  dayOfWeek: number;
   /** whether the scheduler runs it automatically */
   enabled: boolean;
   /** push a summary to the space's bound feishu chat on completion */
@@ -70,6 +72,7 @@ export interface TaskInput {
   topic?: string;
   cadence?: string;
   hour?: number;
+  dayOfWeek?: number;
   enabled?: boolean;
   notify?: boolean;
   distillOnRun?: boolean;
@@ -96,6 +99,11 @@ function normalizeCadence(raw?: string): TaskCadence {
 function normalizeHour(raw?: number): number {
   if (typeof raw !== "number" || !Number.isFinite(raw)) return 8;
   return Math.max(0, Math.min(23, Math.trunc(raw)));
+}
+
+function normalizeDayOfWeek(raw?: number): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return 1;
+  return Math.max(1, Math.min(7, Math.trunc(raw)));
 }
 
 function normalizeTimeoutMinutes(raw?: number): number {
@@ -129,6 +137,8 @@ export class TaskStore {
             } else {
               t.timeoutMinutes = normalizeTimeoutMinutes(t.timeoutMinutes);
             }
+            // Backfill for records written before weekly scheduling existed.
+            t.dayOfWeek = normalizeDayOfWeek(t.dayOfWeek);
             map.set(id, t);
           }
         }
@@ -208,6 +218,7 @@ export class TaskStore {
       topic: input.topic?.trim() ?? "",
       cadence: normalizeCadence(input.cadence),
       hour: normalizeHour(input.hour),
+      dayOfWeek: normalizeDayOfWeek(input.dayOfWeek),
       enabled: input.enabled ?? true,
       notify: input.notify ?? true,
       distillOnRun: input.distillOnRun ?? true,
@@ -233,6 +244,9 @@ export class TaskStore {
       if (input.topic !== undefined) task.topic = input.topic.trim();
       if (input.cadence !== undefined) task.cadence = normalizeCadence(input.cadence);
       if (input.hour !== undefined) task.hour = normalizeHour(input.hour);
+      if (input.dayOfWeek !== undefined) {
+        task.dayOfWeek = normalizeDayOfWeek(input.dayOfWeek);
+      }
       if (input.enabled !== undefined) task.enabled = input.enabled;
       if (input.notify !== undefined) task.notify = input.notify;
       if (input.distillOnRun !== undefined) task.distillOnRun = input.distillOnRun;

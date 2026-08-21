@@ -15,10 +15,21 @@ export const NO_PROVIDER_NOTICE = [
   "请在管理后台检查当前空间的 Agent，或在设置里更换默认的本机 CLI。",
 ].join("\n");
 
-export const PROVIDER_TIMEOUT_NOTICE = [
-  "⚠️ 回答超时：当前 Agent 已配置，但本机 AI 没有在 120 秒内完成这次回答。",
-  "可以稍后重试或改用更快的模型；Codex 推荐在“设置”或当前空间的 Agent 中选择 gpt-5.6-luna。",
-].join("\n");
+export function providerTimeoutNotice(error: unknown): string {
+  const match = String(error).match(/timed out after (\d+)ms/i);
+  const timeoutMs = match ? Number(match[1]) : undefined;
+  const limit = timeoutMs && Number.isFinite(timeoutMs)
+    ? timeoutMs % 60_000 === 0
+      ? `${timeoutMs / 60_000} 分钟`
+      : timeoutMs % 1_000 === 0
+        ? `${timeoutMs / 1_000} 秒`
+        : `${timeoutMs} 毫秒`
+    : "配置的最长回答时间";
+  return [
+    `⚠️ 回答超时：当前 Agent 已配置，但本机 AI 没有在 ${limit} 内完成这次回答。`,
+    "可以稍后重试、在设置中延长聊天最长回答时间，或改用更快的模型；Codex 推荐 gpt-5.6-luna。",
+  ].join("\n");
+}
 
 export const UNSUPPORTED_IMAGE_NOTICE = [
   "⚠️ 当前 Agent 不支持图片输入，因此我没有分析这张图。",
@@ -41,7 +52,7 @@ export function providerNotice(error: unknown): string {
   if (/cannot provide a no-tools execution mode/i.test(message)) {
     return NO_TOOLS_MODE_NOTICE;
   }
-  return isProviderTimeoutError(error) ? PROVIDER_TIMEOUT_NOTICE : NO_PROVIDER_NOTICE;
+  return isProviderTimeoutError(error) ? providerTimeoutNotice(error) : NO_PROVIDER_NOTICE;
 }
 
 /** Usage help for the /task chat commands. */

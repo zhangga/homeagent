@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpaceId } from "@homeagent/shared";
@@ -26,6 +26,7 @@ describe("TaskStore", () => {
     expect(t!.id).toMatch(/^task_/);
     expect(t!.cadence).toBe("daily"); // default
     expect(t!.hour).toBe(8); // default
+    expect(t!.dayOfWeek).toBe(1); // Monday, only used by weekly cadence
     expect(t!.enabled).toBe(true);
     expect(t!.notify).toBe(true);
     expect(t!.distillOnRun).toBe(true); // default on
@@ -36,7 +37,7 @@ describe("TaskStore", () => {
     expect(JSON.parse(readFileSync(path, "utf8")).tasks[t!.id].topic).toBe("大模型进展");
   });
 
-  test("cadence + hour normalize", () => {
+  test("cadence + schedule fields normalize", () => {
     const store = new TaskStore(dir);
     const a = store.create({ name: "a", space: SPACE, cadence: "weird", hour: 99 });
     expect(a!.cadence).toBe("daily");
@@ -44,6 +45,16 @@ describe("TaskStore", () => {
     const b = store.create({ name: "b", space: SPACE, cadence: "hourly", hour: 5 });
     expect(b!.cadence).toBe("hourly");
     expect(b!.hour).toBe(5);
+    const c = store.create({
+      name: "c",
+      space: SPACE,
+      cadence: "weekly",
+      hour: 9,
+      dayOfWeek: 99,
+    });
+    expect(c!.cadence).toBe("weekly");
+    expect(c!.hour).toBe(9);
+    expect(c!.dayOfWeek).toBe(7);
   });
 
   test("timeout minutes are configurable and clamped to a safe range", () => {
@@ -51,6 +62,17 @@ describe("TaskStore", () => {
     expect(store.create({ name: "fast", space: SPACE, timeoutMinutes: 0 })?.timeoutMinutes).toBe(1);
     expect(store.create({ name: "normal", space: SPACE, timeoutMinutes: 12 })?.timeoutMinutes).toBe(12);
     expect(store.create({ name: "bounded", space: SPACE, timeoutMinutes: 999 })?.timeoutMinutes).toBe(60);
+  });
+
+  test("older persisted tasks backfill the weekly weekday", () => {
+    const store = new TaskStore(dir);
+    const task = store.create({ name: "legacy", space: SPACE })!;
+    const path = join(dir, "config", "tasks.json");
+    const file = JSON.parse(readFileSync(path, "utf8"));
+    delete file.tasks[task.id].dayOfWeek;
+    writeFileSync(path, JSON.stringify(file), "utf8");
+
+    expect(new TaskStore(dir).get(task.id)?.dayOfWeek).toBe(1);
   });
 
   test("update patches only provided fields", () => {
@@ -117,6 +139,7 @@ describe("TaskStore", () => {
       topic: "恢复",
       cadence: "daily" as const,
       hour: 8,
+      dayOfWeek: 1,
       enabled: true,
       notify: false,
       distillOnRun: false,
