@@ -638,6 +638,31 @@ describe("provider detection", () => {
     }
   });
 
+  test("all-Skill execution exposes the catalog for on-demand selection", async () => {
+    const previous = process.env.HOMEAGENT_CLAUDE_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-all-execution-skills-"));
+    try {
+      process.env.HOMEAGENT_CLAUDE_BIN = writeArgEchoProvider(directory);
+
+      const output = await runProvider("claude", {
+        prompt: "read the linked Lark document",
+        execution: {
+          permission: "read-only",
+          skills: ["lark-doc", "code-review"],
+          skillMode: "all",
+        },
+      }, 500);
+
+      expect(output).toContain("可按需使用以下技能：/lark-doc、/code-review");
+      expect(output).toContain("只加载与当前请求相关的技能");
+      expect(output).not.toContain("必须先加载并遵循");
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CLAUDE_BIN;
+      else process.env.HOMEAGENT_CLAUDE_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("Codex ordinary calls run as ephemeral read-only completions without native Skills", async () => {
     const previous = process.env.HOMEAGENT_CODEX_BIN;
     const directory = mkdtempSync(join(tmpdir(), "ha-codex-no-tools-"));

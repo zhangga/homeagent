@@ -2050,9 +2050,12 @@ describe("space data governance", () => {
     // Markdown is authoritative; simulate a missing/stale rebuildable index.
     source.registry.store(SPACE).index().deletePage(page.slug);
     const task = source.tasks.create({
-      name: "每日报告",
+      name: "每周报告",
       space: SPACE,
       topic: "项目进展",
+      cadence: "weekly",
+      dayOfWeek: 5,
+      hour: 17,
       distillOnRun: false,
     })!;
     await source.runTask(task.id, { trigger: "scheduled" });
@@ -2069,6 +2072,7 @@ describe("space data governance", () => {
         provider: "codex",
         model: "gpt-5.6",
       },
+      timeoutMs: 25 * 60_000,
       startedAt: 1_700_000_150_000,
     });
     source.chatRuns.succeed(chatRun.id, {
@@ -2157,7 +2161,13 @@ describe("space data governance", () => {
         retractions: [
           expect.objectContaining({ chatId: "oc_governance", messageId: "om_retracted" }),
         ],
-        tasks: [expect.objectContaining({ name: "每日报告", space: SPACE })],
+        tasks: [expect.objectContaining({
+          name: "每周报告",
+          space: SPACE,
+          cadence: "weekly",
+          dayOfWeek: 5,
+          hour: 17,
+        })],
         taskRuns: [
           expect.objectContaining({
             taskId: task.id,
@@ -2436,6 +2446,7 @@ describe("space data governance", () => {
     engine.close();
     archive.version = 5;
     delete archive.tasks[0].timeoutMinutes;
+    delete archive.tasks[0].dayOfWeek;
     delete archive.taskRuns[0].timeoutMs;
     delete archive.taskRuns[0].notify;
     delete archive.taskRuns[0].notification;
@@ -2444,6 +2455,7 @@ describe("space data governance", () => {
 
     expect(parsed.version).toBe(16);
     expect(parsed.tasks[0]?.timeoutMinutes).toBe(12);
+    expect(parsed.tasks[0]?.dayOfWeek).toBe(1);
     expect(parsed.taskRuns).toEqual([
       expect.objectContaining({
         taskId: task.id,

@@ -133,11 +133,11 @@ export interface RunInput {
   reasoningEffort?: CodexReasoningEffort;
   /** local images attached to the current user turn */
   images?: ImageInput[];
-  /** Safe pinned-Skill identifiers supplied independently of ProviderExecution. */
+  /** Resolved Skill identifiers supplied independently of ProviderExecution. */
   skills?: string[];
-  /** Canonical Agent working directory used as read-only context for ordinary calls. */
+  /** Canonical Agent working directory used by the current call. */
   workdir?: string;
-  /** Present only for an explicit task or web-research grant, never ordinary Q&A/distillation. */
+  /** Present for Chat, Task, or explicit web-research grants; absent for distillation. */
   execution?: ProviderExecution;
 }
 
@@ -154,8 +154,10 @@ export interface ProviderExecution {
   permission: ProviderExecutionPermission;
   /** Validated, canonical working directory for the provider process. */
   workdir?: string;
-  /** Safe skill identifiers that the provider must load before acting. */
+  /** Complete-catalog or pinned Skill identifiers visible to the provider. */
   skills: string[];
+  /** Every discovered Skill is available; select only those relevant to the request. */
+  skillMode?: "all";
   /** Explicitly allow the provider's native read-only web research tools. */
   webSearch?: boolean;
 }
@@ -286,8 +288,8 @@ const KNOWN: CliSpec[] = [
       "gpt-5.3-codex-spark",
     ],
     buildRun: ({ model, reasoningEffort, images, execution }) => {
-      // Only explicit task execution reaches this adapter. Ephemeral mode and
-      // ignored ambient config/rules isolate each one-shot from global state.
+      // Chat and Task execution reach this adapter. Ephemeral mode and ignored
+      // ambient config/rules isolate each one-shot from global state.
       const args: string[] = ["-c", 'approval_policy="never"'];
       if (reasoningEffort) args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
       if (execution?.webSearch) args.push("--search");
@@ -321,8 +323,7 @@ const KNOWN: CliSpec[] = [
     versionArgs: ["--version"],
     models: ["openrouter-3o", "openrouter-sonnet", "openrouter-gpt-5"],
     buildRun: ({ prompt, model, execution }) => {
-      // Ordinary LLM work stays read-only; task execution maps the Agent's
-      // permission tier to TRAE's sandbox.
+      // Chat/Task execution maps the Agent's permission tier to TRAE's sandbox.
       const sandbox = sandboxForPermission(execution?.permission);
       const args = ["exec", "--sandbox", sandbox, prompt];
       if (model) args.push("-m", model);
@@ -583,7 +584,7 @@ function injectProviderSkills(id: ProviderId, input: RunInput): RunInput {
         ? input.skills
         : [],
   );
-  const prepared = {
+  const prepared: RunInput = {
     ...input,
     skills,
     ...(input.execution
@@ -594,23 +595,32 @@ function injectProviderSkills(id: ProviderId, input: RunInput): RunInput {
               ? input.execution.workdir
               : undefined,
             skills,
+            skillMode: input.execution.skillMode === "all" ? "all" : undefined,
             webSearch: input.execution.webSearch === true,
           },
         }
       : {}),
   };
-  // Native Skill invocation is itself an agent capability. Ordinary
-  // completions are intentionally no-tools/no-customizations, so keep their
-  // evidence in the Run trace but do not tell the CLI to load a local Skill.
+  // Native Skill invocation requires an execution grant. Background no-tools
+  // completions keep evidence in the Run trace but do not ask the CLI to load
+  // a local Skill.
   if (!prepared.execution || skills.length === 0) return prepared;
   const references = skills
     .map((skill) => providerSkillReference(id, skill))
     .filter((reference): reference is string => Boolean(reference));
+  const instruction = prepared.execution.skillMode === "all"
+    ? [
+        `可按需使用以下技能：${references.join("、")}；只加载与当前请求相关的技能。`,
+        "如果所需技能不可用，停止执行并明确报告。",
+      ]
+    : [
+        `必须先加载并遵循以下已配置技能：${references.join("、")}。`,
+        "如果任一技能不可用，停止执行并明确报告，不要假装已经使用。",
+      ];
   return {
     ...prepared,
     prompt: [
-      `必须先加载并遵循以下已配置技能：${references.join("、")}。`,
-      "如果任一技能不可用，停止执行并明确报告，不要假装已经使用。",
+      ...instruction,
       "",
       prepared.prompt,
     ].join("\n"),

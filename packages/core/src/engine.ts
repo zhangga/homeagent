@@ -2598,22 +2598,22 @@ export class KnowledgeEngine implements Knowledge {
       ? selectedProvider
       : "gateway";
     const skills = skillsForProviderExecution(
-      options.resolvedSkills ?? this.skillCatalog.resolveAgentBindings(
-        agent?.skills ?? [],
-        provider,
-      ),
+      options.resolvedSkills ?? (options.taskExecution
+        ? this.skillCatalog.resolveAll(provider)
+        : this.skillCatalog.resolveAgentBindings(agent?.skills ?? [], provider)),
       options.taskExecution === true,
     );
     const skillNames = skills.resolved.map((skill) => skill.invocationName);
-    // Only tasks and explicit web research get ProviderExecution. Ask, dream,
-    // and ordinary learning keep it absent; their native Skills are recorded
-    // as skipped so the no-tools boundary and trace evidence stay aligned.
+    // Chat/Task callers opt into ProviderExecution. Dream and background
+    // learning keep it absent; their native Skills are recorded as skipped so
+    // the no-tools boundary and trace evidence stay aligned.
     const execution: ProviderExecution | undefined = options.taskExecution || options.webSearch
       ? {
           ...(options.taskExecution
             ? resolveAgentExecution(agent)
             : { permission: "read-only" as const, skills: [] }),
           skills: skillNames,
+          ...(options.taskExecution ? { skillMode: "all" as const } : {}),
           ...(options.webSearch ? { webSearch: true } : {}),
         }
       : undefined;
@@ -2634,7 +2634,7 @@ export class KnowledgeEngine implements Knowledge {
    */
   agentRunExecutionSnapshot(
     space: SpaceId,
-    taskExecution = false,
+    taskExecution = true,
   ): AgentRunExecutionSnapshot {
     const agent = this.agentForSpace(space);
     const cfg = config();
@@ -2655,10 +2655,9 @@ export class KnowledgeEngine implements Knowledge {
         ? agent.reasoningEffort
         : undefined;
     const skills = skillsForProviderExecution(
-      this.skillCatalog.resolveAgentBindings(
-        agent?.skills ?? [],
-        resolutionProvider,
-      ),
+      taskExecution
+        ? this.skillCatalog.resolveAll(resolutionProvider)
+        : this.skillCatalog.resolveAgentBindings(agent?.skills ?? [], resolutionProvider),
       taskExecution,
     );
     const skillEvidence: TaskRunSkillEvidence = {
@@ -2675,6 +2674,7 @@ export class KnowledgeEngine implements Knowledge {
         execution = {
           ...resolveAgentExecution(agent),
           skills: skills.resolved.map((skill) => skill.invocationName),
+          skillMode: "all",
         };
       }
     } catch (error) {
@@ -2688,6 +2688,7 @@ export class KnowledgeEngine implements Knowledge {
       model,
       reasoningEffort,
       workdir,
+      skillMode: taskExecution ? "all" : undefined,
       execution,
       resolutionError,
     };
@@ -2764,6 +2765,7 @@ export class KnowledgeEngine implements Knowledge {
     ) {
       throw new Error("Resolved execution plan Skill names do not match its frozen evidence.");
     }
+    if (executionPlan.skillMode === "all") return frozen;
     if (frozen.resolved.length === 0) return frozen;
     const provider = executionPlan.provider;
     if (!provider) {
@@ -2827,7 +2829,7 @@ export class KnowledgeEngine implements Knowledge {
     execute: () => Promise<T>,
     queueTimeoutMs = 60 * 60_000,
   ): Promise<T> {
-    const snapshot = this.agentRunExecutionSnapshot(space);
+    const snapshot = this.agentRunExecutionSnapshot(space, false);
     this.backgroundRunCounts.set(
       space,
       (this.backgroundRunCounts.get(space) ?? 0) + 1,
@@ -4139,6 +4141,7 @@ export class KnowledgeEngine implements Knowledge {
       topic: run.topic,
       cadence: "daily",
       hour: 0,
+      dayOfWeek: 1,
       enabled: ["queued", "awaiting_approval", "running"].includes(action.status),
       notify: run.notify ?? true,
       distillOnRun: run.distill,
@@ -4536,6 +4539,7 @@ export class KnowledgeEngine implements Knowledge {
       topic,
       cadence: "daily",
       hour: 0,
+      dayOfWeek: 1,
       enabled: false,
       notify: true,
       distillOnRun: false,
@@ -5247,8 +5251,16 @@ export class KnowledgeEngine implements Knowledge {
     const stores = spaces.filter((s) => this.registry.has(s)).map((s) => this.registry.store(s));
     const primary = spaces[0] ?? stores[0]?.space;
     const context = primary
-      ? this.agentCallContext(primary, { signal: opts.signal })
-      : this.agentCallContext(spaces[0]!, { signal: opts.signal });
+      ? this.agentCallContext(primary, {
+          signal: opts.signal,
+          timeoutMs: opts.timeoutMs,
+          taskExecution: true,
+        })
+      : this.agentCallContext(spaces[0]!, {
+          signal: opts.signal,
+          timeoutMs: opts.timeoutMs,
+          taskExecution: true,
+        });
     const snapshot = primary ? this.agentRunExecutionSnapshot(primary) : undefined;
     return this.executeAsk(
       stores,
@@ -5281,9 +5293,6 @@ export class KnowledgeEngine implements Knowledge {
     opts: AskOptions = {},
     traceAgentId?: string,
   ): Promise<AskResult> {
-    if (executionPlan.execution !== undefined) {
-      throw new Error("Chat execution plan must not grant ProviderExecution");
-    }
     const stores = spaces.filter((space) => this.registry.has(space))
       .map((space) => this.registry.store(space));
     const primary = spaces[0] ?? stores[0]?.space;
@@ -5292,7 +5301,7 @@ export class KnowledgeEngine implements Knowledge {
       primary,
       executionPlan,
       skillEvidence,
-      { signal: opts.signal },
+      { signal: opts.signal, timeoutMs: opts.timeoutMs },
     );
     return this.executeAsk(
       stores,

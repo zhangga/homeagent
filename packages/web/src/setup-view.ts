@@ -193,7 +193,7 @@ function optionalCodexTaskSetup(
       </form></div>`
     : "";
   return html`<details><summary>安装 Codex</summary>
-    <p class="muted">安装并登录后，Codex 可用于普通问答和显式任务；普通会话使用临时只读模式，并从绑定 Agent 的 Workdir 读取上下文。</p>
+    <p class="muted">安装并登录后，Codex 可用于普通聊天和任务；两者会按 Agent 的 Permission / Workdir 执行，并自动获得全部兼容 Skills。</p>
     ${error ? html`<div class="flash">${error}</div>` : ""}
     <form method="post" action="${needsInstall ? "/setup/ai/codex/install" : "/setup/ai/codex/login"}">
       ${needsInstall ? html`<label class="consent"><input type="checkbox" name="consent" value="on" required />
@@ -230,8 +230,8 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
   }
   if (available.length === 0) {
     return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">先连接 Claude Code 或 Codex</h1>
-      <p class="lede">安装并登录任一可用 AI 后回来重新检测。Claude 使用严格 no-tools 模式；Codex 普通会话使用临时只读模式。</p>
-      <div class="choice-grid"><div class="choice"><strong>Claude Code</strong><small>普通问答、提炼和学习使用严格 no-tools 模式</small><div class="command">npm install -g @anthropic-ai/claude-code && claude auth login</div></div></div>
+      <p class="lede">安装并登录任一可用 AI 后回来重新检测。普通聊天和任务可按 Agent 配置使用完整兼容 Skills；提炼与后台学习保持 no-tools。</p>
+      <div class="choice-grid"><div class="choice"><strong>Claude Code</strong><small>普通聊天和任务可使用 Skills，提炼与后台学习使用 no-tools 模式</small><div class="command">npm install -g @anthropic-ai/claude-code && claude auth login</div></div></div>
       ${taskOnlyAvailable.length > 0 ? html`<p class="muted">已检测到 ${taskOnlyAvailable.map((provider) => provider.name).join("、")}，但它目前只能用于显式任务。</p>` : ""}
       <form method="post" action="/setup/providers/refresh" class="actions"><button class="primary-action">重新检测</button></form>
       ${optionalCodexTaskSetup(input)}`;
@@ -239,7 +239,7 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
   return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">先连接一个 AI</h1>
     <p class="lede">检测到本机已有可用的 AI。它负责理解消息、整理知识和回答问题，账号仍由你自己掌控。</p>
     ${available.some((provider) => provider.id === "codex")
-      ? html`<p class="muted">Codex 普通会话使用临时只读模式，以绑定 Agent 的 Workdir 作为上下文目录，不加载本机 Skills、用户配置或规则。</p>`
+      ? html`<p class="muted">Codex 普通聊天和任务会自动获得全部兼容 Skills，并按绑定 Agent 的 Permission / Workdir 执行；提炼与后台学习仍保持 no-tools。</p>`
       : ""}
     ${providerChoice(input, available)}`;
 }
@@ -380,18 +380,24 @@ export function setupView(input: SetupViewInput): HtmlEscapedString | Promise<Ht
   </div>`;
 }
 
-export function restartingView(instanceId: string): HtmlEscapedString | Promise<HtmlEscapedString> {
+export function restartingView(
+  instanceId: string,
+  options: { destination?: string; title?: string; message?: string } = {},
+): HtmlEscapedString | Promise<HtmlEscapedString> {
+  const destination = options.destination ?? "/setup";
   return setupLayout(html`<div class="shell">${setupBrand()}
     <aside class="progress"><div class="progress-kicker">Applying connection</div></aside>
-    <main class="stage"><div class="eyebrow">03 · Activate</div><h1 class="setup-title">正在唤醒机器人</h1>
-      <p class="lede">服务会短暂离线，然后自动回到这里。请不要关闭这个页面。</p><div id="restart-status" data-instance="${instanceId}" class="waiting"><strong>重新连接中…</strong></div>
+    <main class="stage"><div class="eyebrow">03 · Activate</div><h1 class="setup-title">${options.title ?? "正在唤醒机器人"}</h1>
+      <p class="lede">${options.message ?? "服务会短暂离线，然后自动回到这里。请不要关闭这个页面。"}</p><div id="restart-status" data-instance="${instanceId}" data-destination="${destination}" class="waiting"><strong>重新连接中…</strong></div>
     </main></div><script>
       (function () {
-        var oldInstance = document.getElementById("restart-status").dataset.instance;
+        var status = document.getElementById("restart-status");
+        var oldInstance = status.dataset.instance;
+        var destination = status.dataset.destination || "/setup";
         function poll() { fetch("/healthz", { cache:"no-store" }).then(function (r) {
           return r.ok ? r.json() : null;
         }).then(function (health) {
-          if (health && health.instanceId && health.instanceId !== oldInstance) location.href="/setup";
+          if (health && health.instanceId && health.instanceId !== oldInstance) location.href=destination;
           else setTimeout(poll,1000);
         }).catch(function () { setTimeout(poll,1000); }); }
         setTimeout(poll,500);

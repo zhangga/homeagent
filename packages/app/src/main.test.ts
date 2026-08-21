@@ -112,4 +112,53 @@ describe("compiled app command dispatch", () => {
     disabledEngine.close();
     replacedEngine.close();
   });
+
+  test("removes the historical oc_demo binding without touching real groups", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "homeagent-feishu-demo-cleanup-"));
+    temporary.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir });
+    engine.ensureSpace("team/oc_demo", { chatId: "oc_demo" });
+    engine.feishuBindings.connect({
+      chatId: "oc_demo",
+      spaceId: "team/oc_demo",
+      boundAppId: "cli_current",
+      responseMode: "smart",
+      participationLevel: "balanced",
+      replyInThread: true,
+    });
+    engine.feishuBindings.connect({
+      chatId: "oc_real",
+      spaceId: "team/oc_real",
+      boundAppId: "cli_current",
+      responseMode: "mentions_only",
+      replyInThread: false,
+    });
+
+    await prepareFeishuStartup(engine, {
+      status: async () => ({
+        state: "ready" as const,
+        verified: true,
+        appId: "cli_current",
+        brand: "feishu" as const,
+        botName: "HomeAgent",
+        botOpenId: "ou_bot",
+        message: "ready",
+      }),
+    });
+
+    const demoBinding = engine.feishuBindings.getByChatId("oc_demo");
+    const realBinding = engine.feishuBindings.getByChatId("oc_real");
+    engine.close();
+
+    expect(demoBinding).toBeUndefined();
+    expect(realBinding).toMatchObject({
+      state: "active",
+      responseMode: "mentions_only",
+    });
+
+    const restored = new KnowledgeEngine({ dataDir: dir });
+    expect(restored.feishuBindings.getByChatId("oc_demo")).toBeUndefined();
+    expect(restored.feishuBindings.getByChatId("oc_real")?.state).toBe("active");
+    restored.close();
+  });
 });

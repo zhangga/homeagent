@@ -74,9 +74,18 @@ describe("handleTaskCommand", () => {
 
   test("list shows created tasks", async () => {
     engine.tasks.create({ name: "任务甲", space: SPACE, topic: "x" });
+    engine.tasks.create({
+      name: "周报",
+      space: SPACE,
+      topic: "weekly",
+      cadence: "weekly",
+      dayOfWeek: 5,
+      hour: 17,
+    });
     const reply = await handleTaskCommand(engine, SPACE, { verb: "list", arg: "" });
     expect(reply).toContain("任务甲");
     expect(reply).toContain("1.");
+    expect(reply).toContain("周报 · 每周五17点");
   });
 
   test("run by index dispatches the task (fire-and-forget)", async () => {

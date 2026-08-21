@@ -20,7 +20,7 @@
  * per-space serialization still applies underneath.
  */
 import type { SpaceId } from "@homeagent/shared";
-import { Serializer, logger, type SerializerSnapshot } from "@homeagent/shared";
+import { Serializer, config, logger, type SerializerSnapshot } from "@homeagent/shared";
 import { isProviderTimeoutError } from "@homeagent/llm";
 import {
   resolveGroupParticipationLevel,
@@ -92,11 +92,19 @@ const RECENT_CONTEXT_LOOKBACK_MS = 24 * 60 * 60_000;
 const RECENT_CONTEXT_SCAN_LIMIT = 50;
 const RECENT_ANSWER_SAMPLE_SIZE = 50;
 const CHAT_QUEUE_TIMEOUT_MS = 2 * 60_000;
+const LEGACY_CHAT_PROVIDER_TIMEOUT_MS = 2 * 60_000;
 
 class ChatRunCancelledError extends Error {
   constructor() {
     super("Chat Run was cancelled before it completed.");
     this.name = "ChatRunCancelledError";
+  }
+}
+
+class ChatRunTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`chat run timed out after ${timeoutMs}ms`);
+    this.name = "ChatRunTimeoutError";
   }
 }
 
@@ -241,6 +249,8 @@ export interface RuntimeOptions {
   attachmentExtractor?: (attachment: DownloadedAttachment) => Promise<string | null>;
   /** Maximum time a Chat Run may wait for admission. */
   chatQueueTimeoutMs?: number;
+  /** Test/runtime override; ordinary production runs use the editable setting. */
+  chatAnswerTimeoutMs?: number;
 }
 
 export class Orchestrator {
@@ -260,6 +270,7 @@ export class Orchestrator {
   private attachmentDownloader?: (messageId: string) => Promise<DownloadedAttachment[]>;
   private attachmentExtractor: (attachment: DownloadedAttachment) => Promise<string | null>;
   private chatQueueTimeoutMs: number;
+  private chatAnswerTimeoutMs?: number;
   private eventMetrics = {
     total: 0,
     completed: 0,
@@ -302,6 +313,13 @@ export class Orchestrator {
     this.chatQueueTimeoutMs = opts.chatQueueTimeoutMs ?? CHAT_QUEUE_TIMEOUT_MS;
     if (!Number.isFinite(this.chatQueueTimeoutMs) || this.chatQueueTimeoutMs <= 0) {
       throw new Error("chatQueueTimeoutMs must be positive");
+    }
+    this.chatAnswerTimeoutMs = opts.chatAnswerTimeoutMs;
+    if (
+      this.chatAnswerTimeoutMs !== undefined
+      && (!Number.isFinite(this.chatAnswerTimeoutMs) || this.chatAnswerTimeoutMs <= 0)
+    ) {
+      throw new Error("chatAnswerTimeoutMs must be positive");
     }
   }
 
@@ -925,6 +943,7 @@ export class Orchestrator {
       skillEvidence: snapshot.skillEvidence,
       execution: snapshot.execution,
       executionPlan: snapshot.executionPlan,
+      timeoutMs: this.chatAnswerTimeoutMs ?? config().chatTimeoutMinutes * 60_000,
       retryOf,
     });
     if (workItemId) this.engine.workItems.attachChatRun(workItemId, run.id);
@@ -954,7 +973,15 @@ export class Orchestrator {
           if (!this.engine.chatRuns.begin(run.id)) {
             throw new Error(`queued chat run is no longer active: ${run.id}`);
           }
-          await execute(controller.signal);
+          const timeoutMs = run.timeoutMs ?? LEGACY_CHAT_PROVIDER_TIMEOUT_MS;
+          const timeout = setTimeout(() => {
+            controller.abort(new ChatRunTimeoutError(timeoutMs));
+          }, timeoutMs);
+          try {
+            await execute(controller.signal);
+          } finally {
+            clearTimeout(timeout);
+          }
         },
       });
     } catch (error) {
@@ -1144,6 +1171,7 @@ export class Orchestrator {
           {
             images: context.images.map((image) => ({ path: image.localPath })),
             signal,
+            timeoutMs: run.timeoutMs ?? LEGACY_CHAT_PROVIDER_TIMEOUT_MS,
             onFailureTrace: (trace) => {
               failureTrace = trace;
             },

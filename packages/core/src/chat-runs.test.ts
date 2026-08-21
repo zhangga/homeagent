@@ -130,10 +130,12 @@ describe("ChatRunStore", () => {
       input: "queued chat",
       trigger: "message",
       executionPlan,
+      timeoutMs: 7 * 60_000,
       startedAt: 100,
     });
 
     expect(new ChatRunStore(dir).get(run.id)?.executionPlan).toEqual(executionPlan);
+    expect(new ChatRunStore(dir).get(run.id)?.timeoutMs).toBe(7 * 60_000);
     expect(JSON.parse(readFileSync(join(dir, "config", "chat-runs.json"), "utf8")).version)
       .toBe(5);
   });
@@ -157,23 +159,42 @@ describe("ChatRunStore", () => {
     expect(store.list()).toEqual([]);
   });
 
-  test("rejects a Chat execution plan that grants provider execution", () => {
+  test("persists a Chat execution plan that grants provider tools and Skills", () => {
+    const store = new ChatRunStore(dir);
+    const executionPlan: ResolvedExecutionPlan = {
+      version: 1,
+      instruction: "Use every available Skill.",
+      provider: "codex",
+      execution: {
+        permission: "full",
+        workdir: dir,
+        skills: ["lark-doc"],
+      },
+    };
+
+    const run = store.start({
+      space: SPACE,
+      input: "ordinary chat",
+      trigger: "message",
+      execution: executionPlan.execution,
+      executionPlan,
+    });
+
+    expect(new ChatRunStore(dir).get(run.id)).toEqual(expect.objectContaining({
+      execution: executionPlan.execution,
+      executionPlan,
+    }));
+  });
+
+  test("rejects a non-positive provider timeout before persisting a run", () => {
     const store = new ChatRunStore(dir);
 
     expect(() => store.start({
       space: SPACE,
       input: "ordinary chat",
       trigger: "message",
-      executionPlan: {
-        version: 1,
-        instruction: "Answer only.",
-        provider: "claude",
-        execution: {
-          permission: "read-only",
-          skills: [],
-        },
-      },
-    })).toThrow("must not grant provider execution");
+      timeoutMs: 0,
+    })).toThrow("Chat timeout");
     expect(store.list()).toEqual([]);
   });
 
@@ -192,9 +213,12 @@ describe("ChatRunStore", () => {
     };
     legacy.version = 2;
     delete legacy.runs[run.id]!.executionPlan;
+    delete legacy.runs[run.id]!.timeoutMs;
     writeFileSync(path, JSON.stringify(legacy), "utf8");
 
-    expect(new ChatRunStore(dir).get(run.id)).toBeDefined();
+    const reopened = new ChatRunStore(dir).get(run.id);
+    expect(reopened?.id).toBe(run.id);
+    expect(reopened?.timeoutMs).toBeUndefined();
   });
 
   test("recovers an interrupted running record as a typed durable failure", () => {

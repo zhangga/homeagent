@@ -11,6 +11,7 @@ coverage/
 
 # homeagent
 data/
+.homeagent/runtime.json
 reference/
 *.db
 *.db-shm

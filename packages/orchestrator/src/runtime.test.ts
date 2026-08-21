@@ -93,6 +93,7 @@ function makeCliOnlyRuntime(
   cliEngine: KnowledgeEngine,
   space: SpaceId,
   agentInput?: AgentInput,
+  runtimeOptions: { chatAnswerTimeoutMs?: number } = {},
 ) {
   cliEngine.ensureSpace(space);
   if (space.startsWith("team/")) {
@@ -117,7 +118,11 @@ function makeCliOnlyRuntime(
     p2pChatId: "oc_dm",
     userId: "ou_me",
   });
-  const cliOrch = new Orchestrator({ engine: cliEngine, connector: cliConnector });
+  const cliOrch = new Orchestrator({
+    engine: cliEngine,
+    connector: cliConnector,
+    ...runtimeOptions,
+  });
   const runtime = { engine: cliEngine, connector: cliConnector, orchestrator: cliOrch };
   cliOnlyRuntimes.push(runtime);
   return runtime;
@@ -1563,6 +1568,26 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(engine.registry.store("personal/ou_me").index().countRaw(true)).toBe(1);
   });
 
+  test("a long message with a trailing addressed memory command is captured and acknowledged", async () => {
+    engine.askWithExecutionPlan = async () => {
+      throw new Error("explicit memory must not reach the answer model");
+    };
+    const text = [
+      "UE 5.8 Iris 已支持按连接并行 Tick。",
+      "DS 使用 -nothreading 时会失去多核收益。",
+      "@HomeAgent 记住上面的信息",
+    ].join("\n");
+
+    await orch.start();
+    await connector.sendP2P(text);
+
+    expect(connector.sent).toHaveLength(1);
+    expect(connector.sent[0]!.markdown).toContain("记下");
+    expect(engine.registry.store("personal/ou_me").index().listRaw({})).toEqual([
+      expect.objectContaining({ content: text, admission: "ready" }),
+    ]);
+  });
+
   test("an addressed natural-language reminder creates a durable reminder", async () => {
     grantGroupAdministrator();
     const before = Date.now();
@@ -2678,11 +2703,13 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(cliConnector.sent[0]!.markdown).toContain("回答 Agent 暂时不可用");
   });
 
-  test("CLI-only runtime distinguishes a provider timeout from missing configuration", async () => {
+  test("CLI-only runtime reports the frozen timeout instead of a hard-coded 120 seconds", async () => {
+    saveSettings({ chatTimeoutMinutes: 7 }, dir);
+    resetConfig();
     const cliEngine = new KnowledgeEngine({
       dataDir: dir,
-      runProvider: async () => {
-        throw new Error("provider codex timed out after 120000ms");
+      runProvider: async (_id, _input, timeoutMs) => {
+        throw new Error(`provider codex timed out after ${timeoutMs}ms`);
       },
     });
     const { connector: cliConnector, orchestrator: cliOrch } = makeCliOnlyRuntime(
@@ -2695,8 +2722,61 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     await cliConnector.sendP2P("谁负责后端服务");
 
     expect(cliConnector.sent[0]!.markdown).toContain("回答超时");
+    expect(cliConnector.sent[0]!.markdown).toContain("7 分钟");
+    expect(cliConnector.sent[0]!.markdown).not.toContain("120 秒");
     expect(cliConnector.sent[0]!.markdown).toContain("gpt-5.6-luna");
     expect(cliConnector.sent[0]!.markdown).not.toContain("未配置");
+  });
+
+  test("CLI-only runtime freezes the configured chat timeout and passes it to the provider", async () => {
+    saveSettings({ chatTimeoutMinutes: 7 }, dir);
+    resetConfig();
+    const providerTimeouts: Array<number | undefined> = [];
+    const cliEngine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async (_id, _input, timeoutMs) => {
+        providerTimeouts.push(timeoutMs);
+        return "这是一个需要模型回答的问题。";
+      },
+    });
+    const { connector: cliConnector, orchestrator: cliOrch } = makeCliOnlyRuntime(
+      cliEngine,
+      "personal/ou_me",
+      { name: "长回答助手", provider: "codex", model: "gpt-5.6-sol" },
+    );
+
+    await cliOrch.start();
+    await cliConnector.sendP2P("请解释一个复杂技术方案");
+
+    expect(providerTimeouts).toEqual([7 * 60_000]);
+    expect(cliEngine.chatRuns.list()[0]?.timeoutMs).toBe(7 * 60_000);
+  });
+
+  test("CLI-only runtime enforces the frozen timeout across the whole answer", async () => {
+    const cliEngine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async (_id, _input, timeoutMs, signal) => {
+        expect(timeoutMs).toBe(25);
+        return await new Promise<string>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+    });
+    const { connector: cliConnector, orchestrator: cliOrch } = makeCliOnlyRuntime(
+      cliEngine,
+      "personal/ou_me",
+      { name: "限时助手", provider: "codex", model: "gpt-5.6-sol" },
+      { chatAnswerTimeoutMs: 25 },
+    );
+
+    await cliOrch.start();
+    await cliConnector.sendP2P("请分析这个复杂问题");
+
+    expect(cliConnector.sent[0]!.markdown).toContain("25 毫秒");
+    expect(cliEngine.chatRuns.list()[0]).toEqual(expect.objectContaining({
+      timeoutMs: 25,
+      status: "timed_out",
+    }));
   });
 
   test("CLI-only runtime answers a prefiltered greeting without resolving a provider", async () => {

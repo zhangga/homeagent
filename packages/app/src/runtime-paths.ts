@@ -1,6 +1,10 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { brandedEnv } from "@homeagent/shared";
+import {
+  configuredRuntimeDataDir,
+  runtimeDataSettingsPath,
+} from "./runtime-data.ts";
 
 export interface RuntimePaths {
   bundled: boolean;
@@ -18,6 +22,7 @@ export function resolveRuntimePaths(input: {
   homeDir?: string;
   env?: NodeJS.ProcessEnv;
   repoRoot?: string;
+  platform?: NodeJS.Platform;
 } = {}): RuntimePaths {
   const execPath = input.execPath ?? process.execPath;
   const home = input.homeDir ?? homedir();
@@ -35,8 +40,18 @@ export function resolveRuntimePaths(input: {
   const brandAssetDir = bundled
     ? join(resourceDir, "brand")
     : join(appRoot, "assets", "brand");
+  const settingsPath = runtimeDataSettingsPath({
+    bundled,
+    appRoot,
+    homeDir: home,
+    platform: input.platform ?? process.platform,
+    env,
+  });
+  const configuredDataDir = configuredRuntimeDataDir(settingsPath);
+  const environmentDataDir = brandedEnv(env, "DATA_DIR");
+  const managedService = env.HOMEAGENT_SERVICE_MANAGED === "1";
   const dataDir = resolve(
-    brandedEnv(env, "DATA_DIR") ??
+    (managedService ? configuredDataDir ?? environmentDataDir : environmentDataDir ?? configuredDataDir) ??
       (bundled
         ? join(home, "Library", "Application Support", "HomeAgent")
         : join(appRoot, "data")),

@@ -131,8 +131,17 @@ describe("conversation interpretation", () => {
     expect(interpretConversation("记住：发布流程先灰度再全量").disposition).toBe("remember");
     expect(interpretConversation("记住这个发布流程").disposition).toBe("remember");
     expect(interpretConversation("@agent 张洺汐是男的，2018年生的，记住").disposition).toBe("remember");
+    expect(interpretConversation([
+      "UE 5.8 Iris 已支持按连接并行 Tick。",
+      "DS 使用 -nothreading 时会失去多核收益。",
+      "@HomeAgent 记住上面的信息",
+    ].join("\n")).disposition).toBe("remember");
     expect(interpretConversation("你还记得发布流程吗").disposition).toBe("conversation");
     expect(interpretConversation("记住了吗？").disposition).toBe("conversation");
+    expect(interpretConversation([
+      "UE 5.8 Iris 已支持按连接并行 Tick。",
+      "@HomeAgent 你记住上面的信息了吗？",
+    ].join("\n")).disposition).toBe("conversation");
   });
 
   test("parses narrow knowledge controls without hijacking related questions", () => {

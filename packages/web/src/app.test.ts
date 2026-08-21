@@ -1156,6 +1156,22 @@ describe("web backend (read-only)", () => {
     expect(body).toContain("知识页");
   });
 
+  test("space detail offers an accessible local-material import workflow", async () => {
+    const res = await app.request(`/spaces/${encodeURIComponent(SPACE)}`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+
+    expect(body).toContain("导入本地资料");
+    expect(body).toContain(`action="/spaces/${encodeURIComponent(SPACE)}/materials"`);
+    expect(body).toContain('enctype="multipart/form-data"');
+    expect(body).toContain('name="material"');
+    expect(body).toContain('accept=".txt,.md,.markdown,.csv,.json,.log"');
+    expect(body).toContain("multiple required");
+    expect(body).toContain('name="distillNow"');
+    expect(body).toContain("单个文件不超过 20 MiB");
+    expect(body).toContain("未勾选时由夜间提炼兜底");
+  });
+
   test("page view shows full content and metadata", async () => {
     const res = await app.request(`/spaces/${encodeURIComponent(SPACE)}/pages/${encodeURIComponent("entities/alice")}`);
     expect(res.status).toBe(200);
@@ -1636,6 +1652,225 @@ describe("web backend (read-only)", () => {
 });
 
 describe("management backend (read-write)", () => {
+  test("imports a local UTF-8 material into the selected space as pending Raw", async () => {
+    const form = new FormData();
+    form.set(
+      "material",
+      new File(
+        ["# 架构说明\n\n项目代号是北极星，发布前必须完成双人复核。"],
+        "architecture.md",
+        { type: "text/markdown" },
+      ),
+    );
+
+    const imported = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/materials`,
+      { method: "POST", body: form },
+    );
+
+    expect([302, 303]).toContain(imported.status);
+    const location = imported.headers.get("location") ?? "";
+    expect(decodeURIComponent(location)).toContain("资料已导入，等待提炼");
+    expect(location).toContain(`/spaces/${encodeURIComponent(SPACE)}/raw/`);
+
+    const detail = await app.request(location);
+    expect(detail.status).toBe(200);
+    const body = await detail.text();
+    expect(body).toContain("architecture.md");
+    expect(body).toContain("项目代号是北极星");
+    expect(body).toContain("状态：待提炼");
+  });
+
+  test("rejects an unsupported local material without creating Raw", async () => {
+    const before = await (await app.request(`/spaces/${encodeURIComponent(SPACE)}`)).text();
+    expect(before).toContain("原始条目（1）");
+    const form = new FormData();
+    form.set(
+      "material",
+      new File(["not really a document"], "payload.exe", {
+        type: "application/octet-stream",
+      }),
+    );
+
+    const rejected = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/materials`,
+      { method: "POST", body: form },
+    );
+
+    expect([302, 303]).toContain(rejected.status);
+    expect(decodeURIComponent(rejected.headers.get("location") ?? ""))
+      .toContain("导入失败：不支持 .exe 文件");
+    const after = await (await app.request(`/spaces/${encodeURIComponent(SPACE)}`)).text();
+    expect(after).toContain("原始条目（1）");
+  });
+
+  test("rejects a non-UTF-8 local material without creating Raw", async () => {
+    const form = new FormData();
+    form.set(
+      "material",
+      new File([new Uint8Array([0xff, 0xfe, 0xfd])], "broken.txt", {
+        type: "text/plain",
+      }),
+    );
+
+    const rejected = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/materials`,
+      { method: "POST", body: form },
+    );
+
+    expect([302, 303]).toContain(rejected.status);
+    expect(decodeURIComponent(rejected.headers.get("location") ?? ""))
+      .toContain("导入失败：文件不是有效的 UTF-8 文本");
+    const after = await (await app.request(`/spaces/${encodeURIComponent(SPACE)}`)).text();
+    expect(after).toContain("原始条目（1）");
+  });
+
+  test("rejects a local material larger than 20 MiB before creating Raw", async () => {
+    const form = new FormData();
+    form.set(
+      "material",
+      new File([new Uint8Array(20 * 1024 * 1024 + 1)], "oversized.txt", {
+        type: "text/plain",
+      }),
+    );
+
+    const rejected = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/materials`,
+      { method: "POST", body: form },
+    );
+
+    expect([302, 303]).toContain(rejected.status);
+    expect(decodeURIComponent(rejected.headers.get("location") ?? ""))
+      .toContain("导入失败：单个文件不能超过 20 MiB");
+    const after = await (await app.request(`/spaces/${encodeURIComponent(SPACE)}`)).text();
+    expect(after).toContain("原始条目（1）");
+  });
+
+  test("immediately distills only the material imported by that request", async () => {
+    let importedRawId = "";
+    fake.onJSON((opts) => {
+      expect(opts.prompt).not.toContain("一条原始消息");
+      importedRawId = engine.registry.store(SPACE).index().listRaw({})
+        .find((raw) => raw.content.includes("release-notes.md"))?.id ?? "";
+      expect(importedRawId).not.toBe("");
+      const jsonCall = fake.calls.filter((call) => call.kind === "json").length;
+      if (jsonCall === 1) {
+        return {
+          operations: [{
+            type: "concept",
+            name: "release-gate",
+            title: "发布门禁",
+            rawIds: [importedRawId],
+          }],
+          skippedRawIds: [],
+        };
+      }
+      return {
+        title: "发布门禁",
+        summary: "发布必须通过回归测试",
+        aliases: [],
+        tags: ["release"],
+        links: [],
+        content: "# 发布门禁\n\n发布必须通过回归测试。",
+      };
+    });
+    const form = new FormData();
+    form.set(
+      "material",
+      new File(["发布必须通过回归测试。"], "release-notes.md", {
+        type: "text/markdown",
+      }),
+    );
+    form.set("distillNow", "on");
+
+    const imported = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/materials`,
+      { method: "POST", body: form },
+    );
+
+    expect([302, 303]).toContain(imported.status);
+    expect(decodeURIComponent(imported.headers.get("location") ?? ""))
+      .toContain("资料已导入并完成提炼：写入 1 个知识页");
+    expect(await engine.getPage(SPACE, "concepts/release-gate")).toEqual(
+      expect.objectContaining({ sources: [importedRawId] }),
+    );
+    expect(engine.registry.store(SPACE).index().countRaw(true)).toBe(1);
+  });
+
+  test("imports multiple local materials in one request", async () => {
+    const form = new FormData();
+    form.append("material", new File(["Alpha 决策"], "alpha.md", { type: "text/markdown" }));
+    form.append("material", new File(["Beta 纪要"], "beta.txt", { type: "text/plain" }));
+
+    const imported = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/materials`,
+      { method: "POST", body: form },
+    );
+
+    expect([302, 303]).toContain(imported.status);
+    expect(decodeURIComponent(imported.headers.get("location") ?? ""))
+      .toContain("已导入 2 份资料，等待提炼");
+    const rawList = await (await app.request(`/spaces/${encodeURIComponent(SPACE)}/raw`)).text();
+    expect(rawList).toContain("alpha.md");
+    expect(rawList).toContain("beta.txt");
+  });
+
+  test("rejects an empty local material without creating Raw", async () => {
+    const form = new FormData();
+    form.set("material", new File(["  \n"], "empty.md", { type: "text/markdown" }));
+
+    const rejected = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/materials`,
+      { method: "POST", body: form },
+    );
+
+    expect([302, 303]).toContain(rejected.status);
+    expect(decodeURIComponent(rejected.headers.get("location") ?? ""))
+      .toContain("导入失败：empty.md 没有可提炼的文本");
+    const after = await (await app.request(`/spaces/${encodeURIComponent(SPACE)}`)).text();
+    expect(after).toContain("原始条目（1）");
+  });
+
+  test("bounds long local material text while retaining a visible truncation notice", async () => {
+    const form = new FormData();
+    form.set(
+      "material",
+      new File([`${"甲".repeat(200_000)}TAIL_MARKER`], "long-notes.md", {
+        type: "text/markdown",
+      }),
+    );
+
+    const imported = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/materials`,
+      { method: "POST", body: form },
+    );
+
+    const detail = await app.request(imported.headers.get("location") ?? "");
+    const body = await detail.text();
+    expect(body).toContain("正文超过限制，仅保留前 200000 个字符");
+    expect(body).not.toContain("TAIL_MARKER");
+  });
+
+  test("rejects more than 20 local materials in one request", async () => {
+    const form = new FormData();
+    for (let i = 0; i < 21; i += 1) {
+      form.append("material", new File([`资料 ${i}`], `note-${i}.md`, {
+        type: "text/markdown",
+      }));
+    }
+
+    const rejected = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/materials`,
+      { method: "POST", body: form },
+    );
+
+    expect([302, 303]).toContain(rejected.status);
+    expect(decodeURIComponent(rejected.headers.get("location") ?? ""))
+      .toContain("导入失败：一次最多选择 20 份资料");
+    const after = await (await app.request(`/spaces/${encodeURIComponent(SPACE)}`)).text();
+    expect(after).toContain("原始条目（1）");
+  });
+
   test("data governance exports, deletes, and restores a complete space", async () => {
     const governance = await app.request("/governance");
     expect(governance.status).toBe(200);
@@ -2150,13 +2385,13 @@ describe("management backend (read-write)", () => {
     expect(await page.text()).toContain("Skill 目录已刷新");
   });
 
-  test("agent editor explains ordinary Workdir and task-only permission boundaries", async () => {
+  test("agent editor explains shared Chat and Task execution boundaries", async () => {
     const body = await (await app.request("/agents/new")).text();
     expect(body).toContain("Workdir");
     expect(body).toContain("Permission");
     expect(body).toContain("Skills");
-    expect(body).toContain("Permission 仅影响任务");
-    expect(body).toContain("Codex 普通会话只读使用 Workdir");
+    expect(body).toContain("Permission 同时影响普通聊天和任务");
+    expect(body).toContain("提炼和后台学习不启用 Skills");
     expect(body).toContain("可写与完全访问权限必填");
     expect(body).not.toContain("Device");
     expect(body).not.toContain("Repositories");
@@ -3973,10 +4208,15 @@ describe("management backend (read-write)", () => {
     expect(view).toContain('aria-describedby="default-provider-help"');
     expect(view).toContain('<label for="dream-hour">提炼时刻</label>');
     expect(view).toContain('<option value="3" selected>03:00</option>');
+    expect(view).toContain('<label for="chat-timeout-minutes">聊天最长回答时间</label>');
+    expect(view).toContain('name="chatTimeoutMinutes" value="10"');
     expect(view).toContain('data-settings-form');
     expect(view).toContain('type="reset"');
     expect(view).toContain("取消");
     expect(view).toContain("保存更改");
+    expect(view).toContain("<legend>数据目录</legend>");
+    expect(view).toContain("<code>.obsidian</code>");
+    expect(view).toContain("若目标已有 <code>.git</code>，则直接沿用");
     expect(view).toContain('role="status"');
     expect(view).toContain('aria-live="polite"');
   });
@@ -4104,11 +4344,34 @@ describe("management backend (read-write)", () => {
     expect(readSettings(dir)).toEqual({});
   });
 
+  test("settings POST rejects a chat timeout outside 1 through 60 minutes", async () => {
+    const response = await app.request("/settings", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        defaultProvider: "claude",
+        defaultModel: "",
+        dailyBudgetUsd: "5",
+        chatTimeoutMinutes: "61",
+        dreamHour: "3",
+        webPort: "3000",
+        rawRetentionDays: "90",
+      }).toString(),
+    });
+
+    expect(response.status).toBe(400);
+    const view = await response.text();
+    expect(view).toContain("聊天最长回答时间必须是 1 到 60 的整数");
+    expect(view).toContain('name="chatTimeoutMinutes" value="61"');
+    expect(readSettings(dir)).toEqual({});
+  });
+
   test("settings POST persists default provider/model + config and reflects it back", async () => {
     const form = new URLSearchParams({
       defaultProvider: "claude",
       defaultModel: "sonnet",
       dailyBudgetUsd: "12",
+      chatTimeoutMinutes: "25",
       dreamHour: "5",
       webPort: "3000",
       rawRetentionDays: "30",
@@ -4127,6 +4390,70 @@ describe("management backend (read-write)", () => {
     expect(view).toContain('value="5"');
     expect(view).toContain('name="rawRetentionDays"');
     expect(view).toContain('value="30"');
+    expect(view).toContain('name="chatTimeoutMinutes" value="25"');
+    expect(readSettings(dir).chatTimeoutMinutes).toBe(25);
+  });
+
+  test("settings schedules a confirmed external data-directory migration", async () => {
+    let scheduled: { destination: string; initializeGit: boolean } | undefined;
+    const migrationApp = createWebApp({
+      engine,
+      dataDirectory: {
+        status: () => ({
+          currentPath: dir,
+          available: true,
+          lockedByEnvironment: false,
+          gitAvailable: true,
+          gitRepository: false,
+          restartable: false,
+        }),
+        scheduleMigration: (input) => {
+          scheduled = input;
+        },
+      },
+    });
+    const destination = join(dir, "..", "external-homeagent-data");
+    const response = await migrationApp.request("/settings/data-directory", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        dataDirectory: destination,
+        initializeGit: "on",
+        confirmMigration: "on",
+      }).toString(),
+    });
+
+    expect([302, 303]).toContain(response.status);
+    expect(scheduled).toEqual({ destination, initializeGit: true });
+    expect(response.headers.get("location")).toContain("%E8%BF%81%E7%A7%BB%E5%B7%B2%E5%AE%89%E6%8E%92");
+  });
+
+  test("settings refuses an unconfirmed data-directory migration", async () => {
+    let scheduled = false;
+    const migrationApp = createWebApp({
+      engine,
+      dataDirectory: {
+        status: () => ({
+          currentPath: dir,
+          available: true,
+          lockedByEnvironment: false,
+          gitAvailable: true,
+          gitRepository: false,
+          restartable: false,
+        }),
+        scheduleMigration: () => {
+          scheduled = true;
+        },
+      },
+    });
+    const response = await migrationApp.request("/settings/data-directory", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ dataDirectory: join(dir, "next") }).toString(),
+    });
+
+    expect([302, 303]).toContain(response.status);
+    expect(scheduled).toBeFalse();
   });
 
   test("work context: create, edit, and render the current item", async () => {
@@ -4541,6 +4868,8 @@ describe("management backend (read-write)", () => {
     expect(home).toContain("任务");
     expect(home).toContain("新建任务");
     expect(home).toContain('name="timeoutMinutes" value="12"');
+    expect(home).toContain('<option value="weekly"');
+    expect(home).toContain('name="dayOfWeek"');
 
     const form = new URLSearchParams({
       name: "每日AI",
@@ -4574,6 +4903,36 @@ describe("management backend (read-write)", () => {
     expect(editor).toContain("完成后立即提炼");
     expect(editor).toContain('name="timeoutMinutes"');
     expect(editor).toContain('value="12"');
+  });
+
+  test("tasks: create and render a weekly schedule", async () => {
+    const form = new URLSearchParams({
+      name: "每周AI",
+      space: SPACE,
+      topic: "总结本周 AI 进展",
+      cadence: "weekly",
+      dayOfWeek: "5",
+      hour: "17",
+      timeoutMinutes: "12",
+    });
+    form.append("enabled", "on");
+    const res = await app.request("/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: form.toString(),
+    });
+    expect([302, 303]).toContain(res.status);
+
+    const created = engine.tasks.list().find((task) => task.name === "每周AI");
+    expect(created).toEqual(expect.objectContaining({
+      cadence: "weekly",
+      dayOfWeek: 5,
+      hour: 17,
+    }));
+
+    const editor = await (await app.request(`/tasks/${encodeURIComponent(created!.id)}`)).text();
+    expect(editor).toContain("每周五 17:00");
+    expect(editor).toContain('<option value="5" selected>周五</option>');
   });
 
   test("tasks: create with invalid space is rejected with a flash", async () => {

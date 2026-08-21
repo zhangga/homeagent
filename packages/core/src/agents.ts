@@ -4,11 +4,10 @@
  * research tasks in a space.
  *
  * Active fields: name, instruction (persona), provider (local CLI), model,
- * Codex reasoning effort, visibility, and task execution controls.
- * Task permission is consumed only by explicit research tasks; Workdir also
- * anchors ordinary Codex calls as read-only context. Ordinary calls receive no
- * ProviderExecution grant. Claude disables tools; Codex stays ephemeral and
- * read-only; TRAE remains task-only.
+ * Codex reasoning effort, visibility, and execution controls. Ordinary Chat
+ * and research Tasks use the Agent permission/Workdir and automatically expose
+ * the complete compatible Skill catalog. Background distillation and learning
+ * remain no-tools calls; TRAE remains task-only.
  *
  * Agents are persisted to data/config/agents.json using the same whole-file
  * JSON pattern as the space registry (registry.ts). The markdown/DB knowledge is
@@ -602,7 +601,7 @@ export function resolveAgentWorkdir(agent?: Agent): string | undefined {
   return agent?.workdir ? resolveWorkdir(agent.workdir) : undefined;
 }
 
-/** Resolve the task-only execution contract before a provider process starts. */
+/** Resolve an Agent's Chat/Task execution contract before a provider process starts. */
 export function resolveAgentExecution(agent?: Agent): AgentExecution {
   const permission = agent?.permission ?? "read-only";
   const workdir = resolveAgentWorkdir(agent);

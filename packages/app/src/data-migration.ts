@@ -27,6 +27,7 @@ export type DataMigrationReason =
   | "legacy-source-missing"
   | "source-invalid"
   | "destination-not-empty"
+  | "destination-conflict"
   | "paths-overlap"
   | "filesystem-error";
 
@@ -69,6 +70,10 @@ export interface DataMigrationOptions {
   stagingDir?: string;
   now?: () => number;
   fileSystem?: MigrationFileSystem;
+  /** Run additional synchronous preparation against the complete staging tree. */
+  prepareStaging?: (stagingDir: string) => void;
+  /** Permit selected destination-root metadata to be preserved in the migrated tree. */
+  allowDestinationEntry?: (entry: MigrationDirectoryEntry) => boolean;
 }
 
 export type DataMigrationPromptResult = "continue" | "exit";
@@ -156,7 +161,12 @@ export const nodeMigrationFileSystem: MigrationFileSystem = {
       fsyncSync(fd);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EBADF") throw error;
+      if (
+        code !== "EINVAL"
+        && code !== "ENOTSUP"
+        && code !== "EBADF"
+        && code !== "EPERM"
+      ) throw error;
     } finally {
       if (fd !== undefined) closeSync(fd);
     }
@@ -193,8 +203,24 @@ export function planDataMigration(options: DataMigrationOptions): DataMigrationP
   }
 
   try {
+    let destinationEntries: MigrationDirectoryEntry[] = [];
     if (fs.exists(destination)) {
-      if (!fs.isDirectory(destination) || fs.readDirectory(destination).length > 0) {
+      if (!fs.isDirectory(destination)) {
+        return {
+          state: "rejected",
+          source,
+          destination,
+          reason: "destination-not-empty",
+        };
+      }
+      destinationEntries = fs.readDirectory(destination);
+      if (
+        destinationEntries.length > 0
+        && (
+          !options.allowDestinationEntry
+          || destinationEntries.some((entry) => !options.allowDestinationEntry!(entry))
+        )
+      ) {
         return {
           state: "rejected",
           source,
@@ -213,6 +239,12 @@ export function planDataMigration(options: DataMigrationOptions): DataMigrationP
     }
     if (!fs.isDirectory(source)) {
       return { state: "rejected", source, destination, reason: "source-invalid" };
+    }
+    if (destinationEntries.length > 0) {
+      const sourceNames = new Set(fs.readDirectory(source).map((entry) => entry.name));
+      if (destinationEntries.some((entry) => sourceNames.has(entry.name))) {
+        return { state: "rejected", source, destination, reason: "destination-conflict" };
+      }
     }
   } catch {
     return { state: "rejected", source, destination, reason: "filesystem-error" };
@@ -237,6 +269,7 @@ export function confirmDataMigration(options: DataMigrationOptions): DataMigrati
         `.${basename(plan.destination)}.migration-${at}-${process.pid}`,
       ),
   );
+  const backup = dataMigrationBackupPath(plan.destination);
   if (dirname(staging) !== destinationParent) {
     throw new Error("migration staging directory must be a sibling of the destination");
   }
@@ -244,10 +277,24 @@ export function confirmDataMigration(options: DataMigrationOptions): DataMigrati
     throw new Error("migration staging directory overlaps source or destination");
   }
   if (fs.exists(staging)) throw new Error("migration staging directory already exists");
+  if (fs.exists(backup)) throw new Error("migration destination backup already exists");
 
   fs.makeDirectory(destinationParent, true);
+  let destinationBackedUp = false;
+  let committed = false;
   try {
     copyDirectory(plan.source, staging, fs);
+    if (fs.exists(plan.destination)) {
+      for (const entry of fs.readDirectory(plan.destination)) {
+        copyEntry(
+          join(plan.destination, entry.name),
+          join(staging, entry.name),
+          entry,
+          fs,
+        );
+      }
+    }
+    options.prepareStaging?.(staging);
     const recordPath = join(staging, "migration-v2.json");
     const record = {
       source: plan.source,
@@ -260,14 +307,32 @@ export function confirmDataMigration(options: DataMigrationOptions): DataMigrati
     fs.syncPath(staging);
 
     if (fs.exists(plan.destination)) {
-      if (!fs.isDirectory(plan.destination) || fs.readDirectory(plan.destination).length > 0) {
-        throw new Error("migration destination is not empty");
+      if (!fs.isDirectory(plan.destination)) {
+        throw new Error("migration destination is not a directory");
       }
-      fs.removeEmptyDirectory(plan.destination);
+      if (fs.readDirectory(plan.destination).length > 0) {
+        fs.rename(plan.destination, backup);
+        destinationBackedUp = true;
+      } else {
+        fs.removeEmptyDirectory(plan.destination);
+      }
       fs.syncPath(destinationParent);
     }
     fs.rename(staging, plan.destination);
-    fs.syncPath(destinationParent);
+    committed = true;
+    try {
+      fs.syncPath(destinationParent);
+    } catch {
+      // The destination rename already committed; a sync failure cannot safely roll it back.
+    }
+    if (destinationBackedUp && fs.exists(backup)) {
+      try {
+        fs.removeTree(backup);
+        fs.syncPath(destinationParent);
+      } catch {
+        // A leftover backup is recoverable and must not revert a committed migration.
+      }
+    }
 
     return {
       state: "completed",
@@ -276,9 +341,18 @@ export function confirmDataMigration(options: DataMigrationOptions): DataMigrati
       recordPath: join(plan.destination, "migration-v2.json"),
     };
   } catch (error) {
+    if (!committed && destinationBackedUp && !fs.exists(plan.destination) && fs.exists(backup)) {
+      fs.rename(backup, plan.destination);
+      fs.syncPath(destinationParent);
+    }
     if (fs.exists(staging)) fs.removeTree(staging);
     throw error;
   }
+}
+
+export function dataMigrationBackupPath(destination: string): string {
+  const resolved = resolve(destination);
+  return join(dirname(resolved), `.${basename(resolved)}.migration-backup`);
 }
 
 function copyDirectory(
@@ -302,6 +376,22 @@ function copyDirectory(
   fs.syncPath(destination);
 }
 
+function copyEntry(
+  source: string,
+  destination: string,
+  entry: MigrationDirectoryEntry,
+  fs: MigrationFileSystem,
+): void {
+  if (entry.kind === "directory") {
+    copyDirectory(source, destination, fs);
+  } else if (entry.kind === "file") {
+    fs.copyFile(source, destination);
+    fs.syncPath(destination);
+  } else {
+    throw new Error("migration data contains an unsupported filesystem entry");
+  }
+}
+
 function pathsOverlap(first: string, second: string): boolean {
   return isWithin(first, second) || isWithin(second, first);
 }
@@ -318,6 +408,8 @@ function rejectionMessage(plan: DataMigrationPlan): string {
   switch (plan.reason) {
     case "destination-not-empty":
       return "migration destination is not empty";
+    case "destination-conflict":
+      return "migration source conflicts with destination metadata";
     case "paths-overlap":
       return "migration source and destination overlap";
     case "source-invalid":

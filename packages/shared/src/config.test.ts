@@ -44,6 +44,7 @@ describe("editable settings overlay", () => {
     expect(cfg.defaultProvider).toBe("claude");
     expect(cfg.defaultModel).toBe("");
     expect(cfg.rawRetentionDays).toBe(90);
+    expect(cfg.chatTimeoutMinutes).toBe(10);
     expect(cfg.webHost).toBe("127.0.0.1");
     expect(cfg.webAdminToken).toBeUndefined();
   });
@@ -108,7 +109,13 @@ describe("editable settings overlay", () => {
   });
 
   test("saveSettings writes config/settings.json and overlays it", () => {
-    saveSettings({ model: "claude-opus-4-8", dreamHour: 5, dailyBudgetUsd: 12, rawRetentionDays: 30 }, dir);
+    saveSettings({
+      model: "claude-opus-4-8",
+      dreamHour: 5,
+      dailyBudgetUsd: 12,
+      rawRetentionDays: 30,
+      chatTimeoutMinutes: 25,
+    }, dir);
     const path = join(dir, "config", "settings.json");
     expect(existsSync(path)).toBe(true);
     const raw = JSON.parse(readFileSync(path, "utf8"));
@@ -119,6 +126,7 @@ describe("editable settings overlay", () => {
     expect(cfg.dreamHour).toBe(5);
     expect(cfg.dailyBudgetUsd).toBe(12);
     expect(cfg.rawRetentionDays).toBe(30);
+    expect(cfg.chatTimeoutMinutes).toBe(25);
   });
 
   test("persisted settings win over env defaults", () => {

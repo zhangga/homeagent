@@ -29,6 +29,7 @@ function task(over: Partial<Task>): Task {
     topic: "x",
     cadence: "daily",
     hour: 8,
+    dayOfWeek: 1,
     enabled: true,
     notify: false,
     distillOnRun: false,
@@ -164,6 +165,42 @@ describe("shouldRunTask", () => {
   test("hourly: >=1h since last -> run; <1h -> skip", () => {
     expect(shouldRunTask(task({ cadence: "hourly", lastRunAt: T23.getTime() - 3600_000 }), T23)).toBe(true);
     expect(shouldRunTask(task({ cadence: "hourly", lastRunAt: T23.getTime() - 600_000 }), T23)).toBe(false);
+  });
+
+  test("weekly: runs after the selected weekday/hour only once per week", () => {
+    const previousMonday = new Date("2026-06-29T09:00:00+08:00").getTime();
+    expect(shouldRunTask(task({
+      cadence: "weekly",
+      dayOfWeek: 1,
+      hour: 8,
+      lastRunAt: previousMonday,
+    }), T10)).toBe(true);
+
+    const earlierToday = new Date("2026-07-06T08:30:00+08:00").getTime();
+    expect(shouldRunTask(task({
+      cadence: "weekly",
+      dayOfWeek: 1,
+      hour: 8,
+      lastRunAt: earlierToday,
+    }), T10)).toBe(false);
+
+    expect(shouldRunTask(task({
+      cadence: "weekly",
+      dayOfWeek: 2,
+      hour: 8,
+      lastRunAt: previousMonday,
+    }), T10)).toBe(false);
+  });
+
+  test("weekly: a task created after this week's occurrence waits until next week", () => {
+    const createdAfterSchedule = new Date("2026-07-06T09:00:00+08:00").getTime();
+    expect(shouldRunTask(task({
+      cadence: "weekly",
+      dayOfWeek: 1,
+      hour: 8,
+      createdAt: createdAfterSchedule,
+      lastRunAt: undefined,
+    }), T10)).toBe(false);
   });
 });
 

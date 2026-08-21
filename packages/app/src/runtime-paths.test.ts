@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   homeAgentFeishuAvatarPath,
@@ -96,5 +98,33 @@ describe("resolveRuntimePaths", () => {
     expect(homeAgentFeishuAvatarPath(source)).toBe(
       join(repoRoot, "assets", "brand", "homeagent-feishu-avatar-512.png"),
     );
+  });
+
+  test("uses the persisted pointer unless an external environment override is active", () => {
+    const repoRoot = mkdtempSync(join(tmpdir(), "homeagent-runtime-paths-"));
+    try {
+      const configured = resolve(join(repoRoot, "external-data"));
+      const overridden = resolve(join(repoRoot, "environment-data"));
+      mkdirSync(join(repoRoot, ".homeagent"), { recursive: true });
+      writeFileSync(join(repoRoot, ".homeagent", "runtime.json"), JSON.stringify({
+        version: 1,
+        dataDir: configured,
+      }));
+
+      expect(resolveRuntimePaths({ repoRoot, env: {} }).dataDir).toBe(configured);
+      expect(resolveRuntimePaths({
+        repoRoot,
+        env: { HOMEAGENT_DATA_DIR: overridden },
+      }).dataDir).toBe(overridden);
+      expect(resolveRuntimePaths({
+        repoRoot,
+        env: {
+          HOMEAGENT_DATA_DIR: overridden,
+          HOMEAGENT_SERVICE_MANAGED: "1",
+        },
+      }).dataDir).toBe(configured);
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
   });
 });

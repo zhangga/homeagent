@@ -251,6 +251,15 @@ export class FeishuGroupBindingStore {
     return cloneBinding(binding);
   }
 
+  removeByChatId(chatId: string): boolean {
+    if (!this.bindings.has(chatId)) return false;
+    const candidate = new Map(this.bindings);
+    candidate.delete(chatId);
+    this.persist(candidate);
+    this.bindings = candidate;
+    return true;
+  }
+
   markAppNeedsReconnect(appId: string): number {
     const candidate = new Map(this.bindings);
     const now = Date.now();

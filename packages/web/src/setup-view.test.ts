@@ -54,11 +54,11 @@ function render(current: SetupStep, overrides: Partial<Parameters<typeof setupVi
 }
 
 describe("guided setup view", () => {
-  test("offers Codex for ordinary conversations with its restricted-mode boundary", () => {
+  test("offers Codex for ordinary conversations with automatic Skills", () => {
     const body = render("ai");
 
     expect(body).toContain('<option value="codex"');
-    expect(body).toContain("Codex 普通会话使用临时只读模式");
+    expect(body).toContain("Codex 普通聊天和任务会自动获得全部兼容 Skills");
     expect(body).not.toContain("Codex 只能用于显式任务");
   });
 
@@ -92,7 +92,8 @@ describe("guided setup view", () => {
     });
     expect(install).toContain("先连接 Claude Code 或 Codex");
     expect(install).toContain("安装 Codex");
-    expect(install).toContain("普通问答和显式任务");
+    expect(install).toContain("普通聊天和任务");
+    expect(install).toContain("自动获得全部兼容 Skills");
     expect(install).toContain('name="consent"');
 
     const waiting = render("ai", {

@@ -15,6 +15,10 @@ import { resolve, join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { brandedEnv } from "./brand.ts";
 
+export const DEFAULT_CHAT_TIMEOUT_MINUTES = 10;
+export const MIN_CHAT_TIMEOUT_MINUTES = 1;
+export const MAX_CHAT_TIMEOUT_MINUTES = 60;
+
 export interface Config {
   gatewayBaseUrl: string;
   gatewayToken: string;
@@ -26,6 +30,8 @@ export interface Config {
   /** heavy model reserved for complex synthesis (opt-in) */
   modelHeavy: string;
   dailyBudgetUsd: number;
+  /** maximum provider runtime for an interactive chat answer */
+  chatTimeoutMinutes: number;
   /** management backend bind address; loopback by default */
   webHost: string;
   webPort: number;
@@ -74,6 +80,7 @@ export interface PersistedSettings {
   modelFast?: string;
   modelHeavy?: string;
   dailyBudgetUsd?: number;
+  chatTimeoutMinutes?: number;
   webPort?: number;
   dreamHour?: number;
   rawRetentionDays?: number;
@@ -96,6 +103,7 @@ export const EDITABLE_KEYS: (keyof PersistedSettings)[] = [
   "modelFast",
   "modelHeavy",
   "dailyBudgetUsd",
+  "chatTimeoutMinutes",
   "webPort",
   "dreamHour",
   "rawRetentionDays",
@@ -126,6 +134,14 @@ function num(env: NodeJS.ProcessEnv, suffix: string, fallback: number): number {
 function nonnegativeInt(value: number, fallback: number): number {
   if (!Number.isFinite(value)) return fallback;
   return Math.max(0, Math.min(36_500, Math.trunc(value)));
+}
+
+function chatTimeoutMinutes(value: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(
+    MIN_CHAT_TIMEOUT_MINUTES,
+    Math.min(MAX_CHAT_TIMEOUT_MINUTES, Math.trunc(value)),
+  );
 }
 
 function settingsPath(dataDir: string): string {
@@ -176,6 +192,10 @@ export function loadConfig(env = process.env): Config {
     modelFast: brandedEnv(env, "LLM_MODEL_FAST") ?? "claude-haiku-4-5-20251001",
     modelHeavy: brandedEnv(env, "LLM_MODEL_HEAVY") ?? "claude-opus-4-8",
     dailyBudgetUsd: num(env, "DAILY_BUDGET_USD", 5),
+    chatTimeoutMinutes: chatTimeoutMinutes(
+      num(env, "CHAT_TIMEOUT_MINUTES", DEFAULT_CHAT_TIMEOUT_MINUTES),
+      DEFAULT_CHAT_TIMEOUT_MINUTES,
+    ),
     webHost: brandedEnv(env, "WEB_HOST")?.trim() || "127.0.0.1",
     webPort: num(env, "WEB_PORT", 3000),
     webAdminToken: brandedEnv(env, "WEB_ADMIN_TOKEN")?.trim() || undefined,
@@ -200,6 +220,12 @@ export function loadConfig(env = process.env): Config {
   if (persisted.modelFast) base.modelFast = persisted.modelFast;
   if (persisted.modelHeavy) base.modelHeavy = persisted.modelHeavy;
   if (typeof persisted.dailyBudgetUsd === "number") base.dailyBudgetUsd = persisted.dailyBudgetUsd;
+  if (typeof persisted.chatTimeoutMinutes === "number") {
+    base.chatTimeoutMinutes = chatTimeoutMinutes(
+      persisted.chatTimeoutMinutes,
+      base.chatTimeoutMinutes,
+    );
+  }
   if (typeof persisted.webPort === "number") base.webPort = persisted.webPort;
   if (typeof persisted.dreamHour === "number") base.dreamHour = persisted.dreamHour;
   if (typeof persisted.rawRetentionDays === "number") {

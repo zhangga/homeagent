@@ -582,6 +582,12 @@ function parseTask(value: unknown, index: number, space: SpaceId, version: numbe
   if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
     throw new Error(`tasks[${index}].hour is invalid`);
   }
+  const dayOfWeek = item.dayOfWeek === undefined
+    ? 1
+    : finiteNumber(item.dayOfWeek, `tasks[${index}].dayOfWeek`);
+  if (!Number.isInteger(dayOfWeek) || dayOfWeek < 1 || dayOfWeek > 7) {
+    throw new Error(`tasks[${index}].dayOfWeek is invalid`);
+  }
   const timeoutMinutes = item.timeoutMinutes === undefined
     && version < TASK_EXECUTION_SPACE_ARCHIVE_VERSION
     ? DEFAULT_TASK_TIMEOUT_MINUTES
@@ -600,6 +606,7 @@ function parseTask(value: unknown, index: number, space: SpaceId, version: numbe
     topic: text(item.topic, `tasks[${index}].topic`),
     cadence,
     hour,
+    dayOfWeek,
     enabled: boolean(item.enabled, `tasks[${index}].enabled`),
     notify: boolean(item.notify, `tasks[${index}].notify`),
     distillOnRun: boolean(item.distillOnRun, `tasks[${index}].distillOnRun`),
@@ -1112,6 +1119,7 @@ function parseChatRun(
     executionPlan: normalized.executionPlan
       ? cloneResolvedExecutionPlan(normalized.executionPlan)
       : undefined,
+    timeoutMs: normalized.timeoutMs,
     skillEvidence: normalized.skillEvidence
       ? {
           requested: normalized.skillEvidence.requested.map((item) => ({ ...item })),

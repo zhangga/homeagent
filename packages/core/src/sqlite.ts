@@ -1,21 +1,32 @@
 /**
  * SQLite index for one space (plan §2.4). This is a rebuildable projection of
- * the markdown pages plus the durable `raw` capture table. We use bun:sqlite.
+ * the authoritative Markdown pages and readable Raw journal. We use bun:sqlite.
  *
  * Two roles:
  *   1. `pages` + `pages_fts` — the queryable metadata + full-text mirror. FTS
  *      stores CJK-bigram-tokenized text (see tokenize.ts) under the default
  *      tokenizer so two-character Chinese queries actually match.
- *   2. `raw` — durable capture of every RawEntry. remember() writes here without
- *      calling any LLM; the dream cycle reads un-ingested rows and marks them.
+ *   2. `raw` — query projection of the Raw journal. remember() writes the
+ *      journal first without calling an LLM, then mirrors it here; the dream
+ *      cycle reads un-ingested rows and marks them in both stores.
  *
- * Provenance note: pages can always be rebuilt from markdown via rebuildFromPages,
- * but `raw` is authoritative capture and is never derived from anything else.
+ * Provenance note: pages rebuild from Markdown and Raw rebuilds from daily
+ * JSONL. A legacy SQLite-only Raw table is backfilled on first journal-aware
+ * open, preserving existing installations without a separate migration step.
  */
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import type { Hit, Page, PageRef, RawAdmission, RawEntry, RawRecord } from "@homeagent/shared";
+import type {
+  Hit,
+  Page,
+  PageRef,
+  RawAdmission,
+  RawEntry,
+  RawRecord,
+  SpaceId,
+} from "@homeagent/shared";
 import type { MessageRetractionRecord } from "./governance.ts";
+import { RawJournal } from "./raw-journal.ts";
 import { toMatchQuery, toSearchText } from "./tokenize.ts";
 
 export const MAX_SEARCH_RESULTS = 100;
@@ -27,12 +38,30 @@ export function normalizeSearchLimit(limit: number): number {
 
 export class SpaceIndex {
   private db: Database;
+  private rawJournal?: RawJournal;
 
-  constructor(dbPath: string) {
+  constructor(
+    dbPath: string,
+    options: { rawDir?: string; space?: SpaceId } = {},
+  ) {
+    if (options.rawDir !== undefined && !options.space) {
+      throw new Error("Raw journal requires a space id");
+    }
     this.db = new Database(dbPath, { create: true });
     this.db.run("PRAGMA journal_mode = WAL");
     this.db.run("PRAGMA foreign_keys = ON");
     this.migrate();
+    if (options.rawDir !== undefined) {
+      try {
+        this.rawJournal = new RawJournal(options.rawDir, options.space!);
+        this.initializeRawProjection();
+      } catch (error) {
+        // A corrupt authoritative journal must fail closed without leaking the
+        // SQLite handle (notably important on Windows, where it locks cleanup).
+        this.db.close();
+        throw error;
+      }
+    }
   }
 
   private migrate(): void {
@@ -133,6 +162,71 @@ export class SpaceIndex {
        ON raw(agent_id, agent_handled, created DESC)`,
     );
     this.db.run(`CREATE INDEX IF NOT EXISTS pages_type ON pages(type)`);
+  }
+
+  /**
+   * Establish the readable journal as Raw authority. Existing SQLite-only
+   * installations are backfilled once; initialized journals replace the SQL
+   * projection so a deleted or stale index repairs itself on open.
+   */
+  private initializeRawProjection(): void {
+    const journal = this.rawJournal!;
+    if (!journal.isInitialized()) {
+      journal.initialize(this.listRaw({}), this.listMessageRetractions());
+      return;
+    }
+    const raw = journal.listRaw();
+    const retractions = journal.listRetractions();
+    const replace = this.db.transaction(() => {
+      this.db.run(`DELETE FROM raw`);
+      this.db.run(`DELETE FROM message_retractions`);
+      for (const record of raw) this.insertRawProjection(record);
+      for (const record of retractions) this.insertRetractionProjection(record);
+    });
+    replace();
+  }
+
+  private insertRawProjection(record: RawRecord): void {
+    this.db
+      .query(
+        `INSERT INTO raw (id, space, source, work_item_id, work_action_id, agent_id, agent_handled, agent_response, agent_responded_at, author, chat_id, message_id, content, attachments_json, created, ingested, admission)
+         VALUES ($id, $space, $source, $workItem, $workAction, $agent, $handled, $response, $respondedAt, $author, $chat, $msg, $content, $att, $created, $ingested, $admission)`,
+      )
+      .run({
+        $id: record.id,
+        $space: record.space,
+        $source: record.source,
+        $workItem: record.workItemId ?? null,
+        $workAction: record.workActionId ?? null,
+        $agent: record.agentId ?? null,
+        $handled: record.agentHandled === undefined ? null : record.agentHandled ? 1 : 0,
+        $response: record.agentResponse ?? null,
+        $respondedAt: record.agentRespondedAt ?? null,
+        $author: record.author ?? null,
+        $chat: record.chatId ?? null,
+        $msg: record.messageId ?? null,
+        $content: record.content,
+        $att: JSON.stringify(record.attachments ?? []),
+        $created: record.createdAt,
+        $ingested: record.ingested ? 1 : 0,
+        $admission: record.admission,
+      });
+  }
+
+  private insertRetractionProjection(record: MessageRetractionRecord): void {
+    this.db
+      .query(
+        `INSERT INTO message_retractions
+         (chat_id, message_id, original_author, retracted_by, created)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.chatId,
+        record.messageId,
+        record.originalAuthor,
+        record.retractedBy,
+        record.createdAt,
+      );
   }
 
   // ---- pages ---------------------------------------------------------------
@@ -266,60 +360,26 @@ export class SpaceIndex {
       throw new Error("New WorkAction Raw must start as a held task owned by an action");
     }
     const id = randomUUID();
-    this.db
-      .query(
-        `INSERT INTO raw (id, space, source, work_item_id, work_action_id, agent_id, agent_handled, agent_response, agent_responded_at, author, chat_id, message_id, content, attachments_json, created, ingested, admission)
-         VALUES ($id, $space, $source, $workItem, $workAction, $agent, $handled, $response, $respondedAt, $author, $chat, $msg, $content, $att, $created, 0, $admission)`,
-      )
-      .run({
-        $id: id,
-        $space: entry.space,
-        $source: entry.source,
-        $workItem: entry.workItemId ?? null,
-        $workAction: entry.workActionId ?? null,
-        $agent: entry.agentId ?? null,
-        $handled: entry.source === "message"
-          ? (entry.agentHandled ?? Boolean(entry.agentId) ? 1 : 0)
-          : null,
-        $response: entry.agentResponse ?? null,
-        $respondedAt: entry.agentRespondedAt ?? null,
-        $author: entry.author ?? null,
-        $chat: entry.chatId ?? null,
-        $msg: entry.messageId ?? null,
-        $content: entry.content,
-        $att: JSON.stringify(entry.attachments ?? []),
-        $created: entry.createdAt ?? Date.now(),
-        $admission: admission,
-      });
+    const record: RawRecord = {
+      ...entry,
+      id,
+      admission,
+      createdAt: entry.createdAt ?? Date.now(),
+      ingested: false,
+      ...(entry.source === "message"
+        ? { agentHandled: entry.agentHandled ?? Boolean(entry.agentId) }
+        : {}),
+    };
+    this.rawJournal?.insert(record);
+    this.insertRawProjection(record);
     return id;
   }
 
   /** Restore one exact raw record, preserving its provenance id and state. */
   restoreRaw(record: RawRecord): void {
-    this.db
-      .query(
-        `INSERT INTO raw (id, space, source, work_item_id, work_action_id, agent_id, agent_handled, agent_response, agent_responded_at, author, chat_id, message_id, content, attachments_json, created, ingested, admission)
-         VALUES ($id, $space, $source, $workItem, $workAction, $agent, $handled, $response, $respondedAt, $author, $chat, $msg, $content, $att, $created, $ingested, $admission)`,
-      )
-      .run({
-        $id: record.id,
-        $space: record.space,
-        $source: record.source,
-        $workItem: record.workItemId ?? null,
-        $workAction: record.workActionId ?? null,
-        $agent: record.agentId ?? null,
-        $handled: record.agentHandled === undefined ? null : record.agentHandled ? 1 : 0,
-        $response: record.agentResponse ?? null,
-        $respondedAt: record.agentRespondedAt ?? null,
-        $author: record.author ?? null,
-        $chat: record.chatId ?? null,
-        $msg: record.messageId ?? null,
-        $content: record.content,
-        $att: JSON.stringify(record.attachments ?? []),
-        $created: record.createdAt,
-        $ingested: record.ingested ? 1 : 0,
-        $admission: record.admission,
-      });
+    if (this.getRaw(record.id)) throw new Error(`Raw id already exists: ${record.id}`);
+    this.rawJournal?.insert(record);
+    this.insertRawProjection(record);
   }
 
   listRaw(
@@ -359,17 +419,18 @@ export class SpaceIndex {
     target: "ready" | "excluded",
   ): boolean {
     if (!workActionId.trim()) return false;
+    const current = this.getRaw(id);
+    if (!current || current.workActionId !== workActionId) return false;
+    if (current.admission === target) return true;
+    if (current.admission !== "held") return false;
+    this.rawJournal?.replaceMany([{ ...current, admission: target }]);
     const result = this.db
       .query(
         `UPDATE raw SET admission = ?
          WHERE id = ? AND work_action_id = ? AND admission = 'held'`,
       )
       .run(target, id, workActionId);
-    if (result.changes > 0) return true;
-    const row = this.db
-      .query(`SELECT admission FROM raw WHERE id = ? AND work_action_id = ?`)
-      .get(id, workActionId) as { admission: string } | null;
-    return row?.admission === target;
+    return result.changes > 0;
   }
 
   /**
@@ -382,6 +443,17 @@ export class SpaceIndex {
     admission: RawAdmission,
   ): boolean {
     if (!workActionId.trim()) return false;
+    const current = this.getRaw(id);
+    if (
+      !current
+      || current.source !== "task"
+      || (current.workActionId !== undefined && current.workActionId !== workActionId)
+    ) return false;
+    this.rawJournal?.replaceMany([{
+      ...current,
+      workActionId,
+      admission,
+    }]);
     const result = this.db
       .query(
         `UPDATE raw
@@ -396,6 +468,9 @@ export class SpaceIndex {
 
   attributeRawToAgent(id: string, agentId: string): boolean {
     if (!agentId.trim()) return false;
+    const current = this.getRaw(id);
+    if (!current || current.source !== "message") return false;
+    this.rawJournal?.replaceMany([{ ...current, agentId, agentHandled: true }]);
     const result = this.db
       .query(
         `UPDATE raw
@@ -412,6 +487,14 @@ export class SpaceIndex {
     response: string,
     respondedAt = Date.now(),
   ): boolean {
+    const current = this.findRawsByMessageId(messageId, chatId)
+      .filter((record) => record.source === "message");
+    if (current.length === 0) return false;
+    this.rawJournal?.replaceMany(current.map((record) => ({
+      ...record,
+      agentResponse: response,
+      agentRespondedAt: respondedAt,
+    })));
     const result = this.db
       .query(
         `UPDATE raw
@@ -504,6 +587,7 @@ export class SpaceIndex {
   }
 
   deleteRaw(id: string): void {
+    this.rawJournal?.deleteMany([id]);
     this.db.query(`DELETE FROM raw WHERE id = ?`).run(id);
   }
 
@@ -533,19 +617,10 @@ export class SpaceIndex {
     originalAuthor: string;
     retractedBy: string;
   }): void {
-    this.db
-      .query(
-        `INSERT OR IGNORE INTO message_retractions
-         (chat_id, message_id, original_author, retracted_by, created)
-         VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(
-        input.chatId,
-        input.messageId,
-        input.originalAuthor,
-        input.retractedBy,
-        Date.now(),
-      );
+    if (this.getMessageRetraction(input.chatId, input.messageId)) return;
+    const record: MessageRetractionRecord = { ...input, createdAt: Date.now() };
+    this.rawJournal?.insertRetraction(record);
+    this.insertRetractionProjection(record);
   }
 
   listMessageRetractions(): MessageRetractionRecord[] {
@@ -565,19 +640,11 @@ export class SpaceIndex {
   }
 
   restoreMessageRetraction(record: MessageRetractionRecord): void {
-    this.db
-      .query(
-        `INSERT INTO message_retractions
-         (chat_id, message_id, original_author, retracted_by, created)
-         VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(
-        record.chatId,
-        record.messageId,
-        record.originalAuthor,
-        record.retractedBy,
-        record.createdAt,
-      );
+    if (this.getMessageRetraction(record.chatId, record.messageId)) {
+      throw new Error(`message retraction already exists: ${record.chatId}/${record.messageId}`);
+    }
+    this.rawJournal?.insertRetraction(record);
+    this.insertRetractionProjection(record);
   }
 
   markIngested(ids: string[]): void {
@@ -590,6 +657,8 @@ export class SpaceIndex {
 
   private setRawIngested(ids: string[], ingested: boolean): void {
     if (ids.length === 0) return;
+    const records = this.listRawByIds(ids);
+    this.rawJournal?.replaceMany(records.map((record) => ({ ...record, ingested })));
     const value = ingested ? 1 : 0;
     const update = this.db.transaction((batch: string[]) => {
       const stmt = this.db.query(`UPDATE raw SET ingested = ? WHERE id = ?`);
@@ -616,14 +685,16 @@ export class SpaceIndex {
   /** Delete expired message bodies only after they have been distilled/handled. */
   deleteExpiredRawMessages(cutoff: number, protectedIds: ReadonlySet<string> = new Set()): number {
     const candidates = this.db
-      .query(`SELECT id FROM raw WHERE source = 'message' AND ingested = 1 AND created < ?`)
-      .all(cutoff) as Array<{ id: string }>;
+      .query(`SELECT * FROM raw WHERE source = 'message' AND ingested = 1 AND created < ?`)
+      .all(cutoff) as Array<Record<string, unknown>>;
+    const records = candidates.map(rowToRaw).filter((record) => !protectedIds.has(record.id));
+    this.rawJournal?.deleteMany(records.map((record) => record.id));
     let deleted = 0;
     const remove = this.db.transaction((ids: string[]) => {
       const statement = this.db.query(`DELETE FROM raw WHERE id = ?`);
       for (const id of ids) deleted += statement.run(id).changes;
     });
-    remove(candidates.map(({ id }) => id).filter((id) => !protectedIds.has(id)));
+    remove(records.map(({ id }) => id));
     return deleted;
   }
 

@@ -1,8 +1,8 @@
 /**
  * Local dev server for the management backend. Starts just the web app (no
- * feishu) over a KnowledgeEngine, seeding a demo space + CLI agents so the
- * Agents/Integrations/Settings pages have something to show. Use it to click
- * through the backend during development:
+ * feishu) over a KnowledgeEngine. It detects local CLI agents and can
+ * optionally seed a demo space for isolated UI work. Use it to click through
+ * the backend during development:
  *
  *   bun run packages/web/src/dev.ts
  *   # then open http://localhost:3000
@@ -13,6 +13,8 @@
  *     real CLI (fast; answers won't reflect a real model).
  *   - HOMEAGENT_DEV_REAL_CLI=1: no fake — the engine spawns the real detected
  *     CLI (claude/trae-cli). Slower, but you SEE the real agent answer.
+ *   - HOMEAGENT_SEED_DEMO=1: explicitly seed a local demo space. This is off by
+ *     default so normal development does not create a fake Feishu connection.
  *
  * Writes to ./data by default (honors HOMEAGENT_DATA_DIR).
  */
@@ -23,6 +25,13 @@ import { resolve } from "node:path";
 import { createWebApp } from "./app.ts";
 
 const realCli = brandedEnv(process.env, "DEV_REAL_CLI") === "1";
+const seedDemo = brandedEnv(process.env, "SEED_DEMO") === "1";
+
+// Keep opt-in demo records away from the normal runtime data directory unless
+// the developer deliberately provides a separate location.
+if (seedDemo && !brandedEnv(process.env, "DATA_DIR")) {
+  process.env.HOMEAGENT_DATA_DIR = resolve("./data/dev-demo");
+}
 
 // config() requires these; provide harmless placeholders (the CLIs manage their
 // own auth, so homeagent itself doesn't use the network gateway).
@@ -49,12 +58,14 @@ const fakeRunner = async (
 
 const engine = new KnowledgeEngine(realCli ? {} : { runProvider: fakeRunner });
 
-// Seed a demo team space + CLI agents so the pages aren't empty on first run.
-const demo: SpaceId = "team/oc_demo";
-if (!engine.registry.has(demo)) {
-  engine.ensureSpace(demo, { chatId: "oc_demo" });
-  engine.registry.updateMeta(demo, { name: "演示群" });
-  await engine.remember({ space: demo, source: "message", content: "这是一条示例消息，用于演示后台。" });
+// Demo data is opt-in so it cannot be mistaken for a real Feishu connection.
+if (seedDemo) {
+  const demo: SpaceId = "team/oc_demo";
+  if (!engine.registry.has(demo)) {
+    engine.ensureSpace(demo, { chatId: "oc_demo" });
+    engine.registry.updateMeta(demo, { name: "演示群" });
+    await engine.remember({ space: demo, source: "message", content: "这是一条示例消息，用于演示后台。" });
+  }
 }
 if (engine.agents.list().length === 0) {
   // One agent per local CLI actually detected on this machine (like mew's

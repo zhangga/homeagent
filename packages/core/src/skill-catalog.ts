@@ -580,6 +580,42 @@ export class SkillCatalog {
     };
   }
 
+  /** Resolve every valid Skill that the selected Provider can invoke. */
+  resolveAll(provider: ProviderId): ResolvedAgentSkills {
+    const snapshot = this.current();
+    const names = new Map<string, string>();
+    for (const source of snapshot.sources) {
+      if (
+        source.status !== "available"
+        || !source.providerIds.includes(provider)
+        || providerSkillReference(provider, source.name) === undefined
+      ) {
+        continue;
+      }
+      const key = source.name.toLowerCase();
+      if (!names.has(key)) names.set(key, source.name);
+    }
+    const sources = [...names.values()]
+      .map((name) => effectiveProviderSource(snapshot.sources, provider, name))
+      .filter((source): source is SkillSource => source !== undefined)
+      .sort((left, right) =>
+        left.name.localeCompare(right.name) || left.sourceKey.localeCompare(right.sourceKey)
+      );
+    const requested: SkillRequestSnapshot[] = sources.map((source) => ({
+      kind: "source",
+      sourceKey: source.sourceKey,
+      name: source.name,
+    }));
+    const resolved: ResolvedSkillSnapshot[] = sources.map((source) => ({
+      sourceKey: source.sourceKey,
+      name: source.name,
+      invocationName: source.name,
+      reference: providerSkillReference(provider, source.name)!,
+      skillFileHash: source.skillFileHash,
+    }));
+    return { requested, resolved, skipped: [], warnings: [] };
+  }
+
   resolve(bindings: readonly SkillBindingRequest[], provider: ProviderId): ResolvedAgentSkills {
     const snapshot = this.current();
     const byKey = new Map(snapshot.sources.map((source) => [source.sourceKey, source]));

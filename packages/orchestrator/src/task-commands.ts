@@ -48,7 +48,12 @@ export function parseTaskCommand(text: string): TaskCommand | null {
 }
 
 function fmtTask(t: Task, i: number): string {
-  const cad = t.cadence === "daily" ? `每天${t.hour}点` : "每小时";
+  const weekdays = ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+  const cad = t.cadence === "daily"
+    ? `每天${t.hour}点`
+    : t.cadence === "weekly"
+      ? `每${weekdays[t.dayOfWeek] ?? "周一"}${t.hour}点`
+      : "每小时";
   const status = t.lastStatus ? (t.lastStatus === "ok" ? "✅" : "⚠️") : "—";
   const off = t.enabled ? "" : "（已停用）";
   return `${i + 1}. ${t.name} · ${cad} · ${status}${off}`;

@@ -18,6 +18,10 @@ import type {
   LarkSetupStatus,
   LarkChatSummary,
 } from "@homeagent/shared";
+import {
+  MAX_CHAT_TIMEOUT_MINUTES,
+  MIN_CHAT_TIMEOUT_MINUTES,
+} from "@homeagent/shared";
 import type {
   SpaceMeta,
   Agent,
@@ -212,6 +216,35 @@ export function spaceDetailView(
       </div>
     </div>
     ${personalAgentSettings}
+    <section class="card material-import" aria-labelledby="material-import-title">
+      <div class="material-import-head">
+        <div>
+          <div class="material-kicker">INGEST / LOCAL</div>
+          <h2 id="material-import-title">导入本地资料</h2>
+          <p>文件会先成为可追溯的 Raw，再由 Dream Cycle 判断如何整理进 Wiki。</p>
+        </div>
+        <ol class="material-flow" aria-label="导入流程">
+          <li><span>1</span>选择资料</li>
+          <li><span>2</span>登记 Raw</li>
+          <li><span>3</span>提炼 Wiki</li>
+        </ol>
+      </div>
+      <form method="post" action="/spaces/${enc}/materials" enctype="multipart/form-data" class="material-import-form">
+        <div class="field">
+          <label for="local-material-${enc}">资料文件</label>
+          <input class="material-file-input" id="local-material-${enc}" name="material" type="file"
+            accept=".txt,.md,.markdown,.csv,.json,.log" multiple required />
+          <p class="field-help">可一次选择最多 20 份 UTF-8 文本、Markdown、CSV、JSON 或日志；单个文件不超过 20 MiB。</p>
+        </div>
+        <div class="material-import-actions">
+          <label class="checkbox-row">
+            <input type="checkbox" name="distillNow" />
+            <span>导入后立即提炼 <small>未勾选时由夜间提炼兜底</small></span>
+          </label>
+          <button type="submit">导入资料</button>
+        </div>
+      </form>
+    </section>
     <h2>知识页（${content.length}）</h2>
     <table>
       <tr><th>标题</th><th>类型</th><th>摘要</th></tr>
@@ -865,7 +898,7 @@ export function agentsView(
     : "";
 
   return html`<h1>Agents</h1>
-    <p class="subtitle">配置回答与任务执行使用的智能体。Visibility 限制可绑定的空间类型；任务权限不会影响普通问答、提炼或学习。</p>
+    <p class="subtitle">配置回答与任务执行使用的智能体。Permission / Workdir 同时作用于普通聊天和任务；提炼与后台学习保持 no-tools。</p>
     <div class="split">
       <div class="listcol">
         <a class="item ${newActive}" href="/agents"><div class="name">＋ 新建 Agent</div>
@@ -1231,7 +1264,28 @@ export function workItemsView(
 
 // ---- Tasks (research task execution) ---------------------------------------
 
-const CADENCE_LABELS: Record<string, string> = { hourly: "每小时", daily: "每天" };
+const CADENCE_LABELS: Record<string, string> = {
+  hourly: "每小时",
+  daily: "每天",
+  weekly: "每周",
+};
+const WEEKDAY_LABELS: Record<number, string> = {
+  1: "周一",
+  2: "周二",
+  3: "周三",
+  4: "周四",
+  5: "周五",
+  6: "周六",
+  7: "周日",
+};
+
+function taskCadenceLabel(task: Task): string {
+  if (task.cadence === "hourly") return CADENCE_LABELS.hourly!;
+  if (task.cadence === "weekly") {
+    return `每${WEEKDAY_LABELS[task.dayOfWeek] ?? "周一"} ${task.hour}:00`;
+  }
+  return `每天 ${task.hour}:00`;
+}
 
 /** Tasks page: list column + right editor. `selected` is the task being edited (or null = new). */
 export function tasksView(
@@ -1249,10 +1303,9 @@ export function tasksView(
   };
   const listItems = tasks.map((t) => {
     const active = selected && t.id === selected.id;
-    const cad = CADENCE_LABELS[t.cadence] ?? t.cadence;
     return html`<a class="item ${active ? "active" : ""}" href="/tasks/${encodeURIComponent(t.id)}">
       <div class="name"><span class="dot" style="${t.enabled ? "" : "background:#cbd5e1"}"></span>${t.name}</div>
-      <div class="sub">${cad}${t.cadence === "daily" ? ` ${t.hour}:00` : ""} · ${t.space}</div>
+      <div class="sub">${taskCadenceLabel(t)} · ${t.space}</div>
     </a>`;
   });
   const newActive = selected === null ? "active" : "";
@@ -1265,6 +1318,7 @@ export function tasksView(
   const spaceVal = editing?.space ?? spaces[0]?.id ?? "";
   const cadenceVal = editing?.cadence ?? "daily";
   const hourVal = editing?.hour ?? 8;
+  const dayOfWeekVal = editing?.dayOfWeek ?? 1;
   const enabledOn = editing ? editing.enabled : true;
   const notifyOn = editing ? editing.notify : true;
   const distillOn = editing ? editing.distillOnRun : true;
@@ -1350,7 +1404,15 @@ export function tasksView(
               </select>
             </div>
             <div class="field">
-              <label>每天几点 <span class="hint">0-23，仅每天周期用</span></label>
+              <label>星期 <span class="hint">仅每周周期使用</span></label>
+              <select name="dayOfWeek">
+                ${Object.entries(WEEKDAY_LABELS).map(([day, label]) =>
+                  html`<option value="${day}" ${Number(day) === dayOfWeekVal ? "selected" : ""}>${label}</option>`
+                )}
+              </select>
+            </div>
+            <div class="field">
+              <label>执行时间 <span class="hint">0-23，每天/每周周期使用</span></label>
               <input type="number" min="0" max="23" name="hour" value="${hourVal}" />
             </div>
             <div class="field">
@@ -2928,15 +2990,39 @@ export interface SettingsData {
   defaultProvider: string;
   defaultModel: string;
   dailyBudgetUsd: number;
+  chatTimeoutMinutes: number;
   dreamHour: number;
   rawRetentionDays: number;
   webPort: number;
+  dataDir: string;
+}
+
+export interface DataDirectorySettingsData {
+  currentPath: string;
+  available: boolean;
+  lockedByEnvironment: boolean;
+  gitAvailable: boolean;
+  gitRepository: boolean;
+  restartable: boolean;
+  migrationError?: string;
+  pendingMigration?: {
+    destination: string;
+    initializeGit: boolean;
+    requestedAt: number;
+  };
+  lastMigration?: {
+    source: string;
+    destination: string;
+    completedAt: number;
+    gitInitialized: boolean;
+  };
 }
 
 export interface SettingsFormValues {
   defaultProvider: string;
   defaultModel: string;
   dailyBudgetUsd: string;
+  chatTimeoutMinutes: string;
   dreamHour: string;
   rawRetentionDays: string;
   webPort: string;
@@ -2951,11 +3037,20 @@ export function settingsView(
   flashMsg?: string,
   submitted?: SettingsFormValues,
   errors: SettingsFieldErrors = {},
+  dataDirectory: DataDirectorySettingsData = {
+    currentPath: s.dataDir,
+    available: false,
+    lockedByEnvironment: false,
+    gitAvailable: false,
+    gitRepository: false,
+    restartable: false,
+  },
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const values: SettingsFormValues = submitted ?? {
     defaultProvider: s.defaultProvider,
     defaultModel: s.defaultModel,
     dailyBudgetUsd: String(s.dailyBudgetUsd),
+    chatTimeoutMinutes: String(s.chatTimeoutMinutes),
     dreamHour: String(s.dreamHour),
     rawRetentionDays: String(s.rawRetentionDays),
     webPort: String(s.webPort),
@@ -2995,6 +3090,7 @@ export function settingsView(
     defaultProvider: "default-provider",
     defaultModel: "default-model",
     dailyBudgetUsd: "daily-budget",
+    chatTimeoutMinutes: "chat-timeout-minutes",
     dreamHour: "dream-hour",
     rawRetentionDays: "raw-retention-days",
     webPort: "web-port",
@@ -3013,6 +3109,9 @@ export function settingsView(
   const describedBy = (field: keyof SettingsFormValues, helpId: string, errorId: string) =>
     errors[field] ? `${helpId} ${errorId}` : helpId;
   const catalogJson = JSON.stringify(models);
+  const dataMigrationDisabled = !dataDirectory.available
+    || dataDirectory.lockedByEnvironment
+    || dataDirectory.pendingMigration !== undefined;
   const settingsScript = raw(`<script>
 (function(){
   var CATALOG = ${catalogJson};
@@ -3118,6 +3217,19 @@ export function settingsView(
             <p class="field-help" id="dream-hour-help">每天按 Asia/Shanghai 时区执行。</p>
             ${errorMessage("dreamHour", "dream-hour-error")}
           </div>
+          <div class="field">
+            <label for="chat-timeout-minutes">聊天最长回答时间</label>
+            <div class="input-with-unit">
+              <input id="chat-timeout-minutes" type="number"
+                min="${MIN_CHAT_TIMEOUT_MINUTES}" max="${MAX_CHAT_TIMEOUT_MINUTES}"
+                name="chatTimeoutMinutes" value="${values.chatTimeoutMinutes}"
+                aria-describedby="${describedBy("chatTimeoutMinutes", "chat-timeout-minutes-help", "chat-timeout-minutes-error")}"
+                aria-invalid="${errors.chatTimeoutMinutes ? "true" : "false"}" />
+              <span class="input-unit">分钟</span>
+            </div>
+            <p class="field-help" id="chat-timeout-minutes-help">每条新消息入队时冻结；复杂回答可延长，仍可随时取消。</p>
+            ${errorMessage("chatTimeoutMinutes", "chat-timeout-minutes-error")}
+          </div>
         </div>
       </fieldset>
 
@@ -3154,6 +3266,62 @@ export function settingsView(
         <button type="reset" class="secondary" data-settings-cancel>取消</button>
         <button type="submit" data-settings-save>保存更改</button>
       </div>
+    </form>
+
+    <form method="post" action="/settings/data-directory" class="stack settings-form">
+      <fieldset class="settings-section data-directory-section">
+        <legend>数据目录</legend>
+        <p class="settings-section-description">把运行数据移出程序或源码目录。迁移通过重启完成，成功后旧目录仍会原样保留，可用于回滚。</p>
+        ${dataDirectory.migrationError
+          ? html`<div class="form-error-summary" role="alert"><strong>上次迁移未完成</strong><p>${dataDirectory.migrationError}</p></div>`
+          : ""}
+        ${dataDirectory.pendingMigration
+          ? html`<div class="flash" role="status"><strong>迁移已安排</strong><p>重新启动后将复制到 ${dataDirectory.pendingMigration.destination}${dataDirectory.pendingMigration.initializeGit ? "，并初始化 Git 仓库" : ""}。</p></div>`
+          : ""}
+        ${dataDirectory.lastMigration
+          ? html`<p class="field-help">最近一次迁移：${dataDirectory.lastMigration.source} → ${dataDirectory.lastMigration.destination}</p>`
+          : ""}
+        <div class="field">
+          <div class="field-label-row">
+            <label for="data-directory">当前目录</label>
+            <span class="effect-badge">${dataDirectory.gitRepository ? "Git 仓库" : "未启用 Git"}</span>
+          </div>
+          <code class="path-value">${dataDirectory.currentPath}</code>
+        </div>
+        <div class="field">
+          <div class="field-label-row">
+            <label for="data-directory">新目录</label>
+            <span class="effect-badge">需重启生效</span>
+          </div>
+          <input id="data-directory" name="dataDirectory" type="text" placeholder="/Volumes/Knowledge/homeagent-data"
+            autocomplete="off" ${dataMigrationDisabled ? "disabled" : ""} />
+          <p class="field-help">必须使用绝对路径。目标可不存在、为空，或仅包含 <code>.git</code>、<code>.obsidian</code>、<code>.gitignore</code>、<code>.gitattributes</code> 等受支持的元数据；其他内容及同名冲突会被拒绝。新旧目录不能互相包含。</p>
+        </div>
+        <label class="checkbox-row">
+          <input type="checkbox" name="initializeGit"
+            ${dataMigrationDisabled || !dataDirectory.gitAvailable || dataDirectory.gitRepository ? "disabled" : ""} />
+          <span>在新目录初始化 Git 仓库</span>
+        </label>
+        <p class="field-help">新仓库只执行 <code>git init</code>；若目标已有 <code>.git</code>，则直接沿用。两种情况都会补充适合 HomeAgent 的 <code>.gitignore</code>，但不会 add、commit、配置远端或推送。运行锁、日志、内置 CLI 和可重建 SQLite 索引默认不纳入版本控制。</p>
+        ${!dataDirectory.gitAvailable && !dataDirectory.gitRepository
+          ? html`<p class="field-help">当前系统未找到 Git，因此不能勾选初始化；仍可只迁移目录。</p>`
+          : ""}
+        ${dataDirectory.lockedByEnvironment
+          ? html`<p class="field-error">当前目录由 <code>HOMEAGENT_DATA_DIR</code> 环境变量固定。请先移除该变量，再从设置页迁移。</p>`
+          : !dataDirectory.available
+            ? html`<p class="field-help">当前运行方式不能从页面迁移。可停止服务后设置 <code>HOMEAGENT_DATA_DIR</code> 并手动复制数据。</p>`
+            : ""}
+        <label class="checkbox-row">
+          <input type="checkbox" name="confirmMigration"
+            ${dataMigrationDisabled ? "disabled" : ""} />
+          <span>我确认迁移采用复制方式，成功后自行核验并决定是否删除旧目录</span>
+        </label>
+        <div class="actions settings-actions">
+          <button type="submit" ${dataMigrationDisabled ? "disabled" : ""}>
+            ${dataDirectory.restartable ? "迁移并重启" : "安排迁移"}
+          </button>
+        </div>
+      </fieldset>
     </form>
     ${settingsScript}`;
 }

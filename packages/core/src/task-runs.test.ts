@@ -22,6 +22,7 @@ const TASK: Task = {
   topic: "记录运行历史",
   cadence: "daily",
   hour: 8,
+  dayOfWeek: 1,
   enabled: true,
   notify: false,
   distillOnRun: false,
