@@ -78,16 +78,30 @@ export class WorkContinuationScheduler {
     try {
       // Snapshot once: a successful action cannot recursively run the next one
       // in the same tick. This is the safety brake against runaway loops.
+      const scheduled: Array<{ workItemId: string; completion: Promise<unknown> }> = [];
       for (const item of this.engine.listDueWorkContinuations()) {
         try {
           const started = this.engine.startWorkContinuation(item.id, { trigger: "scheduled" });
           ran.push(item.id);
-          if (started.state === "scheduled") await started.completion;
+          if (started.state === "scheduled") {
+            scheduled.push({ workItemId: item.id, completion: started.completion });
+          }
         } catch (error) {
           errors.push(`${item.id}: ${String(error)}`);
           log.error("work continuation failed", { workItemId: item.id, error: String(error) });
         }
       }
+      await Promise.all(scheduled.map(async (entry) => {
+        try {
+          await entry.completion;
+        } catch (error) {
+          errors.push(`${entry.workItemId}: ${String(error)}`);
+          log.error("work continuation failed", {
+            workItemId: entry.workItemId,
+            error: String(error),
+          });
+        }
+      }));
     } finally {
       this.running = false;
       if (errors.length === 0) {

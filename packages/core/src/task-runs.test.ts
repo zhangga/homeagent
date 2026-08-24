@@ -10,6 +10,7 @@ import {
   MAX_TASK_RUN_ERROR_CHARACTERS,
   MAX_TASK_RUN_HISTORY_PER_TASK,
   MAX_TASK_RUN_OUTPUT_CHARACTERS,
+  MAX_TASK_RUN_SKILLS,
   TaskRunStore,
 } from "./task-runs.ts";
 
@@ -271,6 +272,7 @@ describe("TaskRunStore", () => {
       },
     });
     const child = store.claimRetry(parent.id, 60_003)!;
+    store.admitLaunch(child.id);
     store.begin(child.id, 60_004);
 
     const reopened = new TaskRunStore(dir, { recoverInterrupted: true });
@@ -517,7 +519,7 @@ describe("TaskRunStore", () => {
       }),
       approvalNotification: { status: "pending", attempts: 0 },
     }));
-    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(11);
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(12);
   });
 
   test("rejects pending approval as a durable cancelled run", () => {
@@ -628,7 +630,7 @@ describe("TaskRunStore", () => {
       finishedAt: expect.any(Number),
       error: expect.stringMatching(/approval/i),
     }));
-    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(11);
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(12);
   });
 
   test("preserves an unapproved legacy running write run as a durable failure", () => {
@@ -670,7 +672,7 @@ describe("TaskRunStore", () => {
         error: expect.stringMatching(/approval/i),
       }));
       expect(new TaskRunStore(dir).get(run.id)?.finishedAt).toBe(460);
-      expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(11);
+      expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(12);
     } finally {
       clock.mockRestore();
     }
@@ -713,7 +715,7 @@ describe("TaskRunStore", () => {
       decidedBy: "homeagent.archive-v10",
       reason: expect.stringMatching(/not recorded/i),
     });
-    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(11);
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(12);
 
     const dishonest = JSON.parse(readFileSync(path, "utf8"));
     dishonest.runs[run.id].approval.decidedAt = 551;
@@ -1050,6 +1052,95 @@ describe("TaskRunStore", () => {
     }));
   });
 
+  test("durable launch admission gates execution and approval outbox delivery", () => {
+    const store = new TaskRunStore(dir);
+    const queued = store.start({
+      task: TASK,
+      trigger: "manual",
+      distill: false,
+      startedAt: 10_000,
+      launchAdmission: "pending",
+      executionPlan: {
+        version: 1,
+        instruction: "Read only after ownership is durable.",
+        execution: { permission: "read-only", skills: [] },
+      },
+    });
+    expect(store.begin(queued.id, 10_001)).toBeUndefined();
+    expect(store.succeed(queued.id, {
+      finishedAt: 10_001,
+      output: "must not settle",
+    })).toBeUndefined();
+    expect(new TaskRunStore(dir).get(queued.id)?.launchAdmission).toBe("pending");
+    expect(store.admitLaunch(queued.id)).toEqual(expect.objectContaining({
+      launchAdmission: "admitted",
+    }));
+    expect(store.begin(queued.id, 10_002)?.status).toBe("running");
+
+    const approval = store.start({
+      task: TASK,
+      trigger: "manual",
+      distill: false,
+      startedAt: 20_000,
+      launchAdmission: "pending",
+      approvalRequired: true,
+      executionPlan: {
+        version: 1,
+        instruction: "Write only after ownership is durable.",
+        provider: "codex",
+        execution: {
+          permission: "write",
+          workdir: "C:\\workspace\\launch-admission",
+          skills: [],
+        },
+      },
+    });
+    expect(store.listNeedingApprovalNotification(20_000)).toEqual([]);
+    expect(store.startApprovalNotificationAttempt(approval.id, 20_001)).toBeUndefined();
+    expect(store.approve(approval.id, {
+      decidedAt: 20_002,
+      decidedBy: "reviewer",
+    })).toBeUndefined();
+    store.admitLaunch(approval.id);
+    expect(store.listNeedingApprovalNotification(20_003).map((run) => run.id))
+      .toEqual([approval.id]);
+    expect(store.approve(approval.id, {
+      decidedAt: 20_004,
+      decidedBy: "reviewer",
+    })?.status).toBe("queued");
+
+    const pendingRetry = store.start({
+      task: TASK,
+      trigger: "scheduled",
+      distill: false,
+      startedAt: 30_000,
+      launchAdmission: "pending",
+      executionPlan: {
+        version: 1,
+        instruction: "Never retry an unadmitted parent.",
+        execution: { permission: "read-only", skills: [] },
+      },
+    });
+    const path = join(dir, "config", "task-runs.json");
+    const persisted = JSON.parse(readFileSync(path, "utf8"));
+    Object.assign(persisted.runs[pendingRetry.id], {
+      status: "failed",
+      finishedAt: 30_001,
+      error: "provider failed before admission",
+      failure: { phase: "provider", kind: "overloaded", retryable: true },
+      retry: {
+        attempt: 1,
+        maxAttempts: 2,
+        status: "waiting",
+        nextAttemptAt: 90_001,
+      },
+    });
+    writeFileSync(path, JSON.stringify(persisted), "utf8");
+    const reopened = new TaskRunStore(dir);
+    expect(reopened.listDueRetries(90_001)).toEqual([]);
+    expect(reopened.claimRetry(pendingRetry.id, 90_001)).toBeUndefined();
+  });
+
   test("recovers an interrupted running record as a durable failure", () => {
     const store = new TaskRunStore(dir);
     const run = store.start({ task: TASK, trigger: "manual", distill: false });
@@ -1195,7 +1286,7 @@ describe("TaskRunStore", () => {
       },
     });
     expect(JSON.parse(readFileSync(join(dir, "config", "task-runs.json"), "utf8")).version)
-      .toBe(11);
+      .toBe(12);
   });
 
   test("rejects an invalid resolved execution plan before persisting a run", () => {
@@ -1273,7 +1364,7 @@ describe("TaskRunStore", () => {
       }],
       skipped: [],
     });
-    expect(JSON.parse(readFileSync(join(dir, "config", "task-runs.json"), "utf8")).version).toBe(11);
+    expect(JSON.parse(readFileSync(join(dir, "config", "task-runs.json"), "utf8")).version).toBe(12);
   });
 
   test("rejects unbounded Skill evidence before persisting a run", () => {
@@ -1284,7 +1375,7 @@ describe("TaskRunStore", () => {
       trigger: "manual",
       distill: false,
       skillEvidence: {
-        requested: Array.from({ length: 51 }, (_, index) => ({
+        requested: Array.from({ length: MAX_TASK_RUN_SKILLS + 1 }, (_, index) => ({
           kind: "legacy-name" as const,
           name: `skill-${index}`,
         })),

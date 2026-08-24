@@ -357,6 +357,7 @@ const CLAUDE_ORDINARY_REQUIRED_FLAGS = [
 ] as const;
 const MAX_CLAUDE_AUTH_STATUS_BYTES = 16 * 1024;
 const CLAUDE_AUTH_UNAVAILABLE_DETAIL = "Claude 认证不可用";
+const CODEX_AUTH_UNAVAILABLE_DETAIL = "ChatGPT 尚未连接";
 
 function missingClaudeOrdinaryFlags(help: string): string[] {
   const flags = new Set(help.match(/--?[a-zA-Z][a-zA-Z0-9-]*/gu) ?? []);
@@ -441,9 +442,10 @@ async function runCmd(
 
 /**
  * Probe every known CLI once. A provider is "available" only if its version
- * command exits 0 and prints something (installed AND runnable). Claude also
- * needs no-completion `--help` and `auth status --json` probes proving every
- * ordinary no-tools flag exists and the CLI considers its current auth usable.
+ * command exits 0 and prints something (installed AND runnable). Codex also
+ * needs a no-completion `login status` probe. Claude needs no-completion
+ * `--help` and `auth status --json` probes proving every ordinary no-tools flag
+ * exists and each CLI considers its current auth usable.
  * Bounded so a hanging CLI can't stall the backend.
  */
 export async function detectProviders(timeoutMs = 6000): Promise<DetectedProvider[]> {
@@ -456,6 +458,33 @@ export async function detectProviders(timeoutMs = 6000): Promise<DetectedProvide
       if (timedOut) {
         out.push({ ...base(spec, bin), available: false, detail: "探测超时" });
       } else if (code === 0 && version && !/not found|no such|cannot|error/i.test(version)) {
+        if (spec.id === "codex") {
+          let authProbe: Awaited<ReturnType<typeof runCmd>>;
+          try {
+            authProbe = await runCmd(
+              bin,
+              [...MANAGED_CODEX_AUTH_ARGS, "login", "status"],
+              timeoutMs,
+            );
+          } catch {
+            out.push({
+              ...base(spec, bin),
+              available: false,
+              detail: CODEX_AUTH_UNAVAILABLE_DETAIL,
+            });
+            continue;
+          }
+          if (authProbe.timedOut || authProbe.code !== 0) {
+            out.push({
+              ...base(spec, bin),
+              available: false,
+              detail: CODEX_AUTH_UNAVAILABLE_DETAIL,
+            });
+            continue;
+          }
+          out.push({ ...base(spec, bin), available: true, detail: version });
+          continue;
+        }
         if (spec.id !== "claude") {
           out.push({ ...base(spec, bin), available: true, detail: version });
           continue;

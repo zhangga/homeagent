@@ -702,6 +702,46 @@ export class WorkContinuationStore {
     });
   }
 
+  /**
+   * Append recovered TaskRun history without reopening the action or rewriting
+   * its audit order. Existing run ids and acceptance attempt numbers are the
+   * durable authority; recovery may only add previously missing later runs.
+   */
+  reconcileRunHistory(
+    id: string,
+    orderedRunIds: string[],
+    now = Date.now(),
+  ): WorkAction {
+    this.assertHealthy();
+    if (!finite(now)) throw new Error("work action reconciliation time is invalid");
+    const normalized = orderedRunIds.map((runId) => runId.trim());
+    if (normalized.some((runId) => !runId)) {
+      throw new Error("work action run id is required");
+    }
+    if (new Set(normalized).size !== normalized.length) {
+      throw new Error("work action run history contains duplicates");
+    }
+    if (normalized.length > MAX_WORK_ACTION_RUNS) {
+      throw new Error("work action has too many runs");
+    }
+    const existing = this.actions.get(id);
+    if (!existing) throw new Error(`work action not found: ${id}`);
+    if (existing.taskRunIds.some((runId) => !normalized.includes(runId))) {
+      throw new Error("work action reconciliation cannot discard run history");
+    }
+    if (existing.taskRunIds.some((runId, index) => normalized[index] !== runId)) {
+      throw new Error("work action reconciliation cannot reorder or insert into run history");
+    }
+    const recoveredRunIds = normalized.slice(existing.taskRunIds.length);
+    if (recoveredRunIds.length === 0) return clone(existing);
+    return this.commit((candidate) => {
+      const action = candidate.get(id)!;
+      action.taskRunIds = [...action.taskRunIds, ...recoveredRunIds];
+      action.attempt = Math.max(action.attempt, action.taskRunIds.length);
+      return clone(action);
+    });
+  }
+
   markRunning(id: string, runId: string, now = Date.now()): WorkAction {
     this.assertHealthy();
     if (!this.actions.has(id)) throw new Error(`work action not found: ${id}`);

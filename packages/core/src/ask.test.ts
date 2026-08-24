@@ -581,7 +581,7 @@ describe("ask pipeline", () => {
     store.writePage(page("entities/alice", "Alice", "Alice 负责后端服务。"));
     // A CLI client whose runner returns JSON for structured calls (route +
     // synth) and text otherwise — proving ask() is client-agnostic.
-    const cli = makeCliClient("claude", "", async (_id, input) => {
+    const cli = makeCliClient("claude", "", dir, async (_id, input) => {
       if (/JSON Schema/.test(input.prompt) && /relevant/.test(input.prompt)) {
         return JSON.stringify({ slugs: ["entities/alice"], relevant: true });
       }

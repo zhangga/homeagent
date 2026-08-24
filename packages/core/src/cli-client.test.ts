@@ -1,11 +1,17 @@
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetConfig } from "@homeagent/shared";
 import { ProviderRunError, spentToday } from "@homeagent/llm";
 import { extractJson, makeCliClient } from "./cli-client.ts";
 import { observeLlmUsage, RunUsageAccumulator } from "./usage.ts";
+
+const testAccountingDataDir = mkdtempSync(join(tmpdir(), "ha-cli-client-suite-"));
+
+afterAll(() => {
+  rmSync(testAccountingDataDir, { recursive: true, force: true });
+});
 
 describe("extractJson", () => {
   test("parses a bare JSON object", () => {
@@ -28,8 +34,63 @@ describe("extractJson", () => {
 });
 
 describe("makeCliClient", () => {
+  test("requires an explicit accounting directory", () => {
+    expect(() => (makeCliClient as unknown as (...args: unknown[]) => unknown)(
+      "codex",
+      "",
+      async () => "unused",
+    )).toThrow(/accounting data directory/i);
+  });
+
+  test("an accounting write failure does not replace a successful provider result", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ha-cli-accounting-failure-"));
+    const invalidAccountingDir = join(directory, "not-a-directory");
+    writeFileSync(invalidAccountingDir, "occupied");
+    try {
+      const cli = makeCliClient(
+        "codex",
+        "gpt-5.6-sol",
+        invalidAccountingDir,
+        async () => "provider result",
+      );
+
+      await expect(cli.complete({ prompt: "hello" })).resolves.toEqual(
+        expect.objectContaining({ text: "provider result" }),
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("an accounting write failure preserves the original provider error", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ha-cli-accounting-provider-error-"));
+    const invalidAccountingDir = join(directory, "not-a-directory");
+    writeFileSync(invalidAccountingDir, "occupied");
+    const providerError = new Error("original provider failure");
+    try {
+      const cli = makeCliClient(
+        "codex",
+        "gpt-5.6-sol",
+        invalidAccountingDir,
+        async () => {
+          throw providerError;
+        },
+      );
+
+      let thrown: unknown;
+      try {
+        await cli.complete({ prompt: "hello" });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBe(providerError);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("complete() preserves structured provider usage without inventing a cost", async () => {
-    const cli = makeCliClient("codex", "gpt-5.6-sol", async () => ({
+    const cli = makeCliClient("codex", "gpt-5.6-sol", testAccountingDataDir, async () => ({
       text: "answer",
       usage: {
         inputTokens: 240,
@@ -58,14 +119,12 @@ describe("makeCliClient", () => {
 
   test("known CLI cost is recorded and blocks the next deferrable call at the daily budget", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ha-cli-budget-"));
-    const previousDataDir = process.env.HOMEAGENT_DATA_DIR;
     const previousBudget = process.env.HOMEAGENT_DAILY_BUDGET_USD;
     let calls = 0;
     try {
-      process.env.HOMEAGENT_DATA_DIR = directory;
       process.env.HOMEAGENT_DAILY_BUDGET_USD = "0.01";
       resetConfig();
-      const cli = makeCliClient("claude", "sonnet", async () => {
+      const cli = makeCliClient("claude", "sonnet", directory, async () => {
         calls += 1;
         return {
           text: "answer",
@@ -81,13 +140,11 @@ describe("makeCliClient", () => {
 
       await cli.complete({ prompt: "first", purpose: "other" });
 
-      expect(spentToday()).toBeCloseTo(0.02, 8);
+      expect(spentToday(undefined, directory)).toBeCloseTo(0.02, 8);
       await expect(cli.complete({ prompt: "second", purpose: "other" }))
         .rejects.toThrow(/budget/i);
       expect(calls).toBe(1);
     } finally {
-      if (previousDataDir === undefined) delete process.env.HOMEAGENT_DATA_DIR;
-      else process.env.HOMEAGENT_DATA_DIR = previousDataDir;
       if (previousBudget === undefined) delete process.env.HOMEAGENT_DAILY_BUDGET_USD;
       else process.env.HOMEAGENT_DAILY_BUDGET_USD = previousBudget;
       resetConfig();
@@ -97,14 +154,12 @@ describe("makeCliClient", () => {
 
   test("completeJSON participates in the same usage accounting and budget preflight", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ha-cli-json-budget-"));
-    const previousDataDir = process.env.HOMEAGENT_DATA_DIR;
     const previousBudget = process.env.HOMEAGENT_DAILY_BUDGET_USD;
     let calls = 0;
     try {
-      process.env.HOMEAGENT_DATA_DIR = directory;
       process.env.HOMEAGENT_DAILY_BUDGET_USD = "0.01";
       resetConfig();
-      const cli = makeCliClient("claude", "sonnet", async () => {
+      const cli = makeCliClient("claude", "sonnet", directory, async () => {
         calls += 1;
         return {
           text: '{"intent":"question"}',
@@ -126,12 +181,10 @@ describe("makeCliClient", () => {
       const first = await cli.completeJSON<{ intent: string }>(options);
 
       expect(first.result.usage?.costUsd).toBe(0.02);
-      expect(spentToday()).toBeCloseTo(0.02, 8);
+      expect(spentToday(undefined, directory)).toBeCloseTo(0.02, 8);
       await expect(cli.completeJSON(options)).rejects.toThrow(/budget/i);
       expect(calls).toBe(1);
     } finally {
-      if (previousDataDir === undefined) delete process.env.HOMEAGENT_DATA_DIR;
-      else process.env.HOMEAGENT_DATA_DIR = previousDataDir;
       if (previousBudget === undefined) delete process.env.HOMEAGENT_DAILY_BUDGET_USD;
       else process.env.HOMEAGENT_DAILY_BUDGET_USD = previousBudget;
       resetConfig();
@@ -146,6 +199,7 @@ describe("makeCliClient", () => {
       const cli = makeCliClient(
         "claude",
         "sonnet",
+        directory,
         async () => ({
           text: "not json",
           usage: {
@@ -161,7 +215,6 @@ describe("makeCliClient", () => {
         undefined,
         undefined,
         [],
-        directory,
       );
       const observed = observeLlmUsage(cli, (usage) => accumulator.record(usage));
 
@@ -185,13 +238,11 @@ describe("makeCliClient", () => {
 
   test("provider-reported spend is recorded even when the structured run fails", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ha-cli-failed-spend-"));
-    const previousDataDir = process.env.HOMEAGENT_DATA_DIR;
     const previousBudget = process.env.HOMEAGENT_DAILY_BUDGET_USD;
     try {
-      process.env.HOMEAGENT_DATA_DIR = directory;
       process.env.HOMEAGENT_DAILY_BUDGET_USD = "5";
       resetConfig();
-      const cli = makeCliClient("claude", "sonnet", async () => {
+      const cli = makeCliClient("claude", "sonnet", directory, async () => {
         throw new ProviderRunError("claude", "provider failed", {
           inputTokens: 40,
           outputTokens: 5,
@@ -204,10 +255,8 @@ describe("makeCliClient", () => {
       await expect(cli.complete({ prompt: "fail", purpose: "other" }))
         .rejects.toThrow("provider failed");
 
-      expect(spentToday()).toBeCloseTo(0.004, 8);
+      expect(spentToday(undefined, directory)).toBeCloseTo(0.004, 8);
     } finally {
-      if (previousDataDir === undefined) delete process.env.HOMEAGENT_DATA_DIR;
-      else process.env.HOMEAGENT_DATA_DIR = previousDataDir;
       if (previousBudget === undefined) delete process.env.HOMEAGENT_DAILY_BUDGET_USD;
       else process.env.HOMEAGENT_DAILY_BUDGET_USD = previousBudget;
       resetConfig();
@@ -217,7 +266,7 @@ describe("makeCliClient", () => {
 
   test("complete() returns the CLI stdout as text and folds system into prompt", async () => {
     let seen = "";
-    const cli = makeCliClient("claude", "sonnet", async (_id, input) => {
+    const cli = makeCliClient("claude", "sonnet", testAccountingDataDir, async (_id, input) => {
       seen = input.prompt;
       return "  hello world  ";
     });
@@ -229,7 +278,7 @@ describe("makeCliClient", () => {
 
   test("complete() forwards visual inputs to the provider boundary", async () => {
     let images: unknown;
-    const cli = makeCliClient("codex", "", async (_id, input) => {
+    const cli = makeCliClient("codex", "", testAccountingDataDir, async (_id, input) => {
       images = input.images;
       return "看到了晚餐图片";
     });
@@ -247,6 +296,7 @@ describe("makeCliClient", () => {
     const cli = makeCliClient(
       "codex",
       "",
+      testAccountingDataDir,
       async (_id, input) => {
         seen.push(input);
         return /JSON Schema/.test(input.prompt) ? '{"ok":true}' : "ok";
@@ -272,7 +322,7 @@ describe("makeCliClient", () => {
 
   test("completeJSON() appends a schema instruction, parses, and validates", async () => {
     let seen = "";
-    const cli = makeCliClient("trae-cli", "", async (_id, input) => {
+    const cli = makeCliClient("trae-cli", "", testAccountingDataDir, async (_id, input) => {
       seen = input.prompt;
       return '```json\n{"intent":"question"}\n```';
     });
@@ -286,7 +336,7 @@ describe("makeCliClient", () => {
   });
 
   test("completeJSON() throws a clear error on unparseable output", async () => {
-    const cli = makeCliClient("codex", "", async () => "not json at all");
+    const cli = makeCliClient("codex", "", testAccountingDataDir, async () => "not json at all");
     await expect(
       cli.completeJSON({ prompt: "x", schema: { type: "object" } }),
     ).rejects.toThrow(/did not return parseable JSON/);
@@ -297,10 +347,15 @@ describe("makeCliClient", () => {
     // that a local CLI would reject; the client must pin the model chosen by the
     // engine at construction time.
     let usedModel: string | undefined;
-    const cli = makeCliClient("trae-cli", "openrouter-3o", async (_id, input) => {
-      usedModel = input.model;
-      return "ok";
-    });
+    const cli = makeCliClient(
+      "trae-cli",
+      "openrouter-3o",
+      testAccountingDataDir,
+      async (_id, input) => {
+        usedModel = input.model;
+        return "ok";
+      },
+    );
     await cli.complete({ prompt: "a" });
     expect(usedModel).toBe("openrouter-3o");
     await cli.complete({ prompt: "a", model: "claude-sonnet-5" });
@@ -309,7 +364,7 @@ describe("makeCliClient", () => {
 
   test("empty constructor model => CLI's own default (undefined passed through)", async () => {
     let usedModel: string | undefined = "sentinel";
-    const cli = makeCliClient("trae-cli", "", async (_id, input) => {
+    const cli = makeCliClient("trae-cli", "", testAccountingDataDir, async (_id, input) => {
       usedModel = input.model;
       return "ok";
     });

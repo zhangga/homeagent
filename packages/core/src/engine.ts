@@ -94,6 +94,7 @@ import {
   MAX_AUTOMATIC_TASK_RUN_ATTEMPTS,
   MAX_TASK_RUN_ERROR_CHARACTERS,
   TaskRunStore,
+  isTaskRunLaunchAdmitted,
   type TaskRun,
   type TaskRunFailure,
   type TaskRunSkillEvidence,
@@ -111,7 +112,11 @@ import {
   type RunConcurrencyLayer,
 } from "./run-scheduler.ts";
 import { ReminderStore, type Reminder } from "./reminders.ts";
-import { WorkItemStore, type WorkItem } from "./work-items.ts";
+import {
+  WorkItemStore,
+  workActionBlockerMessage,
+  type WorkItem,
+} from "./work-items.ts";
 import {
   MAX_WORK_ACTION_RUNS,
   parseWorkActionProviderReport,
@@ -1452,21 +1457,118 @@ export class KnowledgeEngine implements Knowledge {
       )?.id;
   }
 
-  private reconcileWorkContinuationState(): void {
-    this.reconcileTaskRunWorkActionRawEvidence();
-    for (const run of this.taskRuns.list().filter((candidate) => candidate.workActionId)) {
-      const action = this.workContinuations.get(run.workActionId!);
+  private reconcileTaskRunAssociations(
+    filter: { space?: SpaceId; actionId?: string } = {},
+  ): void {
+    const activeRunStatuses = new Set(["awaiting_approval", "queued", "running"]);
+    const activeActionStatuses = new Set(["queued", "awaiting_approval", "running"]);
+    const runs = this.taskRuns.list()
+      .filter((run) => filter.space === undefined || run.space === filter.space)
+      .filter((run) => filter.actionId === undefined || run.workActionId === filter.actionId)
+      .sort((left, right) =>
+        left.startedAt - right.startedAt || left.id.localeCompare(right.id)
+      );
+
+    const launchAdmissionError =
+      "Task Run 启动准入未完成：跨存储关联未能确认，已阻止自动执行";
+
+    for (const original of runs) {
+      let run = this.taskRuns.get(original.id) ?? original;
       const item = run.workItemId ? this.workItems.get(run.workItemId) : undefined;
+      const action = run.workActionId
+        ? this.workContinuations.get(run.workActionId)
+        : undefined;
+      const validItem = run.workItemId === undefined
+        || (item !== undefined && item.space === run.space);
+      const validAction = run.workActionId === undefined
+        || (
+          action !== undefined
+          && item !== undefined
+          && action.workItemId === item.id
+          && action.space === run.space
+          && item.space === run.space
+        );
+      const missingItemLink = Boolean(
+        run.workItemId && validItem && !item!.taskRunIds.includes(run.id),
+      );
+      const missingActionLink = Boolean(
+        run.workActionId && validAction && !action!.taskRunIds.includes(run.id),
+      );
+      const active = activeRunStatuses.has(run.status);
+      const invalidExplicitOwner = Boolean(
+        (run.workItemId && !validItem) || (run.workActionId && !validAction),
+      );
+      const incompletePlainAdmission = active
+        && !run.workActionId
+        && Boolean(run.workItemId)
+        && missingItemLink;
+      const closedWorkActionAdmission = active
+        && Boolean(run.workActionId)
+        && (!validItem || !validAction || missingItemLink || missingActionLink)
+        && (
+          !validItem
+          || !validAction
+          || !action
+          || !item
+          || !activeActionStatuses.has(action.status)
+          || !item.active
+          || item.phase !== "active"
+          || item.blockers.length > 0
+        );
+
+      // A plain managed Run has no WorkAction boundary to stop a partially
+      // admitted launch from replaying. A Run whose action boundary is already
+      // closed is likewise never made executable merely by repairing links.
       if (
-        !action
-        || !item
-        || action.workItemId !== item.id
-        || action.space !== run.space
-        || item.space !== run.space
-      ) continue;
+        active
+        && (
+          run.launchAdmission === "pending"
+          || invalidExplicitOwner
+          || incompletePlainAdmission
+          || closedWorkActionAdmission
+        )
+      ) {
+        const reason = run.launchAdmission === "pending"
+          ? launchAdmissionError
+          : "Task Run 关联恢复失败：持久化 owner 或反向关联无效，已阻止自动执行";
+        run = this.finishQueuedTaskRun(run, reason, "cancelled") ?? run;
+      }
+
       if (
-        !action.taskRunIds.includes(run.id)
-        && ["queued", "awaiting_approval", "running"].includes(action.status)
+        run.workItemId
+        && !run.workActionId
+        && !validItem
+        && !activeRunStatuses.has(run.status)
+      ) {
+        const foreignReverseLink = item !== undefined
+          && item.space !== run.space
+          && item.taskRunIds.includes(run.id);
+        if (!foreignReverseLink) {
+          run = this.taskRuns.detachInvalidPlainWorkItem(
+            run.id,
+            run.workItemId,
+          ) ?? run;
+        }
+      }
+
+      if (run.workItemId && validItem && !item!.taskRunIds.includes(run.id)) {
+        this.workItems.attachTaskRun(
+          item!.id,
+          run.id,
+          Math.max(item!.updatedAt, run.startedAt, run.finishedAt ?? 0),
+        );
+      }
+      if (
+        activeRunStatuses.has(run.status)
+        && missingActionLink
+        && validAction
+        && action
+        && item
+        && activeActionStatuses.has(action.status)
+        && item.active
+        && item.phase === "active"
+        && item.blockers.length === 0
+        && runs.filter((candidate) => candidate.workActionId === action.id).at(-1)?.id === run.id
       ) {
         this.workContinuations.attachRun(
           action.id,
@@ -1475,10 +1577,168 @@ export class KnowledgeEngine implements Knowledge {
           Math.max(action.updatedAt, run.startedAt),
         );
       }
-      if (!item.taskRunIds.includes(run.id)) {
-        this.workItems.attachTaskRun(item.id, run.id, Math.max(item.updatedAt, run.startedAt));
+    }
+
+    for (const action of this.workContinuations.list()
+      .filter((action) => filter.space === undefined || action.space === filter.space)
+      .filter((action) => filter.actionId === undefined || action.id === filter.actionId)) {
+      const ownedRuns = runs
+        .filter((run) => {
+          if (run.workActionId !== action.id || run.workItemId !== action.workItemId) return false;
+          const item = this.workItems.get(run.workItemId);
+          return item?.space === run.space && action.space === run.space;
+        });
+      const ownedRunById = new Map(ownedRuns.map((run) => [run.id, run]));
+      if (action.taskRunIds.some((runId) => !ownedRunById.has(runId))) {
+        // A separately audited missing-TaskRun/Raw recovery path owns this
+        // corruption case. Never rewrite or compact the authoritative action
+        // order merely because one of its forward records is unavailable.
+        continue;
+      }
+      const missing = new Map(
+        ownedRuns
+          .filter((run) => !action.taskRunIds.includes(run.id))
+          .map((run) => [run.id, run]),
+      );
+      const recoveredRunIds: string[] = [];
+      let previousRunId = action.taskRunIds.at(-1);
+      while (missing.size > 0) {
+        const candidates = [...missing.values()].filter(
+          (run) => run.retryOf === previousRunId,
+        );
+        if (candidates.length !== 1) {
+          throw new Error(
+            `work action Task Run history cannot safely append recovered attempts: ${action.id}`,
+          );
+        }
+        const recovered = candidates[0]!;
+        recoveredRunIds.push(recovered.id);
+        missing.delete(recovered.id);
+        previousRunId = recovered.id;
+      }
+      if (recoveredRunIds.length > 0) {
+        this.workContinuations.reconcileRunHistory(
+          action.id,
+          [...action.taskRunIds, ...recoveredRunIds],
+          Math.max(action.updatedAt, ...runs
+            .filter((run) => run.workActionId === action.id)
+            .map((run) => run.finishedAt ?? run.startedAt)),
+        );
       }
     }
+
+    for (const original of runs) {
+      if (original.launchAdmission !== "pending" || !original.workActionId) continue;
+      const run = this.taskRuns.get(original.id) ?? original;
+      const action = this.workContinuations.get(original.workActionId);
+      if (!action) continue;
+      if (["queued", "awaiting_approval", "running", "awaiting_acceptance"]
+        .includes(action.status)) {
+        this.failClosedWorkActionRun(run, launchAdmissionError);
+      }
+      const reconciled = this.workContinuations.get(action.id);
+      if (reconciled?.status === "blocked") {
+        this.ensureWorkActionBlockerProjection(reconciled);
+      }
+    }
+  }
+
+  private ensureWorkActionBlockerProjection(action: WorkAction): void {
+    if (action.status !== "blocked" || !action.error) return;
+    const item = this.workItems.get(action.workItemId);
+    const blocker = workActionBlockerMessage(action.instruction, action.error);
+    if (
+      item?.phase === "blocked"
+      && item.actionBlockers?.[action.id] === blocker
+      && item.blockers.includes(blocker)
+    ) return;
+    this.workItems.applyActionBlocker(
+      action.workItemId,
+      action.id,
+      action.instruction,
+      action.error,
+      action.updatedAt,
+    );
+  }
+
+  /** Repair only durable execution boundaries; unlike startup recovery this
+   * does not reconcile Raw evidence or mutate knowledge pages. */
+  private reconcileExecutionBoundaries(
+    filter: { space?: SpaceId; actionId?: string } = {},
+  ): void {
+    this.reconcileTaskRunAssociations(filter);
+    const activeActionStatuses = new Set([
+      "queued",
+      "awaiting_approval",
+      "running",
+      "awaiting_acceptance",
+    ]);
+    for (const snapshot of this.workContinuations.list()
+      .filter((action) => filter.space === undefined || action.space === filter.space)
+      .filter((action) => filter.actionId === undefined || action.id === filter.actionId)) {
+      let action = this.workContinuations.get(snapshot.id) ?? snapshot;
+      if (action.status === "blocked") {
+        this.ensureWorkActionBlockerProjection(action);
+        continue;
+      }
+      const runId = action.taskRunIds.at(-1);
+      const run = runId ? this.taskRuns.get(runId) : undefined;
+      let recoveryError: string | undefined;
+      if (activeActionStatuses.has(action.status) && (!runId || !run)) {
+        recoveryError = "工作动作恢复失败：没有关联的 Task Run，已阻止自动重放";
+      } else if (
+        activeActionStatuses.has(action.status)
+        && action.taskRunIds.length < action.attempt
+      ) {
+        recoveryError = "工作动作恢复失败：重试意图已保存，但缺少本次尝试的新 Task Run，已阻止自动重放";
+      }
+      if (recoveryError) {
+        action = this.workContinuations.failClosed(action.id, recoveryError);
+        this.ensureWorkActionBlockerProjection(action);
+        continue;
+      }
+      const item = this.workItems.get(action.workItemId);
+      if (item?.actionBlockers?.[action.id]) {
+        this.workItems.clearActionBlocker(action.workItemId, action.id, action.updatedAt);
+      }
+      if (run?.finishedAt !== undefined) this.settleWorkActionFromTaskRun(run.id);
+    }
+  }
+
+  /** Archive-only recovery: repair durable links and idempotently project
+   * terminal decisions. It never settles a Run or creates an acceptance. */
+  private reconcileArchiveBoundaries(space: SpaceId): void {
+    this.reconcileTaskRunAssociations({ space });
+    for (const action of this.workContinuations.list()
+      .filter((candidate) => candidate.space === space)) {
+      if (action.status === "blocked") {
+        this.ensureWorkActionBlockerProjection(action);
+        continue;
+      }
+      if (action.status === "succeeded") {
+        this.projectAcceptedWorkAction(action);
+        if (!this.workItems.get(action.workItemId)?.completedActionIds?.includes(action.id)) {
+          throw new Error(`succeeded WorkAction cannot be projected for archive: ${action.id}`);
+        }
+        continue;
+      }
+      if (action.status === "cancelled") {
+        this.excludeWorkActionRaws(action);
+        const item = this.workItems.get(action.workItemId);
+        if (item?.actionBlockers?.[action.id]) {
+          this.workItems.clearActionBlocker(
+            action.workItemId,
+            action.id,
+            action.updatedAt,
+          );
+        }
+      }
+    }
+  }
+
+  private reconcileWorkContinuationState(): void {
+    this.reconcileTaskRunAssociations();
+    this.reconcileTaskRunWorkActionRawEvidence();
     for (const action of this.workContinuations.list()) {
       this.reconcileWorkActionRawAdmissions(action);
       if (action.status === "blocked" && action.error) {
@@ -1487,13 +1747,7 @@ export class KnowledgeEngine implements Knowledge {
           action,
           latestRunId ? this.taskRuns.get(latestRunId)?.rawId : undefined,
         );
-        this.workItems.applyActionBlocker(
-          action.workItemId,
-          action.id,
-          action.instruction,
-          action.error,
-          action.updatedAt,
-        );
+        this.ensureWorkActionBlockerProjection(action);
         continue;
       }
       const item = this.workItems.get(action.workItemId);
@@ -1976,6 +2230,9 @@ export class KnowledgeEngine implements Knowledge {
   }
 
   private workActionExecutionBoundaryError(run: TaskRun): string | undefined {
+    if (!isTaskRunLaunchAdmitted(run)) {
+      return "work action execution boundary is pending durable launch admission";
+    }
     if (!run.workActionId) return undefined;
     const action = this.workContinuations.get(run.workActionId);
     const item = run.workItemId ? this.workItems.get(run.workItemId) : undefined;
@@ -2055,7 +2312,13 @@ export class KnowledgeEngine implements Knowledge {
 
   private settleWorkActionFromTaskRun(runId: string): void {
     const run = this.taskRuns.get(runId);
-    if (!run?.workActionId || !run.workItemId || run.finishedAt === undefined) return;
+    if (
+      !run
+      || !isTaskRunLaunchAdmitted(run)
+      || !run.workActionId
+      || !run.workItemId
+      || run.finishedAt === undefined
+    ) return;
     const action = this.workContinuations.get(run.workActionId);
     if (
       !action
@@ -2914,13 +3177,13 @@ export class KnowledgeEngine implements Knowledge {
       client = makeCliClient(
         executionPlan.provider,
         executionPlan.model,
+        this.dataDir,
         this.runProvider,
         options.timeoutMs,
         executionPlan.reasoningEffort,
         options.signal,
         executionPlan.execution,
         skillNames,
-        this.dataDir,
         executionPlan.workdir,
       );
     }
@@ -3086,13 +3349,13 @@ export class KnowledgeEngine implements Knowledge {
     return makeCliClient(
       provider as ProviderId,
       model,
+      this.dataDir,
       this.runProvider,
       timeoutMs,
       reasoningEffort,
       signal,
       execution,
       skillNames,
-      this.dataDir,
       resolveAgentWorkdir(agent),
     );
   }
@@ -3869,6 +4132,9 @@ export class KnowledgeEngine implements Knowledge {
   async exportSpace(space: SpaceId): Promise<SpaceArchive> {
     if (!this.registry.has(space)) throw new Error(`unknown space: ${space}`);
     return this.serializer.run(space, async () => {
+      // Export repairs archive integrity and replays already-durable terminal
+      // projections; it must not settle Runs or create acceptance decisions.
+      this.reconcileArchiveBoundaries(space);
       const meta = this.registry.get(space);
       if (!meta) throw new Error(`unknown space: ${space}`);
       const store = this.registry.store(space);
@@ -3881,6 +4147,24 @@ export class KnowledgeEngine implements Knowledge {
       const workContinuation = this.workContinuations.exportBySpace(space);
       const reminders = this.reminders.list().filter((reminder) => reminder.space === space);
       const learning = this.learning.listBySpace(space);
+      const crossSpaceRunOwner = taskRuns.find((run) => {
+        if (!run.workItemId) return false;
+        const owner = this.workItems.get(run.workItemId);
+        return owner !== undefined && owner.space !== run.space;
+      });
+      if (crossSpaceRunOwner) {
+        throw new Error(
+          `space has a Task Run with a cross-space WorkItem owner: ${crossSpaceRunOwner.id}`,
+        );
+      }
+      const crossSpaceItemRun = workItems.flatMap((item) => item.taskRunIds
+        .map((runId) => ({ item, run: this.taskRuns.get(runId) })))
+        .find(({ item, run }) => run !== undefined && run.space !== item.space);
+      if (crossSpaceItemRun) {
+        throw new Error(
+          `space has a WorkItem linked to a cross-space Task Run: ${crossSpaceItemRun.run!.id}`,
+        );
+      }
       if (taskRuns.some((run) =>
         ["awaiting_approval", "queued", "running"].includes(run.status)
         || run.retry?.status === "waiting"
@@ -4545,6 +4829,33 @@ export class KnowledgeEngine implements Knowledge {
       ));
   }
 
+  private failClosedWorkActionStart(action: WorkAction, reason: string): void {
+    let blocked = action;
+    try {
+      blocked = this.workContinuations.failClosed(action.id, reason);
+    } catch (error) {
+      log.warn("failed to persist WorkAction start blocker", {
+        actionId: action.id,
+        err: String(error),
+      });
+    }
+    try {
+      this.workItems.applyActionBlocker(
+        blocked.workItemId,
+        blocked.id,
+        blocked.instruction,
+        reason,
+        blocked.updatedAt,
+      );
+    } catch (error) {
+      log.warn("failed to persist WorkItem start blocker", {
+        actionId: action.id,
+        workItemId: action.workItemId,
+        err: String(error),
+      });
+    }
+  }
+
   startWorkContinuation(
     workItemId: string,
     opts: { trigger?: "manual" | "scheduled" } = {},
@@ -4570,6 +4881,8 @@ export class KnowledgeEngine implements Knowledge {
         run: this.taskRuns.get(started.run.id) ?? started.run,
       };
     } catch (error) {
+      const reason = "工作动作启动失败：Task Run 未能完成持久化与关联，已阻止自动重放";
+      this.failClosedWorkActionStart(action, reason);
       throw error;
     }
   }
@@ -4578,6 +4891,7 @@ export class KnowledgeEngine implements Knowledge {
     actionId: string,
     expected: { runId?: string | null; attempt?: number } = {},
   ): StartedTaskRun {
+    this.reconcileExecutionBoundaries({ actionId });
     const previous = this.workContinuations.get(actionId);
     if (!previous) throw new Error(`work action not found: ${actionId}`);
     this.assertExpectedWorkActionState(previous, expected);
@@ -4588,20 +4902,35 @@ export class KnowledgeEngine implements Knowledge {
     const item = this.workItems.get(previous.workItemId);
     if (!item) throw new Error(`work item not found: ${previous.workItemId}`);
     const action = this.workContinuations.retry(actionId);
-    this.workItems.clearActionBlocker(
-      action.workItemId,
-      action.id,
-      action.updatedAt,
-    );
-    const task = this.workActionTask(item, action);
-    return this.launchTaskRun(
-      task,
-      "retry",
-      false,
-      previousRunId,
-      task.timeoutMinutes * 60_000,
-      action.id,
-    );
+    try {
+      this.workItems.clearActionBlocker(
+        action.workItemId,
+        action.id,
+        action.updatedAt,
+      );
+      const task = this.workActionTask(item, action);
+      return this.launchTaskRun(
+        task,
+        "retry",
+        false,
+        previousRunId,
+        task.timeoutMinutes * 60_000,
+        action.id,
+      );
+    } catch (error) {
+      const fallbackReason = "工作动作启动失败：Task Run 未能完成持久化与关联，已阻止自动重放";
+      const previousBlocker = previous.error
+        ? workActionBlockerMessage(previous.instruction, previous.error)
+        : undefined;
+      const reason = previous.status === "blocked"
+          && previous.error
+          && item.actionBlockers?.[previous.id] === previousBlocker
+          && item.blockers.includes(previousBlocker!)
+        ? previous.error
+        : fallbackReason;
+      this.failClosedWorkActionStart(action, reason);
+      throw error;
+    }
   }
 
   acceptWorkAction(
@@ -4743,6 +5072,10 @@ export class KnowledgeEngine implements Knowledge {
   approveTaskRun(runId: string, decidedBy: string): StartedTaskRun {
     const pending = this.taskRuns.get(runId);
     if (!pending) throw new Error(`unknown task run: ${runId}`);
+    if (!isTaskRunLaunchAdmitted(pending)) {
+      this.reconcileTaskRunAssociations({ space: pending.space });
+      throw new Error(`task run launch is not admitted: ${runId}`);
+    }
     if (pending.status !== "awaiting_approval") {
       throw new Error(`task run is not awaiting approval: ${runId}`);
     }
@@ -4835,6 +5168,9 @@ export class KnowledgeEngine implements Knowledge {
   retryTaskRun(runId: string): StartedTaskRun {
     const previous = this.taskRuns.get(runId);
     if (!previous) throw new Error(`unknown task run: ${runId}`);
+    if (!isTaskRunLaunchAdmitted(previous)) {
+      throw new Error(`task run launch was never admitted and cannot be retried: ${runId}`);
+    }
     if (previous.workActionId) {
       throw new Error(
         "WorkAction Task Runs must be retried through the WorkAction boundary",
@@ -4854,11 +5190,68 @@ export class KnowledgeEngine implements Knowledge {
     }, "retry", previous.distill, previous.id, task.timeoutMinutes * 60_000);
   }
 
+  private attachTaskRunWorkItem(run: TaskRun, now?: number): void {
+    if (!run.workItemId) return;
+    try {
+      this.workItems.attachTaskRun(run.workItemId, run.id, now);
+    } catch (error) {
+      let committed = false;
+      try {
+        committed = this.workItems.get(run.workItemId)?.taskRunIds.includes(run.id) === true;
+      } catch {
+        // An unavailable read cannot prove that the write committed.
+      }
+      if (!committed) throw error;
+    }
+  }
+
+  private attachTaskRunWorkAction(
+    run: TaskRun,
+    status: "queued" | "awaiting_approval",
+    now?: number,
+  ): void {
+    if (!run.workActionId) return;
+    try {
+      this.workContinuations.attachRun(run.workActionId, run.id, status, now);
+    } catch (error) {
+      let committed = false;
+      try {
+        committed = this.workContinuations.get(run.workActionId)
+          ?.taskRunIds.includes(run.id) === true;
+      } catch {
+        // An unavailable read cannot prove that the write committed.
+      }
+      if (!committed) throw error;
+    }
+  }
+
+  private admitTaskRunLaunch(run: TaskRun): TaskRun {
+    let admitted: TaskRun | undefined;
+    try {
+      admitted = this.taskRuns.admitLaunch(run.id);
+    } catch (error) {
+      try {
+        admitted = this.taskRuns.get(run.id);
+      } catch {
+        // Preserve the primary admission persistence error when read-back is unavailable.
+      }
+      if (admitted?.launchAdmission !== "admitted") throw error;
+    }
+    if (admitted?.launchAdmission !== "admitted") {
+      throw new Error(`Task Run launch admission was not persisted: ${run.id}`);
+    }
+    return admitted;
+  }
+
   /**
    * Admit durable automatic retries whose backoff has elapsed. Each child is a
    * fresh execution of the parent's frozen plan; no provider checkpoint exists.
    */
   retryDueTaskRuns(now = Date.now()): StartedTaskRun[] {
+    // A prior admission attempt may have persisted a pending child while its
+    // compensation store was unavailable. Reconcile that durable boundary
+    // before active-run de-duplication so recovery does not require restart.
+    this.reconcileTaskRunAssociations();
     const scheduled: StartedTaskRun[] = [];
     for (const parent of this.taskRuns.listDueRetries(now)) {
       if (this.activeTaskRunId(parent.taskId)) continue;
@@ -4889,21 +5282,84 @@ export class KnowledgeEngine implements Knowledge {
         }
         continue;
       }
-      const child = this.taskRuns.claimRetry(parent.id, now);
+      let child: TaskRun | undefined;
+      try {
+        child = this.taskRuns.claimRetry(parent.id, now);
+      } catch (claimError) {
+        try {
+          const claimedByRunId = this.taskRuns.get(parent.id)?.retry?.claimedByRunId;
+          const persisted = claimedByRunId ? this.taskRuns.get(claimedByRunId) : undefined;
+          if (persisted?.retryOf === parent.id) child = persisted;
+        } catch {
+          // Preserve the primary retry-claim error when read-back is unavailable.
+        }
+        if (!child) throw claimError;
+      }
       if (!child) continue;
-      if (child.workItemId) this.workItems.attachTaskRun(child.workItemId, child.id, now);
-      if (child.workActionId) {
-        this.workContinuations.claimAutomaticRetry(child.workActionId, now);
-        this.workContinuations.attachRun(child.workActionId, child.id, "queued", now);
+      let admittedChild = child;
+      try {
+        this.attachTaskRunWorkItem(child, now);
+        if (child.workActionId) {
+          const before = this.workContinuations.get(child.workActionId);
+          const expectedAttempt = (before?.taskRunIds.length ?? 0) + 1;
+          try {
+            this.workContinuations.claimAutomaticRetry(child.workActionId, now);
+          } catch (claimError) {
+            let committed = false;
+            try {
+              const persisted = this.workContinuations.get(child.workActionId);
+              committed = persisted?.status === "queued"
+                && persisted.attempt === expectedAttempt;
+            } catch {
+              // An unavailable read cannot prove that the write committed.
+            }
+            if (!committed) throw claimError;
+          }
+          this.attachTaskRunWorkAction(child, "queued", now);
+        }
+        admittedChild = this.admitTaskRunLaunch(child);
+      } catch (error) {
+        const reason = "Task Run 自动重试准入失败，已阻止自动执行";
+        try {
+          this.taskRuns.cancel(child.id, {
+            finishedAt: Math.max(now, child.startedAt),
+            error: reason,
+          });
+        } catch (compensationError) {
+          log.warn("failed to cancel Task Run after retry admission failure", {
+            runId: child.id,
+            err: String(compensationError),
+          });
+        }
+        if (child.workActionId) {
+          try {
+            const action = this.workContinuations.get(child.workActionId);
+            const blocked = action
+              && ["queued", "awaiting_approval", "running", "awaiting_acceptance"]
+                .includes(action.status)
+              ? this.workContinuations.failClosed(action.id, reason, now)
+              : action;
+            if (blocked?.status === "blocked") {
+              this.ensureWorkActionBlockerProjection(blocked);
+            }
+          } catch (compensationError) {
+            log.warn("failed to block WorkAction after retry admission failure", {
+              runId: child.id,
+              workActionId: child.workActionId,
+              err: String(compensationError),
+            });
+          }
+        }
+        throw error;
       }
       const task: Task = {
         ...storedTask,
-        name: child.taskName,
-        space: child.space,
-        topic: child.topic,
-        notify: child.notify ?? storedTask.notify,
+        name: admittedChild.taskName,
+        space: admittedChild.space,
+        topic: admittedChild.topic,
+        notify: admittedChild.notify ?? storedTask.notify,
       };
-      scheduled.push(this.scheduleApprovedTaskRun(task, child));
+      scheduled.push(this.scheduleApprovedTaskRun(task, admittedChild));
     }
     return scheduled;
   }
@@ -4960,39 +5416,124 @@ export class KnowledgeEngine implements Knowledge {
       distill,
       timeoutMs,
       approvalRequired,
+      launchAdmission: "pending",
     });
-    if (workItemId) this.workItems.attachTaskRun(workItemId, run.id);
-    if (workActionId) {
-      this.workContinuations.attachRun(
-        workActionId,
-        run.id,
+    let admittedRun = run;
+    try {
+      this.attachTaskRunWorkItem(run);
+      this.attachTaskRunWorkAction(
+        run,
         run.status === "awaiting_approval" ? "awaiting_approval" : "queued",
       );
+      admittedRun = this.admitTaskRunLaunch(run);
+    } catch (error) {
+      const failedAt = Math.max(Date.now(), run.startedAt);
+      const reason = "Task Run 关联持久化失败，运行已在执行前取消";
+      let terminal = false;
+      try {
+        const cancelled = this.taskRuns.cancel(run.id, {
+          finishedAt: failedAt,
+          error: reason,
+        });
+        terminal = cancelled !== undefined
+          || !["awaiting_approval", "queued", "running"]
+            .includes(this.taskRuns.get(run.id)?.status ?? "");
+      } catch (compensationError) {
+        log.warn("failed to cancel Task Run after association failure", {
+          runId: run.id,
+          err: String(compensationError),
+        });
+      }
+      if (!terminal) {
+        try {
+          const current = this.taskRuns.get(run.id);
+          const terminalized = current?.status === "awaiting_approval"
+            && current.approval?.status === "pending"
+            ? this.taskRuns.reject(run.id, {
+                decidedAt: Math.max(failedAt, current.approval.requestedAt),
+                decidedBy: "homeagent.association-recovery",
+                reason,
+              })
+            : this.taskRuns.fail(run.id, {
+                finishedAt: failedAt,
+                error: reason,
+              });
+          terminal = terminalized !== undefined
+            || !["awaiting_approval", "queued", "running"]
+              .includes(this.taskRuns.get(run.id)?.status ?? "");
+        } catch (compensationError) {
+          log.warn("failed to terminalize Task Run after cancellation failure", {
+            runId: run.id,
+            err: String(compensationError),
+          });
+        }
+      }
+      if (!terminal) {
+        log.warn("Task Run remains active after association compensation", {
+          runId: run.id,
+          status: this.taskRuns.get(run.id)?.status,
+        });
+      }
+      if (workItemId) {
+        try {
+          if (!this.workItems.get(workItemId)?.taskRunIds.includes(run.id)) {
+            this.workItems.attachTaskRun(workItemId, run.id, failedAt);
+          }
+        } catch (compensationError) {
+          log.warn("failed to repair WorkItem Task Run association", {
+            runId: run.id,
+            workItemId,
+            err: String(compensationError),
+          });
+        }
+      }
+      if (workActionId) {
+        try {
+          if (!this.workContinuations.get(workActionId)?.taskRunIds.includes(run.id)) {
+            this.workContinuations.attachRun(
+              workActionId,
+              run.id,
+              run.status === "awaiting_approval" ? "awaiting_approval" : "queued",
+              failedAt,
+            );
+          }
+        } catch (compensationError) {
+          log.warn("failed to repair WorkAction Task Run association", {
+            runId: run.id,
+            workActionId,
+            err: String(compensationError),
+          });
+        }
+      }
+      throw error;
     }
-    if (run.status === "awaiting_approval") {
+    if (admittedRun.status === "awaiting_approval") {
       const completion = Promise.resolve<TaskReport>({
-        runId: run.id,
-        taskId: run.taskId,
-        space: run.space,
+        runId: admittedRun.id,
+        taskId: admittedRun.taskId,
+        space: admittedRun.space,
         ok: false,
-        status: run.status,
+        status: admittedRun.status,
         error: "Task Run is awaiting human approval",
-        startedAt: run.startedAt,
+        startedAt: admittedRun.startedAt,
         // Compatibility: callers historically receive a completion Promise.
         // `state` distinguishes this admission result from a terminal report.
-        finishedAt: run.startedAt,
+        finishedAt: admittedRun.startedAt,
       });
       return {
         state: "awaiting_approval",
-        run,
+        run: admittedRun,
         completion,
       };
     }
-    const scheduled = this.scheduleApprovedTaskRun(task, run);
+    const scheduled = this.scheduleApprovedTaskRun(task, admittedRun);
     return scheduled;
   }
 
   private scheduleApprovedTaskRun(task: Task, run: TaskRun): StartedTaskRun {
+    if (!isTaskRunLaunchAdmitted(run)) {
+      throw new Error(`task run launch is not admitted: ${run.id}`);
+    }
     if (!run.executionPlan) {
       throw new Error(`task run has no immutable execution plan: ${run.id}`);
     }
@@ -5169,6 +5710,7 @@ export class KnowledgeEngine implements Knowledge {
 
   /** Re-enqueue durable Task Runs that had not started when the service stopped. */
   resumeQueuedTaskRuns(): StartedTaskRun[] {
+    this.reconcileExecutionBoundaries();
     const resumed: StartedTaskRun[] = [];
     const queued = this.taskRuns.list()
       .filter((run) => run.status === "queued")

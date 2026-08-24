@@ -176,8 +176,9 @@ function progress(snapshot: SetupSnapshot): HtmlEscapedString | Promise<HtmlEsca
   </aside>`;
 }
 
-function optionalCodexTaskSetup(
+function managedCodexSetup(
   input: SetupViewInput,
+  primary = false,
 ): HtmlEscapedString | Promise<HtmlEscapedString> | string {
   if (!input.codex.enabled) return "";
   const needsInstall = input.codex.canInstall && !input.codex.installed;
@@ -192,15 +193,26 @@ function optionalCodexTaskSetup(
         <button class="secondary-action">重新安装 Codex</button>
       </form></div>`
     : "";
-  return html`<details><summary>安装 Codex</summary>
-    <p class="muted">安装并登录后，Codex 可用于普通聊天和任务；两者会按 Agent 的 Permission / Workdir 执行，并自动获得全部兼容 Skills。</p>
+  const action = html`<form method="post" action="${needsInstall ? "/setup/ai/codex/install" : "/setup/ai/codex/login"}">
+    ${needsInstall ? html`<label class="consent"><input type="checkbox" name="consent" value="on" required />
+      <span>允许 HomeAgent 下载并校验 OpenAI 官方 Codex，将它安装在本机 HomeAgent 专用目录。不会修改系统级软件。</span></label>` : ""}
+    <div class="actions"><button class="${primary ? "primary-action" : "secondary-action"}">${needsInstall ? "安装并连接 ChatGPT" : "连接 ChatGPT"}</button></div>
+  </form>`;
+  const content = html`<p class="muted">HomeAgent 会使用 OpenAI 官方 Codex 连接 ChatGPT。连接后可用于普通聊天和任务；两者会按 Agent 的 Permission / Workdir 执行，并自动获得全部兼容 Skills。提炼与后台学习仍保持 no-tools。</p>
     ${error ? html`<div class="flash">${error}</div>` : ""}
-    <form method="post" action="${needsInstall ? "/setup/ai/codex/install" : "/setup/ai/codex/login"}">
-      ${needsInstall ? html`<label class="consent"><input type="checkbox" name="consent" value="on" required />
-        <span>允许 HomeAgent 下载并校验 OpenAI 官方 Codex，将它安装在本机 HomeAgent 专用目录。不会修改系统级软件。</span></label>` : ""}
-      <div class="actions"><button class="secondary-action">${needsInstall ? "安装 Codex" : "连接 Codex"}</button></div>
-    </form>
+    ${action}
     ${repair}
+  `;
+  return primary
+    ? content
+    : html`<details><summary>连接 ChatGPT</summary>${content}</details>`;
+}
+
+function advancedProviderSetup(taskOnlyAvailable: DetectedProvider[]): HtmlEscapedString | Promise<HtmlEscapedString> {
+  return html`<details><summary>高级选项：使用其他本机 Provider</summary>
+    <p class="muted">如果你已经自行安装并登录 Claude Code，可以重新检测并用于普通聊天和任务；它会按 Agent 配置使用兼容 Skills，提炼与后台学习保持 no-tools。HomeAgent 不会在首次设置中代为安装 Claude。</p>
+    ${taskOnlyAvailable.length > 0 ? html`<p class="muted">已检测到 ${taskOnlyAvailable.map((provider) => provider.name).join("、")}，但它目前只能用于显式任务。</p>` : ""}
+    <form method="post" action="/setup/providers/refresh" class="actions"><button class="secondary-action">重新检测本机 Provider</button></form>
   </details>`;
 }
 
@@ -221,7 +233,7 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
         ? "正在确认 ChatGPT 登录…"
         : "请在浏览器中确认登录";
     return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">正在准备 Codex</h1>
-      <p class="lede">登录授权由 OpenAI 页面处理，HomeAgent 不会接触你的密码。登录后可用于普通问答和显式任务。</p>
+      <p class="lede">登录授权由 OpenAI 页面处理，HomeAgent 不会接触你的密码。登录后可用于普通聊天和任务，并自动获得全部兼容 Skills。</p>
       <div class="waiting"><strong>${title}</strong>
         <span class="muted">${input.codex.installing ? "正在下载并校验 OpenAI 官方 Codex" : input.codex.login.message}</span>
         ${input.codex.login.userCode ? html`<div class="command">${input.codex.login.userCode}</div>` : ""}
@@ -229,12 +241,20 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
       </div>${codexPollScript()}`;
   }
   if (available.length === 0) {
+    if (input.codex.enabled && input.codex.canInstall) {
+      return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">用 ChatGPT 唤醒 HomeAgent</h1>
+        ${input.codex.installed
+          ? html`<p class="lede">Codex 已安装，尚未连接 ChatGPT。无需打开终端，点击下方按钮后在 OpenAI 官方页面完成登录。</p>`
+          : html`<p class="lede">无需打开终端。HomeAgent 会在你确认后下载并校验 OpenAI 官方 Codex，再打开官方页面完成 ChatGPT 登录。</p>`}
+        ${managedCodexSetup(input, true)}
+        ${advancedProviderSetup(taskOnlyAvailable)}`;
+    }
     return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">先连接 Claude Code 或 Codex</h1>
       <p class="lede">安装并登录任一可用 AI 后回来重新检测。普通聊天和任务可按 Agent 配置使用完整兼容 Skills；提炼与后台学习保持 no-tools。</p>
       <div class="choice-grid"><div class="choice"><strong>Claude Code</strong><small>普通聊天和任务可使用 Skills，提炼与后台学习使用 no-tools 模式</small><div class="command">npm install -g @anthropic-ai/claude-code && claude auth login</div></div></div>
       ${taskOnlyAvailable.length > 0 ? html`<p class="muted">已检测到 ${taskOnlyAvailable.map((provider) => provider.name).join("、")}，但它目前只能用于显式任务。</p>` : ""}
       <form method="post" action="/setup/providers/refresh" class="actions"><button class="primary-action">重新检测</button></form>
-      ${optionalCodexTaskSetup(input)}`;
+      ${managedCodexSetup(input)}`;
   }
   return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">先连接一个 AI</h1>
     <p class="lede">检测到本机已有可用的 AI。它负责理解消息、整理知识和回答问题，账号仍由你自己掌控。</p>

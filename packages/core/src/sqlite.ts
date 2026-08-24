@@ -382,6 +382,7 @@ export class SpaceIndex {
     this.insertRawProjection(record);
   }
 
+  /** Chronological order, with durable id as the stable same-millisecond tie-breaker. */
   listRaw(
     opts: { onlyPending?: boolean; onlyAdmitted?: boolean; limit?: number } = {},
   ): RawRecord[] {
@@ -389,9 +390,11 @@ export class SpaceIndex {
     if (opts.onlyPending) filters.push("ingested = 0");
     if (opts.onlyPending || opts.onlyAdmitted) filters.push("admission = 'ready'");
     const where = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : ``;
-    const limit = opts.limit ? `LIMIT ${Math.max(0, Math.floor(opts.limit))}` : ``;
+    const limit = opts.limit === undefined
+      ? ``
+      : `LIMIT ${Math.max(0, Math.floor(opts.limit))}`;
     const rows = this.db
-      .query(`SELECT * FROM raw ${where} ORDER BY created ASC ${limit}`)
+      .query(`SELECT * FROM raw ${where} ORDER BY created ASC, id ASC ${limit}`)
       .all() as Record<string, unknown>[];
     return rows.map(rowToRaw);
   }
@@ -566,6 +569,7 @@ export class SpaceIndex {
     return rows.map(rowToRaw);
   }
 
+  /** Matches listRaw ordering even when the caller supplies ids in another order. */
   listRawByIds(
     ids: string[],
     opts: { onlyPending?: boolean; onlyAdmitted?: boolean; limit?: number } = {},
@@ -580,7 +584,7 @@ export class SpaceIndex {
       .query(
         `SELECT * FROM raw
          WHERE id IN (${placeholders}) ${pending} ${admitted}
-         ORDER BY created ASC ${limit}`,
+         ORDER BY created ASC, id ASC ${limit}`,
       )
       .all(...uniqueIds) as Record<string, unknown>[];
     return rows.map(rowToRaw);

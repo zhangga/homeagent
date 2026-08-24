@@ -152,6 +152,11 @@ describe("space data governance", () => {
       delete raw.admission;
       delete raw.workActionId;
     }
+    // Model the actual legacy capture crash window: neither side persisted the
+    // Raw ownership edge. Export-time reconciliation must not accidentally
+    // turn the ambiguity fixture into a directly linked TaskRun.
+    const legacyRun = legacy.taskRuns.find((candidate: { id: string }) => candidate.id === run.id);
+    delete legacyRun.rawId;
     source.close();
 
     expect(parseSpaceArchive(legacy).raw).toEqual([
@@ -1037,6 +1042,7 @@ describe("space data governance", () => {
       },
     });
     const child = source.taskRuns.claimRetry(run.id, 60_120)!;
+    source.taskRuns.admitLaunch(child.id);
     source.taskRuns.begin(child.id, 60_121);
     source.taskRuns.fail(child.id, {
       finishedAt: 60_122,
@@ -1842,6 +1848,7 @@ describe("space data governance", () => {
       },
     });
     const child = source.taskRuns.claimRetry(parent.id, 60_120)!;
+    source.taskRuns.admitLaunch(child.id);
     source.taskRuns.begin(child.id, 60_121);
     source.taskRuns.fail(child.id, {
       finishedAt: 60_122,

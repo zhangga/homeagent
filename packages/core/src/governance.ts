@@ -822,6 +822,19 @@ function parseTaskRun(
   if (!["interactive", "manual", "scheduled", "background"].includes(priority)) {
     throw new Error(`taskRuns[${index}].priority is invalid`);
   }
+  const launchAdmission = item.launchAdmission === undefined
+    ? undefined
+    : text(item.launchAdmission, `taskRuns[${index}].launchAdmission`) as TaskRun["launchAdmission"];
+  if (
+    launchAdmission !== undefined
+    && launchAdmission !== "pending"
+    && launchAdmission !== "admitted"
+  ) {
+    throw new Error(`taskRuns[${index}].launchAdmission is invalid`);
+  }
+  if (launchAdmission === "pending" && status === "succeeded") {
+    throw new Error(`taskRuns[${index}].pending launch admission cannot have succeeded`);
+  }
   const queuedAt = version < RUN_QUEUE_SPACE_ARCHIVE_VERSION
     ? startedAt
     : finiteNumber(item.queuedAt, `taskRuns[${index}].queuedAt`);
@@ -1047,6 +1060,7 @@ function parseTaskRun(
     notify,
     timeoutMs,
     priority,
+    launchAdmission,
     status,
     approval,
     approvalNotification,

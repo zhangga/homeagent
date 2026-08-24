@@ -93,7 +93,15 @@ export function createNativeExtractor(runtime: NativeExtractorRuntime = {}): Nat
     const startedAt = Date.now();
     try {
       const compilation = await runProcess(
-        ["/usr/bin/xcrun", "swiftc", script, "-o", binary],
+        [
+          "/usr/bin/xcrun",
+          "swiftc",
+          script,
+          "-module-cache-path",
+          join(directory, "module-cache"),
+          "-o",
+          binary,
+        ],
         NATIVE_TIMEOUT_MS,
       );
       if (compilation.code !== 0) return compilation;
