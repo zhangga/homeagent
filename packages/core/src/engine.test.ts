@@ -3567,10 +3567,7 @@ describe("Knowledge seam contract", () => {
     // A dedicated engine whose CLI runner returns research text for the task.
     const taskEngine = new KnowledgeEngine({
       dataDir: dir,
-      runProvider: async (_id, input) => {
-        if (/研究/.test(input.prompt)) return "要点一：...\n要点二：...";
-        return "";
-      },
+      runProvider: async () => "要点一：...\n要点二：...",
     });
     taskEngine.ensureSpace(SPACE);
     const task = taskEngine.tasks.create({ name: "调研", space: SPACE, topic: "大模型 Agent 进展" })!;
@@ -3584,6 +3581,62 @@ describe("Knowledge seam contract", () => {
     // lastRun recorded on the task
     expect(taskEngine.tasks.get(task.id)?.lastStatus).toBe("ok");
     taskEngine.close();
+  });
+
+  test("runTask lets research use commands needed to collect evidence", async () => {
+    let providerPrompt = "";
+    const taskEngine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async (_id, input) => {
+        providerPrompt = input.prompt;
+        return "已通过只读查询取得资料";
+      },
+    });
+    taskEngine.ensureSpace(SPACE);
+    const task = taskEngine.tasks.create({
+      name: "飞书周报调研",
+      space: SPACE,
+      topic: "读取飞书文档并总结",
+      distillOnRun: false,
+    })!;
+
+    const report = await taskEngine.runTask(task.id);
+    taskEngine.close();
+
+    expect(report.status).toBe("succeeded");
+    expect(providerPrompt).toContain("可以执行获取资料所需的查询命令");
+    expect(providerPrompt).not.toContain("不要执行任何命令");
+  });
+
+  test("runTask opens command, Skill, and web research capabilities by default", async () => {
+    let execution: unknown;
+    const taskEngine = new KnowledgeEngine({
+      dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
+      runProvider: async (_id, input) => {
+        execution = input.execution;
+        return "已完成网页调研";
+      },
+    });
+    taskEngine.ensureSpace(SPACE);
+    const task = taskEngine.tasks.create({
+      name: "网页调研",
+      space: SPACE,
+      topic: "核验近期公开资料",
+      distillOnRun: false,
+    })!;
+
+    const report = await taskEngine.runTask(task.id);
+    taskEngine.close();
+
+    expect(report.status).toBe("succeeded");
+    expect(execution).toEqual({
+      permission: "read-only",
+      workdir: undefined,
+      skills: [],
+      skillMode: "all",
+      research: true,
+    });
   });
 
   test("runTask passes the assigned Agent execution contract to the provider", async () => {
@@ -3651,6 +3704,7 @@ describe("Knowledge seam contract", () => {
       workdir: realpathSync(workdir),
       skills: ["code-review", "github-yeet"],
       skillMode: "all",
+      research: true,
     });
     expect(storedRun?.skillEvidence).toEqual({
       requested: [
@@ -3732,6 +3786,7 @@ describe("Knowledge seam contract", () => {
       workdir: undefined,
       skills: ["code-review", "lark-doc"],
       skillMode: "all",
+      research: true,
     });
     expect(storedRun?.skillEvidence?.requested).toEqual([
       {

@@ -605,7 +605,9 @@ function researchPrompt(topic: string): string {
     "要求：",
     "- 用中文输出，条理清晰（可用小标题/要点）。",
     "- 聚焦事实、结论、关键信息，避免空泛。",
-    "- 不要执行任何命令或修改文件，只需给出研究内容文本。",
+    "- 可以执行获取资料所需的查询命令，并使用网页、已配置的 Skill 和其他可用工具。",
+    "- 严格遵守本次运行实际授予的执行权限；除非任务明确要求且已获写入权限，不要修改文件或外部系统。",
+    "- 只总结实际取得并核验过的资料；无法访问来源时明确说明，不要推测或伪造内容。",
   ].join("\n");
 }
 
@@ -2635,6 +2637,7 @@ export class KnowledgeEngine implements Knowledge {
   agentRunExecutionSnapshot(
     space: SpaceId,
     taskExecution = true,
+    research = false,
   ): AgentRunExecutionSnapshot {
     const agent = this.agentForSpace(space);
     const cfg = config();
@@ -2675,6 +2678,7 @@ export class KnowledgeEngine implements Knowledge {
           ...resolveAgentExecution(agent),
           skills: skills.resolved.map((skill) => skill.invocationName),
           skillMode: "all",
+          ...(research ? { research: true } : {}),
         };
       }
     } catch (error) {
@@ -4732,7 +4736,11 @@ export class KnowledgeEngine implements Knowledge {
     }
     let snapshot: AgentRunExecutionSnapshot;
     try {
-      snapshot = this.agentRunExecutionSnapshot(task.space, true);
+      snapshot = this.agentRunExecutionSnapshot(
+        task.space,
+        true,
+        workActionId === undefined,
+      );
     } catch (error) {
       const resolutionError = executionResolutionError(error);
       snapshot = {

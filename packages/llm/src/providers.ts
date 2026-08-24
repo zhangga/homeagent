@@ -158,6 +158,8 @@ export interface ProviderExecution {
   skills: string[];
   /** Every discovered Skill is available; select only those relevant to the request. */
   skillMode?: "all";
+  /** Allow evidence-gathering commands, configured Skills, and native web research together. */
+  research?: boolean;
   /** Explicitly allow the provider's native read-only web research tools. */
   webSearch?: boolean;
 }
@@ -245,18 +247,23 @@ const KNOWN: CliSpec[] = [
         // every built-in tool from the ordinary completion process.
         args.push("--tools", "");
       } else if (execution.permission === "read-only") {
+        const tools = execution.research
+          ? "Read,Glob,Grep,Bash,WebSearch,WebFetch"
+          : execution.webSearch
+            ? "WebSearch,WebFetch"
+            : "Read,Glob,Grep";
         args.push(
           "--tools",
-          execution.webSearch
-            ? "WebSearch,WebFetch"
-            : "Read,Glob,Grep",
+          tools,
           "--permission-mode",
           "dontAsk",
         );
       } else if (execution.permission === "write") {
-        const tools = execution.webSearch
-          ? "Read,Glob,Grep,Edit,Write,NotebookEdit,WebSearch,WebFetch"
-          : "Read,Glob,Grep,Edit,Write,NotebookEdit";
+        const tools = execution.research
+          ? "Read,Glob,Grep,Edit,Write,NotebookEdit,Bash,WebSearch,WebFetch"
+          : execution.webSearch
+            ? "Read,Glob,Grep,Edit,Write,NotebookEdit,WebSearch,WebFetch"
+            : "Read,Glob,Grep,Edit,Write,NotebookEdit";
         args.push(
           "--tools",
           tools,
@@ -292,7 +299,7 @@ const KNOWN: CliSpec[] = [
       // ambient config/rules isolate each one-shot from global state.
       const args: string[] = ["-c", 'approval_policy="never"'];
       if (reasoningEffort) args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
-      if (execution?.webSearch) args.push("--search");
+      if (execution?.webSearch || execution?.research) args.push("--search");
       const sandbox = sandboxForPermission(execution?.permission);
       // Codex 0.147+ scopes these isolation flags to the `exec` subcommand.
       // Keeping them before `exec` makes the CLI exit during argument parsing.
@@ -596,6 +603,7 @@ function injectProviderSkills(id: ProviderId, input: RunInput): RunInput {
               : undefined,
             skills,
             skillMode: input.execution.skillMode === "all" ? "all" : undefined,
+            research: input.execution.research === true,
             webSearch: input.execution.webSearch === true,
           },
         }

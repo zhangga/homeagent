@@ -1082,6 +1082,82 @@ describe("provider detection", () => {
     }
   });
 
+  test("Claude research can combine query commands and web tools", async () => {
+    const previous = process.env.HOMEAGENT_CLAUDE_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-provider-research-"));
+    try {
+      process.env.HOMEAGENT_CLAUDE_BIN = writeArgEchoProvider(directory);
+
+      const output = await runProvider("claude", {
+        prompt: "读取飞书文档并核验公开资料",
+        execution: {
+          permission: "read-only",
+          skills: [],
+          skillMode: "all",
+          research: true,
+        },
+      }, 500);
+
+      expect(output).toContain(
+        "--tools Read,Glob,Grep,Bash,WebSearch,WebFetch --permission-mode dontAsk",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CLAUDE_BIN;
+      else process.env.HOMEAGENT_CLAUDE_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Codex research enables native search inside its configured sandbox", async () => {
+    const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-codex-research-"));
+    try {
+      process.env.HOMEAGENT_CODEX_BIN = writeArgEchoProvider(directory);
+
+      const output = await runProvider("codex", {
+        prompt: "读取资料并交叉核验",
+        execution: {
+          permission: "read-only",
+          skills: ["lark-doc"],
+          skillMode: "all",
+          research: true,
+        },
+      }, 500);
+
+      expect(output).toContain("--search exec");
+      expect(output).toContain("--sandbox read-only");
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+      else process.env.HOMEAGENT_CODEX_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Claude writable research keeps editing, query-command, and web tools", async () => {
+    const previous = process.env.HOMEAGENT_CLAUDE_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-provider-write-research-"));
+    try {
+      process.env.HOMEAGENT_CLAUDE_BIN = writeArgEchoProvider(directory);
+
+      const output = await runProvider("claude", {
+        prompt: "调研并更新工作区报告",
+        execution: {
+          permission: "write",
+          skills: [],
+          research: true,
+        },
+      }, 500);
+
+      expect(output).toContain(
+        "--tools Read,Glob,Grep,Edit,Write,NotebookEdit,Bash,WebSearch,WebFetch --permission-mode acceptEdits",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CLAUDE_BIN;
+      else process.env.HOMEAGENT_CLAUDE_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("task execution maps permission tiers to provider sandboxes", async () => {
     const keys = [
       "HOMEAGENT_CODEX_BIN",

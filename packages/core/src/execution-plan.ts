@@ -57,6 +57,7 @@ export function isProviderExecution(value: unknown): value is ProviderExecution 
       && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,79}$/.test(skill)
     )
     && (execution.skillMode === undefined || execution.skillMode === "all")
+    && (execution.research === undefined || typeof execution.research === "boolean")
     && (execution.webSearch === undefined || typeof execution.webSearch === "boolean")
   );
 }
