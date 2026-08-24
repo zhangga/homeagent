@@ -94,7 +94,7 @@ describe("runtime data directory settings", () => {
       settingsPath,
       currentDataDir: source,
       destinationDir: destination,
-    })).toThrow("仅包含支持的 Git/Obsidian 元数据");
+    })).toThrow("仅包含支持的 Git、Obsidian、AGENTS.md 元数据");
   });
 
   test("adopts an existing Git and Obsidian directory while preserving its metadata", () => {
@@ -103,6 +103,7 @@ describe("runtime data directory settings", () => {
     writeFileSync(join(destination, ".git", "HEAD"), "ref: refs/heads/main\n", "utf8");
     writeFileSync(join(destination, ".obsidian", "app.json"), "{}", "utf8");
     writeFileSync(join(destination, ".gitignore"), "private-notes/\n", "utf8");
+    writeFileSync(join(destination, "AGENTS.md"), "# 自定义数据仓库规则\n", "utf8");
 
     scheduleDataDirectoryMigration({
       settingsPath,
@@ -115,6 +116,8 @@ describe("runtime data directory settings", () => {
     expect(readFileSync(join(destination, ".git", "HEAD"), "utf8"))
       .toBe("ref: refs/heads/main\n");
     expect(readFileSync(join(destination, ".obsidian", "app.json"), "utf8")).toBe("{}");
+    expect(readFileSync(join(destination, "AGENTS.md"), "utf8"))
+      .toBe("# 自定义数据仓库规则\n");
     const gitignore = readFileSync(join(destination, ".gitignore"), "utf8");
     expect(gitignore).toStartWith("private-notes/\n");
     expect(gitignore).toContain(DATA_GITIGNORE);
@@ -130,7 +133,7 @@ describe("runtime data directory settings", () => {
       settingsPath,
       currentDataDir: source,
       destinationDir: destination,
-    })).toThrow("仅包含支持的 Git/Obsidian 元数据");
+    })).toThrow("仅包含支持的 Git、Obsidian、AGENTS.md 元数据");
 
     rmSync(destination, { recursive: true, force: true });
     mkdirSync(join(destination, ".obsidian"), { recursive: true });
@@ -200,6 +203,25 @@ describe("runtime data directory settings", () => {
       },
     });
     expect(readRuntimeDataSettings(settingsPath).pendingMigration).toBeUndefined();
+  });
+
+  test("migration seeds agent guides for the repository and verified Spaces", () => {
+    const workspace = join(source, "workspaces", "team__oc_migrated");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, ".spaceid"), "team/oc_migrated", "utf8");
+
+    scheduleDataDirectoryMigration({
+      settingsPath,
+      currentDataDir: source,
+      destinationDir: destination,
+    });
+    expect(applyPendingDataDirectoryMigration({ settingsPath }).state).toBe("completed");
+
+    expect(readFileSync(join(destination, "AGENTS.md"), "utf8")).toContain("默认只读");
+    expect(readFileSync(
+      join(destination, "workspaces", "team__oc_migrated", "AGENTS.md"),
+      "utf8",
+    )).toContain("当前 Space");
   });
 
   test("keeps the source selected and removes staging when Git initialization fails", () => {

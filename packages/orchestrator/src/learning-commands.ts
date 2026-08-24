@@ -191,6 +191,9 @@ export async function handleLearningCommand(
       target.profile?.status === "assessing"
         ? "🧭 当前是初步路线，完成入学诊断后会按你的水平和目标重做。"
         : "",
+      target.profile?.status === "active" && target.profile.goals.length > 0
+        ? `学习使命与成功标准：${target.profile.goals.join("；")}`
+        : "",
       ...target.route.map((step) =>
         `${routeStatusIcon(step.status)} ${step.title} — ${step.objective}${step.attempts > 0 ? `（已学习 ${step.attempts} 次）` : ""}`
       ),
@@ -300,7 +303,7 @@ export async function handleLearningAnswer(
       "",
       `当前判断：${levelLabel(profile.level)} — ${profile.levelRationale}`,
       `建议节奏：${paceLabel(profile.pace)}，每天约 ${profile.dailyMinutes} 分钟`,
-      profile.goals.length > 0 ? `学习目标：${profile.goals.join("；")}` : "",
+      profile.goals.length > 0 ? `学习使命与成功标准：${profile.goals.join("；")}` : "",
       profile.strengths.length > 0 ? `知识优势：${profile.strengths.join("；")}` : "",
       profile.gaps.length > 0 ? `优先补齐：${profile.gaps.join("；")}` : "",
       assessed.lastRouteAdjustment ? `路线调整：${assessed.lastRouteAdjustment}` : "",
@@ -320,8 +323,11 @@ export async function handleLearningAnswer(
     : result.session.mastery === "review"
       ? `\n\n🔁 下一课将继续当前步骤，重点补强：${result.session.nextFocus}`
       : "";
+  const recordStatus = result.rawId
+    ? `✅ 已记录「${target.name}」第 ${result.session.sequence} 课，并形成一条已验证学习记录。`
+    : `🧭 已完成「${target.name}」第 ${result.session.sequence} 课反馈；当前证据还不足，暂不写入知识空间。`;
   return withSkillWarnings(
-    `✅ 已记录「${target.name}」第 ${result.session.sequence} 课。\n\n${result.feedback}${completion}`,
+    `${recordStatus}\n\n${result.feedback}${completion}`,
     engine,
     context.space,
   );

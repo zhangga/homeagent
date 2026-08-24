@@ -62,9 +62,15 @@ function makeFake(): FakeLlm {
     }
     if ("mastery" in props) {
       return {
-        feedback: "## 回应点评\n理解正确\n\n## 今日总结\n掌握重点",
+        feedback: "## 回应点评\n理解正确\n\n## 需要澄清\n无\n\n## 今日总结\n掌握重点\n\n## 下一步\n继续应用",
         mastery: "ready",
         nextFocus: "进入下一个知识点",
+        learningRecord: {
+          title: "原则支持稳定决策",
+          summary: "原则帮助学习者在不同情境中稳定地做出决策。",
+          evidence: "学习者能够用自己的话说明原则的实际作用。",
+          implications: [],
+        },
       };
     }
     if ("relevant" in props) {

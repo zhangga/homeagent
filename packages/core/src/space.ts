@@ -21,6 +21,7 @@ import type { Page, SpaceId } from "@homeagent/shared";
 import { spaceToDir } from "@homeagent/shared";
 import { SpaceIndex } from "./sqlite.ts";
 import { markdownToPage, pageToMarkdown } from "./markdown.ts";
+import { ensureSpaceAgentGuide } from "./agent-guides.ts";
 
 export const DEFAULT_PURPOSE = `# 空间意图 (purpose)
 
@@ -58,12 +59,18 @@ export class SpaceStore {
   ensure(): void {
     mkdirSync(this.wikiDir, { recursive: true });
     mkdirSync(this.rawSourcesDir, { recursive: true });
+    this.ensureAgentGuide();
     const purpose = join(this.root, "purpose.md");
     if (!existsSync(purpose)) writeFileSync(purpose, DEFAULT_PURPOSE, "utf8");
     const schema = join(this.root, "schema.md");
     if (!existsSync(schema)) writeFileSync(schema, DEFAULT_SCHEMA, "utf8");
     // touch the index
     this.index();
+  }
+
+  /** Seed the scoped agent reading guide without opening the SQLite projection. */
+  ensureAgentGuide(): void {
+    ensureSpaceAgentGuide(this.root);
   }
 
   exists(): boolean {

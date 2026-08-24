@@ -686,10 +686,12 @@ function validSession(value: unknown): value is LearningSession {
 function sessionFitsPlan(plan: LearningPlan, session: LearningSession): boolean {
   if (session.planId !== plan.id || session.endOffset > plan.sourceLength) return false;
   if (plan.mode === "reading") {
-    return session.routeStepId === undefined
-      && session.mastery === undefined
-      && session.nextFocus === undefined
-      && session.routeAdjustment === undefined;
+    if (session.routeStepId !== undefined || session.routeAdjustment !== undefined) return false;
+    if (session.status === "completed" && session.mastery !== undefined) {
+      return ["review", "ready"].includes(session.mastery)
+        && Boolean(session.nextFocus?.trim());
+    }
+    return session.mastery === undefined && session.nextFocus === undefined;
   }
   const stepIndex = plan.route.findIndex((step) => step.id === session.routeStepId);
   if (
@@ -1245,9 +1247,9 @@ export class LearningPlanStore {
     if (
       !session || !plan || session.status !== "awaiting_reply" || !learnerReply || !feedback
       || !finite(input.completedAt)
-      || (plan.mode === "topic" && (
-        !["review", "ready"].includes(input.mastery ?? "") || !nextFocus
-      ))
+      || (input.mastery !== undefined
+        && (!["review", "ready"].includes(input.mastery) || !nextFocus))
+      || (plan.mode === "topic" && input.mastery === undefined)
       || (input.adaptive !== undefined && (
         plan.mode !== "topic"
         || !validProfileInput(input.adaptive.profile)
@@ -1519,8 +1521,14 @@ function advancePlan(plan: LearningPlan, session: LearningSession, completedAt: 
     plan.updatedAt = completedAt;
     return;
   }
-  plan.cursor = session.endOffset;
   plan.currentSessionId = undefined;
+  if (session.mastery !== undefined) plan.adaptiveFocus = session.nextFocus;
+  if (session.status === "completed" && session.mastery === "review") {
+    plan.status = wasPaused ? "paused" : "active";
+    plan.updatedAt = completedAt;
+    return;
+  }
+  plan.cursor = session.endOffset;
   plan.status = plan.cursor >= plan.sourceLength ? "completed" : wasPaused ? "paused" : "active";
   plan.updatedAt = completedAt;
 }

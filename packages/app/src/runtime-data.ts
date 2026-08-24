@@ -25,6 +25,7 @@ import {
   planDataMigration,
   type MigrationDirectoryEntry,
 } from "./data-migration.ts";
+import { ensureDataRepositoryAgentGuides } from "@homeagent/core";
 
 const RUNTIME_SETTINGS_VERSION = 1 as const;
 
@@ -92,6 +93,7 @@ export function isSupportedDestinationMetadata(entry: MigrationDirectoryEntry): 
     case ".gitignore":
     case ".gitattributes":
     case ".DS_Store":
+    case "AGENTS.md":
       return entry.kind === "file";
     default:
       return false;
@@ -205,11 +207,14 @@ export function applyPendingDataDirectoryMigration(input: {
       destinationDir: pending.destination,
       now: input.now,
       allowDestinationEntry: isSupportedDestinationMetadata,
-      prepareStaging: pending.initializeGit
-        ? (staging) => initializeGitRepository(staging, input.gitRunner)
-        : destinationAlreadyGit
-          ? ensureGitIgnore
-          : undefined,
+      prepareStaging: (staging) => {
+        ensureDataRepositoryAgentGuides(staging);
+        if (pending.initializeGit) {
+          initializeGitRepository(staging, input.gitRunner);
+        } else if (destinationAlreadyGit) {
+          ensureGitIgnore(staging);
+        }
+      },
     });
     return completePendingMigration(current, pending, input.settingsPath, input.now);
   } catch (error) {
@@ -372,7 +377,7 @@ function assertWritableDestination(destination: string): void {
 function migrationPlanMessage(reason: ReturnType<typeof planDataMigration>["reason"]): string {
   switch (reason) {
     case "destination-not-empty":
-      return "新数据目录必须不存在、为空，或仅包含支持的 Git/Obsidian 元数据";
+      return "新数据目录必须不存在、为空，或仅包含支持的 Git、Obsidian、AGENTS.md 元数据";
     case "destination-conflict":
       return "当前数据与目标目录的 Git/Obsidian 元数据存在同名冲突";
     case "paths-overlap":

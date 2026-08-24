@@ -15,6 +15,7 @@ function topicGuide(sourceSection = "暂无用户材料"): string {
     `## 来源材料\n${sourceSection}`,
     "## 扩展知识\n以下来自模型一般知识，未经外部检索验证。",
     "## 推荐资料\n本次未获得可验证的联网资料。",
+    "## 回忆练习\n先不看答案，回忆上一课的关键点。",
     "## 实践任务\n用自己的话解释概念",
     "## 思考题\n这个概念解决了什么问题？",
   ].join("\n\n");
@@ -292,6 +293,7 @@ describe("guided learning engine", () => {
       "## 来源材料\n[材料1] Future 需要 poll",
       "## 扩展知识\n以下来自模型一般知识，未经外部检索验证。",
       "## 推荐资料\n本次未获得可验证的联网资料。",
+      "## 回忆练习\n先回忆 Future 为什么不会自动推进。",
       "## 实践任务\n解释 poll",
       "## 思考题\n为什么 Future 是惰性的？",
     ].join("\n\n"));
@@ -352,6 +354,7 @@ describe("guided learning engine", () => {
       "## 来源材料\n暂无用户材料",
       "## 扩展知识\n以下来自模型一般知识，未经外部检索验证。",
       "## 推荐资料\n[联网资料1] Rust Async Book：https://rust-lang.github.io/async-book/02_execution/03_wakeups.html。",
+      "## 回忆练习\n先回忆任务何时需要再次 poll。",
       "## 实践任务\n画出唤醒流程",
       "## 思考题\n唤醒是否等于立即 poll？",
     ].join("\n\n"));
@@ -429,6 +432,7 @@ describe("guided learning engine", () => {
       "## 来源材料\n[材料9] 声称 Future 会自动运行",
       "## 扩展知识\n模型一般知识，未经外部检索验证：https://invented.example/future",
       "## 推荐资料\n本次未获得可验证的联网资料。",
+      "## 回忆练习\n回忆 Future 的推进条件。",
       "## 实践任务\n解释 poll",
       "## 思考题\nFuture 如何推进？",
     ].join("\n\n"));
@@ -531,7 +535,17 @@ describe("guided learning engine", () => {
 
     await expect(engine.answerLearningSession(plan.id, "ou_other", "我的回答", NOW + 2))
       .rejects.toThrow("只有学习计划创建者可以提交回答");
-    llm.queueText("## 回应点评\n理解正确\n\n## 需要澄清\n无\n\n## 今日总结\n掌握重点\n\n## 下一步\n继续阅读");
+    llm.queueJSON({
+      feedback: "## 回应点评\n理解正确\n\n## 需要澄清\n无\n\n## 今日总结\n掌握重点\n\n## 下一步\n继续阅读",
+      mastery: "ready",
+      nextFocus: "继续用具体案例辨析原则与规则",
+      learningRecord: {
+        title: "区分原则与规则",
+        summary: "原则用于指导判断，规则用于约束具体行为。",
+        evidence: "学习者能够用自己的话指出作者强调原则。",
+        implications: ["下一课可以比较不同原则的适用边界"],
+      },
+    });
     const result = await engine.answerLearningSession(plan.id, "ou_me", "作者强调原则", NOW + 3);
 
     expect(result.feedback).toContain("## 回应点评");
@@ -540,11 +554,101 @@ describe("guided learning engine", () => {
       cursor: plan.sourceLength,
       status: "completed",
     }));
-    expect(engine.registry.store(SPACE).index().getRaw(result.rawId)).toEqual(expect.objectContaining({
+    expect(result.rawId).toBeDefined();
+    expect(engine.registry.store(SPACE).index().getRaw(result.rawId!)).toEqual(expect.objectContaining({
       source: "learning",
       author: "ou_me",
-      content: expect.stringContaining("## 我的回答\n作者强调原则"),
+      content: expect.stringContaining("# 学习记录：区分原则与规则"),
     }));
+  });
+
+  test("keeps a reading segment active and out of Raw until understanding is demonstrated", async () => {
+    const plan = engine.learning.create({
+      name: "读原则",
+      space: SPACE,
+      creatorId: "ou_me",
+      chatId: "oc_p2p",
+      sourceTitle: "原则",
+      sourceContent: "# 第一章\n\n短正文",
+      sourceRawIds: ["raw_book"],
+      sourceMessageId: "om_book",
+    }, NOW);
+    llm.queueText("## 今日目标\n理解第一章");
+    await engine.deliverLearningSession(plan.id, NOW + 1, async () => {});
+    llm.queueJSON({
+      feedback: "## 回应点评\n仍在复述导读\n\n## 需要澄清\n原则与规则的差别\n\n## 今日总结\n尚未达到目标\n\n## 下一步\n换一个案例",
+      mastery: "review",
+      nextFocus: "用生活案例区分原则与规则",
+    });
+
+    const reviewed = await engine.answerLearningSession(
+      plan.id,
+      "ou_me",
+      "我还说不清楚",
+      NOW + 2,
+    );
+
+    expect(reviewed.rawId).toBeUndefined();
+    expect(reviewed.plan).toEqual(expect.objectContaining({
+      cursor: 0,
+      status: "active",
+      adaptiveFocus: "用生活案例区分原则与规则",
+    }));
+    expect(engine.registry.store(SPACE).index().listRaw({})
+      .filter((raw) => raw.source === "learning")).toHaveLength(0);
+
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm });
+    expect(engine.learning.get(plan.id)).toEqual(expect.objectContaining({
+      cursor: 0,
+      status: "active",
+      adaptiveFocus: "用生活案例区分原则与规则",
+    }));
+    llm.queueText("## 今日目标\n换一个案例补强第一章");
+    const retry = await engine.prepareLearningSession(plan.id, NOW + 3);
+    expect(retry.excerpt).toBe("# 第一章\n\n短正文");
+    expect(llm.calls.at(-1)?.opts.prompt).toContain("用生活案例区分原则与规则");
+  });
+
+  test("uses verified learning records for spaced retrieval in a later topic lesson", async () => {
+    const plan = engine.learning.createTopic({
+      name: "Rust 异步",
+      topic: "Rust 异步编程",
+      space: SPACE,
+      creatorId: "ou_me",
+      chatId: "oc_p2p",
+      route: [
+        { title: "Future", objective: "理解惰性轮询" },
+        { title: "Waker", objective: "理解唤醒机制" },
+      ],
+    }, NOW);
+    llm.queueText(topicGuide());
+    await engine.deliverLearningSession(plan.id, NOW + 1, async () => {});
+    llm.queueJSON({
+      feedback: "## 回应点评\n解释准确\n\n## 今日总结\n已理解惰性轮询",
+      mastery: "ready",
+      nextFocus: "Waker 如何触发再次轮询",
+      learningRecord: {
+        title: "Future 是惰性计算",
+        summary: "Future 只有在被 poll 时才会推进。",
+        evidence: "学习者能脱离导读准确解释推进条件。",
+        implications: ["可以继续学习 Waker"],
+      },
+    });
+    const learned = await engine.answerLearningSession(
+      plan.id,
+      "ou_me",
+      "Future 不会自己运行，只有 poll 才推进。",
+      NOW + 2,
+    );
+    expect(learned.rawId).toBeDefined();
+
+    llm.queueText(topicGuide());
+    await engine.prepareLearningSession(plan.id, NOW + 3);
+    const prompt = llm.calls.at(-1)?.opts.prompt ?? "";
+    expect(prompt).toContain("[已验证记录：第 1 课 · Future]");
+    expect(prompt).toContain("Future 不会自己运行，只有 poll 才推进");
+    expect(prompt).toContain("间隔提取");
   });
 
   test("uses structured mastery feedback to adapt the next topic lesson", async () => {
@@ -634,7 +738,17 @@ describe("guided learning engine", () => {
     }, NOW);
     llm.queueText("## 今日目标\n理解第一章");
     await engine.deliverLearningSession(plan.id, NOW + 1, async () => {});
-    llm.queueText("## 回应点评\n理解正确\n\n## 今日总结\n掌握重点");
+    llm.queueJSON({
+      feedback: "## 回应点评\n理解正确\n\n## 需要澄清\n无\n\n## 今日总结\n掌握重点\n\n## 下一步\n继续",
+      mastery: "ready",
+      nextFocus: "继续阅读",
+      learningRecord: {
+        title: "掌握第一章重点",
+        summary: "能够概括第一章的核心观点。",
+        evidence: "学习者给出了符合原文的解释。",
+        implications: [],
+      },
+    });
     Object.defineProperty(engine, "remember", {
       value: async () => { throw new Error("capture unavailable"); },
     });

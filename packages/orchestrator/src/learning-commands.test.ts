@@ -297,7 +297,17 @@ describe("learning command handling", () => {
 
   test("submits an answer only when exactly one owned lesson is awaiting", async () => {
     const plan = seedAwaitingPlan(engine, "ou_me");
-    llm.queueText("## 回应点评\n很好\n\n## 需要澄清\n无\n\n## 今日总结\n完成\n\n## 下一步\n继续");
+    llm.queueJSON({
+      feedback: "## 回应点评\n很好\n\n## 需要澄清\n无\n\n## 今日总结\n完成\n\n## 下一步\n继续",
+      mastery: "ready",
+      nextFocus: "继续下一段阅读",
+      learningRecord: {
+        title: "掌握正文要点",
+        summary: "能够用自己的话概括正文内容。",
+        evidence: "回答与原文重点一致。",
+        implications: [],
+      },
+    });
 
     const reply = await handleLearningAnswer(engine, "我的理解", {
       space: "personal/ou_me",

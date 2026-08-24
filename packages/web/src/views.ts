@@ -2045,6 +2045,15 @@ function learningResourceKindLabel(
   return "文章";
 }
 
+function verifiedLearningRecord(session: LearningSession): string {
+  const feedback = session.feedback?.trim() ?? "";
+  const marker = "## 已验证学习记录";
+  const marked = feedback.includes(marker) ? feedback.split(marker).at(-1)?.trim() : undefined;
+  if (marked) return marked.slice(0, 600);
+  const summary = feedback.match(/## 今日总结\s+([\s\S]*?)(?=\n## |$)/u)?.[1]?.trim();
+  return (summary || "已达到本课目标，后续课程可在此基础上继续。").slice(0, 600);
+}
+
 export function learningView(
   plans: LearningPlan[],
   selected: LearningPlan | null,
@@ -2070,6 +2079,7 @@ export function learningView(
   const sessionHistory = sessions.filter(
     (session) => session.status === "completed" || session.status === "skipped",
   ).slice().reverse();
+  const verifiedHistory = sessionHistory.filter((session) => session.mastery === "ready");
 
   const detail = selected
     ? html`<article class="learning-map">
@@ -2136,8 +2146,8 @@ export function learningView(
                       : html`<span class="muted">暂未发现关键缺口</span>`}</div>
                   </div>
                   <div class="profile-card">
-                    <h3>目标与偏好</h3>
-                    <p>${selected.profile.goals.join("；") || "目标继续澄清中"}</p>
+                    <h3>学习使命与成功标准</h3>
+                    <p>${selected.profile.goals.join("；") || "使命与成功标准继续澄清中"}</p>
                     <div class="chip-cloud" style="margin-top:9px">${selected.profile.preferences.map((item) =>
                       html`<span class="knowledge-chip">${item}</span>`
                     )}</div>
@@ -2213,12 +2223,24 @@ export function learningView(
               </section>`
             : ""}
           <section>
+            <h3 class="section-label">已验证学习记录</h3>
+            ${verifiedHistory.length > 0
+              ? html`<div class="history-stack">${verifiedHistory.slice(0, 6).map((session) => html`<div class="history-note">
+                  <div class="history-head">
+                    <strong>第 ${session.sequence} 课 · ${session.sectionTitle}</strong>
+                    <span>已掌握 · ${fmtTime(session.completedAt ?? session.preparedAt)}</span>
+                  </div>
+                  <p>${verifiedLearningRecord(session)}</p>
+                </div>`)}</div>`
+              : html`<div class="material-card">尚无已验证记录。只有能被回答证据支持的理解才会进入知识空间；仅仅读过或做过不计为掌握。</div>`}
+          </section>
+          <section>
             <h3 class="section-label">反馈轨迹</h3>
             ${sessionHistory.length > 0
               ? html`<div class="history-stack">${sessionHistory.slice(0, 6).map((session) => html`<div class="history-note">
                   <div class="history-head">
                     <strong>第 ${session.sequence} 课 · ${session.sectionTitle}</strong>
-                    <span>${LEARNING_SESSION_LABELS[session.status]} · ${fmtTime(session.completedAt ?? session.deliveredAt ?? session.preparedAt)}</span>
+                    <span>${session.mastery === "ready" ? "已掌握" : session.mastery === "review" ? "需复习" : LEARNING_SESSION_LABELS[session.status]} · ${fmtTime(session.completedAt ?? session.deliveredAt ?? session.preparedAt)}</span>
                   </div>
                   ${session.learnerReply ? html`<p><strong>学习回答：</strong>${session.learnerReply}</p>` : ""}
                   ${session.feedback ? html`<p>${session.feedback.slice(0, 360)}</p>` : ""}
@@ -3295,7 +3317,7 @@ export function settingsView(
           </div>
           <input id="data-directory" name="dataDirectory" type="text" placeholder="/Volumes/Knowledge/homeagent-data"
             autocomplete="off" ${dataMigrationDisabled ? "disabled" : ""} />
-          <p class="field-help">必须使用绝对路径。目标可不存在、为空，或仅包含 <code>.git</code>、<code>.obsidian</code>、<code>.gitignore</code>、<code>.gitattributes</code> 等受支持的元数据；其他内容及同名冲突会被拒绝。新旧目录不能互相包含。</p>
+          <p class="field-help">必须使用绝对路径。目标可不存在、为空，或仅包含 <code>.git</code>、<code>.obsidian</code>、<code>.gitignore</code>、<code>.gitattributes</code>、<code>AGENTS.md</code> 等受支持的元数据；其他内容及同名冲突会被拒绝。已有 agent 规则会保留，缺失的仓库与 Space 指南在迁移时补齐。新旧目录不能互相包含。</p>
         </div>
         <label class="checkbox-row">
           <input type="checkbox" name="initializeGit"

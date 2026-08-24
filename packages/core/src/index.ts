@@ -34,3 +34,4 @@ export * from "./quarantine.ts";
 export * from "./knowledge-governance.ts";
 export * from "./quality.ts";
 export * from "./usage.ts";
+export { ensureDataRepositoryAgentGuides } from "./agent-guides.ts";

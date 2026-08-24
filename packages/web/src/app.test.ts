@@ -4216,6 +4216,7 @@ describe("management backend (read-write)", () => {
     expect(view).toContain("保存更改");
     expect(view).toContain("<legend>数据目录</legend>");
     expect(view).toContain("<code>.obsidian</code>");
+    expect(view).toContain("<code>AGENTS.md</code>");
     expect(view).toContain("若目标已有 <code>.git</code>，则直接沿用");
     expect(view).toContain('role="status"');
     expect(view).toContain('aria-live="polite"');
@@ -5489,6 +5490,9 @@ describe("management backend (read-write)", () => {
     expect(body).toContain("当前判断");
     expect(body).toContain("知识优势");
     expect(body).toContain("待补齐");
+    expect(body).toContain("学习使命与成功标准");
+    expect(body).toContain("已验证学习记录");
+    expect(body).toContain("需复习");
     expect(body).toContain("路线已迭代");
     expect(body).toContain("主题学习");
     expect(body).toContain("Rust 异步编程");

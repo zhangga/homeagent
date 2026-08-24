@@ -286,7 +286,7 @@ Claude strict no-tools 或 Codex 临时只读路径。`network_recovery` 不接�
 - `attachment_extraction`：文本或 PDF 附件提取；
 - `research_notification`：研究任务及飞书通知；
 - `reminder_delivery`：提醒创建与送达；
-- `learning_interaction`：学习课程推送与回答；
+- `learning_interaction`：学习课程推送与回答；至少验证一次 `review` 留在当前内容且不产生 `source=learning` Raw，再用正确回答触发 `ready`、已验证学习记录和后续课程中的间隔回忆；
 - `distill_citation`：Claude no-tools 或 Codex 临时只读的手动提炼和引用问答；
 - `network_recovery`：网络短暂中断后恢复。
 
