@@ -35,8 +35,8 @@ export interface AskOptions {
   maxPages?: number;
   /** when true, never fall back to general knowledge (knowledge-only) */
   knowledgeOnly?: boolean;
-  /** Ordinary Codex may use the bound Agent directory as read-only fallback context. */
-  fallbackContext?: "agent-workdir";
+  /** Bounded non-KB context that may ground an ordinary answer. */
+  fallbackContext?: "agent-workdir" | "message-source";
   /** cancel the active provider call when the owning Run is cancelled. */
   signal?: AbortSignal;
   /** maximum runtime for each provider call in this answer */
@@ -68,6 +68,15 @@ export interface RetractionResult {
 }
 
 /** A durable record for raw sources whose generated knowledge page failed validation or execution. */
+export interface QuarantinedDreamOperation {
+  type: "entity" | "concept" | "source" | "analysis";
+  name: string;
+  title: string;
+  rawIds: string[];
+  /** Hash of the Knowledge page base used by the failed generation; null means create. */
+  basePageHash: string | null;
+}
+
 export interface QuarantineRecord {
   /** Safe filename-backed identifier used by management actions. */
   id: string;
@@ -76,6 +85,8 @@ export interface QuarantineRecord {
   error: string;
   rawIds: string[];
   createdAt: number;
+  /** Frozen generate plan. Legacy records may not have one and fail closed on retry. */
+  operation?: QuarantinedDreamOperation;
 }
 
 export type QuarantineRetryStatus = "recovered" | "failed" | "not_found";

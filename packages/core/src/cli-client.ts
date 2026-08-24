@@ -4,11 +4,9 @@
  * is the only LLM path in homeagent — there is no network-API fallback.
  *
  *   - complete(): the CLI's stdout is the answer text.
- *   - completeJSON(): we append a strict "output only JSON matching this schema"
- *     instruction to the prompt, then parse the CLI's stdout (tolerating ```json
- *     fences``` and surrounding prose). Because CLIs give no structured-output
- *     guarantee, callers must handle a thrown parse/validation error — dream
- *     already quarantines bad output, and ask surfaces a graceful message.
+ *   - completeJSON(): Codex receives its schema through the native output
+ *     contract; other CLIs receive a strict JSON instruction in the prompt.
+ *     Core then parses and validates the final response at the domain seam.
  *
  * These CLIs are full coding agents: slower and heavier than an API call, and
  * they manage their own auth/model. Structured usage is preserved when a CLI
@@ -39,10 +37,13 @@ import type { LlmClient } from "./llm.ts";
 const log = logger.child("cli-client");
 
 /** A provider call completed, but its text could not satisfy the caller's JSON contract. */
+export type CliCompletionFailureKind = "invalid_json" | "schema_validation";
+
 export class CliCompletionError extends Error {
   constructor(
     message: string,
     readonly usage: CompletionUsage,
+    readonly kind: CliCompletionFailureKind,
     readonly cause?: unknown,
   ) {
     super(message);
@@ -61,6 +62,8 @@ export type RunProviderFn = (
     skills?: string[];
     workdir?: string;
     execution?: ProviderExecution;
+    outputSchema?: Record<string, unknown>;
+    maxTokens?: number;
   },
   timeoutMs?: number,
   signal?: AbortSignal,
@@ -127,10 +130,19 @@ function recordCliCall(input: {
 /** Extract the first JSON object/array from CLI stdout (handles code fences + prose). */
 export function extractJson(raw: string): unknown {
   const text = raw.trim();
-  // Prefer a fenced ```json ... ``` block when present.
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  // Parse the complete payload before looking for a wrapper. Generated JSON
+  // string fields may legitimately contain Markdown code fences, and treating
+  // those inner fences as the outer response corrupts an otherwise valid value.
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Continue with compatibility recovery for providers that wrap JSON.
+  }
+
+  // Only accept a standard unlabeled/JSON fence. A language fence inside
+  // surrounding prose is content, not a structured response wrapper.
+  const fence = text.match(/```(?:json[ \t]*)?\r?\n([\s\S]*?)```/i);
   const candidate = fence ? fence[1]!.trim() : text;
-  // Try a direct parse first.
   try {
     return JSON.parse(candidate);
   } catch {
@@ -215,6 +227,7 @@ export function makeCliClient(
             skills: [...skills],
             workdir,
             execution,
+            maxTokens: opts.maxTokens,
           },
           timeoutMs,
           signal,
@@ -242,7 +255,10 @@ export function makeCliClient(
 
     async completeJSON<T>(opts: JSONOptions<T>): Promise<{ value: T; result: CompleteResult }> {
       const base = opts.prompt ?? (opts.messages ?? []).map((m) => m.content).join("\n\n");
-      const prompt = withSystem(opts.system, base) + jsonInstruction(opts.schema);
+      const structuredPrompt = withSystem(opts.system, base);
+      const prompt = provider === "codex"
+        ? structuredPrompt
+        : structuredPrompt + jsonInstruction(opts.schema);
       const purpose = opts.purpose ?? "other";
       const decision = checkBudget(purpose, undefined, accountingDataDir);
       if (!decision.allowed) throw new BudgetExceededError(decision);
@@ -262,6 +278,8 @@ export function makeCliClient(
             skills: [...skills],
             workdir,
             execution,
+            ...(provider === "codex" ? { outputSchema: opts.schema } : {}),
+            maxTokens: opts.maxTokens,
           },
           timeoutMs,
           signal,
@@ -275,6 +293,7 @@ export function makeCliClient(
           throw new CliCompletionError(
             `provider ${provider} did not return parseable JSON`,
             result.usage ?? unavailableUsage(),
+            "invalid_json",
             err,
           );
         }
@@ -285,6 +304,7 @@ export function makeCliClient(
           throw new CliCompletionError(
             err instanceof Error ? err.message : String(err),
             result.usage ?? unavailableUsage(),
+            "schema_validation",
             err,
           );
         }

@@ -143,6 +143,12 @@ interface PendingReminderConfirmation {
 interface ConversationContext {
   text: string;
   images: DownloadedAttachment[];
+  sourceContext?: boolean;
+}
+
+interface SourceSyncResult {
+  attempted: number;
+  succeeded: number;
 }
 
 interface RuntimeTimingMetrics {
@@ -700,6 +706,7 @@ export class Orchestrator {
 
     let inputsCaptured = false;
     let capturedMessageRawId: string | undefined;
+    let sourceSync: SourceSyncResult = { attempted: 0, succeeded: 0 };
     const captureInputs = async (): Promise<void> => {
       if (inputsCaptured) return;
       inputsCaptured = true;
@@ -728,9 +735,9 @@ export class Orchestrator {
         await this.syncAttachments(msg, writeSpace);
       }
 
-      // Doc sync (Q8): pull any docx/wiki links referenced in the message.
+      // Source sync: pull allowlisted Feishu documents and internal articles.
       if (this.docFetcher && msg.docLinks && msg.docLinks.length > 0) {
-        await this.syncDocs(msg, writeSpace);
+        sourceSync = await this.syncDocs(msg, writeSpace);
       }
     };
 
@@ -872,6 +879,19 @@ export class Orchestrator {
         capturedMessageRawId,
       );
 
+      if (sourceSync.attempted > 0 && sourceSync.succeeded === 0) {
+        return this.scheduleChatRun(
+          msg,
+          writeSpace,
+          chatRun,
+          () => this.completeChatRunAndSend(
+            msg,
+            chatRun.id,
+            "我已收录这条消息，但未能读取链接正文，因此不能确认已经理解或完整收录文章内容。请确认该资料在 HomeAgent 运行环境中可访问后重试。",
+          ),
+        );
+      }
+
       switch (interpretation.disposition) {
         case "conversation":
           return this.scheduleChatRun(
@@ -895,7 +915,9 @@ export class Orchestrator {
             () => this.completeChatRunAndSend(
               msg,
               chatRun.id,
-              "好的，我记下了。",
+              sourceSync.succeeded > 0
+                ? "好的，我已读取并记下来源正文。"
+                : "好的，我记下了。",
             ),
           );
         case "chitchat":
@@ -1170,6 +1192,7 @@ export class Orchestrator {
           run.skillEvidence,
           {
             images: context.images.map((image) => ({ path: image.localPath })),
+            fallbackContext: context.sourceContext ? "message-source" : undefined,
             signal,
             timeoutMs: run.timeoutMs ?? LEGACY_CHAT_PROVIDER_TIMEOUT_MS,
             onFailureTrace: (trace) => {
@@ -1225,7 +1248,7 @@ export class Orchestrator {
       let text = formatAnswer(res);
       if (
         res.source === "general"
-        && res.context !== "agent-workdir"
+        && !res.context
         && (await this.isColdStart(readSpaces))
       ) {
         text = `${text}\n\n${coldStartNote()}`;
@@ -1271,7 +1294,12 @@ export class Orchestrator {
     userText: string,
     writeSpace: SpaceId,
   ): Promise<ConversationContext> {
-    if (!mayReferToConversationContext(userText)) {
+    const currentSourceParts = this.storedReplySourceText(
+      writeSpace,
+      msg.chatId,
+      msg.messageId,
+    );
+    if (!mayReferToConversationContext(userText) && currentSourceParts.length === 0) {
       return { text: userText, images: [] };
     }
     let target;
@@ -1286,15 +1314,28 @@ export class Orchestrator {
       }
     }
     if (!target) {
-      const recentParts = this.storedRecentSourceText(writeSpace, msg);
+      const sourceParts = currentSourceParts.length > 0
+        ? currentSourceParts
+        : this.storedRecentSourceText(writeSpace, msg);
       return {
-        text: this.contextualText(userText, "最近的附件或文档", recentParts),
+        text: this.contextualText(
+          userText,
+          currentSourceParts.length > 0 ? "当前消息的来源正文" : "最近的附件或文档",
+          sourceParts,
+        ),
         images: [],
+        sourceContext: sourceParts.length > 0,
       };
     }
+    const replySourceParts = this.storedReplySourceText(
+      writeSpace,
+      msg.chatId,
+      target.messageId,
+    );
     const replyParts = [
+      ...currentSourceParts,
       target.text?.trim(),
-      ...this.storedReplySourceText(writeSpace, msg.chatId, target.messageId),
+      ...replySourceParts,
     ].filter((part): part is string => Boolean(part));
     const uniqueReplyParts = [...new Set(replyParts)];
     const text = this.contextualText(userText, "被回复的消息", uniqueReplyParts);
@@ -1302,10 +1343,18 @@ export class Orchestrator {
       || target.messageType === "post"
       || target.text?.includes("【图片");
     if (!mayContainImages) {
-      return { text, images: [] };
+      return {
+        text,
+        images: [],
+        sourceContext: currentSourceParts.length > 0 || replySourceParts.length > 0,
+      };
     }
     if (!this.attachmentDownloader) {
-      return { text: discloseUnavailableVision(text), images: [] };
+      return {
+        text: discloseUnavailableVision(text),
+        images: [],
+        sourceContext: currentSourceParts.length > 0 || replySourceParts.length > 0,
+      };
     }
 
     let downloads: DownloadedAttachment[];
@@ -1316,7 +1365,11 @@ export class Orchestrator {
         messageId: target.messageId,
         err: String(err),
       });
-      return { text: discloseUnavailableVision(text), images: [] };
+      return {
+        text: discloseUnavailableVision(text),
+        images: [],
+        sourceContext: currentSourceParts.length > 0 || replySourceParts.length > 0,
+      };
     }
 
     const images: DownloadedAttachment[] = [];
@@ -1335,6 +1388,7 @@ export class Orchestrator {
     return {
       text: images.length > 0 ? text : discloseUnavailableVision(text),
       images,
+      sourceContext: currentSourceParts.length > 0 || replySourceParts.length > 0,
     };
   }
 
@@ -1495,7 +1549,11 @@ export class Orchestrator {
     await this.send(msg, `已撤回这条消息${pageNote}${rebuildNote}。`);
   }
 
-  private async syncDocs(msg: InboundMessage, writeSpace: SpaceId): Promise<void> {
+  private async syncDocs(
+    msg: InboundMessage,
+    writeSpace: SpaceId,
+  ): Promise<SourceSyncResult> {
+    let succeeded = 0;
     for (const link of msg.docLinks ?? []) {
       try {
         const md = await this.docFetcher!(link);
@@ -1506,13 +1564,22 @@ export class Orchestrator {
           author: msg.senderId,
           chatId: msg.chatId,
           messageId: msg.messageId,
-          content: `# 来源文档：${link}\n\n${md}`,
+          content: `# 来源资料：${link}\n\n${md}`,
+          createdAt: msg.createdAt,
         });
-        log.info("synced doc into space", { space: writeSpace, link });
+        succeeded += 1;
+        log.info("synced source into space", { space: writeSpace });
       } catch (err) {
-        log.warn("doc sync failed", { link, err: String(err) });
+        log.warn("source sync failed", {
+          space: writeSpace,
+          kind: chatRunError(err).kind,
+        });
       }
     }
+    return {
+      attempted: msg.docLinks?.length ?? 0,
+      succeeded,
+    };
   }
 
   private async syncAttachments(msg: InboundMessage, writeSpace: SpaceId): Promise<void> {

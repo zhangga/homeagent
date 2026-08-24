@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetConfig } from "@homeagent/shared";
 import { ProviderRunError, spentToday } from "@homeagent/llm";
-import { extractJson, makeCliClient } from "./cli-client.ts";
+import { CliCompletionError, extractJson, makeCliClient } from "./cli-client.ts";
 import { observeLlmUsage, RunUsageAccumulator } from "./usage.ts";
 
 const testAccountingDataDir = mkdtempSync(join(tmpdir(), "ha-cli-client-suite-"));
@@ -16,6 +16,15 @@ afterAll(() => {
 describe("extractJson", () => {
   test("parses a bare JSON object", () => {
     expect(extractJson('{"a":1}')).toEqual({ a: 1 });
+  });
+
+  test("parses a JSON object whose string content contains a Markdown code fence", () => {
+    const value = {
+      title: "Troubleshooting",
+      content: "# Troubleshooting\n\n```powershell\nGet-Process bun\n```",
+    };
+
+    expect(extractJson(JSON.stringify(value))).toEqual(value);
   });
 
   test("strips a ```json fenced block", () => {
@@ -299,7 +308,7 @@ describe("makeCliClient", () => {
       testAccountingDataDir,
       async (_id, input) => {
         seen.push(input);
-        return /JSON Schema/.test(input.prompt) ? '{"ok":true}' : "ok";
+        return input.outputSchema ? '{"ok":true}' : "ok";
       },
       undefined,
       undefined,
@@ -335,11 +344,95 @@ describe("makeCliClient", () => {
     expect(seen).toContain("JSON Schema"); // strict-JSON instruction was appended
   });
 
+  test("completeJSON() forwards its schema to native provider enforcement", async () => {
+    const schema = {
+      type: "object",
+      properties: { content: { type: "string" } },
+      required: ["content"],
+    };
+    let observedSchema: unknown;
+    const cli = makeCliClient("codex", "", testAccountingDataDir, async (_id, input) => {
+      observedSchema = input.outputSchema;
+      return '{"content":"# Knowledge"}';
+    });
+
+    await cli.completeJSON({ prompt: "generate", schema });
+
+    expect(observedSchema).toEqual(schema);
+  });
+
+  test("completeJSON() does not duplicate Codex native schema inside the prompt", async () => {
+    let observedPrompt = "";
+    const cli = makeCliClient("codex", "", testAccountingDataDir, async (_id, input) => {
+      observedPrompt = input.prompt;
+      return '{"content":"# Knowledge"}';
+    });
+
+    await cli.completeJSON({
+      prompt: "generate",
+      schema: {
+        type: "object",
+        properties: { content: { type: "string" } },
+        required: ["content"],
+      },
+    });
+
+    expect(observedPrompt).toBe("generate");
+  });
+
+  test("completeJSON() forwards its output budget to the provider boundary", async () => {
+    let observedMaxTokens: number | undefined;
+    const cli = makeCliClient("codex", "", testAccountingDataDir, async (_id, input) => {
+      observedMaxTokens = (input as { maxTokens?: number }).maxTokens;
+      return '{"content":"# Knowledge"}';
+    });
+
+    await cli.completeJSON({
+      prompt: "generate",
+      schema: { type: "object" },
+      maxTokens: 4096,
+    });
+
+    expect(observedMaxTokens).toBe(4096);
+  });
+
   test("completeJSON() throws a clear error on unparseable output", async () => {
     const cli = makeCliClient("codex", "", testAccountingDataDir, async () => "not json at all");
     await expect(
       cli.completeJSON({ prompt: "x", schema: { type: "object" } }),
     ).rejects.toThrow(/did not return parseable JSON/);
+  });
+
+  test("completeJSON() distinguishes invalid JSON from domain schema validation", async () => {
+    const invalidJson = makeCliClient(
+      "codex",
+      "",
+      testAccountingDataDir,
+      async () => "not json",
+    );
+    const invalidDomain = makeCliClient(
+      "codex",
+      "",
+      testAccountingDataDir,
+      async () => '{"content":""}',
+    );
+
+    const parseFailure = await invalidJson.completeJSON({
+      prompt: "generate",
+      schema: { type: "object" },
+    }).catch((error: unknown) => error);
+    const validationFailure = await invalidDomain.completeJSON({
+      prompt: "generate",
+      schema: { type: "object" },
+      validate: () => {
+        throw new Error("generated page has empty content");
+      },
+    }).catch((error: unknown) => error);
+
+    expect(parseFailure).toBeInstanceOf(CliCompletionError);
+    expect((parseFailure as CliCompletionError).kind).toBe("invalid_json");
+    expect(validationFailure).toBeInstanceOf(CliCompletionError);
+    expect((validationFailure as CliCompletionError).kind).toBe("schema_validation");
   });
 
   test("uses the constructor model and ignores per-call opts.model", async () => {

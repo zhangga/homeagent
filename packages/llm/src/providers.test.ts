@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -9,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import {
   codexReasoningEffortsForModel,
   curatedProviderModels,
@@ -64,6 +65,112 @@ function writeStaticProvider(
   return bin;
 }
 
+function writeCodexSchemaInspector(directory: string, name = "provider"): string {
+  const script = join(directory, `${name}.js`);
+  const bin = join(directory, process.platform === "win32" ? `${name}.cmd` : name);
+  writeFileSync(
+    script,
+    [
+      'const { existsSync, readFileSync, writeFileSync } = require("node:fs");',
+      "const args = process.argv.slice(2);",
+      'const index = args.indexOf("--output-schema");',
+      'if (index < 0 || !args[index + 1]) { process.stderr.write("missing output schema"); process.exit(41); }',
+      'const outputIndex = args.findIndex((arg) => arg === "-o" || arg === "--output-last-message");',
+      'if (outputIndex < 0 || !args[outputIndex + 1]) { process.stderr.write("missing final output path"); process.exit(42); }',
+      "const schemaPath = args[index + 1];",
+      "let prompt = '';",
+      'process.stdin.setEncoding("utf8");',
+      "process.stdin.on('data', (chunk) => { prompt += chunk; });",
+      "process.stdin.on('end', () => {",
+      "  const text = JSON.stringify({",
+      '    schema: JSON.parse(readFileSync(schemaPath, "utf8")),',
+      "    schemaPath,",
+      "    schemaExistsDuringRun: existsSync(schemaPath),",
+      "    prompt,",
+      "  });",
+      '  writeFileSync(args[outputIndex + 1], text, "utf8");',
+      "  process.stdout.write(JSON.stringify({ type: 'turn.completed' }));",
+      "});",
+    ].join("\n"),
+    "utf8",
+  );
+  writeFileSync(
+    bin,
+    process.platform === "win32"
+      ? `@echo off\r\n"${process.execPath}" "%~dp0\\${name}.js" %*\r\n`
+      : `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/${name}.js" "$@"\n`,
+    "utf8",
+  );
+  if (process.platform !== "win32") chmodSync(bin, 0o755);
+  return bin;
+}
+
+function writeCodexFinalArtifactProvider(
+  directory: string,
+  finalOutput = JSON.stringify({ content: "# Knowledge\n\nDurable result" }),
+  stdout = JSON.stringify({
+    type: "turn.completed",
+    usage: { input_tokens: 240, output_tokens: 45 },
+  }),
+  name = "provider",
+): string {
+  const script = join(directory, `${name}.js`);
+  const bin = join(directory, process.platform === "win32" ? `${name}.cmd` : name);
+  writeFileSync(
+    script,
+    [
+      'const { writeFileSync } = require("node:fs");',
+      "const args = process.argv.slice(2);",
+      'const outputIndex = args.findIndex((arg) => arg === "-o" || arg === "--output-last-message");',
+      'if (outputIndex < 0 || !args[outputIndex + 1]) { process.stderr.write("missing final output path"); process.exit(41); }',
+      `const finalOutput = ${JSON.stringify(finalOutput)};`,
+      'writeFileSync(args[outputIndex + 1], finalOutput, "utf8");',
+      `process.stdout.write(${JSON.stringify(stdout)});`,
+    ].join("\n"),
+    "utf8",
+  );
+  writeFileSync(
+    bin,
+    process.platform === "win32"
+      ? `@echo off\r\n"${process.execPath}" "%~dp0\\${name}.js" %*\r\n`
+      : `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/${name}.js" "$@"\n`,
+    "utf8",
+  );
+  if (process.platform !== "win32") chmodSync(bin, 0o755);
+  return bin;
+}
+
+function writeCodexSchemaRejector(
+  directory: string,
+  capturedPathFile: string,
+  name = "provider",
+): string {
+  const script = join(directory, `${name}.js`);
+  const bin = join(directory, process.platform === "win32" ? `${name}.cmd` : name);
+  writeFileSync(
+    script,
+    [
+      'const { writeFileSync } = require("node:fs");',
+      "const args = process.argv.slice(2);",
+      'const index = args.indexOf("--output-schema");',
+      'if (index < 0 || !args[index + 1]) { process.stderr.write("missing output schema"); process.exit(41); }',
+      `writeFileSync(${JSON.stringify(capturedPathFile)}, args[index + 1], "utf8");`,
+      'process.stderr.write("structured output rejected");',
+      "process.exitCode = 42;",
+    ].join("\n"),
+    "utf8",
+  );
+  writeFileSync(
+    bin,
+    process.platform === "win32"
+      ? `@echo off\r\n"${process.execPath}" "%~dp0\\${name}.js" %*\r\n`
+      : `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/${name}.js" "$@"\n`,
+    "utf8",
+  );
+  if (process.platform !== "win32") chmodSync(bin, 0o755);
+  return bin;
+}
+
 function writeVersionAndHelpProvider(
   directory: string,
   help: string,
@@ -104,6 +211,12 @@ function writeCodexStatusProvider(
   directory: string,
   name: string,
   statusExitCode: number,
+  statusArgs: readonly string[] = [
+    "-c",
+    'cli_auth_credentials_store="keyring"',
+    "login",
+    "status",
+  ],
 ): string {
   const script = join(directory, `${name}.js`);
   const calls = join(directory, `${name}.calls.jsonl`);
@@ -115,7 +228,7 @@ function writeCodexStatusProvider(
       "const args = process.argv.slice(2);",
       `appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");`,
       `if (args.length === 1 && args[0] === "--version") process.stdout.write(${JSON.stringify(`${name} 1.0\n`)});`,
-      `else if (JSON.stringify(args) === ${JSON.stringify(JSON.stringify(["-c", 'cli_auth_credentials_store="keyring"', "login", "status"]))}) { process.stdout.write("${statusExitCode === 0 ? "Logged in using ChatGPT" : "Not logged in"}\\n"); process.exitCode = ${statusExitCode}; }`,
+      `else if (JSON.stringify(args) === ${JSON.stringify(JSON.stringify(statusArgs))}) { process.stdout.write("${statusExitCode === 0 ? "Logged in using ChatGPT" : "Not logged in"}\\n"); process.exitCode = ${statusExitCode}; }`,
       "else process.exitCode = 42;",
     ].join("\n"),
     "utf8",
@@ -422,6 +535,257 @@ describe("provider detection", () => {
     }
   });
 
+  test("Codex structured calls enforce a readable output schema and clean it up", async () => {
+    const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-codex-output-schema-"));
+    const schema = {
+      type: "object",
+      properties: { content: { type: "string" } },
+      required: ["content"],
+      additionalProperties: false,
+    };
+    try {
+      process.env.HOMEAGENT_CODEX_BIN = writeCodexSchemaInspector(directory);
+
+      const output = await runProviderDetailed(
+        "codex",
+        { prompt: "generate a knowledge page", outputSchema: schema },
+        500,
+      );
+      const observed = JSON.parse(output.text) as {
+        schema: unknown;
+        schemaPath: string;
+        schemaExistsDuringRun: boolean;
+        prompt: string;
+      };
+
+      expect(observed).toEqual(expect.objectContaining({
+        schema,
+        schemaExistsDuringRun: true,
+        prompt: "generate a knowledge page",
+      }));
+      expect(existsSync(observed.schemaPath)).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+      else process.env.HOMEAGENT_CODEX_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Codex structured calls read the final artifact instead of guessing from JSONL events", async () => {
+    const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-codex-final-artifact-"));
+    try {
+      process.env.HOMEAGENT_CODEX_BIN = writeCodexFinalArtifactProvider(directory);
+
+      const output = await runProviderDetailed(
+        "codex",
+        {
+          prompt: "generate a knowledge page",
+          outputSchema: {
+            type: "object",
+            properties: { content: { type: "string" } },
+            required: ["content"],
+            additionalProperties: false,
+          },
+        },
+        500,
+      );
+
+      expect(output).toEqual({
+        text: JSON.stringify({ content: "# Knowledge\n\nDurable result" }),
+        usage: {
+          inputTokens: 240,
+          outputTokens: 45,
+          costBasis: "unavailable",
+          source: "codex-jsonl",
+        },
+      });
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+      else process.env.HOMEAGENT_CODEX_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Codex structured calls enforce the requested output budget locally", async () => {
+    const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-codex-output-budget-"));
+    try {
+      process.env.HOMEAGENT_CODEX_BIN = writeCodexFinalArtifactProvider(
+        directory,
+        JSON.stringify({ content: "x".repeat(20 * 1024) }),
+      );
+
+      await expect(runProviderDetailed(
+        "codex",
+        {
+          prompt: "generate a knowledge page",
+          outputSchema: { type: "object" },
+          maxTokens: 4,
+        },
+        500,
+      )).rejects.toThrow("requested output budget");
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+      else process.env.HOMEAGENT_CODEX_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Codex structured calls use the final artifact when JSONL contains misleading messages", async () => {
+    const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-codex-structured-message-"));
+    const structured = JSON.stringify({ content: "knowledge page" });
+    try {
+      process.env.HOMEAGENT_CODEX_BIN = writeCodexFinalArtifactProvider(
+        directory,
+        structured,
+        [
+          JSON.stringify({
+            type: "item.completed",
+            item: { id: "item_1", type: "agent_message", text: structured },
+          }),
+          JSON.stringify({
+            type: "item.completed",
+            item: {
+              id: "item_2",
+              type: "agent_message",
+              text: "I finished generating the knowledge page.",
+            },
+          }),
+          JSON.stringify({ type: "turn.completed" }),
+        ].join("\n"),
+      );
+
+      const output = await runProviderDetailed(
+        "codex",
+        {
+          prompt: "generate a knowledge page",
+          outputSchema: {
+            type: "object",
+            properties: { content: { type: "string" } },
+            required: ["content"],
+            additionalProperties: false,
+          },
+        },
+        500,
+      );
+
+      expect(output.text).toBe(structured);
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+      else process.env.HOMEAGENT_CODEX_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Codex structured calls close nested objects while preserving optional fields", async () => {
+    const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-codex-strict-output-schema-"));
+    const schema = {
+      type: "object",
+      properties: {
+        operations: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              reason: { type: "string" },
+            },
+            required: ["name"],
+          },
+        },
+      },
+      required: ["operations"],
+    };
+    const original = structuredClone(schema);
+    try {
+      process.env.HOMEAGENT_CODEX_BIN = writeCodexSchemaInspector(directory);
+
+      const output = await runProviderDetailed(
+        "codex",
+        { prompt: "analyze", outputSchema: schema },
+        500,
+      );
+      const observed = JSON.parse(output.text) as { schema: unknown };
+
+      expect(observed.schema).toEqual({
+        type: "object",
+        properties: {
+          operations: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                reason: {
+                  anyOf: [{ type: "string" }, { type: "null" }],
+                },
+              },
+              required: ["name", "reason"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["operations"],
+        additionalProperties: false,
+      });
+      expect(schema).toEqual(original);
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+      else process.env.HOMEAGENT_CODEX_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Codex structured calls clean up the schema after provider failure", async () => {
+    const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-codex-output-schema-failure-"));
+    const capturedPathFile = join(directory, "captured-schema-path.txt");
+    try {
+      process.env.HOMEAGENT_CODEX_BIN = writeCodexSchemaRejector(
+        directory,
+        capturedPathFile,
+      );
+
+      await expect(runProviderDetailed(
+        "codex",
+        { prompt: "generate", outputSchema: { type: "object" } },
+        500,
+      )).rejects.toThrow("structured output rejected");
+
+      const schemaPath = readFileSync(capturedPathFile, "utf8");
+      expect(existsSync(schemaPath)).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+      else process.env.HOMEAGENT_CODEX_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Codex structured calls reject oversized output schemas before invocation", async () => {
+    const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-codex-output-schema-limit-"));
+    try {
+      process.env.HOMEAGENT_CODEX_BIN = writeStaticProvider(directory, "unused");
+
+      await expect(runProviderDetailed(
+        "codex",
+        {
+          prompt: "generate",
+          outputSchema: { type: "object", description: "x".repeat(64 * 1024) },
+        },
+        500,
+      )).rejects.toThrow("output schema exceeds the supported size");
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+      else process.env.HOMEAGENT_CODEX_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("Codex preserves structured failure usage when its CLI exits non-zero", async () => {
     const previous = process.env.HOMEAGENT_CODEX_BIN;
     const directory = mkdtempSync(join(tmpdir(), "ha-codex-exit-usage-"));
@@ -584,6 +948,7 @@ describe("provider detection", () => {
           source: "legacy-text",
         },
       });
+      expect(output.text).not.toContain("--output-schema");
     } finally {
       if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
       else process.env.HOMEAGENT_CODEX_BIN = previous;
@@ -1021,6 +1386,49 @@ describe("provider detection", () => {
     } finally {
       if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
       else process.env.HOMEAGENT_CODEX_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("uses the default credential store for a user-installed Codex on PATH", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ha-codex-default-auth-"));
+    const name = "codex";
+    try {
+      writeCodexStatusProvider(directory, name, 0, ["login", "status"]);
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        PATH: `${directory}${delimiter}${process.env.PATH ?? ""}`,
+      };
+      delete env.HOMEAGENT_CODEX_BIN;
+      delete env.HOMEBRAIN_CODEX_BIN;
+      const proc = Bun.spawn([
+        process.execPath,
+        "-e",
+        "import { detectProviders } from './packages/llm/src/providers.ts'; console.log(JSON.stringify((await detectProviders(500)).find((provider) => provider.id === 'codex')));",
+      ], {
+        cwd: process.cwd(),
+        env,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+
+      expect(code).toBe(0);
+      expect(stderr).toBe("");
+      const codex = JSON.parse(stdout) as Awaited<ReturnType<typeof detectProviders>>[number];
+      expect(providerProbeCalls(directory, name)).toEqual([
+        ["--version"],
+        ["login", "status"],
+      ]);
+      expect(codex).toEqual(expect.objectContaining({
+        available: true,
+        bin: "codex",
+      }));
+    } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   });

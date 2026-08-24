@@ -2302,6 +2302,93 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     await orch2.stop();
   });
 
+  test("a ByteTech article is remembered and available to the same Chat response", async () => {
+    const articleUrl = "https://bytetech.info/articles/7525079282028621867";
+    const articleMarkdown = "# Agent 架构\n\n文章核心观点是把记忆与执行证据分开治理。";
+    const fetched: string[] = [];
+    let answerPrompt = "";
+    let answerSystem = "";
+    fake.onText((opts) => {
+      answerPrompt = String(opts.prompt ?? "");
+      answerSystem = String(opts.system ?? "");
+      return "我已读完并收录。文章主张把记忆与执行证据分开治理。";
+    });
+    orch = new Orchestrator({
+      engine,
+      connector,
+      llm: fake,
+      docFetcher: async (link) => {
+        fetched.push(link);
+        return articleMarkdown;
+      },
+    });
+    await orch.start();
+    await connector.inject({
+      kind: "message",
+      eventId: "bytetech-1",
+      chatType: "p2p",
+      chatId: "oc_dm",
+      senderId: "ou_me",
+      text: `请充分理解并记下这篇文章：${articleUrl}`,
+      messageId: "om_bytetech",
+      mentionsBot: true,
+      docLinks: [articleUrl],
+      createdAt: Date.now(),
+    });
+
+    expect(fetched).toEqual([articleUrl]);
+    expect(engine.registry.store("personal/ou_me").index().listRaw({})).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: "doc",
+          messageId: "om_bytetech",
+          content: expect.stringContaining(articleMarkdown),
+        }),
+      ]),
+    );
+    expect(answerPrompt).toContain(articleMarkdown);
+    expect(answerSystem).toContain("当前消息包含已收录的原始来源正文");
+    expect(connector.sent.at(-1)?.markdown).toContain("我已读完并收录");
+    expect(connector.sent.at(-1)?.markdown).not.toContain("尚缺");
+    expect(connector.sent.at(-1)?.markdown).not.toContain("知识库还是空的");
+  });
+
+  test("a source fetch failure returns a bounded reply without provider retry or false claims", async () => {
+    const articleUrl = "https://bytetech.info/articles/7525079282028621867";
+    let providerCalls = 0;
+    fake.onText(() => {
+      providerCalls += 1;
+      return "不应调用";
+    });
+    orch = new Orchestrator({
+      engine,
+      connector,
+      llm: fake,
+      docFetcher: async () => null,
+    });
+    await orch.start();
+    await connector.inject({
+      kind: "message",
+      eventId: "bytetech-failed-1",
+      chatType: "p2p",
+      chatId: "oc_dm",
+      senderId: "ou_me",
+      text: `请充分理解并记下这篇文章：${articleUrl}`,
+      messageId: "om_bytetech_failed",
+      mentionsBot: true,
+      docLinks: [articleUrl],
+      createdAt: Date.now(),
+    });
+
+    expect(providerCalls).toBe(0);
+    expect(connector.sent.at(-1)?.markdown).toContain("未能读取链接正文");
+    expect(connector.sent.at(-1)?.markdown).toContain("不能确认已经理解");
+    expect(connector.sent.at(-1)?.markdown).not.toContain("bytedcli");
+    expect(engine.registry.store("personal/ou_me").index().listRaw({})).toEqual([
+      expect.objectContaining({ source: "message", messageId: "om_bytetech_failed" }),
+    ]);
+  });
+
   test("attachment text follows message provenance and retraction lifecycle", async () => {
     const attachmentDir = mkdtempSync(join(tmpdir(), "hb-runtime-attachment-"));
     const localPath = join(attachmentDir, "resource.bin");

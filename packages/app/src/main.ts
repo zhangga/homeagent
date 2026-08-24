@@ -19,7 +19,12 @@ import { accessSync, constants, statSync } from "node:fs";
 import { join } from "node:path";
 import { KnowledgeEngine, type TaskRun } from "@homeagent/core";
 import { CodexProviderSetup, CodexReleaseInstaller } from "@homeagent/llm";
-import { FeishuConnector, LarkCliSetup } from "@homeagent/connectors";
+import {
+  ByteTechArticleFetcher,
+  FeishuConnector,
+  LarkCliSetup,
+  isByteTechArticleUrl,
+} from "@homeagent/connectors";
 import {
   FEISHU_GROUP_CONFIRMATION_PROMPT,
   Orchestrator,
@@ -151,6 +156,9 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
 
   // 1. feishu connector + orchestrator
   const connector = new FeishuConnector({ larkBin: runtimePaths.larkBin });
+  const byteTechArticleFetcher = new ByteTechArticleFetcher({
+    bin: brandedEnv(process.env, "BYTEDCLI_BIN"),
+  });
   const nativeAttachmentExtractor = createNativeExtractor({
     attachmentHelper: runtimePaths.attachmentHelper,
   });
@@ -161,7 +169,9 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
       feishuStartup.status.state === "ready" && feishuStartup.status.verified
         ? feishuStartup.status.appId
         : undefined,
-    docFetcher: (link) => connector.fetchDoc(link),
+    docFetcher: (link) => isByteTechArticleUrl(link)
+      ? byteTechArticleFetcher.fetch(link)
+      : connector.fetchDoc(link),
     attachmentExtractor: (attachment) =>
       extractAttachmentText(attachment, nativeAttachmentExtractor),
   });

@@ -138,13 +138,24 @@ describe("detectBotMention", () => {
 });
 
 describe("extractDocLinks (Q8)", () => {
-  test("finds docx/wiki links and dedupes", () => {
+  test("finds docx/wiki and ByteTech article links and dedupes", () => {
     const text =
-      "见文档 https://x.feishu.cn/docx/abc123 和 https://x.feishu.cn/wiki/def456 还有 https://x.feishu.cn/docx/abc123";
+      "见文档 https://x.feishu.cn/docx/abc123 和 https://x.feishu.cn/wiki/def456，" +
+      "再读 https://bytetech.info/articles/7525079282028621867，" +
+      "还有 https://x.feishu.cn/docx/abc123";
     expect(extractDocLinks(text)).toEqual([
       "https://x.feishu.cn/docx/abc123",
       "https://x.feishu.cn/wiki/def456",
+      "https://bytetech.info/articles/7525079282028621867",
     ]);
+  });
+
+  test("does not treat lookalike ByteTech hosts or non-article paths as documents", () => {
+    expect(extractDocLinks([
+      "https://bytetech.info.evil.example/articles/123",
+      "https://evil.example/https://bytetech.info/articles/456",
+      "https://bytetech.info/search?q=articles/789",
+    ].join(" "))).toEqual([]);
   });
 
   test("no links -> empty", () => {

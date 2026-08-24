@@ -164,6 +164,7 @@ import {
 } from "./learning-research.ts";
 import {
   regeneratePageFromSources,
+  retryQuarantinedDreamOperation,
   runDreamCycle as distillSpace,
 } from "./dream.ts";
 import { refreshDigest } from "./digest.ts";
@@ -4083,14 +4084,37 @@ export class KnowledgeEngine implements Knowledge {
         };
       }
       let report: DreamReport;
+      const health = this.dreamCycles.get(space) ?? { space, running: false };
+      health.running = true;
+      health.lastStartedAt = Date.now();
+      this.dreamCycles.set(space, health);
       try {
-        report = await this.executeDreamCycle(space, {
-          rawIds: record.rawIds,
-          force: true,
-          model,
-        });
+        report = await retryQuarantinedDreamOperation(
+          store,
+          record,
+          { model },
+          { client: this.agentCallContext(space).client },
+        );
+        this.syncWorkItemPages(space);
+        this.registry.setLastDream(space, report.finishedAt);
+        health.lastExamined = report.examined;
+        health.lastPagesWritten = report.pagesWritten;
+        if (report.errors.length === 0) {
+          health.lastSuccessAt = report.finishedAt;
+          health.lastStatus = "ok";
+          health.lastError = undefined;
+        } else {
+          health.lastFailureAt = report.finishedAt;
+          health.lastStatus = "error";
+          health.lastError = report.errors.join("; ").slice(0, 500);
+        }
       } catch {
+        health.lastFailureAt = Date.now();
+        health.lastStatus = "error";
+        health.lastError = "隔离记录重试未完成";
         return { status: "failed", id, reason: "重试未完成，原隔离记录已保留" };
+      } finally {
+        health.running = false;
       }
       const processed = new Set(report.processedRawIds);
       const allProcessed = record.rawIds.every((rawId) => processed.has(rawId));
@@ -6048,9 +6072,10 @@ export class KnowledgeEngine implements Knowledge {
         ...opts,
         model: executionPlan.model,
         instruction: executionPlan.instruction || undefined,
-        fallbackContext: executionPlan.provider === "codex" && executionPlan.workdir
-          ? "agent-workdir"
-          : undefined,
+        fallbackContext: opts.fallbackContext
+          ?? (executionPlan.provider === "codex" && executionPlan.workdir
+            ? "agent-workdir"
+            : undefined),
       },
       context,
       answerTraceExecution(executionPlan, skillEvidence, traceAgentId),

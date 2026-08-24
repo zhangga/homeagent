@@ -22,6 +22,7 @@
  */
 import type { Attachment } from "@homeagent/shared";
 import type { BotAddedEvent, InboundMessage } from "./connector.ts";
+import { normalizeByteTechArticleUrl } from "./source-links.ts";
 
 export interface FeishuIdentity {
   botName?: string;
@@ -148,10 +149,42 @@ export function detectBotMention(
   return false;
 }
 
-/** Feishu docx/wiki links appearing in message text (for doc sync, Q8). */
+function supportedFeishuDocUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    if (
+      url.protocol !== "https:"
+      || url.username !== ""
+      || url.password !== ""
+      || !(
+        host === "feishu.cn"
+        || host.endsWith(".feishu.cn")
+        || host === "larkoffice.com"
+        || host.endsWith(".larkoffice.com")
+      )
+      || !/^\/(?:docx|wiki|docs)\/[A-Za-z0-9]+(?:[/?#]|$)/u.test(
+        `${url.pathname}${url.search}${url.hash}`,
+      )
+    ) {
+      return undefined;
+    }
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+/** Feishu documents and allowlisted internal articles appearing in a message. */
 export function extractDocLinks(content: string): string[] {
-  const re = /https?:\/\/[^\s)]+\/(?:docx|wiki|docs)\/[A-Za-z0-9]+/g;
-  const found = content.match(re) ?? [];
+  const candidates = content.match(/https?:\/\/[^\s<>()\[\]{}"'，。！？；：、]+/gu) ?? [];
+  const found: string[] = [];
+  for (const candidate of candidates) {
+    const trimmed = candidate.replace(/[，。！？；：、,.!?;:]+$/gu, "");
+    const normalized = normalizeByteTechArticleUrl(trimmed)
+      ?? supportedFeishuDocUrl(trimmed);
+    if (normalized) found.push(normalized);
+  }
   return [...new Set(found)];
 }
 

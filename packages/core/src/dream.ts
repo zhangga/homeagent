@@ -22,7 +22,11 @@
 import type { DreamReport, Page, RawRecord } from "@homeagent/shared";
 import { config, logger } from "@homeagent/shared";
 import type { SpaceStore } from "./space.ts";
-import type { DreamOptions } from "./types.ts";
+import type {
+  DreamOptions,
+  QuarantinedDreamOperation,
+  QuarantineRecord,
+} from "./types.ts";
 import { gatewayClient, type LlmClient } from "./llm.ts";
 import { canonicalSlug } from "./slug.ts";
 import { refreshDigest } from "./digest.ts";
@@ -35,6 +39,8 @@ const log = logger.child("dream");
 
 /** Max pending raw entries analyzed per run (cost bound). */
 const DEFAULT_MAX_ENTRIES = 40;
+const MAX_ANALYZE_SOURCE_CHARACTERS = 48_000;
+const MAX_GENERATE_SOURCE_CHARACTERS = 48_000;
 
 // ---- step 1: analyze -------------------------------------------------------
 
@@ -105,6 +111,15 @@ function validateAnalyze(raw: unknown): AnalyzeResult {
   return { operations, skippedRawIds: (o.skippedRawIds as unknown[]).map(String) };
 }
 
+function planningExcerpt(content: string, maxCharacters: number): string {
+  if (content.length <= maxCharacters) return content;
+  const marker = "\n…[仅规划阶段截取；生成阶段会处理完整来源]…\n";
+  const available = Math.max(0, maxCharacters - marker.length);
+  const head = Math.ceil(available / 2);
+  const tail = Math.floor(available / 2);
+  return `${content.slice(0, head)}${marker}${content.slice(content.length - tail)}`;
+}
+
 function analyzePrompt(store: SpaceStore, batch: RawRecord[]): string {
   const index = store
     .index()
@@ -112,10 +127,14 @@ function analyzePrompt(store: SpaceStore, batch: RawRecord[]): string {
     .filter((r) => !["index", "overview", "log", "glossary"].includes(r.slug))
     .map((r) => `- ${r.slug} (${r.type})：${r.title}｜${r.summary}`)
     .join("\n");
+  const perEntryBudget = Math.max(
+    64,
+    Math.floor(MAX_ANALYZE_SOURCE_CHARACTERS / Math.max(1, batch.length)),
+  );
   const entries = batch
     .map((r) => {
       const meta = [r.source, r.author ? `by ${r.author}` : ""].filter(Boolean).join(" ");
-      return `<entry id="${r.id}" ${meta ? `meta="${meta}"` : ""}>\n${r.content}\n</entry>`;
+      return `<entry id="${r.id}" ${meta ? `meta="${meta}"` : ""}>\n${planningExcerpt(r.content, perEntryBudget)}\n</entry>`;
     })
     .join("\n\n");
   return [
@@ -223,15 +242,62 @@ function resolveSearchMetadata(existing: string[] | undefined, generated: string
   return generated === undefined ? normalizeSearchMetadata(existing ?? []) : generated;
 }
 
+interface SourceFragment {
+  raw: RawRecord;
+  content: string;
+  part: number;
+  totalParts: number;
+}
+
+function splitSourceFragments(sources: RawRecord[]): SourceFragment[] {
+  return sources.flatMap((raw) => {
+    const totalParts = Math.max(1, Math.ceil(raw.content.length / MAX_GENERATE_SOURCE_CHARACTERS));
+    return Array.from({ length: totalParts }, (_, index) => ({
+      raw,
+      content: raw.content.slice(
+        index * MAX_GENERATE_SOURCE_CHARACTERS,
+        (index + 1) * MAX_GENERATE_SOURCE_CHARACTERS,
+      ),
+      part: index + 1,
+      totalParts,
+    }));
+  });
+}
+
+function groupSourceFragments(fragments: SourceFragment[]): SourceFragment[][] {
+  const groups: SourceFragment[][] = [];
+  let current: SourceFragment[] = [];
+  let currentCharacters = 0;
+  for (const fragment of fragments) {
+    if (
+      current.length > 0
+      && currentCharacters + fragment.content.length > MAX_GENERATE_SOURCE_CHARACTERS
+    ) {
+      groups.push(current);
+      current = [];
+      currentCharacters = 0;
+    }
+    current.push(fragment);
+    currentCharacters += fragment.content.length;
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
 function generatePrompt(
   store: SpaceStore,
   op: PlannedOp,
   slug: string,
   existing: Page | null,
-  sources: RawRecord[],
+  sources: SourceFragment[],
 ): string {
   const src = sources
-    .map((r) => `<source id="${r.id}" type="${r.source}">\n${r.content}\n</source>`)
+    .map((fragment) => {
+      const part = fragment.totalParts > 1
+        ? ` part="${fragment.part}/${fragment.totalParts}"`
+        : "";
+      return `<source id="${fragment.raw.id}" type="${fragment.raw.source}"${part}>\n${fragment.content}\n</source>`;
+    })
     .join("\n\n");
   const parts = [
     `请为知识页「${op.title}」(slug: ${slug}, 类型: ${op.type}) 生成完整内容。`,
@@ -251,7 +317,7 @@ function generatePrompt(
       "",
     );
   }
-  if (sources.some((source) => source.source === "manual")) {
+  if (sources.some((source) => source.raw.source === "manual")) {
     parts.push(
       "## 人工纠错规则",
       "标记为 type=\"manual\" 的来源是管理员明确提交的纠错，若与旧内容或更早来源冲突，以人工纠错为准，并移除被纠正的错误说法。",
@@ -301,27 +367,110 @@ async function generate(
   sources: RawRecord[],
   model: string | undefined,
 ): Promise<GeneratedPage> {
-  const { value } = await client.completeJSON<GeneratedPage>({
-    model,
-    system: "你严格按 schema 输出结构化结果，content 为完整 markdown 正文。",
-    prompt: generatePrompt(store, op, slug, existing, sources),
-    schema: GENERATE_SCHEMA as unknown as Record<string, unknown>,
-    validate: validateGenerate,
-    maxTokens: 4096,
-    purpose: "distill",
-    space: store.space,
-  });
-  return value;
+  const groups = groupSourceFragments(splitSourceFragments(sources));
+  let current = existing;
+  let final: GeneratedPage | undefined;
+  for (const group of groups) {
+    const { value } = await client.completeJSON<GeneratedPage>({
+      model,
+      system: "你严格按 schema 输出结构化结果，content 为完整 markdown 正文。",
+      prompt: generatePrompt(store, op, slug, current, group),
+      schema: GENERATE_SCHEMA as unknown as Record<string, unknown>,
+      validate: validateGenerate,
+      maxTokens: 4096,
+      purpose: "distill",
+      space: store.space,
+    });
+    final = {
+      ...value,
+      aliases: resolveSearchMetadata(current?.aliases, value.aliases),
+      tags: resolveSearchMetadata(current?.tags, value.tags),
+    };
+    current = {
+      slug,
+      type: op.type,
+      title: final.title,
+      summary: final.summary,
+      aliases: final.aliases ?? [],
+      tags: final.tags ?? [],
+      sources: [...new Set([...(current?.sources ?? []), ...group.map((item) => item.raw.id)])],
+      links: final.links,
+      content: final.content,
+      updatedAt: Date.now(),
+      contentHash: "",
+    };
+  }
+  if (!final) throw new Error("knowledge page generation has no source content");
+  return final;
+}
+
+function pageBaseHash(page: Page | null): string | null {
+  if (!page) return null;
+  const h = new Bun.CryptoHasher("sha256");
+  h.update(JSON.stringify({
+    slug: page.slug,
+    type: page.type,
+    title: page.title,
+    summary: page.summary,
+    aliases: page.aliases,
+    tags: page.tags,
+    sources: page.sources,
+    links: page.links,
+    content: page.content,
+    contentHash: page.contentHash,
+  }));
+  return h.digest("hex");
+}
+
+function legacyQuarantineOperation(
+  record: QuarantineRecord,
+  existing: Page | null,
+): QuarantinedDreamOperation {
+  const [folder, name, ...extra] = record.slug.split("/");
+  const type = folder === "entities"
+    ? "entity"
+    : folder === "concepts"
+      ? "concept"
+      : folder === "sources"
+        ? "source"
+        : folder === "analysis"
+          ? "analysis"
+          : undefined;
+  if (!type || !name || extra.length > 0 || canonicalSlug(type, name) !== record.slug) {
+    throw new Error("legacy quarantine record has no safe fixed Knowledge page target");
+  }
+  return {
+    type,
+    name,
+    title: existing?.title || name,
+    rawIds: [...record.rawIds],
+    basePageHash: pageBaseHash(existing),
+  };
 }
 
 // ---- quarantine ------------------------------------------------------------
 
-function quarantine(store: SpaceStore, slug: string, err: unknown, sources: RawRecord[]): void {
+function quarantine(
+  store: SpaceStore,
+  slug: string,
+  err: unknown,
+  sources: RawRecord[],
+  op: PlannedOp,
+  existing: Page | null,
+): void {
+  const operation: QuarantinedDreamOperation = {
+    type: op.type,
+    name: op.name,
+    title: op.title,
+    rawIds: sources.map((source) => source.id),
+    basePageHash: pageBaseHash(existing),
+  };
   writeQuarantineRecord(store, {
     slug,
     error: String(err),
-    rawIds: sources.map((source) => source.id),
+    rawIds: operation.rawIds,
     createdAt: Date.now(),
+    operation,
   });
   log.warn("quarantined bad page", { space: store.space, slug, err: String(err) });
 }
@@ -394,10 +543,111 @@ export async function regeneratePageFromSources(
     return page;
   } catch (error) {
     removeQuarantineRecordsCoveredBy(store, slug, availableRawIds);
-    quarantine(store, slug, error, sources);
+    quarantine(store, slug, error, sources, op, existing);
     store.index().markIngested([...availableRawIds]);
     throw error;
   }
+}
+
+/** Retry exactly the generate operation captured by a quarantine record. */
+export async function retryQuarantinedDreamOperation(
+  store: SpaceStore,
+  record: QuarantineRecord,
+  opts: { model?: string } = {},
+  deps: DreamDeps = {},
+): Promise<DreamReport> {
+  const startedAt = Date.now();
+  const report: DreamReport = {
+    space: store.space,
+    examined: record.rawIds.length,
+    processedRawIds: [],
+    distilled: 0,
+    skipped: 0,
+    pagesWritten: 0,
+    pagesQuarantined: 0,
+    startedAt,
+    finishedAt: startedAt,
+    errors: [],
+  };
+  const existing = store.index().getPage(record.slug);
+  const operation = record.operation ?? legacyQuarantineOperation(record, existing);
+  if (canonicalSlug(operation.type, operation.name) !== record.slug) {
+    throw new Error("quarantine operation does not match its Knowledge page slug");
+  }
+  if (
+    operation.rawIds.length !== record.rawIds.length
+    || operation.rawIds.some((rawId, index) => rawId !== record.rawIds[index])
+  ) {
+    throw new Error("quarantine operation does not match its Raw sources");
+  }
+  const sources = store.index().listRawByIds(operation.rawIds, {
+    onlyPending: false,
+    onlyAdmitted: true,
+  });
+  if (sources.length !== operation.rawIds.length) {
+    throw new Error("quarantine operation Raw sources are unavailable");
+  }
+  if (pageBaseHash(existing) !== operation.basePageHash) {
+    throw new Error("quarantine operation Knowledge page base has changed");
+  }
+  const op: PlannedOp = {
+    type: operation.type,
+    name: operation.name,
+    title: operation.title,
+    rawIds: [...operation.rawIds],
+  };
+  const client = deps.client ?? gatewayClient;
+  const model = opts.model ?? config().model;
+  try {
+    const generated = await generate(
+      client,
+      store,
+      op,
+      record.slug,
+      existing,
+      sources,
+      model,
+    );
+    const page: Page = {
+      slug: record.slug,
+      type: operation.type,
+      title: generated.title,
+      summary: generated.summary,
+      aliases: resolveSearchMetadata(existing?.aliases, generated.aliases),
+      tags: resolveSearchMetadata(existing?.tags, generated.tags),
+      sources: [...new Set([...(existing?.sources ?? []), ...operation.rawIds])],
+      links: generated.links,
+      content: `${generated.content.trimEnd()}\n`,
+      updatedAt: Date.now(),
+      contentHash: sourceHash(sources, existing),
+    };
+    store.writePage(page);
+    try {
+      refreshDigest(store);
+    } catch (error) {
+      if (existing) store.writePage(existing);
+      else store.deletePage(record.slug);
+      refreshDigest(store);
+      throw error;
+    }
+    store.index().markIngested(operation.rawIds);
+    report.processedRawIds = [...operation.rawIds];
+    report.distilled = operation.rawIds.length;
+    report.pagesWritten = 1;
+  } catch (error) {
+    quarantine(store, record.slug, error, sources, op, existing);
+    store.index().markIngested(operation.rawIds);
+    report.processedRawIds = [...operation.rawIds];
+    report.pagesQuarantined = 1;
+    report.errors.push(`generate ${record.slug} failed: ${String(error)}`);
+  }
+  report.finishedAt = Date.now();
+  try {
+    appendLog(store, report);
+  } catch (error) {
+    report.errors.push(`log failed: ${String(error)}`);
+  }
+  return report;
 }
 
 function appendLog(store: SpaceStore, report: DreamReport): void {
@@ -534,7 +784,7 @@ export async function runDreamCycle(
     } catch (err) {
       throwIfAborted();
       report.pagesQuarantined += 1;
-      quarantine(store, slug, err, sources);
+      quarantine(store, slug, err, sources, op, existing);
       // Mark contributing raw ingested so a permanently-bad entry does not
       // re-trigger the same failure (and cost) every cycle; it is preserved in
       // the quarantine record.

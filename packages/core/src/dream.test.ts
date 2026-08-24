@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpaceId } from "@homeagent/shared";
@@ -8,6 +16,7 @@ import { SpaceStore } from "./space.ts";
 import { regeneratePageFromSources, runDreamCycle, isCacheHit } from "./dream.ts";
 import { FakeLlm } from "./testing.ts";
 import type { Page } from "@homeagent/shared";
+import { makeCliClient } from "./cli-client.ts";
 
 let dir: string;
 let store: SpaceStore;
@@ -30,6 +39,42 @@ afterEach(() => {
 
 function seedRaw(content: string): string {
   return store.index().insertRaw({ space: SPACE, source: "message", content });
+}
+
+function writeDreamCodexProvider(directory: string): { bin: string; calls: string } {
+  const script = join(directory, "dream-codex.js");
+  const bin = join(directory, process.platform === "win32" ? "dream-codex.cmd" : "dream-codex");
+  const calls = join(directory, "dream-codex-calls.jsonl");
+  writeFileSync(script, [
+    'const { appendFileSync, existsSync, writeFileSync } = require("node:fs");',
+    "const args = process.argv.slice(2);",
+    'const schemaIndex = args.indexOf("--output-schema");',
+    'const outputIndex = args.findIndex((arg) => arg === "-o" || arg === "--output-last-message");',
+    'if (schemaIndex < 0 || !existsSync(args[schemaIndex + 1])) { process.stderr.write("missing schema"); process.exit(41); }',
+    'if (outputIndex < 0 || !args[outputIndex + 1]) { process.stderr.write("missing final output"); process.exit(42); }',
+    "let prompt = '';",
+    'process.stdin.setEncoding("utf8");',
+    "process.stdin.on('data', (chunk) => { prompt += chunk; });",
+    "process.stdin.on('end', () => {",
+    `  appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ args, prompt }) + "\\n");`,
+    '  if (prompt.includes("## JSON Schema")) { process.stderr.write("schema duplicated in prompt"); process.exitCode = 43; return; }',
+    '  const rawId = /<(?:entry|source) id="([^"]+)"/.exec(prompt)?.[1];',
+    '  const value = prompt.includes("## 待提炼的原始条目")',
+    "    ? { operations: [{ type: 'concept', name: 'cli-seam', title: 'CLI Seam', rawIds: [rawId] }], skippedRawIds: [] }",
+    "    : { title: 'CLI Seam', summary: '结构化边界已贯通。', aliases: [], tags: [], links: [], content: '# CLI Seam\\n\\n结构化边界已贯通。' };",
+    '  writeFileSync(args[outputIndex + 1], JSON.stringify(value), "utf8");',
+    "  process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 20, output_tokens: 10 } }));",
+    "});",
+  ].join("\n"), "utf8");
+  writeFileSync(
+    bin,
+    process.platform === "win32"
+      ? `@echo off\r\n"${process.execPath}" "%~dp0\\dream-codex.js" %*\r\n`
+      : `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/dream-codex.js" "$@"\n`,
+    "utf8",
+  );
+  if (process.platform !== "win32") chmodSync(bin, 0o755);
+  return { bin, calls };
 }
 
 describe("runDreamCycle", () => {
@@ -102,6 +147,80 @@ describe("runDreamCycle", () => {
     expect(generationPrompt).toContain("不要为了提高检索召回而臆造");
     // raw marked ingested
     expect(store.index().countRaw(true)).toBe(0);
+  });
+
+  test("distills every part of a long Raw through bounded provider prompts", async () => {
+    const markers = ["BEGIN_MARKER", "MIDDLE_MARKER", "END_MARKER"];
+    const id = seedRaw([
+      markers[0],
+      "甲".repeat(55_000),
+      markers[1],
+      "乙".repeat(55_000),
+      markers[2],
+    ].join("\n"));
+    const fake = new FakeLlm();
+    let generation = 0;
+    fake.onJSON((opts) => {
+      if (opts.prompt?.includes("## 待提炼的原始条目")) {
+        return {
+          operations: [{ type: "source", name: "long-raw", title: "Long Raw", rawIds: [id] }],
+          skippedRawIds: [],
+        };
+      }
+      generation += 1;
+      return {
+        title: "Long Raw",
+        summary: "长资料已分段提炼。",
+        aliases: [],
+        tags: [],
+        links: [],
+        content: `# Long Raw\n\n已合并第 ${generation} 段。`,
+      };
+    });
+
+    const report = await runDreamCycle(store, {}, { client: fake });
+
+    const prompts = fake.calls
+      .filter((call) => call.kind === "json")
+      .map((call) => call.opts.prompt ?? "");
+    const generationPrompts = prompts.filter((prompt) => prompt.includes("## 相关原始来源"));
+    expect(report.pagesWritten).toBe(1);
+    expect(generationPrompts.length).toBeGreaterThan(1);
+    expect(prompts.every((prompt) => prompt.length <= 100_000)).toBe(true);
+    for (const marker of markers) {
+      expect(generationPrompts.some((prompt) => prompt.includes(marker))).toBe(true);
+    }
+  });
+
+  test("distills through the real Codex CLI adapter final-artifact seam", async () => {
+    const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const provider = writeDreamCodexProvider(dir);
+    process.env.HOMEAGENT_CODEX_BIN = provider.bin;
+    try {
+      const rawId = seedRaw("结构化输出应从最终产物文件进入 Dream。");
+      const client = makeCliClient("codex", "", dir);
+
+      const report = await runDreamCycle(store, {}, { client });
+
+      expect(report).toEqual(expect.objectContaining({
+        pagesWritten: 1,
+        pagesQuarantined: 0,
+      }));
+      expect(store.index().getPage("concepts/cli-seam")).toEqual(expect.objectContaining({
+        sources: [rawId],
+        content: "# CLI Seam\n\n结构化边界已贯通。\n",
+      }));
+      const calls = readFileSync(provider.calls, "utf8")
+        .trim()
+        .split(/\r?\n/u)
+        .map((line) => JSON.parse(line) as { args: string[]; prompt: string });
+      expect(calls).toHaveLength(2);
+      expect(calls.every((call) => call.args.includes("-o"))).toBe(true);
+      expect(calls.every((call) => !call.prompt.includes("## JSON Schema"))).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+      else process.env.HOMEAGENT_CODEX_BIN = previous;
+    }
   });
 
   test("source-grounded aliases survive Dream and become FTS candidates", async () => {

@@ -111,6 +111,8 @@ export HOMEAGENT_WEB_ADMIN_TOKEN=replace-with-a-strong-secret
 # 可选：精确 @ 识别（否则群内任意 @ 都视为叫机器人）
 export HOMEAGENT_FEISHU_BOT_NAME=homeagent
 export HOMEAGENT_FEISHU_BOT_OPEN_ID=ou_xxx
+# 可选：已安装并登录的 bytedcli；用于只读同步 ByteTech 文章正文
+export HOMEAGENT_BYTEDCLI_BIN=/absolute/path/to/bytedcli
 ```
 
 改名前的 `HOMEBRAIN_*` 环境变量仍可读取；若新旧变量同时存在，以 `HOMEAGENT_*` 为准。
@@ -382,6 +384,9 @@ bun run smoke:macos --app dist/HomeAgent.app
 ### 附件提炼（P2 首版）
 
 飞书直接发送的图片和文件消息会通过 bot 身份下载并在本机提取文字，再作为同一条消息的原始材料进入知识库。
+消息中的飞书 docx/wiki 链接会通过现有用户授权同步；`https://bytetech.info/articles/*` 链接会在运行环境已安装并登录
+`bytedcli` 时通过固定的只读 `insearch get` 命令同步。同步成功的正文会作为同一消息的 `doc` Raw 保存，并立即作为
+本次回答上下文；同步失败时机器人只说明正文未读取，不会让普通 Chat 放宽沙箱后重试，也不会假装已理解全文。
 首版支持 UTF-8 编码的 `.txt`、`.md`、`.markdown`、`.csv`、`.json`、`.log` 文件、图片 OCR，
 以及 PDF 已有文本层的提取；扫描版 PDF 不会自动执行 OCR。单个附件下载上限为 20 MiB，
 每个附件最多保留 200,000 个提取字符，超限、损坏或不支持的附件会安全跳过，不影响原消息收录和回复。
@@ -392,7 +397,7 @@ bun run smoke:macos --app dist/HomeAgent.app
 都会覆盖这些派生记录。macOS 使用系统自带的 Vision/PDFKit；其他平台仍可提取上述 UTF-8 文本文件，
 但会安全跳过图片 OCR 和 PDF 文本提取。音频转写、Office 文件、视频理解和 `post` 消息内嵌资源暂不支持。
 
-> **CLI-only 的代价（务必知悉）**：这些本机 CLI 单次调用**慢、开销大**，dream 批量提炼会明显变慢；它们**自带鉴权和模型选择**，不一定尊重 HomeAgent 里选择的 model。普通聊天和任务会获得完整兼容 Skill 目录；提炼与后台学习仍使用严格 no-tools 调用，TRAE 仅用于显式任务。dream 的结构化抽取靠“让 CLI 只输出 JSON + 解析校验 + 失败隔离（quarantine）”，偶有条目建不出页。失败记录会持续显示在对应空间的“提炼失败”页，并让知识健康状态降级但不阻断 `/readyz`；可单条或批量重试，且每次只处理该记录关联的原始来源，不会连带重跑无关消息。恢复所需来源不会被原始消息保留策略清理；若来源被撤回，旧失败记录会移除，仍有效的其他来源会重新进入待提炼队列。CLI 未报告的成本会明确记为未知，因此无法仅靠美元预算对这部分调用执行硬限制。
+> **CLI-only 的代价（务必知悉）**：这些本机 CLI 单次调用**慢、开销大**，dream 批量提炼会明显变慢；它们**自带鉴权和模型选择**，不一定尊重 HomeAgent 里选择的 model。普通聊天和任务会获得完整兼容 Skill 目录；提炼与后台学习仍使用严格 no-tools 调用，TRAE 仅用于显式任务。dream 的结构化抽取使用 Provider 的最终结果通道（Codex 使用 `--output-schema` + `--output-last-message`）并在 Core 做业务校验；长 Raw 不会整份塞入单次生成请求，而会按固定大小分段、逐步合并为同一份完整知识页。失败记录会冻结原 Knowledge page 生成计划并持续显示在对应空间的“提炼失败”页，使知识健康状态降级但不阻断 `/readyz`；单条或批量重试只重做失败的 generate，不会重新 analyze、改换目标页或连带处理无关消息。恢复所需来源不会被原始消息保留策略清理；若来源被撤回，旧失败记录会移除，仍有效的其他来源会重新进入待提炼队列。CLI 未报告的成本会明确记为未知，因此无法仅靠美元预算对这部分调用执行硬限制。
 
 ### 生产启动（接真实飞书）
 

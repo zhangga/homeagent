@@ -160,7 +160,7 @@ export interface AskResult {
   answer: string;
   source: "knowledge" | "general";
   /** Non-KB context boundary used for the answer; never contains the actual path. */
-  context?: "agent-workdir";
+  context?: "agent-workdir" | "message-source";
   citations: Citation[];
   /** Durable local quality trace used for explicit answer feedback. */
   traceId?: string;

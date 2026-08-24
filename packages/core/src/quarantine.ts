@@ -11,13 +11,54 @@ import {
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { SpaceStore } from "./space.ts";
-import type { QuarantineRecord } from "./types.ts";
+import type { QuarantinedDreamOperation, QuarantineRecord } from "./types.ts";
 
 export interface NewQuarantineRecord {
   slug: string;
   error: string;
   rawIds: string[];
   createdAt: number;
+  operation?: QuarantinedDreamOperation;
+}
+
+const MAX_QUARANTINE_ERROR_CHARACTERS = 4_000;
+const MAX_QUARANTINE_RAW_IDS = 40;
+const MAX_QUARANTINE_IDENTIFIER_CHARACTERS = 240;
+
+function rawIds(value: unknown): string[] {
+  return Array.isArray(value)
+    ? [...new Set(value
+        .filter((item): item is string =>
+          typeof item === "string"
+          && item.length > 0
+          && item.length <= MAX_QUARANTINE_IDENTIFIER_CHARACTERS)
+        .slice(0, MAX_QUARANTINE_RAW_IDS))]
+    : [];
+}
+
+function operation(value: unknown): QuarantinedDreamOperation | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const item = value as Record<string, unknown>;
+  if (
+    !["entity", "concept", "source", "analysis"].includes(String(item.type))
+    || typeof item.name !== "string"
+    || !item.name.trim()
+    || item.name.length > MAX_QUARANTINE_IDENTIFIER_CHARACTERS
+    || typeof item.title !== "string"
+    || !item.title.trim()
+    || item.title.length > MAX_QUARANTINE_IDENTIFIER_CHARACTERS
+    || (item.basePageHash !== null
+      && (typeof item.basePageHash !== "string" || !/^[a-f0-9]{64}$/u.test(item.basePageHash)))
+  ) return undefined;
+  const plannedRawIds = rawIds(item.rawIds);
+  if (plannedRawIds.length === 0) return undefined;
+  return {
+    type: item.type as QuarantinedDreamOperation["type"],
+    name: item.name.trim(),
+    title: item.title.trim(),
+    rawIds: plannedRawIds,
+    basePageHash: item.basePageHash as string | null,
+  };
 }
 
 function directory(store: SpaceStore): string {
@@ -77,18 +118,25 @@ function parseRecord(store: SpaceStore, id: string, path: string): QuarantineRec
       ? value.slug.trim()
       : "（未知知识页）";
     const error = typeof value.error === "string" && value.error.trim()
-      ? value.error.trim()
+      ? value.error.trim().slice(0, MAX_QUARANTINE_ERROR_CHARACTERS)
       : "未知提炼错误";
-    const rawIds = Array.isArray(value.rawIds)
-      ? [...new Set(value.rawIds.filter((item): item is string => typeof item === "string" && item.length > 0))]
-      : [];
+    const recordRawIds = rawIds(value.rawIds);
     const legacyCreatedAt = typeof value.at === "string" ? Date.parse(value.at) : Number.NaN;
     const createdAt = typeof value.createdAt === "number" && Number.isFinite(value.createdAt)
       ? value.createdAt
       : Number.isFinite(legacyCreatedAt)
         ? legacyCreatedAt
         : fallbackCreatedAt;
-    return { id, space: store.space, slug, error, rawIds, createdAt };
+    const frozenOperation = operation(value.operation);
+    return {
+      id,
+      space: store.space,
+      slug,
+      error,
+      rawIds: recordRawIds,
+      createdAt,
+      ...(frozenOperation ? { operation: frozenOperation } : {}),
+    };
   } catch (error) {
     return invalidRecord(store, id, fallbackCreatedAt, String(error));
   }
@@ -118,6 +166,26 @@ export function writeQuarantineRecord(
   store: SpaceStore,
   input: NewQuarantineRecord,
 ): QuarantineRecord {
+  const slug = input.slug.trim();
+  if (!slug || slug.length > MAX_QUARANTINE_IDENTIFIER_CHARACTERS || slug.includes("\0")) {
+    throw new Error("invalid quarantine Knowledge page slug");
+  }
+  if (!Number.isFinite(input.createdAt) || input.createdAt < 0) {
+    throw new Error("invalid quarantine creation time");
+  }
+  const recordRawIds = rawIds(input.rawIds);
+  if (recordRawIds.length === 0) throw new Error("quarantine record requires Raw sources");
+  const frozenOperation = input.operation === undefined ? undefined : operation(input.operation);
+  if (input.operation !== undefined && !frozenOperation) {
+    throw new Error("invalid frozen Dream operation");
+  }
+  if (
+    frozenOperation
+    && (
+      frozenOperation.rawIds.length !== recordRawIds.length
+      || frozenOperation.rawIds.some((rawId, index) => rawId !== recordRawIds[index])
+    )
+  ) throw new Error("frozen Dream operation does not match quarantine Raw sources");
   const dir = directory(store);
   mkdirSync(dir, { recursive: true });
   if (!isSafeDirectory(store)) throw new Error("unsafe quarantine directory");
@@ -127,10 +195,11 @@ export function writeQuarantineRecord(
   const record: QuarantineRecord = {
     id,
     space: store.space,
-    slug: input.slug,
-    error: input.error,
-    rawIds: [...new Set(input.rawIds)],
+    slug,
+    error: input.error.trim().slice(0, MAX_QUARANTINE_ERROR_CHARACTERS) || "未知提炼错误",
+    rawIds: recordRawIds,
     createdAt: input.createdAt,
+    ...(frozenOperation ? { operation: frozenOperation } : {}),
   };
   writeFileSync(temporary, `${JSON.stringify(record, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   renameSync(temporary, path);

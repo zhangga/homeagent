@@ -38,7 +38,7 @@ export interface InboundMessage {
   messageType?: string;
   /** true when the bot was @-mentioned (group gating, Q2) */
   mentionsBot: boolean;
-  /** doc links found in the message (docx tokens/urls), for doc sync (Q8) */
+  /** allowlisted source links found in the message, for durable source sync */
   docLinks?: string[];
   /** epoch ms */
   createdAt: number;

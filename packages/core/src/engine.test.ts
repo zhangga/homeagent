@@ -3890,7 +3890,7 @@ describe("Knowledge seam contract", () => {
     ]);
   });
 
-  test("a quarantined distillation can be retried without processing unrelated raw", async () => {
+  test("a quarantined distillation retries its frozen generate plan without re-analysis", async () => {
     engine.close();
     const fake = new FakeLlm();
     engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
@@ -3911,11 +3911,17 @@ describe("Knowledge seam contract", () => {
     fake.queueJSON({ title: "Retry Me", summary: "", content: "   " });
     await engine.runDreamCycle(SPACE, { rawIds: [rawId] });
     const record = (await engine.listQuarantines(SPACE))[0]!;
+    expect(record).toEqual(expect.objectContaining({
+      operation: expect.objectContaining({
+        type: "concept",
+        name: "retry-me",
+        title: "Retry Me",
+        rawIds: [rawId],
+      }),
+    }));
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
 
-    fake.queueJSON({
-      operations: [{ type: "concept", name: "retry-me", title: "Retry Me", rawIds: [rawId] }],
-      skippedRawIds: [],
-    });
     fake.queueJSON({
       title: "Retry Me",
       summary: "恢复成功",
@@ -3931,6 +3937,64 @@ describe("Knowledge seam contract", () => {
     expect(await engine.listQuarantines(SPACE)).toEqual([]);
     expect(await engine.getPage(SPACE, "concepts/retry-me")).not.toBeNull();
     expect(engine.registry.store(SPACE).index().countRaw(true)).toBe(1);
+    expect(fake.calls.filter((call) => call.opts.prompt?.includes("## 待提炼的原始条目")))
+      .toHaveLength(1);
+    expect((await engine.health()).details?.dreamCycles).toEqual([
+      expect.objectContaining({
+        space: SPACE,
+        running: false,
+        lastStatus: "ok",
+        lastSuccessAt: expect.any(Number),
+        lastPagesWritten: 1,
+      }),
+    ]);
+  });
+
+  test("a legacy quarantine upgrades its fixed slug without re-analysis", async () => {
+    engine.close();
+    const fake = new FakeLlm();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "message",
+      content: "旧失败记录也应安全恢复",
+    });
+    fake.queueJSON({
+      operations: [{ type: "concept", name: "legacy-retry", title: "Legacy Retry", rawIds: [rawId] }],
+      skippedRawIds: [],
+    });
+    fake.queueJSON({ title: "Legacy Retry", summary: "", content: "" });
+    await engine.runDreamCycle(SPACE);
+    const record = (await engine.listQuarantines(SPACE))[0]!;
+    writeFileSync(
+      join(engine.registry.store(SPACE).root, "quarantine", `${record.id}.json`),
+      `${JSON.stringify({
+        id: record.id,
+        space: record.space,
+        slug: record.slug,
+        error: record.error,
+        rawIds: record.rawIds,
+        createdAt: record.createdAt,
+      }, null, 2)}\n`,
+      "utf8",
+    );
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    fake.queueJSON({
+      title: "Legacy Retry",
+      summary: "旧记录恢复成功",
+      aliases: [],
+      tags: [],
+      links: [],
+      content: "# Legacy Retry\n\n旧记录恢复成功。",
+    });
+
+    const result = await engine.retryQuarantine(SPACE, record.id);
+
+    expect(result.status).toBe("recovered");
+    expect(await engine.getPage(SPACE, "concepts/legacy-retry")).not.toBeNull();
+    expect(fake.calls.filter((call) => call.opts.prompt?.includes("## 待提炼的原始条目")))
+      .toHaveLength(1);
   });
 
   test("quarantine retry refuses a source that is no longer admitted", async () => {
@@ -3962,7 +4026,7 @@ describe("Knowledge seam contract", () => {
     expect(await engine.listQuarantines(SPACE)).toEqual([record]);
   });
 
-  test("an analysis failure keeps the quarantine and returns a fixed public reason", async () => {
+  test("a retry generation failure replaces the quarantine and returns a fixed public reason", async () => {
     engine.close();
     const fake = new FakeLlm();
     engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
@@ -3981,9 +4045,9 @@ describe("Knowledge seam contract", () => {
     const result = await engine.retryQuarantine(SPACE, record.id);
 
     expect(result.status).toBe("failed");
-    expect(result.reason).toBe("重试未完成，原隔离记录已保留");
+    expect(result.reason).toBe("重试仍未生成有效知识页，已保留新的失败记录");
     expect(result.reason).not.toContain("private provider detail");
-    expect((await engine.listQuarantines(SPACE)).map((item) => item.id)).toEqual([record.id]);
+    expect((await engine.listQuarantines(SPACE)).map((item) => item.id)).not.toContain(record.id);
   });
 
   test("a missing source keeps the quarantine and returns a fixed public reason", async () => {
@@ -4021,7 +4085,7 @@ describe("Knowledge seam contract", () => {
     await engine.runDreamCycle(SPACE);
     const original = (await engine.listQuarantines(SPACE))[0]!;
 
-    fake.queueJSON(analyze).queueJSON({ title: "Still Bad", summary: "", content: "" });
+    fake.queueJSON({ title: "Still Bad", summary: "", content: "" });
     const result = await engine.retryQuarantine(SPACE, original.id);
     const remaining = await engine.listQuarantines(SPACE);
 
@@ -4050,8 +4114,15 @@ describe("Knowledge seam contract", () => {
     await engine.runDreamCycle(SPACE);
     expect(await engine.listQuarantines(SPACE)).toHaveLength(2);
     fake.onJSON((options) => {
-      const rawIds = [first, second].filter((id) => options.prompt?.includes(id));
-      return { operations: [], skippedRawIds: rawIds };
+      const isFirst = options.prompt?.includes(first) ?? false;
+      return {
+        title: isFirst ? "First" : "Second",
+        summary: "恢复成功",
+        aliases: [],
+        tags: [],
+        links: [],
+        content: `# ${isFirst ? "First" : "Second"}\n\n恢复成功。`,
+      };
     });
 
     expect(await engine.retryQuarantines(SPACE)).toEqual(expect.objectContaining({
@@ -4060,6 +4131,8 @@ describe("Knowledge seam contract", () => {
       failed: 0,
     }));
     expect(await engine.listQuarantines(SPACE)).toEqual([]);
+    expect(fake.calls.filter((call) => call.opts.prompt?.includes("## 待提炼的原始条目")))
+      .toHaveLength(1);
   });
 
   test("legacy and malformed quarantine files remain visible", async () => {

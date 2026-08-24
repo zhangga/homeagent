@@ -19,6 +19,16 @@
  * gateway.ts, not here; it is always available and is the default.
  */
 import { brandedEnv, logger } from "@homeagent/shared";
+import {
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  rmdirSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { MANAGED_CODEX_AUTH_ARGS } from "./provider-setup.ts";
 import type { ImageInput } from "./gateway.ts";
 
@@ -123,7 +133,7 @@ interface CliSpec {
    * are folded in per CLI; Codex reads its prompt from stdin so Windows npm
    * command shims cannot truncate multiline input.
    */
-  buildRun: (input: RunInput) => string[];
+  buildRun: (input: PreparedRunInput) => string[];
 }
 
 export interface RunInput {
@@ -139,6 +149,15 @@ export interface RunInput {
   workdir?: string;
   /** Present for Chat, Task, or explicit web-research grants; absent for distillation. */
   execution?: ProviderExecution;
+  /** Final-response contract for providers with native structured-output support. */
+  outputSchema?: Record<string, unknown>;
+  /** Caller output budget, enforced locally when the CLI has no native flag. */
+  maxTokens?: number;
+}
+
+interface PreparedRunInput extends RunInput {
+  outputSchemaPath?: string;
+  outputLastMessagePath?: string;
 }
 
 export class UnsupportedImageInputError extends Error {
@@ -294,7 +313,14 @@ const KNOWN: CliSpec[] = [
       "gpt-5.4-mini",
       "gpt-5.3-codex-spark",
     ],
-    buildRun: ({ model, reasoningEffort, images, execution }) => {
+    buildRun: ({
+      model,
+      reasoningEffort,
+      images,
+      execution,
+      outputSchemaPath,
+      outputLastMessagePath,
+    }) => {
       // Chat and Task execution reach this adapter. Ephemeral mode and ignored
       // ambient config/rules isolate each one-shot from global state.
       const args: string[] = ["-c", 'approval_policy="never"'];
@@ -313,6 +339,8 @@ const KNOWN: CliSpec[] = [
         sandbox,
       );
       args.push("--skip-git-repo-check");
+      if (outputSchemaPath) args.push("--output-schema", outputSchemaPath);
+      if (outputLastMessagePath) args.push("-o", outputLastMessagePath);
       if (model) args.push("-m", model);
       for (const image of images ?? []) args.push("--image", image.path);
       // Codex's --image accepts multiple values. Terminate option parsing
@@ -358,6 +386,12 @@ const CLAUDE_ORDINARY_REQUIRED_FLAGS = [
 const MAX_CLAUDE_AUTH_STATUS_BYTES = 16 * 1024;
 const CLAUDE_AUTH_UNAVAILABLE_DETAIL = "Claude 认证不可用";
 const CODEX_AUTH_UNAVAILABLE_DETAIL = "ChatGPT 尚未连接";
+
+function codexAuthArgsForCurrentBinary(): readonly string[] {
+  return brandedEnv(process.env, "CODEX_BIN")?.trim()
+    ? MANAGED_CODEX_AUTH_ARGS
+    : [];
+}
 
 function missingClaudeOrdinaryFlags(help: string): string[] {
   const flags = new Set(help.match(/--?[a-zA-Z][a-zA-Z0-9-]*/gu) ?? []);
@@ -463,7 +497,7 @@ export async function detectProviders(timeoutMs = 6000): Promise<DetectedProvide
           try {
             authProbe = await runCmd(
               bin,
-              [...MANAGED_CODEX_AUTH_ARGS, "login", "status"],
+              [...codexAuthArgsForCurrentBinary(), "login", "status"],
               timeoutMs,
             );
           } catch {
@@ -664,6 +698,140 @@ function injectProviderSkills(id: ProviderId, input: RunInput): RunInput {
   };
 }
 
+const MAX_CODEX_OUTPUT_SCHEMA_BYTES = 64 * 1024;
+const MAX_CODEX_FINAL_OUTPUT_BYTES = 1024 * 1024;
+
+function isSchemaObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function schemaAllowsNull(value: unknown): boolean {
+  if (!isSchemaObject(value)) return false;
+  const type = value.type;
+  if (type === "null" || (Array.isArray(type) && type.includes("null"))) return true;
+  for (const keyword of ["anyOf", "oneOf"] as const) {
+    const alternatives = value[keyword];
+    if (Array.isArray(alternatives) && alternatives.some(schemaAllowsNull)) return true;
+  }
+  return false;
+}
+
+/** Adapt caller JSON Schema to the strict subset required by Codex output schemas. */
+function strictCodexOutputSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(strictCodexOutputSchema);
+  if (!isSchemaObject(value)) return value;
+
+  const properties = isSchemaObject(value.properties) ? value.properties : undefined;
+  const required = new Set(
+    Array.isArray(value.required)
+      ? value.required.filter((item): item is string => typeof item === "string")
+      : [],
+  );
+  const schemaType = value.type;
+  const isObject = schemaType === "object"
+    || (Array.isArray(schemaType) && schemaType.includes("object"));
+  const normalized: Record<string, unknown> = {};
+
+  for (const [key, child] of Object.entries(value)) {
+    if (isObject && (key === "required" || key === "additionalProperties")) continue;
+    if (isObject && key === "properties" && properties) {
+      normalized.properties = Object.fromEntries(
+        Object.entries(properties).map(([name, propertySchema]) => {
+          const normalizedProperty = strictCodexOutputSchema(propertySchema);
+          return [
+            name,
+            required.has(name) || schemaAllowsNull(normalizedProperty)
+              ? normalizedProperty
+              : { anyOf: [normalizedProperty, { type: "null" }] },
+          ];
+        }),
+      );
+      continue;
+    }
+    normalized[key] = strictCodexOutputSchema(child);
+  }
+
+  if (isObject) {
+    if (properties) normalized.required = Object.keys(properties);
+    normalized.additionalProperties = false;
+  }
+  return normalized;
+}
+
+function stageCodexOutputSchema(schema: Record<string, unknown>): {
+  schemaPath: string;
+  outputPath: string;
+  cleanup: () => void;
+} {
+  const serialized = JSON.stringify(strictCodexOutputSchema(schema));
+  if (Buffer.byteLength(serialized, "utf8") > MAX_CODEX_OUTPUT_SCHEMA_BYTES) {
+    throw new Error("provider output schema exceeds the supported size");
+  }
+  const directory = mkdtempSync(join(tmpdir(), "homeagent-codex-schema-"));
+  const schemaPath = join(directory, "output-schema.json");
+  const outputPath = join(directory, "final-output.json");
+  try {
+    writeFileSync(schemaPath, `${serialized}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  } catch (error) {
+    try {
+      rmdirSync(directory);
+    } catch {
+      // Preserve the staging failure if best-effort cleanup also fails.
+    }
+    throw error;
+  }
+  return {
+    schemaPath,
+    outputPath,
+    cleanup: () => {
+      let failed = false;
+      for (const path of [outputPath, schemaPath]) {
+        try {
+          unlinkSync(path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") failed = true;
+        }
+      }
+      try {
+        rmdirSync(directory);
+      } catch {
+        failed = true;
+      }
+      if (failed) log.warn("Codex output schema cleanup failed");
+    },
+  };
+}
+
+function codexFinalOutputLimit(maxTokens: number | undefined): number {
+  if (maxTokens === undefined || !Number.isFinite(maxTokens) || maxTokens <= 0) {
+    return MAX_CODEX_FINAL_OUTPUT_BYTES;
+  }
+  // Codex exposes no output-token argv. Keep enough room for UTF-8/JSON
+  // expansion while enforcing the caller's budget as a bounded local artifact.
+  return Math.min(
+    MAX_CODEX_FINAL_OUTPUT_BYTES,
+    Math.max(16 * 1024, Math.ceil(maxTokens) * 16),
+  );
+}
+
+function readCodexFinalOutput(path: string, maxTokens?: number): string {
+  let metadata: ReturnType<typeof lstatSync>;
+  try {
+    metadata = lstatSync(path);
+  } catch {
+    throw new Error("provider codex did not write its final output");
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error("provider codex returned an invalid final output file");
+  }
+  if (metadata.size > codexFinalOutputLimit(maxTokens)) {
+    throw new Error("provider codex final output exceeds the requested output budget");
+  }
+  const text = readFileSync(path, "utf8").trim();
+  if (!text) throw new Error("provider codex returned an empty final output");
+  return text;
+}
+
 /**
  * Run a one-shot completion via a local CLI provider with normalized usage.
  * Throws on non-zero exit / timeout so callers can surface a bounded failure.
@@ -700,56 +868,76 @@ export async function runProviderDetailed(
       "provider codex cannot isolate web search from local file tools",
     );
   }
-  const args = spec.buildRun(prepared);
-  if (id === "codex" && brandedEnv(process.env, "CODEX_BIN")?.trim()) {
-    args.unshift(...MANAGED_CODEX_AUTH_ARGS);
-  }
-  const bin = providerBin(spec);
-  log.info("running local provider", { id, bin });
-  const { code, stdout, stderr, timedOut, aborted } = await runCmd(
-    bin,
-    args,
-    timeoutMs,
-    signal,
-    prepared.execution?.workdir ?? prepared.workdir,
-    id === "codex" ? prepared.prompt : undefined,
-  );
-  if (aborted) throw signal?.reason ?? new Error(`provider ${id} cancelled`);
-  if (timedOut) throw new Error(`provider ${id} timed out after ${timeoutMs}ms`);
-  if (code !== 0) {
+  const stagedSchema = id === "codex" && prepared.outputSchema
+    ? stageCodexOutputSchema(prepared.outputSchema)
+    : undefined;
+  try {
+    const providerInput: PreparedRunInput = {
+      ...prepared,
+      ...(stagedSchema
+        ? {
+            outputSchemaPath: stagedSchema.schemaPath,
+            outputLastMessagePath: stagedSchema.outputPath,
+          }
+        : {}),
+    };
+    const args = spec.buildRun(providerInput);
+    if (id === "codex") args.unshift(...codexAuthArgsForCurrentBinary());
+    const bin = providerBin(spec);
+    log.info("running local provider", { id, bin });
+    const { code, stdout, stderr, timedOut, aborted } = await runCmd(
+      bin,
+      args,
+      timeoutMs,
+      signal,
+      prepared.execution?.workdir ?? prepared.workdir,
+      id === "codex" ? prepared.prompt : undefined,
+    );
+    if (aborted) throw signal?.reason ?? new Error(`provider ${id} cancelled`);
+    if (timedOut) throw new Error(`provider ${id} timed out after ${timeoutMs}ms`);
+    if (code !== 0) {
+      if (id === "claude") {
+        const parsed = parseClaudeResult(stdout);
+        if (parsed) {
+          throw new ProviderRunError(
+            id,
+            `provider ${id} exited ${code}: ${providerFailureDetail(stdout, stderr)}`,
+            parsed.usage,
+          );
+        }
+      }
+      if (id === "codex") {
+        const parsed = parseCodexResult(stdout, stagedSchema ? "" : undefined);
+        if (parsed) {
+          throw new ProviderRunError(
+            id,
+            `provider ${id} exited ${code}: ${providerFailureDetail(stdout, stderr)}`,
+            parsed.usage,
+          );
+        }
+      }
+      throw new Error(`provider ${id} exited ${code}: ${providerFailureDetail(stdout, stderr)}`);
+    }
     if (id === "claude") {
       const parsed = parseClaudeResult(stdout);
-      if (parsed) {
-        throw new ProviderRunError(
-          id,
-          `provider ${id} exited ${code}: ${providerFailureDetail(stdout, stderr)}`,
-          parsed.usage,
-        );
-      }
+      if (parsed) return parsed;
+      return unavailableResult(stdout, "legacy-text");
     }
     if (id === "codex") {
-      const parsed = parseCodexResult(stdout);
-      if (parsed) {
-        throw new ProviderRunError(
-          id,
-          `provider ${id} exited ${code}: ${providerFailureDetail(stdout, stderr)}`,
-          parsed.usage,
-        );
+      const parsed = parseCodexResult(stdout, stagedSchema ? "" : undefined);
+      if (stagedSchema) {
+        return {
+          text: readCodexFinalOutput(stagedSchema.outputPath, prepared.maxTokens),
+          usage: parsed?.usage ?? unavailableResult("", "codex-jsonl").usage,
+        };
       }
+      if (parsed) return parsed;
+      return unavailableResult(stdout, "legacy-text");
     }
-    throw new Error(`provider ${id} exited ${code}: ${providerFailureDetail(stdout, stderr)}`);
+    return unavailableResult(stdout, "trae-text");
+  } finally {
+    stagedSchema?.cleanup();
   }
-  if (id === "claude") {
-    const parsed = parseClaudeResult(stdout);
-    if (parsed) return parsed;
-    return unavailableResult(stdout, "legacy-text");
-  }
-  if (id === "codex") {
-    const parsed = parseCodexResult(stdout);
-    if (parsed) return parsed;
-    return unavailableResult(stdout, "legacy-text");
-  }
-  return unavailableResult(stdout, "trae-text");
 }
 
 /** Backward-compatible text-only provider API. */
@@ -818,8 +1006,11 @@ function parseClaudeResult(stdout: string): ProviderRunResult | undefined {
   return { text: result.result.trim(), usage };
 }
 
-function parseCodexResult(stdout: string): ProviderRunResult | undefined {
-  let text: string | undefined;
+function parseCodexResult(
+  stdout: string,
+  finalText?: string,
+): ProviderRunResult | undefined {
+  let lastText: string | undefined;
   let failure: string | undefined;
   let rawUsage: Record<string, unknown> | undefined;
   for (const line of stdout.split(/\r?\n/u)) {
@@ -835,7 +1026,7 @@ function parseCodexResult(stdout: string): ProviderRunResult | undefined {
     if (event.type === "item.completed" && event.item && typeof event.item === "object") {
       const item = event.item as Record<string, unknown>;
       if (item.type === "agent_message" && typeof item.text === "string") {
-        text = item.text;
+        lastText = item.text;
       }
     }
     if (
@@ -868,6 +1059,7 @@ function parseCodexResult(stdout: string): ProviderRunResult | undefined {
   if (failure !== undefined) {
     throw new ProviderRunError("codex", `provider codex returned ${failure}`, usage);
   }
+  const text = finalText ?? lastText;
   if (text === undefined) return undefined;
   return { text: text.trim(), usage };
 }
