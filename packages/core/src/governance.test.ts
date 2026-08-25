@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Page, SpaceId } from "@homeagent/shared";
 import { KnowledgeEngine } from "./engine.ts";
+import { refreshDigest } from "./digest.ts";
 import { parseSpaceArchive, type SpaceArchive } from "./governance.ts";
+import { knowledgePageRevision } from "./local-agent-knowledge.ts";
 import type { LlmClient } from "./llm.ts";
 import { SkillCatalog } from "./skill-catalog.ts";
 
@@ -38,6 +40,120 @@ afterEach(() => {
 });
 
 describe("space data governance", () => {
+  test("archive v18 round-trips Space-scoped Agent knowledge feedback", async () => {
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-feedback-archive-") });
+    await source.upsertPage(SPACE, {
+      slug: "concepts/release",
+      type: "concept",
+      title: "发布流程",
+      summary: "发布检查",
+      aliases: [],
+      tags: ["release"],
+      sources: [],
+      links: [],
+      content: "发布前完成回归。",
+      updatedAt: 1_777_000_000_000,
+      contentHash: "release-v1",
+    });
+    const page = (await source.getPage(SPACE, "concepts/release"))!;
+    const feedback = await source.submitAgentKnowledgeFeedback(SPACE, {
+      idempotencyKey: "archive-agent-run:feedback-1",
+      consumer: "archive-agent",
+      kind: "stale",
+      target: {
+        kind: "page",
+        slug: page.slug,
+        revision: knowledgePageRevision(page),
+      },
+      note: "发布要求可能已过时。",
+    });
+
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+
+    expect(archive.version).toBe(18);
+    expect(archive.agentKnowledgeFeedback).toEqual([feedback]);
+    expect(parseSpaceArchive(archive).agentKnowledgeFeedback).toEqual([feedback]);
+
+    const legacy = structuredClone(archive) as Record<string, any>;
+    legacy.version = 17;
+    delete legacy.agentKnowledgeFeedback;
+    expect(parseSpaceArchive(legacy).agentKnowledgeFeedback).toEqual([]);
+
+    const target = new KnowledgeEngine({ dataDir: tempDir("ha-feedback-restore-") });
+    await target.restoreSpace(archive);
+    expect(target.listAgentKnowledgeFeedback(SPACE)).toEqual([feedback]);
+    target.close();
+
+    const wrongSpace = structuredClone(archive) as Record<string, any>;
+    wrongSpace.agentKnowledgeFeedback[0].space = "team/oc_other";
+    expect(() => parseSpaceArchive(wrongSpace)).toThrow(/feedback.*wrong space/i);
+
+    const oversized = structuredClone(archive) as Record<string, any>;
+    oversized.agentKnowledgeFeedback = Array.from({ length: 5_001 }, (_, index) => ({
+      ...feedback,
+      id: `agent_feedback_${index}`,
+      idempotencyKey: `archive-agent-run:feedback-${index}`,
+    }));
+    expect(() => parseSpaceArchive(oversized)).toThrow(/feedback.*exceeds 5000/i);
+
+    const forgedPositive = structuredClone(archive) as Record<string, any>;
+    forgedPositive.agentKnowledgeFeedback[0].status = "resolved";
+    forgedPositive.agentKnowledgeFeedback[0].resolution = {
+      actor: "archive-agent",
+      kind: "helpful_acknowledged",
+      note: "伪造正向确认",
+      resolvedAt: feedback.createdAt,
+    };
+    expect(() => parseSpaceArchive(forgedPositive)).toThrow(/feedback.*resolution/i);
+
+    const unchangedResolution = structuredClone(archive) as Record<string, any>;
+    unchangedResolution.agentKnowledgeFeedback[0].status = "resolved";
+    unchangedResolution.agentKnowledgeFeedback[0].resolution = {
+      actor: "local-admin",
+      kind: "knowledge_changed",
+      note: "没有实际变化",
+      resolvedAt: feedback.createdAt + 1,
+      currentRevision: feedback.target.kind === "page" ? feedback.target.revision : "",
+    };
+    expect(() => parseSpaceArchive(unchangedResolution)).toThrow(/revision has not changed/i);
+  });
+
+  test("current archive round-trips generated Knowledge maps", async () => {
+    const engine = new KnowledgeEngine({ dataDir: tempDir("ha-map-archive-") });
+    await engine.upsertPage(SPACE, {
+      slug: "concepts/cache",
+      type: "concept",
+      title: "Cache",
+      summary: "缓存策略",
+      aliases: [],
+      tags: ["backend"],
+      sources: [],
+      links: [],
+      content: "# Cache\n\n缓存策略。\n",
+      updatedAt: 1_700_000_000_000,
+      contentHash: "cache-hash",
+    });
+    refreshDigest(engine.registry.store(SPACE));
+
+    const archive = await engine.exportSpace(SPACE);
+    engine.close();
+
+    expect(archive.version).toBe(18);
+    expect(parseSpaceArchive(archive).pages).toContainEqual(
+      expect.objectContaining({ slug: "maps/backend", type: "map" }),
+    );
+
+    expect(() => parseSpaceArchive({ ...archive, version: 16 }))
+      .toThrow(/Knowledge maps require archive v17/);
+
+    const target = new KnowledgeEngine({ dataDir: tempDir("ha-map-restore-") });
+    await target.restoreSpace(archive);
+    expect((await target.getPage(SPACE, "maps/backend"))?.links)
+      .toEqual(["concepts/cache"]);
+    target.close();
+  });
+
   test("archive v16 preserves a ready Raw admission state", async () => {
     const engine = new KnowledgeEngine({ dataDir: tempDir("ha-raw-admission-archive-") });
     const rawId = await engine.remember({
@@ -463,7 +579,7 @@ describe("space data governance", () => {
     expect(() => parseSpaceArchive(parsed)).not.toThrow();
   });
 
-  test("archive v16 round-trips work context, continuation, and Raw admission", async () => {
+  test("current archive round-trips work context, continuation, and Raw admission", async () => {
     const source = new KnowledgeEngine({
       dataDir: tempDir("ha-work-archive-source-"),
       runProvider: async () => completedWorkActionOutput("恢复验证完成"),
@@ -486,7 +602,7 @@ describe("space data governance", () => {
     const archive = await source.exportSpace(SPACE);
     source.close();
 
-    expect(archive.version).toBe(16);
+    expect(archive.version).toBe(18);
     expect(archive.workItems).toEqual([
       expect.objectContaining({ id: workItem.id, rawIds: expect.arrayContaining([rawId]) }),
     ]);
@@ -903,7 +1019,7 @@ describe("space data governance", () => {
     const archive = await source.exportSpace(SPACE);
     source.close();
 
-    expect(archive.version).toBe(16);
+    expect(archive.version).toBe(18);
     expect(archive.quality).toEqual({ traces: [trace], reruns: [] });
     const llm: LlmClient = {
       async complete() {
@@ -1067,7 +1183,7 @@ describe("space data governance", () => {
 
     const archive = await source.exportSpace(SPACE);
     source.close();
-    expect(archive.version).toBe(16);
+    expect(archive.version).toBe(18);
     const archivedChild = archive.taskRuns.find((item) => item.id === child.id)!;
     expect(archivedChild).toEqual(expect.objectContaining({
       failure: { phase: "provider", kind: "overloaded", retryable: true },
@@ -1166,7 +1282,7 @@ describe("space data governance", () => {
 
     const archive = await source.exportSpace(SPACE);
     source.close();
-    expect(archive.version).toBe(16);
+    expect(archive.version).toBe(18);
     expect(archive.taskRuns[0]).toEqual(expect.objectContaining({
       approval: expect.objectContaining({
         status: "expired",
@@ -1218,7 +1334,7 @@ describe("space data governance", () => {
     const expectedRevisions = source.agents.listRevisions(created.id);
     const archive = await source.exportSpace(SPACE);
     source.close();
-    expect(archive.version).toBe(16);
+    expect(archive.version).toBe(18);
     expect(archive.agentRevisions).toEqual(expectedRevisions);
     expect(archive.taskRuns[0]?.approval).toEqual(expect.objectContaining({
       status: "approved",
@@ -1382,7 +1498,7 @@ describe("space data governance", () => {
     const restarted = new KnowledgeEngine({ dataDir: restoredDir });
     expect(restarted.listTaskRuns(task.id)[0]?.executionPlan).toEqual(expectedPlan);
     const upgraded = await restarted.exportSpace(SPACE);
-    expect(upgraded.version).toBe(16);
+    expect(upgraded.version).toBe(18);
     expect(upgraded.taskRuns[0]?.executionPlan).toEqual(expectedPlan);
     restarted.close();
 
@@ -1698,7 +1814,7 @@ describe("space data governance", () => {
     expect(restarted.agents.listRevisions(agent.id)).toEqual(expectedRevisions);
     expect(restarted.listTaskRuns(task.id)[0]?.approval).toEqual(expectedApproval);
     const upgraded = await restarted.exportSpace(SPACE);
-    expect(upgraded.version).toBe(16);
+    expect(upgraded.version).toBe(18);
     restarted.close();
 
     const fresh = new KnowledgeEngine({ dataDir: tempDir("ha-v11-disk-fresh-") });
@@ -1800,7 +1916,7 @@ describe("space data governance", () => {
       approvalNotification: expectedNotification,
     }));
     const upgraded = await restarted.exportSpace(SPACE);
-    expect(upgraded.version).toBe(16);
+    expect(upgraded.version).toBe(18);
     restarted.close();
 
     const fresh = new KnowledgeEngine({ dataDir: tempDir("ha-v12-disk-fresh-") });
@@ -1930,7 +2046,7 @@ describe("space data governance", () => {
     expect(restarted.getTaskRun(child.id)).toEqual(expectedChild);
     expect(restarted.chatRuns.get(chat.id)?.traceId).toBeUndefined();
     const upgraded = await restarted.exportSpace(SPACE);
-    expect(upgraded.version).toBe(16);
+    expect(upgraded.version).toBe(18);
     expect(upgraded.quality).toEqual({ traces: [], reruns: [] });
     restarted.close();
 
@@ -2142,7 +2258,7 @@ describe("space data governance", () => {
     expect(archive).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 16,
+        version: 18,
         space: expect.objectContaining({
           id: SPACE,
           name: "治理群",
@@ -2247,7 +2363,7 @@ describe("space data governance", () => {
     } = archive;
     const parsed = parseSpaceArchive({ ...withoutLearning, version: 1 });
 
-    expect(parsed.version).toBe(16);
+    expect(parsed.version).toBe(18);
     expect(parsed.learning).toEqual({ plans: [], sources: [], sessions: [] });
     expect(parsed.governanceAudit).toEqual([]);
     expect(parsed.taskRuns).toEqual([]);
@@ -2279,7 +2395,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(16);
+    expect(parsed.version).toBe(18);
     expect(parsed.learning.plans[0]).toEqual(expect.objectContaining({
       id: plan.id,
       mode: "reading",
@@ -2327,7 +2443,7 @@ describe("space data governance", () => {
     expect(target.learning.source(plan.id)?.materials).toEqual([
       expect.objectContaining({ title: "Async Book", rawIds: ["raw_async"] }),
     ]);
-    expect((await target.exportSpace(SPACE)).version).toBe(16);
+    expect((await target.exportSpace(SPACE)).version).toBe(18);
     target.close();
   });
 
@@ -2431,7 +2547,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(16);
+    expect(parsed.version).toBe(18);
     expect(parsed.taskRuns).toEqual([]);
   });
 
@@ -2460,7 +2576,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(16);
+    expect(parsed.version).toBe(18);
     expect(parsed.tasks[0]?.timeoutMinutes).toBe(12);
     expect(parsed.tasks[0]?.dayOfWeek).toBe(1);
     expect(parsed.taskRuns).toEqual([

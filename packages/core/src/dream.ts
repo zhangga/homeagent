@@ -16,8 +16,8 @@
  * was distilled from. Incremental cache: a page is not regenerated when its
  * source set is unchanged (unless force).
  *
- * After distillation the deterministic map pages (index/glossary/overview) are
- * refreshed and a log entry is appended.
+ * After distillation the deterministic topic maps plus index/glossary/overview
+ * are refreshed and a log entry is appended.
  */
 import type { DreamReport, Page, RawRecord } from "@homeagent/shared";
 import { config, logger } from "@homeagent/shared";
@@ -29,7 +29,7 @@ import type {
 } from "./types.ts";
 import { gatewayClient, type LlmClient } from "./llm.ts";
 import { canonicalSlug } from "./slug.ts";
-import { refreshDigest } from "./digest.ts";
+import { isKnowledgeContentRef, refreshDigest } from "./digest.ts";
 import {
   removeQuarantineRecordsCoveredBy,
   writeQuarantineRecord,
@@ -37,7 +37,7 @@ import {
 
 const log = logger.child("dream");
 
-/** Max pending raw entries analyzed per run (cost bound). */
+/** Max pending Raw entries analyzed in one stable prompt batch. */
 const DEFAULT_MAX_ENTRIES = 40;
 const MAX_ANALYZE_SOURCE_CHARACTERS = 48_000;
 const MAX_GENERATE_SOURCE_CHARACTERS = 48_000;
@@ -124,7 +124,7 @@ function analyzePrompt(store: SpaceStore, batch: RawRecord[]): string {
   const index = store
     .index()
     .listPages()
-    .filter((r) => !["index", "overview", "log", "glossary"].includes(r.slug))
+    .filter(isKnowledgeContentRef)
     .map((r) => `- ${r.slug} (${r.type})：${r.title}｜${r.summary}`)
     .join("\n");
   const perEntryBudget = Math.max(

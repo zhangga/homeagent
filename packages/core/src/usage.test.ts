@@ -70,12 +70,14 @@ describe("run usage aggregation", () => {
     }]);
   });
 
-  test("does not count a budget admission rejection as a provider call", async () => {
+  test("does not count an external cost-admission rejection as a provider call", async () => {
     const calls: unknown[] = [];
     const blocked: LlmClient = {
       async complete(): Promise<CompleteResult> {
         throw new BudgetExceededError({
           allowed: false,
+          enforced: true,
+          referenceExceeded: true,
           spent: 1,
           budget: 1,
           unknownCostCalls: 0,

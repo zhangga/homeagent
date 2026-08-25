@@ -15,8 +15,8 @@ Bun workspaces monorepo，依赖严格单向：`web/app → orchestrator → cor
 | 包 | 职责 |
 |---|---|
 | `packages/shared` | 类型、写串行化 `Serializer`、logger、config、SpaceId 工具 |
-| `packages/llm` | 网关 fetch 封装（Anthropic messages 格式）+ 成本治理（JSONL 日志 + 每日预算） |
-| `packages/core` | 知识层 seam `Knowledge` + llm_wiki 式引擎：markdown/SQLite(FTS5)/dream cycle/ask 检索问答 |
+| `packages/llm` | 网关 fetch 封装（Anthropic messages 格式）+ 成本观测（JSONL 日志 + 每日成本参考线） |
+| `packages/core` | 知识层 seam `Knowledge` + llm_wiki 式引擎：markdown/SQLite(FTS5)/dream cycle/Wiki Maintenance/ask 检索问答 |
 | `packages/connectors` | `Connector` 抽象 + `cli`（调试）+ `feishu`（lark-cli 子进程守护） |
 | `packages/orchestrator` | runtime 单消费者 + 对话解释 + 应答网关 + 空间归属 + 冷启动话术 |
 | `packages/web` | Hono 管理后台（空间/知识、Agents、任务、学习、提醒、Integrations、运行状态、数据治理、日志、设置） |
@@ -39,8 +39,8 @@ data/
     raw/records/YYYY/MM/DD.jsonl # Raw 当前状态，按 UTC 创建日期分区、可直接阅读
     raw/retractions.jsonl      # 消息撤回标记
     raw/sources/               # 不可变原始来源
-    wiki/{index,overview,log,glossary}.md + {entities,concepts,sources,analysis}/*.md
-    .index.db                  # SQLite 查询投影，可从 raw/**/*.jsonl + wiki/*.md 重建
+    wiki/{index,overview,log,glossary}.md + maps/*.md + {entities,concepts,sources,analysis}/*.md
+    .index.db                  # SQLite 查询投影，可从 raw/**/*.jsonl + wiki/**/*.md 重建
 ```
 
 Raw JSONL 与知识 Markdown 是权威数据源，SQLite 只负责结构化查询与 FTS。每条 JSONL 记录额外包含
@@ -50,9 +50,92 @@ Raw JSONL 与知识 Markdown 是权威数据源，SQLite 只负责结构化查�
 
 HomeAgent 在初始化数据目录、创建 Space、重启旧数据目录或执行安全迁移时补齐两级 `AGENTS.md`。根级文件要求
 外部 agent 先确定单一 Space；Space 级文件再引导按 `purpose.md`、`schema.md`、`wiki/overview.md`、
-`wiki/index.md` / `wiki/glossary.md`、相关知识页、最后才有界追溯 Raw 的顺序读取。文件只在缺失时创建；
+命中的 `wiki/maps/*.md` 分支、相关知识页、最后才有界追溯 Raw 的顺序读取；`wiki/index.md` 与
+`wiki/glossary.md` 作为完整主题或术语定位的后备入口。文件只在缺失时创建；
 已有的用户自定义 `AGENTS.md` 不会被覆盖。它们是访问说明，不改变 Raw journal、Knowledge page 和 SQLite
 projection 的权威关系，也不授权外部 agent 手工修改运行中的数据目录。
+
+普通 Knowledge page 可从 `sources` 只读追溯到同一 Space 的 Raw 元数据。管理后台的页面详情和问答引用会
+显示最新证据时间、`recent / aging / stale / unknown` 时效等级、Raw 数量与证据链完整性；点击页面详情中的
+来源可继续查看本地 Raw。分级以最新 Raw 的 `createdAt` 计算：不超过 90 天为较新，91–365 天为较久，
+超过 365 天为陈旧；来源缺失或未准入时为未知。证据年龄只用于提示复核，不会自动判定知识事实失效，
+也不会增加 Provider 调用或把 Raw 正文送入新的通道。
+
+### 本地 Agent 知识复用与反馈
+
+其他本机 Agent 不需要理解 HomeAgent 的磁盘布局，也不需要直接打开运行中的数据目录。HomeAgent 服务运行时，
+可通过同一个可执行文件启动只读 MCP stdio 代理；它只连接固定的本地查询端点，并复用现有 SQLite FTS 与
+Knowledge page，不启动 Provider、不消耗模型 token、不写入知识或运行状态。接口一次只接受一个显式 Space，
+所有列表和搜索都有上限。
+
+推荐按渐进披露顺序调用：`list_spaces` 选择 Space → `get_overview` 看概览 → `list_maps` 或
+`search_knowledge` 缩小主题 → `get_page` 读取页面；只有确实需要核验 provenance 时再用
+`get_page_trace`。普通页面读取只返回证据数量、最新证据时间、时效等级和完整性；trace 也只暴露有界的
+Raw id、来源、准入状态、时间和可选作者，不返回 Raw 正文、飞书消息 ID 或群绑定。不同 Space 的结果不会
+由接口自动合并。单页正文最多返回 200,000 字符，超出时 `contentTruncated` 为 `true`，调用方不得把截断
+内容当作完整页面。`get_page` 同时返回 opaque `revision`，供消费方反馈精确绑定当时读取的页面版本。
+
+这是当前本机操作者级接口：默认回环访问或一个 read token 会授权读取全部 Space，但每次内容调用仍只允许
+一个 Space，不提供按 Agent 身份细分的 Space ACL。`SpaceId` 本身会照常返回（团队 Space 的标识包含其
+`team/` 后缀）；接口不会额外返回 Raw 的 `chatId`、`messageId`、工作归属字段或空间绑定配置。不要把 read
+token 提供给不应读取全部本机知识的进程。
+
+源码运行时先在一个进程中启动 HomeAgent，再把下面的 MCP 命令配置给本机 Agent：
+
+```bash
+bun start
+bun run mcp
+```
+
+例如支持 MCP stdio 的客户端可使用等价配置（`cwd` 换成仓库绝对路径）：
+
+```json
+{
+  "mcpServers": {
+    "homeagent": {
+      "command": "bun",
+      "args": ["run", "mcp"],
+      "cwd": "/absolute/path/to/homeagent"
+    }
+  }
+}
+```
+
+打包应用使用 `"/Applications/HomeAgent.app/Contents/MacOS/homeagent" mcp`。也可用稳定 JSON
+命令行做脚本化查询，例如：
+
+```bash
+bun run knowledge list_spaces
+bun run knowledge get_overview --space team/oc_xxx
+bun run knowledge search_knowledge --space team/oc_xxx --query "发布流程" --limit 8
+bun run knowledge get_page --space team/oc_xxx --slug concepts/release
+bun run knowledge get_page_trace --space team/oc_xxx --slug concepts/release
+```
+
+消费方可以提交 `helpful / not_found / incorrect / stale / conflicting / hard_to_reuse` 六类反馈。页面反馈必须
+携带 `get_page` 返回的 `slug + revision`，搜索未命中反馈必须携带原始有界 query；每次提交还要提供稳定的
+`idempotency-key` 与 `consumer`。反馈只写入当前 Space 的人工治理队列，不会自动创建 Raw、改写 Wiki、触发
+Dream cycle 或调用 Provider。正向反馈会自动确认，其他反馈在「AI 质量 → Agent 知识反馈」中等待人工核验；
+选择“知识页已修正”时，HomeAgent 会验证当前 revision 确实已变化后才允许关闭。
+
+```bash
+bun run feedback --space team/oc_xxx --idempotency-key run-42:feedback-1 \
+  --consumer codex --kind not_found --query "灰度发布负责人" --note "没有命中"
+bun run feedback --space team/oc_xxx --idempotency-key run-42:feedback-2 \
+  --consumer codex --kind stale --slug concepts/release --revision <get_page 返回值>
+```
+
+MCP 默认仍提供六个读取工具；当反馈写入口可用时额外提供非破坏、幂等的
+`submit_knowledge_feedback`。该工具只提交治理反馈，不改变六个读取工具的 read-only 声明。
+
+服务保持默认回环绑定且未启用管理令牌时，本机查询无需凭据。启用管理令牌后，可在 HomeAgent 服务和 MCP
+代理的环境中配置相同的 `HOMEAGENT_AGENT_READ_TOKEN`；该凭据允许读取全部 Space，但只允许访问
+`POST /api/agent/v1/query`，不能访问管理页面或写接口。未配置专用凭据时代理会兼容使用
+`HOMEAGENT_WEB_ADMIN_TOKEN`，但推荐为 Agent 单独配置只读令牌。令牌只通过 Authorization header
+传递，不出现在 URL、输出或设置文件中。反馈使用另一个环境变量专属
+`HOMEAGENT_AGENT_FEEDBACK_TOKEN`，只允许访问 `POST /api/agent/v1/feedback`，不能读取知识或访问管理页面；
+HomeAgent 会拒绝把它配置成管理/read token 的同一密钥。MCP/JSON 命令不会自行启动服务；连接失败时应先
+确认 HomeAgent 服务、端口和令牌环境一致。
 
 `raw/sources/` 当前不是文件监听目录，手动复制文件进去不会自动入库。需要从空间详情页使用「导入本地资料」，
 或把文件发送到对应的飞书群/私聊，资料先登记为 Raw 后才会进入自动提炼流程。
@@ -101,13 +184,17 @@ export ANTHROPIC_BASE_URL=https://api.gameaigc.cn
 export ANTHROPIC_AUTH_TOKEN=sk-...
 export HOMEAGENT_DATA_DIR=./data                    # 默认 ./data
 export HOMEAGENT_LLM_MODEL=claude-sonnet-5          # ask/提炼默认模型
-export HOMEAGENT_DAILY_BUDGET_USD=5                 # 每日预算
+export HOMEAGENT_DAILY_BUDGET_USD=5                 # 每日成本参考线（只观察，不阻断调用）
 export HOMEAGENT_WEB_HOST=127.0.0.1                 # 默认仅本机访问
 export HOMEAGENT_WEB_PORT=3000                      # 管理后台端口
 export HOMEAGENT_DREAM_HOUR=3                        # 每日提炼时刻（0-23，Asia/Shanghai）
 export HOMEAGENT_RAW_RETENTION_DAYS=90              # 已提炼原始消息保留天数；0=永久
 # 仅当 HOMEAGENT_WEB_HOST 不是本机回环地址时必须设置（环境变量专属，不写盘）
 export HOMEAGENT_WEB_ADMIN_TOKEN=replace-with-a-strong-secret
+# 可选：只授权固定本地 Agent 查询端点；启用后台鉴权时推荐与管理令牌分开
+export HOMEAGENT_AGENT_READ_TOKEN=replace-with-a-read-only-secret
+# 可选：只授权固定本地 Agent 反馈端点；必须与管理/read token 不同
+export HOMEAGENT_AGENT_FEEDBACK_TOKEN=replace-with-a-feedback-secret
 # 可选：精确 @ 识别（否则群内任意 @ 都视为叫机器人）
 export HOMEAGENT_FEISHU_BOT_NAME=homeagent
 export HOMEAGENT_FEISHU_BOT_OPEN_ID=ou_xxx
@@ -121,8 +208,9 @@ export HOMEAGENT_BYTEDCLI_BIN=/absolute/path/to/bytedcli
 
 > 后台「设置 / Agents / Integrations」里改的配置会写入
 > `data/config/{settings,agents,spaces,feishu-group-bindings}.json`
-> 并叠加在上述环境变量之上（后台显式设置优先）。模型 / 预算 / 提炼时刻 / 群设置即时生效；
-> Bot 身份与端口需重启生效。`HOMEAGENT_WEB_HOST` 与 `HOMEAGENT_WEB_ADMIN_TOKEN` 仅从环境变量读取：
+> 并叠加在上述环境变量之上（后台显式设置优先）。模型 / 成本参考线 / 提炼时刻 / 群设置即时生效；
+> Bot 身份与端口需重启生效。`HOMEAGENT_WEB_HOST`、`HOMEAGENT_WEB_ADMIN_TOKEN` 与
+> `HOMEAGENT_AGENT_READ_TOKEN` 与 `HOMEAGENT_AGENT_FEEDBACK_TOKEN` 仅从环境变量读取：
 > 默认绑定 `127.0.0.1`；开放到局域网或 `0.0.0.0` 时必须配置管理令牌，后台支持浏览器 Basic Auth
 > （密码填令牌）及 Bearer Token。可选的 `ANTHROPIC_*` 只在调用旧网关客户端时校验，只读、不写盘，
 > LaunchAgent 也不会保存它们。
@@ -215,7 +303,13 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 
 左侧导航包含：
 
-- **空间 / 知识**：空间列表、知识页、原始条目、问答测试、手动触发提炼，以及提炼失败记录的单条/批量恢复。空间详情页可一次导入最多 20 份本地 UTF-8 文本、Markdown、CSV、JSON 或日志文件；每份不超过 20 MiB，正文最多保留 200,000 字符，文件名与原始内容 SHA-256 会进入可追溯的 `source=manual` Raw。可只登记后等待夜间提炼，也可立即且仅提炼本批资料。支持编辑 `purpose.md` / `schema.md`、查看完整原始记录及其关联知识页、单条重新提炼、固定目标重新生成、删除知识页和提交可追溯的人工纠错；所有人工治理操作都会写入审计记录。
+- **空间 / 知识**：空间列表、分层知识地图、知识页、原始条目、问答测试、手动触发提炼，以及提炼失败记录的单条/批量恢复。
+  - 地图按首个有效标签组织最多 24 个显式一级主题，长尾进入按页面类型划分的兜底主题；单个主题超过 100 页时递归拆成每页最多 100 项的下级地图。地图由系统确定性增量维护，不调用 LLM、不消耗 Token，也不作为回答证据；检索命中地图后只会沿相关分支展开，并继续遵守最多 60 个候选页的 LLM 路由上限。
+  - 普通知识页详情显示只读的 Raw 证据链和时效等级，来源可继续打开本地 Raw；问答引用同步显示最新证据时间、来源数量和完整性。回答综合遇到冲突页面时优先采用证据更新且证据链完整的页面，但证据较久只会提示复核，不会自动让事实失效。系统生成的地图不显示也不参与证据链。
+  - Dream 调度每批最多处理 40 条 Raw，一次 tick 最多连续追赶 4 批；超过单轮安全上限的遗留积压会在下一次 15 分钟 tick 自动续跑，不再等到第二天。失败或没有进展的批次会立即停止该 Space 的本轮追赶，避免重复调用 Provider。
+  - 独立的只读 **Wiki Maintenance cycle** 不依赖待处理 Raw 或 LLM：启动时补跑、此后每周检查断链、孤立页、重复标题/别名、超大页、没有 Raw 来源的不可追溯页、超过 365 天的完整陈旧证据和无效 provenance；空间页可手动运行并查看有界摘要，不会自动改写 Wiki。
+  - 空间详情页可一次导入最多 20 份本地 UTF-8 文本、Markdown、CSV、JSON 或日志文件；每份不超过 20 MiB，正文最多保留 200,000 字符，文件名与原始内容 SHA-256 会进入可追溯的 `source=manual` Raw。可只登记后等待夜间提炼，也可立即且仅提炼本批资料。
+  - 支持编辑 `purpose.md` / `schema.md`、查看完整原始记录及其关联知识页、单条重新提炼、固定目标重新生成、删除知识页和提交可追溯的人工纠错；所有人工治理操作都会写入审计记录。系统生成的地图单独展示，不允许人工纠错、重新生成或删除。
 - **Agents**（三栏工作台）：左侧选择 Agent，中间编辑配置，右侧查看真实的 CLI 状态、当前空间/飞书群绑定和该 Agent 最近处理的 Chat / 研究任务运行。Chat 记录会固定归属到实际处理它的 Agent，并可从 Recent runs 进入对应的原始消息详情。支持新建 / 删除，以及配置 **名称、Provider、Instruction（人格，会注入到回答）、Model、推理强度、Visibility、Permission、Workdir**；旧版 Pinned Skill 绑定会保留兼容，但不再限制运行时能力。编辑先保存为草稿，显式发布后才影响未来运行，发布历史不可变并支持通过新版本回滚，避免在途运行被原地改写。
   - 桌面端保持三栏并可拖拽或用方向键调整栏宽；窄屏把右侧信息收进详情抽屉，手机端在 Agent 列表和详情之间切换。页面不显示 HomeAgent 没有实现的 Mew Device、Repository、Environment、Concurrency 或独立 Chats 模块。
   - **Provider = 本机已安装的 agent CLI**（`claude` / `codex` / `trae-cli`）。所有 LLM 工作都通过当前空间配置的本机 CLI 子进程执行，homeagent 不直连网络 API。普通聊天和研究任务使用绑定 Agent 的 Permission / Workdir，并显式传入全部兼容 Skill；提炼和后台学习继续使用受限 no-tools 调用。Provider 会话仍是一次性的，不写入全局历史；TRAE 当前仍只用于显式任务。后台会探测本机 CLI 的安装和可运行状态。
@@ -235,7 +329,7 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
   - `write/full` 运行先进入持久化人工审批，页面展示真正被冻结的主题、权限、Workdir、Provider、Model、Agent 版本和计划摘要；审批 24 小时过期，批准、拒绝、过期、通知尝试均留审计。`read-only` 保持直接排队；两者都使用冻结计划，执行前仍重新核验 Workdir。
   - 同一任务只允许一个活动运行；后台、定时调度和飞书命令共享互斥保护，不会重复执行。任务可配置 1–60 分钟的运行上限，后台可取消活动运行，超时或取消都会等待本机 CLI 退出或达到安全上限后再释放并发位。排队项在重启后按冻结计划恢复；已经运行的项会标记为失败，不会拿当前 Agent 配置偷偷续跑。
   - 仅定时触发、`read-only`、尚未产生输出且属于可重试 Provider 故障的运行会在 60 秒后自动再尝试一次；这是创建一条关联的新运行，不是进程 checkpoint。工作续作的 Task Run 成功只会提交带“结果 / 检查 / 证据”的验收候选；自动验收还要求冻结权限为 `read-only`、Raw 已落盘、输出未截断，并收到严格 JSON 执行报告（`outcome=completed`、无 blocker、全部检查通过）。普通文本或畸形报告统一停在人工验收，结构化 `blocked` 结果则保留动作边界并形成 blocker；`write/full/unknown` 必须人工接受后才记录动作边界 checkpoint。手动重试、禁用任务、取消或高权限运行都会终结/替代等待中的自动重试，避免重复执行。
-  - Provider 报告的 token 与成本会按调用聚合到 Chat / Task / 质量 trace；无法从 CLI 获得的字段保持“未知”，不会伪装成 0。每日美元预算只会按已知成本执行硬门禁，并同时展示未知成本调用与记账覆盖率。
+  - Provider 报告的 token 与成本会按调用聚合到 Chat / Task / 质量 trace；无法从 CLI 获得的字段保持“未知”，不会伪装成 0。每日成本参考线只用于观察，超出参考线或成本未知都不会暂停、降级或拒绝 Provider 调用；系统仍会展示已知成本、未知成本调用与记账覆盖率。
   - 飞书推送采用持久化通知状态：发送失败会记录错误、尝试次数和退避时间，TaskScheduler 后续自动重试，运行详情页也可手动重试；任务本身的成功结果不会因通知通道暂时故障而丢失。
   - 研究按空间 Agent 的 Permission / Workdir 执行，并自动获得当前 Provider 兼容的全部 Skills；未指定 Agent 时默认 `read-only`。任务写入是异步的，不占用空间写锁；即时提炼始终回到普通受限模式并尽力而为——失败不影响任务成功，原始材料仍会被夜间提炼兜底。
   - **飞书里也能管任务**（`/task` 命令；群聊仅群主/管理员可执行，私聊由本人管理；控制消息不会被当成知识收录）：
@@ -285,10 +379,10 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 - **Bot 停用与更换**：在 HomeAgent 中停用 Bot 只关闭本机事件消费和发送，不删除 `lark-cli` 系统钥匙串凭据，
   也不撤销读取飞书文档所用的用户授权。重新启用或更换 Bot 后必须重启 HomeAgent；旧 App 的群绑定会显示为
   “需要重连”，不会被新旧运行实例混用。对外共享状态也按 App ID 独立记录。
-- **运行状态**：集中展示后台托管方式、PID、启动时间、两条飞书事件消费者的详细状态、必需 CLI、知识存储、任务、提醒、学习、Dream Cycle 与五个调度器；同时展示 AI 回答延迟、失败/超时、主动参与结果和事件队列积压。质量或积压告警会标为 degraded，但不会把仍可服务的实例误判为未就绪。LaunchAgent 托管时可从页面安全重启。
+- **运行状态**：集中展示后台托管方式、PID、启动时间、两条飞书事件消费者的详细状态、必需 CLI、知识存储、任务、提醒、学习、Dream Cycle、Wiki Maintenance 与六个调度器；同时展示 AI 回答延迟、失败/超时、Agent 知识反馈待处理数、主动参与结果、事件队列积压，以及最近一次 Dream 追赶的批次数、已处理 Raw、剩余积压和是否达到单轮上限。积压仍在安全追赶时整体标为 degraded 但不阻断 readiness；维护检查发现知识问题或报告被截断时也采用同一服务降级语义。调度器本身未启动或最近失败仍会让 readiness 失败。LaunchAgent 托管时可从页面安全重启。
 - **工作上下文**：为每个空间维护目标、Brief、Runbook、当前进展、阻塞项与下一步；新 Raw、Chat Run、Task Run 和由 Raw 生成的 Wiki 页会自动关联到当前工作项，并投影为 `work/<id>/{brief.md,runbook.md,status.json}`。可手动执行下一动作，也可对单个工作项显式开启自动续作；每轮最多领取一个动作，复用 Task Run 的冻结计划、权限审批、通知、超时与一次安全重试。Task Run 成功后先进入动作验收门：后台展示结构化结果、确定性检查和 Run/Raw 证据，只有验收通过才消费当前首个下一步并记录 checkpoint；驳回会保留动作边界和证据、形成可见 blocker，并允许从同一动作重试。计划改变时可显式放弃受阻动作并清除其系统 blocker，再继续新的首个动作。待验收期间自动续作暂停；重启只恢复尚未执行的排队动作，绝不重放已中断的运行中动作。
-- **数据治理**：按空间导出 `homeagent.space v16` JSON 完整备份（知识页、原始记录及其动作验收准入状态、工作上下文、续作动作/checkpoint/验收审计/策略及其证据关联、人工治理审计、撤回标记、任务及 Chat 运行历史、冻结执行计划、Agent 发布历史、审批/重试/通知/用量审计、Skill 证据、相关质量 trace 与封闭的重评记录、提醒、学习计划、主题路线、多来源材料及课程历史、空间元数据），兼容恢复 v1–v16 备份；WorkAction 输出在验收前保持 `held`、接受后才进入待提炼队列，驳回/取消/失败后永久 `excluded`。旧版缺失的高权限审批与执行计划会 fail-closed，legacy Skill 不会被静默绑定到错误来源；升级时会重新派生 WorkAction Raw 状态并清理引用未准入来源的旧 Wiki 页。导出、恢复和删除会阻止仍在运行、等待审批/验收/重试或正在外发的工作，恢复会校验 WorkItem、WorkAction、Task Run、验收证据、Raw 准入与 checkpoint 的双向关联，避免删除后继续副作用、恢复后重复执行、污染知识或重复通知。
-- **设置**：**默认 Provider + 默认 Model**（群未指定 Agent 时用它）、聊天最长回答时间（默认 10 分钟，可设 1–60 分钟）、每日预算、提炼时刻、原始消息保留周期、端口，以及安全的数据目录迁移与可选 Git 初始化。最长回答时间会冻结到新建 Chat Run，复杂任务可按需延长，进行中的回答仍可随时取消。
+- **数据治理**：按空间导出 `homeagent.space v18` JSON 完整备份（知识页及系统生成的分层地图、原始记录及其动作验收准入状态、工作上下文、续作动作/checkpoint/验收审计/策略及其证据关联、人工治理审计、本地 Agent 知识消费反馈及处置记录、撤回标记、任务及 Chat 运行历史、冻结执行计划、Agent 发布历史、审批/重试/通知/用量审计、Skill 证据、相关质量 trace 与封闭的重评记录、提醒、学习计划、主题路线、多来源材料及课程历史、Wiki Maintenance 最近摘要、空间元数据），兼容恢复 v1–v18 备份；WorkAction 输出在验收前保持 `held`、接受后才进入待提炼队列，驳回/取消/失败后永久 `excluded`。旧版缺失的高权限审批与执行计划会 fail-closed，legacy Skill 不会被静默绑定到错误来源；升级时会重新派生 WorkAction Raw 状态并清理引用未准入来源的旧 Wiki 页。导出、恢复和删除会阻止仍在运行、等待审批/验收/重试或正在外发的工作，恢复会校验 WorkItem、WorkAction、Task Run、验收证据、Raw 准入与 checkpoint 的双向关联，避免删除后继续副作用、恢复后重复执行、污染知识或重复通知。
+- **设置**：**默认 Provider + 默认 Model**（群未指定 Agent 时用它）、聊天最长回答时间（默认 10 分钟，可设 1–60 分钟）、每日成本参考线（只观察，不阻断）、提炼时刻、原始消息保留周期、端口，以及安全的数据目录迁移与可选 Git 初始化。最长回答时间会冻结到新建 Chat Run，复杂任务可按需延长，进行中的回答仍可随时取消。本机其他 Agent 可通过独立 MCP/JSON 接口渐进复用已提炼知识；可选反馈凭据只允许写入治理反馈队列，不授予 Raw/Wiki/管理权限，也不触发 Provider。
 
 ### 数据目录迁移与 Git
 
@@ -397,7 +491,7 @@ bun run smoke:macos --app dist/HomeAgent.app
 都会覆盖这些派生记录。macOS 使用系统自带的 Vision/PDFKit；其他平台仍可提取上述 UTF-8 文本文件，
 但会安全跳过图片 OCR 和 PDF 文本提取。音频转写、Office 文件、视频理解和 `post` 消息内嵌资源暂不支持。
 
-> **CLI-only 的代价（务必知悉）**：这些本机 CLI 单次调用**慢、开销大**，dream 批量提炼会明显变慢；它们**自带鉴权和模型选择**，不一定尊重 HomeAgent 里选择的 model。普通聊天和任务会获得完整兼容 Skill 目录；提炼与后台学习仍使用严格 no-tools 调用，TRAE 仅用于显式任务。dream 的结构化抽取使用 Provider 的最终结果通道（Codex 使用 `--output-schema` + `--output-last-message`）并在 Core 做业务校验；长 Raw 不会整份塞入单次生成请求，而会按固定大小分段、逐步合并为同一份完整知识页。失败记录会冻结原 Knowledge page 生成计划并持续显示在对应空间的“提炼失败”页，使知识健康状态降级但不阻断 `/readyz`；单条或批量重试只重做失败的 generate，不会重新 analyze、改换目标页或连带处理无关消息。恢复所需来源不会被原始消息保留策略清理；若来源被撤回，旧失败记录会移除，仍有效的其他来源会重新进入待提炼队列。CLI 未报告的成本会明确记为未知，因此无法仅靠美元预算对这部分调用执行硬限制。
+> **CLI-only 的代价（务必知悉）**：这些本机 CLI 单次调用**慢、开销大**，dream 批量提炼会明显变慢；它们**自带鉴权和模型选择**，不一定尊重 HomeAgent 里选择的 model。普通聊天和任务会获得完整兼容 Skill 目录；提炼与后台学习仍使用严格 no-tools 调用，TRAE 仅用于显式任务。dream 的结构化抽取使用 Provider 的最终结果通道（Codex 使用 `--output-schema` + `--output-last-message`）并在 Core 做业务校验；长 Raw 不会整份塞入单次生成请求，而会按固定大小分段、逐步合并为同一份完整知识页。失败记录会冻结原 Knowledge page 生成计划并持续显示在对应空间的“提炼失败”页，使知识健康状态降级但不阻断 `/readyz`；单条或批量重试只重做失败的 generate，不会重新 analyze、改换目标页或连带处理无关消息。恢复所需来源不会被原始消息保留策略清理；若来源被撤回，旧失败记录会移除，仍有效的其他来源会重新进入待提炼队列。CLI 未报告的成本会明确记为未知；每日成本参考线对已知和未知成本都只作观察，不执行硬限制。
 
 ### 生产启动（接真实飞书）
 
@@ -406,7 +500,7 @@ bun run packages/app/src/main.ts
 # 或 bun start
 ```
 
-启动后：feishu 连接器监听事件、管理后台在 `HOMEAGENT_WEB_HOST:HOMEAGENT_WEB_PORT`、调度器做启动 catch-up + 每日 03:00 提炼，并按保留周期清理已提炼的过期消息。
+启动后：feishu 连接器监听事件、管理后台在 `HOMEAGENT_WEB_HOST:HOMEAGENT_WEB_PORT`、Dream 调度器做启动 catch-up + 每日 03:00 提炼，并以有界多批次和 15 分钟续跑消化历史积压；Wiki Maintenance 调度器做启动 catch-up + 每周只读检查，并按保留周期清理已提炼的过期消息。
 SIGTERM/SIGINT 优雅退出（对 lark-cli 子进程发 SIGTERM，绝不 kill -9）。
 
 ### macOS 后台常驻（P3.2）
@@ -437,7 +531,7 @@ bun run service uninstall            # 保留 data 与日志
 Windows 源码运行使用 `LockFileEx`）；SIGTERM/SIGINT 仍会优雅停止所有子进程。活动日志超过
 10 MiB 时会保留最近 1 MiB 并轮转 3 份，所有日志文件权限均为 0600。
 
-部署探针：`GET /healthz` 是不依赖外部组件的快速进程存活检查，始终返回 200；`GET /readyz` 只有在知识存储、必需 CLI、两条飞书事件消费者及 Dream Cycle、任务、提醒、学习四个调度器都可用时返回 200，否则返回 503。管理后台 `/health` 提供完整健康快照的人类可读视图。
+部署探针：`GET /healthz` 是不依赖外部组件的快速进程存活检查，始终返回 200；`GET /readyz` 只有在知识存储、必需 CLI、两条飞书事件消费者及 Dream Cycle、Wiki Maintenance、工作续跑、任务、提醒、学习六个调度器都可用时返回 200，否则返回 503。管理后台 `/health` 提供完整健康快照的人类可读视图；Wiki Maintenance 发现内容问题只使整体状态 degraded，不单独阻断 readiness。
 
 ## 飞书权限边界
 

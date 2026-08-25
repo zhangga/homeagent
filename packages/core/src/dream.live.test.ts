@@ -55,11 +55,11 @@ maybe("dream cycle (live)", () => {
     expect(report.examined).toBe(3);
     expect(report.pagesWritten).toBeGreaterThanOrEqual(1);
 
-    const pages = idx.listPages().filter((p) => !["index", "overview", "log", "glossary"].includes(p.slug));
+    const pages = idx.listPages().filter((p) => p.type !== "map" && !["index", "overview", "log", "glossary"].includes(p.slug));
     expect(pages.length).toBeGreaterThanOrEqual(1);
 
     // At least one page should trace back to the seeded raw entries.
-    const all = idx.allPages().filter((p) => !["index", "overview", "log", "glossary"].includes(p.slug));
+    const all = idx.allPages().filter((p) => p.type !== "map" && !["index", "overview", "log", "glossary"].includes(p.slug));
     const traced = all.some((p) => p.sources.includes(id1) || p.sources.includes(id2));
     expect(traced).toBe(true);
 

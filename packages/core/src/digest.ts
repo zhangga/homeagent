@@ -1,61 +1,239 @@
 /**
- * Deterministic regeneration of the "map" pages (index, glossary, overview) from
- * the current content pages. These are what ask()'s map-routing step feeds to
- * the LLM to choose which pages to load (plan §2.3). Building them by code
- * rather than by LLM keeps them always-consistent with reality and free.
- *
- * - index: a compact table of contents — every page's slug/title/summary.
- * - glossary: title + aliases -> slug, so alias lookups resolve.
- * - overview: grouped counts + the index, a human landing page.
+ * Deterministic regeneration of progressive Knowledge maps. Content pages are
+ * grouped into topic maps, while the top-level index and overview stay small
+ * and point at those maps. No LLM is involved, so the hierarchy is cheap,
+ * reproducible, and safe to refresh after every Knowledge page change.
  */
-import type { Page, PageRef } from "@homeagent/shared";
+import type { Page, PageRef, PageType } from "@homeagent/shared";
 import type { SpaceStore } from "./space.ts";
+import { slugifyName } from "./slug.ts";
 
-function nowHash(refs: PageRef[]): string {
-  // cheap hash of the map's shape so we can skip rewrites when nothing changed
-  const key = refs.map((r) => `${r.slug}:${r.title}:${r.aliases.join(",")}`).join("|");
-  const h = new Bun.CryptoHasher("sha256");
-  h.update(key);
-  return h.digest("hex").slice(0, 16);
+const NAVIGATION_TYPES = new Set<PageType>(["index", "overview", "log", "glossary", "map"]);
+const MAX_EXPLICIT_TOPIC_MAPS = 24;
+const MAX_TOPIC_MAP_ENTRIES = 100;
+const TYPE_LABELS: Record<Exclude<PageType, "index" | "overview" | "log" | "glossary" | "map">, string> = {
+  entity: "实体",
+  concept: "概念",
+  source: "来源",
+  analysis: "分析",
+};
+
+export function isKnowledgeContentRef(ref: Pick<PageRef, "type">): boolean {
+  return !NAVIGATION_TYPES.has(ref.type);
 }
 
-function indexPage(refs: PageRef[], hash: string): Page {
-  const byType = new Map<string, PageRef[]>();
-  for (const r of refs) {
-    const list = byType.get(r.type) ?? [];
-    list.push(r);
-    byType.set(r.type, list);
+interface TopicGroup {
+  slug: string;
+  title: string;
+  refs: PageRef[];
+}
+
+function explicitTopic(ref: PageRef): { slug: string; title: string } | undefined {
+  const tag = ref.tags.find((candidate) => Boolean(candidate.normalize("NFKC").trim()));
+  if (!tag) return undefined;
+  const title = tag.normalize("NFKC").trim();
+  return { slug: `maps/${slugifyName(title)}`, title };
+}
+
+function fallbackTopic(ref: PageRef): { slug: string; title: string } {
+  const title = TYPE_LABELS[ref.type as keyof typeof TYPE_LABELS] || "其他";
+  return { slug: `maps/type-${slugifyName(ref.type)}`, title };
+}
+
+function digestHash(parts: string[]): string {
+  const hash = new Bun.CryptoHasher("sha256");
+  hash.update(parts.join("\n"));
+  return hash.digest("hex").slice(0, 16);
+}
+
+function refKey(ref: PageRef): string {
+  return [
+    ref.slug,
+    ref.type,
+    ref.title,
+    ref.summary,
+    ref.aliases.join(","),
+    ref.tags.join(","),
+  ].join(":");
+}
+
+function topicGroups(refs: PageRef[]): TopicGroup[] {
+  const candidates = new Map<string, TopicGroup>();
+  for (const ref of refs) {
+    const topic = explicitTopic(ref);
+    if (!topic) continue;
+    const group = candidates.get(topic.slug) ?? { ...topic, refs: [] };
+    group.refs.push(ref);
+    candidates.set(topic.slug, group);
   }
-  const lines: string[] = ["# Index", "", "本空间所有知识页的目录（由系统自动生成）。", ""];
-  for (const [type, list] of [...byType.entries()].sort()) {
-    lines.push(`## ${type}`, "");
-    for (const r of list.sort((a, b) => a.slug.localeCompare(b.slug))) {
-      const aliases = r.aliases.length ? ` （别名：${r.aliases.join("、")}）` : "";
-      lines.push(`- [[${r.slug}|${r.title}]]${aliases}：${r.summary}`);
+  const selected = [...candidates.values()]
+    .sort((left, right) =>
+      right.refs.length - left.refs.length || left.slug.localeCompare(right.slug)
+    )
+    .slice(0, MAX_EXPLICIT_TOPIC_MAPS);
+  const selectedSlugs = new Set(selected.map((group) => group.slug));
+  const groups = new Map<string, TopicGroup>(
+    selected.map((group) => [group.slug, { ...group, refs: [] as PageRef[] }]),
+  );
+  for (const ref of refs) {
+    const explicit = explicitTopic(ref);
+    const topic = explicit && selectedSlugs.has(explicit.slug) ? explicit : fallbackTopic(ref);
+    const group = groups.get(topic.slug) ?? { ...topic, refs: [] };
+    group.refs.push(ref);
+    groups.set(topic.slug, group);
+  }
+  return [...groups.values()]
+    .map((group) => ({
+      ...group,
+      refs: group.refs.slice().sort((left, right) => left.slug.localeCompare(right.slug)),
+    }))
+    .sort((left, right) => left.slug.localeCompare(right.slug));
+}
+
+function contentMap(slug: string, title: string, refs: PageRef[], summaryCount = refs.length): Page {
+  const lines = [
+    `# ${title}`,
+    "",
+    `本主题包含 ${summaryCount} 个知识页（由系统自动生成）。`,
+    "",
+    "## 页面",
+    "",
+    ...refs.map((ref) => `- [[${ref.slug}|${ref.title}]]：${ref.summary}`),
+    "",
+  ];
+  return {
+    slug,
+    type: "map",
+    title,
+    summary: `${title}：${summaryCount} 个知识页`,
+    aliases: [],
+    tags: [],
+    sources: [],
+    links: refs.map((ref) => ref.slug),
+    content: lines.join("\n"),
+    updatedAt: Date.now(),
+    contentHash: digestHash(refs.map(refKey)),
+  };
+}
+
+interface MapNode {
+  page: Page;
+  contentCount: number;
+}
+
+function navigationMap(slug: string, title: string, nodes: MapNode[]): Page {
+  const contentCount = nodes.reduce((total, node) => total + node.contentCount, 0);
+  const lines = [
+    `# ${title}`,
+    "",
+    `本主题包含 ${contentCount} 个知识页，已拆分为 ${nodes.length} 个下级地图（由系统自动生成）。`,
+    "",
+    "## 下级地图",
+    "",
+    ...nodes.map((node) =>
+      `- [[${node.page.slug}|${node.page.title}]]：${node.contentCount} 个知识页`
+    ),
+    "",
+  ];
+  return {
+    slug,
+    type: "map",
+    title,
+    summary: `${title}：${contentCount} 个知识页`,
+    aliases: [],
+    tags: [],
+    sources: [],
+    links: nodes.map((node) => node.page.slug),
+    content: lines.join("\n"),
+    updatedAt: Date.now(),
+    contentHash: digestHash(nodes.flatMap((node) => [
+      node.page.slug,
+      node.page.title,
+      String(node.contentCount),
+    ])),
+  };
+}
+
+function topicMaps(group: TopicGroup): Page[] {
+  if (group.refs.length <= MAX_TOPIC_MAP_ENTRIES) {
+    return [contentMap(group.slug, group.title, group.refs)];
+  }
+  const generated: Page[] = [];
+  const leafCount = Math.ceil(group.refs.length / MAX_TOPIC_MAP_ENTRIES);
+  let nodes: MapNode[] = [];
+  for (let index = 0; index < leafCount; index += 1) {
+    const number = String(index + 1).padStart(3, "0");
+    const refs = group.refs.slice(
+      index * MAX_TOPIC_MAP_ENTRIES,
+      (index + 1) * MAX_TOPIC_MAP_ENTRIES,
+    );
+    const page = contentMap(
+      `${group.slug}-part-${number}`,
+      `${group.title} · ${index + 1}/${leafCount}`,
+      refs,
+    );
+    generated.push(page);
+    nodes.push({ page, contentCount: refs.length });
+  }
+  let level = 2;
+  while (nodes.length > MAX_TOPIC_MAP_ENTRIES) {
+    const next: MapNode[] = [];
+    const parentCount = Math.ceil(nodes.length / MAX_TOPIC_MAP_ENTRIES);
+    for (let index = 0; index < parentCount; index += 1) {
+      const children = nodes.slice(
+        index * MAX_TOPIC_MAP_ENTRIES,
+        (index + 1) * MAX_TOPIC_MAP_ENTRIES,
+      );
+      const page = navigationMap(
+        `${group.slug}-level-${level}-part-${String(index + 1).padStart(3, "0")}`,
+        `${group.title} · 第 ${level} 层 ${index + 1}/${parentCount}`,
+        children,
+      );
+      generated.push(page);
+      next.push({
+        page,
+        contentCount: children.reduce((total, child) => total + child.contentCount, 0),
+      });
     }
-    lines.push("");
+    nodes = next;
+    level += 1;
   }
+  return [navigationMap(group.slug, group.title, nodes), ...generated];
+}
+
+function indexPage(groups: TopicGroup[], contentCount: number): Page {
+  const lines = [
+    "# Index",
+    "",
+    "本空间的一级主题导航（由系统自动生成）。",
+    "",
+    ...groups.map((group) =>
+      `- [[${group.slug}|${group.title}]]：${group.refs.length} 个知识页`
+    ),
+    "",
+  ];
   return {
     slug: "index",
     type: "index",
     title: "Index",
-    summary: `目录：${refs.length} 个知识页`,
+    summary: `主题导航：${groups.length} 个主题，${contentCount} 个知识页`,
     aliases: [],
     tags: [],
     sources: [],
-    links: refs.map((r) => r.slug),
-    content: lines.join("\n") + "\n",
+    links: groups.map((group) => group.slug),
+    content: lines.join("\n"),
     updatedAt: Date.now(),
-    contentHash: hash,
+    contentHash: digestHash(groups.flatMap((group) => [group.slug, group.title, String(group.refs.length)])),
   };
 }
 
-function glossaryPage(refs: PageRef[], hash: string): Page {
-  const lines: string[] = ["# Glossary", "", "标题与别名到页面的映射（自动生成）。", ""];
-  for (const r of refs.slice().sort((a, b) => a.title.localeCompare(b.title))) {
-    const names = [r.title, ...r.aliases];
-    lines.push(`- ${names.join(" / ")} → [[${r.slug}]]`);
+function glossaryPage(refs: PageRef[]): Page {
+  const sorted = refs.slice().sort((left, right) => left.title.localeCompare(right.title));
+  const lines = ["# Glossary", "", "标题与别名到页面的映射（自动生成）。", ""];
+  for (const ref of sorted) {
+    lines.push(`- ${[ref.title, ...ref.aliases].join(" / ")} → [[${ref.slug}]]`);
   }
+  lines.push("");
   return {
     slug: "glossary",
     type: "glossary",
@@ -64,53 +242,98 @@ function glossaryPage(refs: PageRef[], hash: string): Page {
     aliases: [],
     tags: [],
     sources: [],
-    links: refs.map((r) => r.slug),
-    content: lines.join("\n") + "\n",
+    links: refs.map((ref) => ref.slug),
+    content: lines.join("\n"),
     updatedAt: Date.now(),
-    contentHash: hash,
+    contentHash: digestHash(sorted.map(refKey)),
   };
 }
 
-function overviewPage(refs: PageRef[], hash: string): Page {
-  const counts = new Map<string, number>();
-  for (const r of refs) counts.set(r.type, (counts.get(r.type) ?? 0) + 1);
-  const lines: string[] = ["# Overview", "", "## 概况", ""];
-  for (const [type, n] of [...counts.entries()].sort()) lines.push(`- ${type}: ${n}`);
-  lines.push("", `共 ${refs.length} 个知识页。详见 [[index]] 与 [[glossary]]。`, "");
+function overviewPage(groups: TopicGroup[], pages: Page[]): Page {
+  const ranked = groups.slice().sort((left, right) =>
+    right.refs.length - left.refs.length || left.slug.localeCompare(right.slug)
+  );
+  const recent = pages.slice().sort((left, right) =>
+    right.updatedAt - left.updatedAt || left.slug.localeCompare(right.slug)
+  ).slice(0, 8);
+  const untagged = pages.filter((page) => page.tags.length === 0).length;
+  const unlinked = pages.filter((page) => page.links.length === 0).length;
+  const lines = [
+    "# Overview",
+    "",
+    "## 核心主题",
+    "",
+    ...ranked.map((group) =>
+      `- [[${group.slug}|${group.title}]]：${group.refs.length} 个知识页`
+    ),
+    "",
+    "## 最近更新",
+    "",
+    ...recent.map((page) => `- [[${page.slug}|${page.title}]]：${page.summary}`),
+    "",
+    "## 知识缺口",
+    "",
+    `- ${untagged} 个知识页没有主题标签。`,
+    `- ${unlinked} 个知识页没有关联其他知识页。`,
+    "",
+    `共 ${pages.length} 个知识页。完整一级导航见 [[index]]，术语定位见 [[glossary]]。`,
+    "",
+  ];
   return {
     slug: "overview",
     type: "overview",
     title: "Overview",
-    summary: `概况：共 ${refs.length} 个知识页`,
+    summary: `概览：${groups.length} 个主题，${pages.length} 个知识页`,
     aliases: [],
     tags: [],
     sources: [],
-    links: ["index", "glossary"],
-    content: lines.join("\n") + "\n",
+    links: [
+      ...ranked.map((group) => group.slug),
+      ...recent.map((page) => page.slug),
+      "index",
+      "glossary",
+    ],
+    content: lines.join("\n"),
     updatedAt: Date.now(),
-    contentHash: hash,
+    contentHash: digestHash([
+      ...ranked.flatMap((group) => [group.slug, group.title, String(group.refs.length)]),
+      ...recent.map((page) => `${page.slug}:${page.title}:${page.updatedAt}:${page.summary}`),
+      `untagged:${untagged}`,
+      `unlinked:${unlinked}`,
+    ]),
   };
 }
 
-const SINGLETONS = new Set(["index", "overview", "log", "glossary"]);
-
 /**
- * Regenerate index/glossary/overview from the current content pages. Skips the
- * rewrite when the map's shape hash is unchanged (idempotent, cheap to call
- * after every dream cycle). Returns the number of map pages written.
+ * Regenerate topic maps plus index/glossary/overview from current content
+ * pages. The returned count is the number of generated pages written.
  */
 export function refreshDigest(store: SpaceStore): number {
-  const refs = store
-    .index()
-    .listPages()
-    .filter((r) => !SINGLETONS.has(r.slug));
-  const hash = nowHash(refs);
-
-  const existing = store.index().getPage("index");
-  if (existing && existing.contentHash === hash) return 0;
-
-  store.writePage(indexPage(refs, hash));
-  store.writePage(glossaryPage(refs, hash));
-  store.writePage(overviewPage(refs, hash));
-  return 3;
+  const allPages = store.index().allPages();
+  const pages = allPages
+    .filter(isKnowledgeContentRef)
+    .sort((left, right) => left.slug.localeCompare(right.slug));
+  const refs: PageRef[] = pages;
+  const groups = topicGroups(refs);
+  const maps = groups.flatMap(topicMaps);
+  const generated = [
+    ...maps,
+    indexPage(groups, refs.length),
+    glossaryPage(refs),
+    overviewPage(groups, pages),
+  ];
+  let written = 0;
+  for (const page of generated) {
+    const existing = store.index().getPage(page.slug);
+    if (existing?.type === page.type && existing.contentHash === page.contentHash) continue;
+    store.writePage(page);
+    written += 1;
+  }
+  const generatedMapSlugs = new Set(maps.map((page) => page.slug));
+  for (const stale of allPages.filter((ref) =>
+    ref.type === "map" && !generatedMapSlugs.has(ref.slug)
+  )) {
+    store.deletePage(stale.slug);
+  }
+  return written;
 }

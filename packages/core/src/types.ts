@@ -12,7 +12,7 @@ export interface AskFailureTrace {
 }
 
 export interface DreamOptions {
-  /** cap on raw entries processed this run (cost control) */
+  /** cap on Raw entries processed in one bounded prompt batch */
   maxEntries?: number;
   /** process only these raw entries; when set, the normal 40-entry batch cap is not applied */
   rawIds?: string[];
@@ -110,6 +110,12 @@ export interface SpaceMeta {
   id: SpaceId;
   createdAt: number;
   lastDreamAt?: number;
+  /** Last completed deterministic Wiki Maintenance cycle. */
+  lastMaintenanceAt?: number;
+  /** Bounded summary from the last completed Wiki Maintenance cycle. */
+  lastMaintenanceScannedPages?: number;
+  lastMaintenanceIssueCount?: number;
+  lastMaintenanceTruncated?: boolean;
   /** feishu chat_id this space is bound to (team spaces) */
   chatId?: string;
   /** human-readable display name for the group (management backend) */

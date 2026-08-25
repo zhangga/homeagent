@@ -11,7 +11,13 @@ import {
   type SpaceId,
   type SystemHealthSnapshot,
 } from "@homeagent/shared";
-import { KnowledgeEngine, FakeLlm, SkillCatalog } from "@homeagent/core";
+import {
+  KnowledgeEngine,
+  FakeLlm,
+  SkillCatalog,
+  knowledgePageRevision,
+  refreshDigest,
+} from "@homeagent/core";
 import { createWebApp } from "./app.ts";
 import { FeishuIntegrationService } from "./feishu-integration-service.ts";
 import type { LarkSetupPort } from "./integrations.ts";
@@ -301,6 +307,37 @@ describe("web backend (read-only)", () => {
     expect((await engine.getSpaceGovernance(SPACE)).purpose).toContain(
       "这是一个 homeagent 知识空间",
     );
+  });
+
+  test("shows generated maps separately and prevents manual governance", async () => {
+    refreshDigest(engine.registry.store(SPACE));
+
+    const detail = await app.request(`/spaces/${encodeURIComponent(SPACE)}`);
+    const detailBody = await detail.text();
+    expect(detailBody).toContain("知识地图（1）");
+    expect(detailBody).toContain("知识页（1）");
+    expect(detailBody).toContain("maps/team");
+
+    const mapPage = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/pages/${encodeURIComponent("maps/team")}`,
+    );
+    const mapBody = await mapPage.text();
+    expect(mapBody).toContain("系统自动生成的导航页");
+    expect(mapBody).not.toContain("证据链与时效性");
+    expect(mapBody).not.toContain("重新生成知识页");
+    expect(mapBody).not.toContain("提交人工纠错");
+
+    const removal = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/pages/delete`,
+      {
+        method: "POST",
+        body: new URLSearchParams({ slug: "maps/team" }),
+      },
+    );
+    expect([302, 303]).toContain(removal.status);
+    expect(decodeURIComponent(removal.headers.get("location") ?? ""))
+      .toContain("自动生成的导航页不能人工删除或重新生成");
+    expect(await engine.getPage(SPACE, "maps/team")).not.toBeNull();
   });
 
   test("shows the full raw record and its derived knowledge pages", async () => {
@@ -1259,6 +1296,34 @@ describe("web backend (read-only)", () => {
     expect(body).toContain("raw-1"); // provenance
   });
 
+  test("page view shows a dated Page-to-Raw evidence chain and freshness", async () => {
+    const sourceCreatedAt = Date.UTC(2024, 0, 2);
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "manual",
+      author: "ou_owner",
+      content: "历史发布窗口约定。",
+      createdAt: sourceCreatedAt,
+    });
+    await engine.upsertPage(SPACE, {
+      ...page("concepts/release-window", "发布窗口", "发布窗口在周二。"),
+      type: "concept",
+      sources: [rawId],
+    });
+
+    const response = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/pages/${encodeURIComponent("concepts/release-window")}`,
+    );
+    const body = await response.text();
+
+    expect(body).toContain("证据链与时效性");
+    expect(body).toContain("证据陈旧");
+    expect(body).toContain("2024");
+    expect(body).toContain("manual");
+    expect(body).toContain(`/raw/${rawId}`);
+    expect(body).toContain("ou_owner");
+  });
+
   test("raw list shows captured entries", async () => {
     const res = await app.request(`/spaces/${encodeURIComponent(SPACE)}/raw`);
     expect(res.status).toBe(200);
@@ -1279,6 +1344,8 @@ describe("web backend (read-only)", () => {
     const body = await res.text();
     expect(body).toContain("后端由 Alice 负责");
     expect(body).toContain("知识库"); // source badge
+    expect(body).toContain("证据时间未知");
+    expect(body).toContain("证据链不完整");
     expect(body).toContain('value="helpful"');
     expect(body).toContain('value="unhelpful"');
     expect(body).toContain('value="citation_error"');
@@ -1400,6 +1467,68 @@ describe("web backend (read-only)", () => {
       `/spaces/${encodeURIComponent(SPACE)}/pages/${encodeURIComponent("entities/alice")}`,
     );
     expect(body).not.toContain("这条回答很好吗？");
+  });
+
+  test("Agent feedback workbench verifies a page change before closing the report", async () => {
+    const original = (await engine.getPage(SPACE, "entities/alice"))!;
+    const feedback = await engine.submitAgentKnowledgeFeedback(SPACE, {
+      idempotencyKey: "web-agent-run-1:feedback-1",
+      consumer: "external-codex",
+      kind: "incorrect",
+      target: {
+        kind: "page",
+        slug: original.slug,
+        revision: knowledgePageRevision(original),
+      },
+      note: "Alice 已经不再负责后端服务。",
+    });
+
+    const before = await (await app.request("/quality/agent-feedback")).text();
+    expect(before).toContain("Agent 知识反馈");
+    expect(before).toContain("external-codex");
+    expect(before).toContain("内容不正确");
+    expect(before).toContain("Alice 已经不再负责后端服务。");
+    expect(before).toContain(
+      `/spaces/${encodeURIComponent(SPACE)}/pages/${encodeURIComponent(original.slug)}`,
+    );
+
+    const unchanged = await app.request(
+      `/quality/agent-feedback/${encodeURIComponent(SPACE)}/${encodeURIComponent(feedback.id)}/resolve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          kind: "knowledge_changed",
+          note: "已经更新知识页。",
+        }),
+      },
+    );
+    expect(unchanged.status).toBe(409);
+    expect(engine.listAgentKnowledgeFeedback(SPACE, { status: "open" })).toHaveLength(1);
+
+    await engine.upsertPage(SPACE, {
+      ...original,
+      content: "Alice 已转岗，后端服务负责人待确认。",
+      updatedAt: original.updatedAt + 1,
+      contentHash: "h2",
+    });
+    const resolved = await app.request(
+      `/quality/agent-feedback/${encodeURIComponent(SPACE)}/${encodeURIComponent(feedback.id)}/resolve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          kind: "knowledge_changed",
+          note: "已更新负责人状态。",
+        }),
+      },
+    );
+
+    expect(resolved.status).toBe(302);
+    const history = await (await app.request("/quality/agent-feedback?status=resolved")).text();
+    expect(history).toContain("已解决");
+    expect(history).toContain("已更新负责人状态。");
+    expect(history).toContain("知识页已变更");
   });
 
   test("quality workbench promotes one negative feedback into a calibration case", async () => {
@@ -1627,6 +1756,20 @@ describe("web backend (read-only)", () => {
     expect([302, 303]).toContain(res.status);
   });
 
+  test("Wiki Maintenance POST runs an independent read-only cycle", async () => {
+    const res = await app.request(
+      `/spaces/${encodeURIComponent(SPACE)}/maintenance`,
+      { method: "POST" },
+    );
+
+    expect([302, 303]).toContain(res.status);
+    expect(res.headers.get("location")).toContain("Wiki+Maintenance");
+    expect(engine.registry.get(SPACE)?.lastMaintenanceAt).toEqual(expect.any(Number));
+
+    const page = await app.request(`/spaces/${encodeURIComponent(SPACE)}`);
+    expect(await page.text()).toContain("运行 Wiki 维护检查");
+  });
+
   test("quarantine page lists a failure and retries only its sources", async () => {
     const rawId = await engine.remember({
       space: SPACE,
@@ -1652,10 +1795,6 @@ describe("web backend (read-only)", () => {
     expect(body).toContain("generated page has empty content");
     expect(body).toContain("1 条原始来源");
 
-    fake.queueJSON({
-      operations: [{ type: "concept", name: "web-retry", title: "Web Retry", rawIds: [rawId] }],
-      skippedRawIds: [],
-    });
     fake.queueJSON({
       title: "Web Retry",
       summary: "后台恢复成功",
@@ -1690,8 +1829,16 @@ describe("web backend (read-only)", () => {
     expect(await engine.listQuarantines(SPACE)).toHaveLength(2);
 
     fake.onJSON((options) => {
-      const rawIds = [first, second].filter((id) => options.prompt?.includes(id));
-      return { operations: [], skippedRawIds: rawIds };
+      const isFirst = options.prompt?.includes(first) ?? false;
+      const title = isFirst ? "Batch One" : "Batch Two";
+      return {
+        title,
+        summary: "后台批量恢复成功",
+        aliases: [],
+        tags: [],
+        links: [],
+        content: `# ${title}\n\n后台批量恢复成功。\n`,
+      };
     });
     const retry = await app.request(`/spaces/${encodeURIComponent(SPACE)}/quarantine/retry-all`, {
       method: "POST",
@@ -1955,8 +2102,9 @@ describe("management backend (read-write)", () => {
     const governanceBody = await governance.text();
     expect(governanceBody).toContain("数据治理");
     expect(governanceBody).toContain("原始消息保留");
-    expect(governanceBody).toContain("homeagent.space v1–v16");
-    expect(governanceBody).toContain("v16 包含 WorkAction Raw");
+    expect(governanceBody).toContain("homeagent.space v1–v18");
+    expect(governanceBody).toContain("v17 包含系统生成的分层知识地图");
+    expect(governanceBody).toContain("v18 包含本地 Agent 知识消费反馈及处置记录");
 
     const exported = await app.request(`/spaces/${encodeURIComponent(SPACE)}/export`);
     expect(exported.status).toBe(200);
@@ -1965,7 +2113,8 @@ describe("management backend (read-write)", () => {
     expect(JSON.parse(archiveText)).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 16,
+        version: 18,
+        agentKnowledgeFeedback: [],
         agentRevisions: [],
         learning: { plans: [], sources: [], sessions: [] },
         governanceAudit: [],
@@ -4288,6 +4437,8 @@ describe("management backend (read-write)", () => {
     expect(view).toContain('<option value="3" selected>03:00</option>');
     expect(view).toContain('<label for="chat-timeout-minutes">聊天最长回答时间</label>');
     expect(view).toContain('name="chatTimeoutMinutes" value="10"');
+    expect(view).toContain('<label for="daily-budget">每日成本参考线</label>');
+    expect(view).toContain("只用于成本观察，不会暂停或拒绝任何 Provider 调用");
     expect(view).toContain('data-settings-form');
     expect(view).toContain('type="reset"');
     expect(view).toContain("取消");
@@ -4336,7 +4487,7 @@ describe("management backend (read-write)", () => {
     expect(view).toContain("Escape");
   });
 
-  test("settings POST rejects an invalid budget without persisting other fields", async () => {
+  test("settings POST rejects an invalid cost reference without persisting other fields", async () => {
     const response = await app.request("/settings", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -4352,7 +4503,7 @@ describe("management backend (read-write)", () => {
 
     expect(response.status).toBe(400);
     const view = await response.text();
-    expect(view).toContain("每日预算不能小于 0");
+    expect(view).toContain("每日成本参考线不能小于 0");
     expect(view).toContain('value="-1"');
     expect(view).toContain('aria-invalid="true"');
     expect(view).toContain('value="trae-cli" selected');

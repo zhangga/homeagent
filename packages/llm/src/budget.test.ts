@@ -91,23 +91,40 @@ describe("budget", () => {
 
     expect(spentToday()).toBe(0);
     expect(spentToday(localDay(), isolated)).toBe(1);
-    expect(checkBudget("distill", 1, isolated).allowed).toBe(false);
+    expect(checkBudget("distill", 1, isolated)).toEqual(expect.objectContaining({
+      allowed: true,
+      referenceExceeded: true,
+      spent: 1,
+    }));
   });
 
-  test("distill is blocked at the cap", () => {
+  test("distill remains runnable after the daily cost reference is exceeded", () => {
     seed(5.0);
     const d = checkBudget("distill");
-    expect(d.allowed).toBe(false);
-    expect(d.reason).toContain("budget");
+    expect(d).toEqual(expect.objectContaining({
+      allowed: true,
+      enforced: false,
+      referenceExceeded: true,
+      spent: 5,
+      budget: 5,
+    }));
   });
 
-  test("ask gets grace headroom past the cap", () => {
+  test("all purposes stay allowed while retaining their historical reference thresholds", () => {
     seed(5.0);
-    // deferrable blocked, but ask allowed until 1.5x
-    expect(checkBudget("distill").allowed).toBe(false);
-    expect(checkBudget("ask").allowed).toBe(true);
-    seed(3.0); // now 8.0 >= 7.5 grace limit
-    expect(checkBudget("ask").allowed).toBe(false);
+    expect(checkBudget("distill")).toEqual(expect.objectContaining({
+      allowed: true,
+      referenceExceeded: true,
+    }));
+    expect(checkBudget("ask")).toEqual(expect.objectContaining({
+      allowed: true,
+      referenceExceeded: false,
+    }));
+    seed(3.0);
+    expect(checkBudget("ask")).toEqual(expect.objectContaining({
+      allowed: true,
+      referenceExceeded: true,
+    }));
   });
 
   test("tolerates malformed log lines", async () => {

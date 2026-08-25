@@ -47,6 +47,12 @@ import {
 import {
   isGroupParticipationLevel,
   isAnswerFeedbackKind,
+  isAgentKnowledgeFeedbackManualResolutionKind,
+  isKnowledgeContentRef,
+  isLocalAgentKnowledgeToolName,
+  AgentKnowledgeFeedbackError,
+  LocalAgentKnowledge,
+  LocalAgentKnowledgeError,
   NEGATIVE_ANSWER_FEEDBACK_KINDS,
   TaskAlreadyRunningError,
   type FeishuResponseMode,
@@ -54,6 +60,7 @@ import {
   type Agent,
   type ChatRun,
   type KnowledgeEngine,
+  type SubmitAgentKnowledgeFeedbackInput,
   type TaskRun,
   type WorkItemPhase,
 } from "@homeagent/core";
@@ -81,6 +88,7 @@ import {
 } from "./external-sharing.ts";
 import {
   askView,
+  agentKnowledgeFeedbackView,
   integrationsView,
   learningView,
   healthView,
@@ -107,7 +115,41 @@ import {
 
 const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 const LOCAL_GOVERNANCE_ACTOR = "local-admin";
+const MAX_LOCAL_AGENT_API_REQUEST_BYTES = 64 * 1024;
 const log = logger.child("web");
+
+async function readBoundedRequestBody(request: Request, maximumBytes: number): Promise<string | undefined> {
+  const body = request.body;
+  if (!body) return "";
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maximumBytes) {
+        await reader.cancel();
+        return undefined;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const merged = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(merged);
+  } catch {
+    throw new SyntaxError("invalid UTF-8");
+  }
+}
 
 export interface WebOptions {
   engine: KnowledgeEngine;
@@ -115,6 +157,10 @@ export interface WebOptions {
   brandAvatarPath?: string;
   /** protects all management routes; liveness/readiness probes remain public */
   adminToken?: string;
+  /** Optional env-only credential limited to the local Agent read API. */
+  agentReadToken?: string;
+  /** Optional env-only credential limited to local Agent feedback submission. */
+  agentFeedbackToken?: string;
   /** process-level health reporter; production wires all runtime components */
   health?: () => Promise<SystemHealthSnapshot>;
   /** injected for tests; defaults to probing local CLIs. */
@@ -206,9 +252,9 @@ function parseSettingsForm(body: Record<string, unknown>): {
   const errors: SettingsFieldErrors = {};
   const budget = Number(values.dailyBudgetUsd);
   if (values.dailyBudgetUsd.trim() === "" || !Number.isFinite(budget)) {
-    errors.dailyBudgetUsd = "每日预算必须是有效数字";
+    errors.dailyBudgetUsd = "每日成本参考线必须是有效数字";
   } else if (budget < 0) {
-    errors.dailyBudgetUsd = "每日预算不能小于 0";
+    errors.dailyBudgetUsd = "每日成本参考线不能小于 0";
   }
   const chatTimeoutMinutes = Number(values.chatTimeoutMinutes);
   if (
@@ -370,12 +416,34 @@ export function createWebApp(opts: WebOptions): Hono {
   const { engine } = opts;
   const app = new Hono();
   const instanceId = randomUUID();
+  const localAgentKnowledge = new LocalAgentKnowledge(engine);
 
   if (opts.adminToken) {
     const token = opts.adminToken;
+    const agentReadToken = opts.agentReadToken;
+    const agentFeedbackToken = opts.agentFeedbackToken;
+    if (
+      agentFeedbackToken
+      && (
+        equalSecret(agentFeedbackToken, token)
+        || (agentReadToken && equalSecret(agentFeedbackToken, agentReadToken))
+      )
+    ) {
+      throw new Error("local Agent feedback token must be distinct from other web credentials");
+    }
     app.use("*", async (c, next) => {
       if (c.req.path === "/healthz" || c.req.path === "/readyz") return next();
       if (isAuthorized(c.req.header("authorization"), token)) return next();
+      if (
+        c.req.path === "/api/agent/v1/query"
+        && agentReadToken
+        && isAuthorized(c.req.header("authorization"), agentReadToken)
+      ) return next();
+      if (
+        c.req.path === "/api/agent/v1/feedback"
+        && agentFeedbackToken
+        && isAuthorized(c.req.header("authorization"), agentFeedbackToken)
+      ) return next();
       c.header("www-authenticate", 'Basic realm="homeagent", charset="UTF-8"');
       return c.text("Unauthorized", 401);
     });
@@ -388,6 +456,126 @@ export function createWebApp(opts: WebOptions): Hono {
   app.use("*", async (c, next) => {
     if (isCrossSiteMutation(c.req.raw)) return c.text("Forbidden", 403);
     return next();
+  });
+
+  app.post("/api/agent/v1/query", async (c) => {
+    c.header("cache-control", "no-store");
+    if (!c.req.header("content-type")?.toLowerCase().startsWith("application/json")) {
+      return c.json({ ok: false, error: { code: "invalid_input", message: "JSON body required" } }, 415);
+    }
+    const declaredLength = Number(c.req.header("content-length") ?? "0");
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_LOCAL_AGENT_API_REQUEST_BYTES) {
+      return c.json({ ok: false, error: { code: "invalid_input", message: "request is too large" } }, 413);
+    }
+    try {
+      const bodyText = await readBoundedRequestBody(
+        c.req.raw,
+        MAX_LOCAL_AGENT_API_REQUEST_BYTES,
+      );
+      if (bodyText === undefined) {
+        return c.json({ ok: false, error: { code: "invalid_input", message: "request is too large" } }, 413);
+      }
+      const parsed = JSON.parse(bodyText) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return c.json({ ok: false, error: { code: "invalid_input", message: "invalid query request" } }, 400);
+      }
+      const request = parsed as Record<string, unknown>;
+      const keys = Object.keys(request);
+      if (
+        keys.some((key) => key !== "tool" && key !== "arguments")
+        || !isLocalAgentKnowledgeToolName(request.tool)
+        || (request.arguments !== undefined && (
+          !request.arguments
+          || typeof request.arguments !== "object"
+          || Array.isArray(request.arguments)
+        ))
+      ) {
+        return c.json({ ok: false, error: { code: "invalid_input", message: "invalid query request" } }, 400);
+      }
+      const result = await localAgentKnowledge.call(
+        request.tool,
+        (request.arguments ?? {}) as Record<string, unknown>,
+      );
+      return c.json({ ok: true, result });
+    } catch (error) {
+      if (error instanceof LocalAgentKnowledgeError) {
+        const status = error.code === "not_found" ? 404 : 400;
+        return c.json({ ok: false, error: { code: error.code, message: error.message } }, status);
+      }
+      if (error instanceof SyntaxError) {
+        return c.json({ ok: false, error: { code: "invalid_input", message: "invalid JSON" } }, 400);
+      }
+      log.warn("local Agent knowledge query failed", {
+        err: String(error).slice(0, 500),
+      });
+      return c.json({ ok: false, error: { code: "unavailable", message: "knowledge query unavailable" } }, 503);
+    }
+  });
+
+  app.post("/api/agent/v1/feedback", async (c) => {
+    c.header("cache-control", "no-store");
+    if (!c.req.header("content-type")?.toLowerCase().startsWith("application/json")) {
+      return c.json({ ok: false, error: { code: "invalid_input", message: "JSON body required" } }, 415);
+    }
+    const declaredLength = Number(c.req.header("content-length") ?? "0");
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_LOCAL_AGENT_API_REQUEST_BYTES) {
+      return c.json({ ok: false, error: { code: "invalid_input", message: "request is too large" } }, 413);
+    }
+    try {
+      const bodyText = await readBoundedRequestBody(
+        c.req.raw,
+        MAX_LOCAL_AGENT_API_REQUEST_BYTES,
+      );
+      if (bodyText === undefined) {
+        return c.json({ ok: false, error: { code: "invalid_input", message: "request is too large" } }, 413);
+      }
+      const parsed = JSON.parse(bodyText) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return c.json({ ok: false, error: { code: "invalid_input", message: "invalid feedback request" } }, 400);
+      }
+      const request = parsed as Record<string, unknown>;
+      const allowed = ["space", "idempotencyKey", "consumer", "kind", "target", "note"];
+      if (
+        Object.keys(request).some((key) => !allowed.includes(key))
+        || typeof request.space !== "string"
+        || request.space.length > 256
+        || !isSpaceId(request.space)
+      ) {
+        return c.json({ ok: false, error: { code: "invalid_input", message: "invalid feedback request" } }, 400);
+      }
+      const feedback = await engine.submitAgentKnowledgeFeedback(request.space, {
+        idempotencyKey: request.idempotencyKey,
+        consumer: request.consumer,
+        kind: request.kind,
+        target: request.target,
+        ...(request.note === undefined ? {} : { note: request.note }),
+      } as SubmitAgentKnowledgeFeedbackInput);
+      return c.json({ ok: true, feedback });
+    } catch (error) {
+      if (error instanceof AgentKnowledgeFeedbackError) {
+        if (error.code === "corrupt_state") {
+          log.warn("local Agent feedback persistence is unavailable", {
+            err: error.message.slice(0, 500),
+          });
+          return c.json({ ok: false, error: { code: "unavailable", message: "feedback unavailable" } }, 503);
+        }
+        const status = error.code === "not_found"
+          ? 404
+          : error.code === "conflict"
+            ? 409
+            : error.code === "capacity"
+              ? 429
+              : 400;
+        return c.json({ ok: false, error: { code: error.code, message: error.message } }, status);
+      }
+      if (error instanceof SyntaxError) {
+        return c.json({ ok: false, error: { code: "invalid_input", message: "invalid JSON" } }, 400);
+      }
+      log.warn("local Agent feedback submission failed", {
+        err: String(error).slice(0, 500),
+      });
+      return c.json({ ok: false, error: { code: "unavailable", message: "feedback unavailable" } }, 503);
+    }
   });
 
   app.get("/brand/homeagent-feishu-avatar.png", (c) => {
@@ -836,6 +1024,65 @@ export function createWebApp(opts: WebOptions): Hono {
     );
   });
 
+  app.get("/quality/agent-feedback", async (c) => {
+    const status = c.req.query("status") === "resolved" ? "resolved" : "open";
+    try {
+      const feedback = engine.registry.list()
+        .flatMap((space) => engine.listAgentKnowledgeFeedback(space.id, { status, limit: 500 }))
+        .sort((left, right) => right.createdAt - left.createdAt || left.id.localeCompare(right.id))
+        .slice(0, 500);
+      return c.html(
+        await layout(
+          "Agent 知识反馈",
+          [{ label: "AI 质量", href: "/quality" }, { label: "Agent 知识反馈" }],
+          await agentKnowledgeFeedbackView(
+            feedback,
+            status,
+            c.req.query("ok") ?? undefined,
+          ),
+          "quality",
+        ),
+      );
+    } catch (error) {
+      log.warn("Agent knowledge feedback workbench unavailable", {
+        err: String(error).slice(0, 500),
+      });
+      return c.text("Agent feedback unavailable", 503);
+    }
+  });
+
+  app.post("/quality/agent-feedback/:space/:feedbackId/resolve", async (c) => {
+    const space = parseSpace(c.req.param("space"));
+    if (!space || !engine.registry.has(space)) return c.notFound();
+    const body = await c.req.parseBody();
+    const kind = str(body, "kind");
+    const note = str(body, "note").trim();
+    if (!isAgentKnowledgeFeedbackManualResolutionKind(kind) || !note) {
+      return c.text("Invalid feedback resolution", 400);
+    }
+    try {
+      await engine.resolveAgentKnowledgeFeedback(space, c.req.param("feedbackId"), {
+        actor: LOCAL_GOVERNANCE_ACTOR,
+        kind,
+        note,
+      });
+      return c.redirect(
+        `/quality/agent-feedback?ok=${encodeURIComponent("Agent 知识反馈已验证并关闭")}`,
+      );
+    } catch (error) {
+      if (error instanceof AgentKnowledgeFeedbackError) {
+        if (error.code === "not_found") return c.notFound();
+        if (error.code === "conflict") return c.text("Feedback resolution conflict", 409);
+        if (error.code === "invalid_input") return c.text("Invalid feedback resolution", 400);
+      }
+      log.warn("Agent knowledge feedback resolution failed", {
+        space,
+        err: String(error).slice(0, 500),
+      });
+      return c.text("Agent feedback unavailable", 503);
+    }
+  });
+
   app.get("/quality/evaluation-cases.json", (c) => {
     c.header("cache-control", "no-store");
     c.header(
@@ -1149,7 +1396,11 @@ export function createWebApp(opts: WebOptions): Hono {
     }
     const spaces = engine.registry.list().map((meta) => {
       const idx = engine.registry.store(meta.id).index();
-      return { meta, pages: idx.countPages(), pending: idx.countRaw(true) };
+      return {
+        meta,
+        pages: idx.listPages().filter(isKnowledgeContentRef).length,
+        pending: idx.countRaw(true),
+      };
     });
     return c.html(await layout("空间", [{ label: "空间 / 知识" }], await spaceListView(spaces), "spaces"));
   });
@@ -1161,6 +1412,7 @@ export function createWebApp(opts: WebOptions): Hono {
     const rawCount = engine.registry.store(space).index().countRaw();
     const quarantineCount = (await engine.listQuarantines(space)).length;
     const meta = engine.registry.get(space);
+    const topLevelMapLinks = (await engine.getPage(space, "index"))?.links;
     return c.html(
       await layout(
         space,
@@ -1173,6 +1425,7 @@ export function createWebApp(opts: WebOptions): Hono {
           meta,
           engine.agents.list(),
           c.req.query("ok") ?? undefined,
+          topLevelMapLinks,
         ),
         "spaces",
       ),
@@ -1386,13 +1639,14 @@ export function createWebApp(opts: WebOptions): Hono {
     const space = parseSpace(c.req.param("space"));
     if (!space || !engine.registry.has(space)) return c.notFound();
     const slug = decodeURIComponent(c.req.param("slug"));
-    const page = await engine.getPage(space, slug);
-    if (!page) return c.notFound();
+    const trace = await engine.getKnowledgePageTrace(space, slug);
+    if (!trace) return c.notFound();
+    const page = trace.page;
     return c.html(
       await layout(
         page.title,
         [{ label: "空间 / 知识", href: "/" }, { label: space, href: `/spaces/${encodeURIComponent(space)}` }, { label: page.title }],
-        await pageView(space, page, c.req.query("ok") ?? undefined),
+        await pageView(space, page, c.req.query("ok") ?? undefined, trace),
         "spaces",
       ),
     );
@@ -1583,6 +1837,24 @@ export function createWebApp(opts: WebOptions): Hono {
     const model = engine.agentForSpace(space)?.model || undefined;
     void engine.runDreamCycle(space, { model }).catch(() => {});
     return c.redirect(`/spaces/${encodeURIComponent(space)}`);
+  });
+
+  app.post("/spaces/:space/maintenance", async (c) => {
+    const space = parseSpace(c.req.param("space"));
+    if (!space || !engine.registry.has(space)) return c.notFound();
+    try {
+      const report = await engine.runWikiMaintenanceCycle(space);
+      const message = [
+        `Wiki Maintenance 完成：扫描 ${report.scannedPages}/${report.totalPages} 页`,
+        `发现 ${report.issues.length} 项问题`,
+        report.truncated ? "报告已按安全上限截断" : undefined,
+      ].filter(Boolean).join("，");
+      const query = new URLSearchParams({ ok: message });
+      return c.redirect(`/spaces/${encodeURIComponent(space)}?${query.toString()}`);
+    } catch {
+      const query = new URLSearchParams({ ok: "Wiki Maintenance 失败，请查看运行状态" });
+      return c.redirect(`/spaces/${encodeURIComponent(space)}?${query.toString()}`);
+    }
   });
 
   // ---- Skills --------------------------------------------------------------

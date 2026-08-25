@@ -2672,11 +2672,12 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     const cliEngine = new KnowledgeEngine({
       dataDir: dir,
       runProvider: async (id, input) => {
+        const outputSchema = JSON.stringify(input.outputSchema ?? {});
         if (/像海盗一样说话/.test(input.prompt)) sawInstruction = true;
-        if (/JSON Schema/.test(input.prompt) && /relevant/.test(input.prompt)) {
+        if (/relevant/.test(outputSchema)) {
           return JSON.stringify({ slugs: ["entities/alice"], relevant: true });
         }
-        if (/JSON Schema/.test(input.prompt) && /grounded/.test(input.prompt)) {
+        if (/grounded/.test(outputSchema)) {
           return JSON.stringify({
             answer: "后端由 [[entities/alice|Alice]] 负责。",
             grounded: true,
@@ -2684,7 +2685,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
             gaps: [],
           });
         }
-        if (/JSON Schema/.test(input.prompt) && /intent/.test(input.prompt)) {
+        if (/intent/.test(outputSchema)) {
           sawLegacyIntentPrompt =
             id === "codex" &&
             input.model === "gpt-5.6-sol" &&

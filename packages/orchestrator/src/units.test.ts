@@ -167,6 +167,29 @@ describe("formatAnswer (Q1)", () => {
     expect(md).toContain("[[entities/alice|Alice]]");
   });
 
+  test("knowledge answer exposes citation evidence time without Raw ids", () => {
+    const res: AskResult = {
+      answer: "后端由 Alice 负责。",
+      source: "knowledge",
+      citations: [{
+        slug: "entities/alice",
+        title: "Alice",
+        evidence: {
+          sourceCount: 1,
+          latestSourceAt: Date.UTC(2025, 0, 2),
+          freshness: "stale",
+          complete: true,
+        },
+      }],
+    };
+
+    const md = formatAnswer(res);
+
+    expect(md).toContain("最新证据：2025-01-02");
+    expect(md).toContain("证据陈旧");
+    expect(md).toContain("1 条 Raw");
+  });
+
   test("ambiguous citations show a safe scope label without exposing Space ids", () => {
     const res: AskResult = {
       answer: "请查看 Alice。",

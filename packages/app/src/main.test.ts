@@ -26,6 +26,9 @@ describe("compiled app command dispatch", () => {
     expect(selectAppCommand(["desktop"], true)).toBe("desktop");
     expect(selectAppCommand(["service", "status"], true)).toBe("service");
     expect(selectAppCommand(["doctor", "--json"], true)).toBe("doctor");
+    expect(selectAppCommand(["mcp"], true)).toBe("mcp");
+    expect(selectAppCommand(["knowledge", "list_spaces"], true)).toBe("knowledge");
+    expect(selectAppCommand(["feedback", "--space", "team/oc_x"], true)).toBe("feedback");
     expect(selectAppCommand(["wat"], true)).toBe("unknown");
   });
 

@@ -35,8 +35,12 @@ describe("data repository agent guides", () => {
     expect(guide).toContain("一个 Space");
     expect(guide).toContain("purpose.md");
     expect(guide).toContain("wiki/overview.md");
+    expect(guide).toContain("wiki/maps/");
     expect(guide).toContain("wiki/index.md");
     expect(guide).toContain("raw/records/**/*.jsonl");
+    expect(guide).toContain("证据时间");
+    expect(guide).toContain("search_knowledge");
+    expect(guide).toContain("get_page_trace");
   });
 
   test("creating a Space adds a scoped guide beside its purpose and schema", () => {
@@ -51,8 +55,12 @@ describe("data repository agent guides", () => {
     expect(guide).toContain("purpose.md");
     expect(guide).toContain("schema.md");
     expect(guide).toContain("wiki/index.md");
+    expect(guide).toContain("wiki/maps/");
     expect(guide).toContain("wiki/sources/");
     expect(guide).toContain("Raw id");
+    expect(guide).toContain("最新且证据链完整");
+    expect(guide).toContain("不会自动失效");
+    expect(guide).toContain("get_overview");
   });
 
   test("reopening an existing repository backfills Space guides without replacing its rules", () => {

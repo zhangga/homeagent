@@ -4,6 +4,7 @@
  *   - the feishu connector + orchestrator (inbound events -> knowledge + replies)
  *   - the read-only web backend (Bun.serve + Hono)
  *   - the dream-cycle scheduler (nightly + startup catch-up)
+ *   - the Wiki Maintenance scheduler (weekly + startup catch-up)
  * and shuts everything down gracefully on SIGINT/SIGTERM (propagating SIGTERM to
  * the lark-cli consumers — never kill -9).
  */
@@ -33,6 +34,7 @@ import {
 } from "@homeagent/orchestrator";
 import { createWebApp, FeishuIntegrationService } from "@homeagent/web";
 import { Scheduler } from "./scheduler.ts";
+import { MaintenanceScheduler } from "./maintenance-scheduler.ts";
 import {
   formatTaskApprovalNotification,
   formatTaskRunNotification,
@@ -62,6 +64,10 @@ import {
   startServiceLogMaintenance,
   type ProcessLock,
 } from "./service.ts";
+import { LocalAgentApiClient, localAgentApiBaseUrl } from "./local-agent-client.ts";
+import { runKnowledgeMcpStdio } from "./mcp.ts";
+import { runKnowledgeCli } from "./knowledge-cli.ts";
+import { runFeedbackCli } from "./feedback-cli.ts";
 
 const log = logger.child("app");
 
@@ -254,6 +260,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   }
 
   let scheduler: Scheduler | undefined;
+  let maintenanceScheduler: MaintenanceScheduler | undefined;
   let taskScheduler: TaskScheduler | undefined;
   let workContinuationScheduler: WorkContinuationScheduler | undefined;
   let learningScheduler: LearningScheduler | undefined;
@@ -263,6 +270,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
     connectorHealth: () => connector.health(),
     feishuLocallyDisabled: () => feishuLocallyDisabled,
     dreamSchedulerHealth: () => scheduler?.health(),
+    maintenanceSchedulerHealth: () => maintenanceScheduler?.health(),
     taskSchedulerHealth: () => taskScheduler?.health(),
     workContinuationSchedulerHealth: () => workContinuationScheduler?.health(),
     reminderSchedulerHealth: () => reminderScheduler?.health(),
@@ -313,6 +321,8 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
     engine,
     brandAvatarPath: homeAgentFeishuAvatarPath(runtimePaths),
     adminToken: cfg.webAdminToken,
+    agentReadToken: cfg.agentReadToken,
+    agentFeedbackToken: cfg.agentFeedbackToken,
     health: reportHealth,
     larkSetup,
     codexSetup: codexProviderSetup && codexInstaller
@@ -407,12 +417,17 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   await scheduler.start();
   log.info("scheduler started (nightly + catch-up)");
 
-  // 4. opted-in WorkItems continue one durable action boundary per tick.
+  // 4. deterministic Wiki inspection is independent from pending Raw and LLM providers.
+  maintenanceScheduler = new MaintenanceScheduler(engine);
+  await maintenanceScheduler.start();
+  log.info("Wiki Maintenance scheduler started (weekly + catch-up)");
+
+  // 5. opted-in WorkItems continue one durable action boundary per tick.
   workContinuationScheduler = new WorkContinuationScheduler(engine);
   await workContinuationScheduler.start();
   log.info("work continuation scheduler started");
 
-  // 5. task scheduler (research tasks). On completion, push a summary to the
+  // 6. task scheduler (research tasks). On completion, push a summary to the
   // task's space-bound feishu chat when the task opts in.
   taskScheduler = new TaskScheduler(engine, {
     notify: async (_task, run) => {
@@ -425,7 +440,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   await taskScheduler.start();
   log.info("task scheduler started");
 
-  // 6. guided-learning scheduler. A prepared lesson remains retryable until
+  // 7. guided-learning scheduler. A prepared lesson remains retryable until
   // Feishu accepts it; an accepted lesson then waits for the learner's answer.
   learningScheduler = new LearningScheduler(engine, {
     notify: async (plan, _source, session, skillWarnings, deliveryKey) => {
@@ -443,7 +458,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   await learningScheduler.start();
   log.info("learning scheduler started");
 
-  // 7. user reminder scheduler. Delivery state advances only after Feishu
+  // 8. user reminder scheduler. Delivery state advances only after Feishu
   // accepts the outbound message, so transient failures remain retryable.
   reminderScheduler = new ReminderScheduler(engine, {
     notify: async (reminder, message, deliveryKey) => {
@@ -466,6 +481,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
       }
     };
     contain("dream scheduler", () => scheduler.stop());
+    contain("Wiki Maintenance scheduler", () => maintenanceScheduler.stop());
     contain("work continuation scheduler", () => workContinuationScheduler.stop());
     contain("task scheduler", () => taskScheduler.stop());
     contain("learning scheduler", () => learningScheduler.stop());
@@ -501,12 +517,22 @@ export async function serve(): Promise<void> {
   }
 }
 
-export type AppCommand = "serve" | "desktop" | "service" | "doctor" | "unknown";
+export type AppCommand =
+  | "serve"
+  | "desktop"
+  | "service"
+  | "doctor"
+  | "mcp"
+  | "knowledge"
+  | "feedback"
+  | "unknown";
 
 export function selectAppCommand(args: string[], bundled: boolean): AppCommand {
   const command = args[0];
   if (!command) return bundled ? "desktop" : "serve";
-  if (["serve", "desktop", "service", "doctor"].includes(command)) return command as AppCommand;
+  if (["serve", "desktop", "service", "doctor", "mcp", "knowledge", "feedback"].includes(command)) {
+    return command as AppCommand;
+  }
   return "unknown";
 }
 
@@ -542,6 +568,24 @@ export async function runEntrypoint(args = process.argv.slice(2)): Promise<numbe
     process.env.HOMEAGENT_LOG_DIR ??= paths.logDir;
     process.env.HOMEAGENT_CODEX_BIN ??= join(paths.dataDir, "bin", "codex");
   }
+  if (command === "mcp" || command === "knowledge" || command === "feedback") {
+    const cfg = config();
+    const client = new LocalAgentApiClient({
+      baseUrl: localAgentApiBaseUrl(cfg),
+      token: cfg.agentReadToken ?? cfg.webAdminToken,
+      feedbackToken: cfg.agentFeedbackToken,
+    });
+    if (command === "mcp") {
+      await runKnowledgeMcpStdio(client, {
+        feedbackEnabled: !cfg.webAdminToken || Boolean(cfg.agentFeedbackToken),
+      });
+      return 0;
+    }
+    if (command === "knowledge") {
+      return runKnowledgeCli(args.slice(1), { caller: client });
+    }
+    return runFeedbackCli(args.slice(1), { caller: client });
+  }
   if (command === "serve") {
     await serve();
     return 0;
@@ -569,7 +613,7 @@ export async function runEntrypoint(args = process.argv.slice(2)): Promise<numbe
     const { runDoctorCli } = await import("./doctor.ts");
     return runDoctorCli(args.slice(1));
   }
-  process.stderr.write("Usage: homeagent <serve|desktop|service|doctor>\n");
+  process.stderr.write("Usage: homeagent <serve|desktop|service|doctor|mcp|knowledge>\n");
   return 2;
 }
 

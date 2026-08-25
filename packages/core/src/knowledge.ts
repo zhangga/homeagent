@@ -31,6 +31,11 @@ import type {
   KnowledgePageRegenerationResult,
   RawGovernanceDetail,
 } from "./knowledge-governance.ts";
+import type {
+  WikiMaintenanceOptions,
+  WikiMaintenanceReport,
+} from "./maintenance.ts";
+import type { KnowledgePageTrace } from "./traceability.ts";
 
 export interface Knowledge {
   /** Cheap capture — persists a raw entry, no LLM call. */
@@ -80,6 +85,12 @@ export interface Knowledge {
   /** Nightly distillation: turn pending raw entries into wiki pages. */
   runDreamCycle(space: SpaceId, opts?: DreamOptions): Promise<DreamReport>;
 
+  /** Read-only deterministic health inspection of one Space's Knowledge pages. */
+  runWikiMaintenanceCycle(
+    space: SpaceId,
+    opts?: WikiMaintenanceOptions,
+  ): Promise<WikiMaintenanceReport>;
+
   /** Durable failed page generations awaiting an explicit retry. */
   listQuarantines(space: SpaceId): Promise<QuarantineRecord[]>;
 
@@ -96,6 +107,8 @@ export interface Knowledge {
   search(spaces: SpaceId[], keyword: string, opts?: SearchOptions): Promise<Hit[]>;
 
   getPage(space: SpaceId, slug: string): Promise<Page | null>;
+  /** Read-only Page -> Raw evidence chain with derived evidence freshness. */
+  getKnowledgePageTrace(space: SpaceId, slug: string): Promise<KnowledgePageTrace | null>;
   upsertPage(space: SpaceId, page: Page): Promise<void>;
   listPages(space: SpaceId, type?: string): Promise<PageRef[]>;
 

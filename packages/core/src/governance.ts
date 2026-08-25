@@ -100,6 +100,11 @@ import {
   type WorkActionExecutionCheck,
   type WorkContinuationPolicy,
 } from "./work-continuation.ts";
+import {
+  parseAgentKnowledgeFeedbackArchiveRecord,
+  MAX_AGENT_KNOWLEDGE_FEEDBACK_RECORDS,
+  type AgentKnowledgeFeedback,
+} from "./knowledge-consumption-feedback.ts";
 
 export const SPACE_ARCHIVE_FORMAT = "homeagent.space" as const;
 export const LEGACY_SPACE_ARCHIVE_FORMAT = "homebrain.space" as const;
@@ -119,7 +124,9 @@ export const TASK_RUN_RESILIENCE_SPACE_ARCHIVE_VERSION = 13 as const;
 export const CHAT_QUALITY_TRACE_SPACE_ARCHIVE_VERSION = 14 as const;
 export const WORK_CONTEXT_SPACE_ARCHIVE_VERSION = 15 as const;
 export const RAW_ADMISSION_SPACE_ARCHIVE_VERSION = 16 as const;
-export const SPACE_ARCHIVE_VERSION = RAW_ADMISSION_SPACE_ARCHIVE_VERSION;
+export const KNOWLEDGE_MAPS_SPACE_ARCHIVE_VERSION = 17 as const;
+export const AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION = 18 as const;
+export const SPACE_ARCHIVE_VERSION = AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION;
 
 export interface MessageRetractionRecord {
   chatId: string;
@@ -214,8 +221,17 @@ export interface SpaceArchiveV16 extends Omit<SpaceArchiveV15, "version"> {
   version: typeof RAW_ADMISSION_SPACE_ARCHIVE_VERSION;
 }
 
+export interface SpaceArchiveV17 extends Omit<SpaceArchiveV16, "version"> {
+  version: typeof KNOWLEDGE_MAPS_SPACE_ARCHIVE_VERSION;
+}
+
+export interface SpaceArchiveV18 extends Omit<SpaceArchiveV17, "version"> {
+  version: typeof AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION;
+  agentKnowledgeFeedback: AgentKnowledgeFeedback[];
+}
+
 /** Current normalized archive shape returned by export and parsing. */
-export type SpaceArchive = SpaceArchiveV16;
+export type SpaceArchive = SpaceArchiveV18;
 
 export interface SpaceDeleteResult {
   status: "deleted" | "not_found";
@@ -240,6 +256,7 @@ const PAGE_TYPES: PageType[] = [
   "overview",
   "log",
   "glossary",
+  "map",
   "entity",
   "concept",
   "source",
@@ -280,6 +297,14 @@ function finiteNumber(value: unknown, label: string): number {
     throw new Error(`${label} must be a finite number`);
   }
   return value;
+}
+
+function boundedNonNegativeInteger(value: unknown, label: string, maximum: number): number {
+  const parsed = finiteNumber(value, label);
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > maximum) {
+    throw new Error(`${label} must be an integer between 0 and ${maximum}`);
+  }
+  return parsed;
 }
 
 function boolean(value: unknown, label: string): boolean {
@@ -333,11 +358,14 @@ function safeSlug(value: unknown, label: string): string {
   return slug;
 }
 
-function parsePage(value: unknown, index: number): Page {
+function parsePage(value: unknown, index: number, version: number): Page {
   const item = record(value, `pages[${index}]`);
   const type = text(item.type, `pages[${index}].type`) as PageType;
   if (!PAGE_TYPES.includes(type)) throw new Error(`pages[${index}].type is invalid`);
-  return {
+  if (type === "map" && version < KNOWLEDGE_MAPS_SPACE_ARCHIVE_VERSION) {
+    throw new Error("Knowledge maps require archive v17");
+  }
+  const page: Page = {
     slug: safeSlug(item.slug, `pages[${index}].slug`),
     type,
     title: text(item.title, `pages[${index}].title`),
@@ -350,6 +378,10 @@ function parsePage(value: unknown, index: number): Page {
     updatedAt: finiteNumber(item.updatedAt, `pages[${index}].updatedAt`),
     contentHash: text(item.contentHash, `pages[${index}].contentHash`),
   };
+  if (page.type === "map" && (!page.slug.startsWith("maps/") || page.sources.length > 0)) {
+    throw new Error(`pages[${index}] Knowledge map is invalid`);
+  }
+  return page;
 }
 
 function parseRaw(value: unknown, index: number, space: SpaceId, version: number): RawRecord {
@@ -1834,6 +1866,8 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       && version !== CHAT_QUALITY_TRACE_SPACE_ARCHIVE_VERSION
       && version !== WORK_CONTEXT_SPACE_ARCHIVE_VERSION
       && version !== RAW_ADMISSION_SPACE_ARCHIVE_VERSION
+      && version !== KNOWLEDGE_MAPS_SPACE_ARCHIVE_VERSION
+      && version !== AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION
     )
   ) {
     throw new Error("unsupported space archive format or version");
@@ -1852,6 +1886,26 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
     id,
     createdAt: finiteNumber(meta.createdAt, "space.createdAt"),
     lastDreamAt: meta.lastDreamAt === undefined ? undefined : finiteNumber(meta.lastDreamAt, "space.lastDreamAt"),
+    lastMaintenanceAt: meta.lastMaintenanceAt === undefined
+      ? undefined
+      : finiteNumber(meta.lastMaintenanceAt, "space.lastMaintenanceAt"),
+    lastMaintenanceScannedPages: meta.lastMaintenanceScannedPages === undefined
+      ? undefined
+      : boundedNonNegativeInteger(
+          meta.lastMaintenanceScannedPages,
+          "space.lastMaintenanceScannedPages",
+          50_000,
+        ),
+    lastMaintenanceIssueCount: meta.lastMaintenanceIssueCount === undefined
+      ? undefined
+      : boundedNonNegativeInteger(
+          meta.lastMaintenanceIssueCount,
+          "space.lastMaintenanceIssueCount",
+          5_000,
+        ),
+    lastMaintenanceTruncated: meta.lastMaintenanceTruncated === undefined
+      ? undefined
+      : boolean(meta.lastMaintenanceTruncated, "space.lastMaintenanceTruncated"),
     chatId: optionalText(meta.chatId, "space.chatId"),
     name: optionalText(meta.name, "space.name"),
     agentId: optionalText(meta.agentId, "space.agentId"),
@@ -1885,6 +1939,10 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       version >= WORK_CONTEXT_SPACE_ARCHIVE_VERSION
       && !Array.isArray(root.workItems)
     )
+    || (
+      version >= AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION
+      && !Array.isArray(root.agentKnowledgeFeedback)
+    )
   ) {
     throw new Error("archive collections must be arrays");
   }
@@ -1905,7 +1963,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
   const agent = legacyAgentHistory?.agent ?? parsedAgent;
   const agentRevisions = legacyAgentHistory?.revisions
     ?? parseAgentRevisions(root.agentRevisions, agent, version);
-  const pages = root.pages.map(parsePage);
+  const pages = root.pages.map((page, index) => parsePage(page, index, version));
   const raw = root.raw.map((item, index) => parseRaw(item, index, id, version));
   const retractions = root.retractions.map((value, index) => {
     const item = record(value, `retractions[${index}]`);
@@ -2284,6 +2342,25 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
         parseKnowledgeGovernanceAuditRecord(item, index + 1, id)
       );
   assertUnique(governanceAudit, (record) => record.id, "governance audit id");
+  const agentKnowledgeFeedback = version < AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION
+    ? []
+    : (() => {
+        const records = root.agentKnowledgeFeedback as unknown[];
+        if (records.length > MAX_AGENT_KNOWLEDGE_FEEDBACK_RECORDS) {
+          throw new Error(
+            `Agent feedback exceeds ${MAX_AGENT_KNOWLEDGE_FEEDBACK_RECORDS} records`,
+          );
+        }
+        return records.map((item, index) =>
+          parseAgentKnowledgeFeedbackArchiveRecord(item, index, id)
+        );
+      })();
+  assertUnique(agentKnowledgeFeedback, (record) => record.id, "Agent feedback id");
+  assertUnique(
+    agentKnowledgeFeedback,
+    (record) => record.idempotencyKey,
+    "Agent feedback idempotency key",
+  );
   return {
     format: SPACE_ARCHIVE_FORMAT,
     version: SPACE_ARCHIVE_VERSION,
@@ -2306,5 +2383,6 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
     reminders,
     learning,
     governanceAudit,
+    agentKnowledgeFeedback,
   };
 }

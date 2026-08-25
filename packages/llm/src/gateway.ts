@@ -16,8 +16,6 @@ import { config, logger, type Logger } from "@homeagent/shared";
 import { estimateCost } from "./pricing.ts";
 import type { CompletionUsage } from "./providers.ts";
 import {
-  BudgetExceededError,
-  checkBudget,
   recordCall,
   type CallPurpose,
 } from "./budget.ts";
@@ -168,6 +166,16 @@ function gatewayUsage(model: string, input?: number, output?: number): Completio
   };
 }
 
+function recordGatewayCall(call: Parameters<typeof recordCall>[0]): void {
+  try {
+    recordCall(call);
+  } catch (err) {
+    // Usage accounting is observational. A local log failure must not replace
+    // an otherwise valid Provider result or mask the original Provider error.
+    log.warn("failed to persist gateway usage accounting", { err: String(err) });
+  }
+}
+
 /** Free-form text completion. */
 export async function complete(opts: CompleteOptions): Promise<CompleteResult> {
   if (opts.images?.length) {
@@ -176,9 +184,6 @@ export async function complete(opts: CompleteOptions): Promise<CompleteResult> {
   const cfg = config();
   const model = opts.model ?? cfg.model;
   const purpose = opts.purpose ?? "other";
-
-  const decision = checkBudget(purpose);
-  if (!decision.allowed) throw new BudgetExceededError(decision);
 
   const body: Record<string, unknown> = {
     model,
@@ -213,7 +218,7 @@ export async function complete(opts: CompleteOptions): Promise<CompleteResult> {
       usage,
     };
   } finally {
-    recordCall({
+    recordGatewayCall({
       t: new Date().toISOString(),
       model,
       purpose,
@@ -253,9 +258,6 @@ export async function completeJSON<T = unknown>(opts: JSONOptions<T>): Promise<{
   const cfg = config();
   const model = opts.model ?? cfg.model;
   const purpose = opts.purpose ?? "other";
-
-  const decision = checkBudget(purpose);
-  if (!decision.allowed) throw new BudgetExceededError(decision);
 
   const toolName = "extract";
   const body: Record<string, unknown> = {
@@ -304,7 +306,7 @@ export async function completeJSON<T = unknown>(opts: JSONOptions<T>): Promise<{
       },
     };
   } finally {
-    recordCall({
+    recordGatewayCall({
       t: new Date().toISOString(),
       model,
       purpose,

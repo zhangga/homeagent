@@ -24,6 +24,7 @@ import { Serializer, config, logger, type SerializerSnapshot } from "@homeagent/
 import { isProviderTimeoutError } from "@homeagent/llm";
 import {
   resolveGroupParticipationLevel,
+  isKnowledgeContentRef,
   type AnswerOutcome,
   type AskFailureTrace,
   type ChatRun,
@@ -1454,7 +1455,7 @@ export class Orchestrator {
   private async isColdStart(spaces: SpaceId[]): Promise<boolean> {
     for (const s of spaces) {
       const pages = await this.engine.listPages(s);
-      if (pages.some((p) => !["index", "overview", "log", "glossary"].includes(p.slug))) {
+      if (pages.some(isKnowledgeContentRef)) {
         return false;
       }
     }

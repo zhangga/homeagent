@@ -3843,14 +3843,16 @@ describe("Knowledge seam contract", () => {
     const sanitized = {
       ...exported,
       pages: exported.pages.filter((candidate) =>
-        !["index", "glossary", "overview"].includes(candidate.slug)
+        !["index", "glossary", "overview"].includes(candidate.slug) &&
+        !candidate.slug.startsWith("maps/")
       ),
     };
 
     expect(await engine.restoreSpace(sanitized)).toBe(SPACE);
 
     const store = engine.registry.store(SPACE);
-    expect(store.index().getPage("index")?.content).toContain("可信页面");
+    expect(store.index().getPage("index")?.links).toEqual(["maps/type-entity"]);
+    expect(store.index().getPage("maps/type-entity")?.content).toContain("可信页面");
     expect(store.index().getPage("glossary")?.content).toContain("可信页面");
     expect(store.index().getPage("overview")?.content).toContain("共 1 个知识页");
   });
@@ -6638,6 +6640,8 @@ describe("Knowledge seam contract", () => {
       new Error("unknown model configuration"),
       new BudgetExceededError({
         allowed: false,
+        enforced: true,
+        referenceExceeded: true,
         spent: 5,
         budget: 5,
         unknownCostCalls: 0,

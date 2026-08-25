@@ -78,6 +78,31 @@ function writeDreamCodexProvider(directory: string): { bin: string; calls: strin
 }
 
 describe("runDreamCycle", () => {
+  test("keeps generated topic maps out of the Dream planning catalog", async () => {
+    store.writePage({
+      slug: "maps/hidden-map",
+      type: "map",
+      title: "不应参与提炼规划",
+      summary: "系统生成的导航页。",
+      aliases: [],
+      tags: [],
+      sources: [],
+      links: [],
+      content: "# 不应参与提炼规划\n",
+      updatedAt: 1,
+      contentHash: "map-hash",
+    });
+    const rawId = seedRaw("一条新的产品知识。");
+    const fake = new FakeLlm();
+    fake.queueJSON({ operations: [], skippedRawIds: [rawId] });
+
+    await runDreamCycle(store, {}, { client: fake });
+
+    const planningPrompt = fake.calls.find((call) => call.kind === "json")?.opts.prompt ?? "";
+    expect(planningPrompt).not.toContain("maps/hidden-map");
+    expect(planningPrompt).not.toContain("不应参与提炼规划");
+  });
+
   test("manual page regeneration rejects a held WorkAction Raw before calling the LLM", async () => {
     const readyRawId = seedRaw("Alice 负责发布流程。");
     const heldRawId = store.index().insertRaw({
@@ -383,8 +408,9 @@ describe("runDreamCycle", () => {
     expect(store.index().getPage("index")).not.toBeNull();
     expect(store.index().getPage("glossary")).not.toBeNull();
     expect(store.index().getPage("overview")).not.toBeNull();
-    // index links to the new page
-    expect(store.index().getPage("index")!.content).toContain("entities/orion");
+    // index reveals the topic map, which then links to the content page
+    expect(store.index().getPage("index")!.links).toEqual(["maps/type-entity"]);
+    expect(store.index().getPage("maps/type-entity")!.content).toContain("entities/orion");
     // log page appended
     expect(store.index().getPage("log")).not.toBeNull();
   });

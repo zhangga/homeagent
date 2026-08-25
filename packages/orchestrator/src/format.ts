@@ -37,6 +37,31 @@ export function formatSkillWarnings(
     : "";
 }
 
+function citationEvidenceText(citation: AskResult["citations"][number]): string {
+  const evidence = citation.evidence;
+  if (!evidence) return "";
+  const parts: string[] = [];
+  if (
+    typeof evidence.latestSourceAt === "number"
+    && Number.isFinite(evidence.latestSourceAt)
+    && Math.abs(evidence.latestSourceAt) <= 8_640_000_000_000_000
+  ) {
+    parts.push(`最新证据：${new Date(evidence.latestSourceAt).toISOString().slice(0, 10)}`);
+  }
+  const freshnessLabel = {
+    recent: "证据较新",
+    aging: "证据较久",
+    stale: "证据陈旧",
+    unknown: "证据时间未知",
+  }[evidence.freshness];
+  if (freshnessLabel) parts.push(freshnessLabel);
+  if (Number.isInteger(evidence.sourceCount) && evidence.sourceCount >= 0) {
+    parts.push(`${evidence.sourceCount} 条 Raw`);
+  }
+  if (!evidence.complete) parts.push("证据链不完整");
+  return parts.length > 0 ? `（${parts.join(" · ")}）` : "";
+}
+
 export function formatAnswer(res: AskResult): string {
   const parts: string[] = [res.answer.trim()];
 
@@ -48,7 +73,7 @@ export function formatAnswer(res: AskResult): string {
           ? "群空间"
           : undefined;
       const title = scope ? `${citation.title}（${scope}）` : citation.title;
-      return `[[${citation.slug}|${title}]]`;
+      return `[[${citation.slug}|${title}]]${citationEvidenceText(citation)}`;
     }).join("、");
     parts.push("", `— 依据：${list}`);
   }

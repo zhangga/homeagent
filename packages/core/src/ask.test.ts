@@ -8,6 +8,7 @@ import { resetConfig } from "@homeagent/shared";
 import { SpaceStore } from "./space.ts";
 import { ask, buildCatalog, expandGraph, resolveCitations } from "./ask.ts";
 import { makeCliClient } from "./cli-client.ts";
+import { refreshDigest } from "./digest.ts";
 import { FakeLlm } from "./testing.ts";
 
 let dir: string;
@@ -83,6 +84,41 @@ describe("buildCatalog", () => {
     store.writePage(page("index", "Index", "toc", { type: "index" }));
     const catalog = buildCatalog([store], "谁负责后端");
     expect(catalog.map((c) => c.ref.slug)).toEqual(["entities/alice"]);
+  });
+
+  test("uses a matching topic map to expand a bounded large-space catalog", () => {
+    for (let index = 0; index < 61; index += 1) {
+      store.writePage(page(
+        `concepts/item-${index}`,
+        `条目 ${index}`,
+        `固定填充内容 ${index}。`,
+        { type: "concept", updatedAt: index },
+      ));
+    }
+    refreshDigest(store);
+
+    const catalog = buildCatalog([store], "概念");
+
+    expect(catalog).toHaveLength(60);
+    expect(catalog.every((candidate) => candidate.ref.type !== "map")).toBeTrue();
+  });
+
+  test("walks a matching root map into bounded second-level maps", () => {
+    for (let index = 0; index < 101; index += 1) {
+      store.writePage(page(
+        `concepts/backend-${index.toString().padStart(3, "0")}`,
+        `后端条目 ${index}`,
+        `固定填充内容 ${index}。`,
+        { type: "concept", tags: ["后端"], updatedAt: index },
+      ));
+    }
+    refreshDigest(store);
+
+    const catalog = buildCatalog([store], "下级地图");
+
+    expect(catalog).toHaveLength(60);
+    expect(catalog.every((candidate) => candidate.ref.slug.startsWith("concepts/backend-")))
+      .toBeTrue();
   });
 
 });
@@ -164,6 +200,72 @@ describe("ask pipeline", () => {
     expect(res.source).toBe("knowledge");
     expect(res.citations).toEqual([{ slug: "entities/alice", title: "Alice" }]);
     expect(res.answer).toContain("Alice");
+  });
+
+  test("grounded citations expose bounded Raw provenance and evidence freshness", async () => {
+    const sourceCreatedAt = Date.now() - 400 * 24 * 60 * 60 * 1_000;
+    const rawId = store.index().insertRaw({
+      space: SPACE,
+      source: "manual",
+      content: "Alice 负责后端服务。",
+      createdAt: sourceCreatedAt,
+    });
+    store.writePage(page("entities/alice", "Alice", "Alice 负责后端服务。", {
+      sources: [rawId],
+    }));
+    const fake = scriptedLlm({
+      routeSlugs: ["entities/alice"],
+      relevant: true,
+      answer: "后端由 Alice 负责。",
+      grounded: true,
+      usedSlugs: ["entities/alice"],
+    });
+
+    const result = await ask([store], "谁负责后端？", {}, { client: fake });
+
+    expect(result.citations).toEqual([{
+      slug: "entities/alice",
+      title: "Alice",
+      evidence: {
+        sourceCount: 1,
+        latestSourceAt: sourceCreatedAt,
+        freshness: "stale",
+        complete: true,
+      },
+    }]);
+  });
+
+  test("synthesis receives evidence time and conflict guidance without Raw ids", async () => {
+    const sourceCreatedAt = Date.UTC(2025, 0, 2);
+    const rawId = store.index().insertRaw({
+      space: SPACE,
+      source: "manual",
+      content: "Alice 负责后端服务。",
+      createdAt: sourceCreatedAt,
+    });
+    store.writePage(page("entities/alice", "Alice", "Alice 负责后端服务。", {
+      sources: [rawId],
+    }));
+    const fake = new FakeLlm();
+    fake.onJSON((call) => {
+      const properties = (call.schema as { properties?: Record<string, unknown> }).properties ?? {};
+      if ("relevant" in properties) {
+        return { slugs: ["entities/alice"], relevant: true };
+      }
+      const prompt = String(call.prompt);
+      expect(prompt).toContain(`latestEvidenceAt="${sourceCreatedAt}"`);
+      expect(prompt).toContain("优先采用证据更新且证据链完整的页面");
+      expect(prompt).not.toContain(rawId);
+      return {
+        answer: "后端由 Alice 负责。",
+        grounded: true,
+        usedSlugs: ["entities/alice"],
+        gaps: [],
+      };
+    });
+
+    await expect(ask([store], "谁负责后端？", {}, { client: fake }))
+      .resolves.toEqual(expect.objectContaining({ source: "knowledge" }));
   });
 
   test("a large catalog routes bounded batches when literal FTS has no candidates", async () => {

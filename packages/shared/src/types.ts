@@ -78,14 +78,15 @@ export type PageType =
   | "overview"
   | "log"
   | "glossary"
+  | "map"
   | "entity"
   | "concept"
   | "source"
   | "analysis";
 
 /**
- * A distilled wiki page. Content is markdown with a frontmatter-derived meta
- * header; the structured fields below are the queryable projection of it.
+ * A wiki page. Content pages are distilled from admitted Raw; map and singleton
+ * pages are generated navigation. Markdown frontmatter projects these fields.
  */
 export interface Page {
   /** stable url-safe id, unique within a space, e.g. "entities/alice" */
@@ -128,11 +129,22 @@ export interface Hit {
 }
 
 /** A citation attached to an answer, pointing at a wiki page. */
+export type KnowledgeEvidenceFreshness = "recent" | "aging" | "stale" | "unknown";
+
+export interface CitationEvidence {
+  sourceCount: number;
+  latestSourceAt?: number;
+  freshness: KnowledgeEvidenceFreshness;
+  complete: boolean;
+}
+
 export interface Citation {
   slug: string;
   title: string;
   /** Exact source only when the same slug exists in more than one queried space. */
   space?: SpaceId;
+  /** Derived at answer time from Page -> Raw provenance; Raw ids remain private. */
+  evidence?: CitationEvidence;
 }
 
 export type SkillWarningCode =

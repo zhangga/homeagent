@@ -26,9 +26,7 @@ import type {
 } from "@homeagent/llm";
 import { runProviderDetailed as realRunProvider } from "@homeagent/llm";
 import {
-  BudgetExceededError,
   ProviderRunError,
-  checkBudget,
   recordCall,
 } from "@homeagent/llm";
 import { logger } from "@homeagent/shared";
@@ -209,8 +207,6 @@ export function makeCliClient(
       const base = opts.prompt ?? (opts.messages ?? []).map((m) => m.content).join("\n\n");
       const prompt = withSystem(opts.system, base);
       const purpose = opts.purpose ?? "other";
-      const decision = checkBudget(purpose, undefined, accountingDataDir);
-      if (!decision.allowed) throw new BudgetExceededError(decision);
       const started = Date.now();
       let result: CompleteResult | undefined;
       let failure: unknown;
@@ -260,8 +256,6 @@ export function makeCliClient(
         ? structuredPrompt
         : structuredPrompt + jsonInstruction(opts.schema);
       const purpose = opts.purpose ?? "other";
-      const decision = checkBudget(purpose, undefined, accountingDataDir);
-      if (!decision.allowed) throw new BudgetExceededError(decision);
       const started = Date.now();
       let result: CompleteResult | undefined;
       let failure: unknown;

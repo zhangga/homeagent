@@ -3,7 +3,8 @@
  * relying on a precise cron fire: it wakes on a coarse interval, and on each
  * wake (and once at startup — the "catch-up") it distills any space whose last
  * dream is older than the staleness threshold, or when the daily run hour has
- * passed and today's run hasn't happened yet.
+ * passed and today's run hasn't happened yet. Once due, it drains several
+ * bounded batches; durable carry-over resumes on the next tick.
  *
  * The decision of *whether* to run a space is a pure function (shouldRunSpace)
  * so the policy is unit-tested without timers.
@@ -20,6 +21,10 @@ export interface ScheduleConfig {
   stalenessHours: number;
   /** wake cadence in ms; default 15 min */
   tickMs: number;
+  /** admitted pending Raw entries in one bounded Dream batch */
+  batchEntries: number;
+  /** maximum batches drained for one Space during a scheduler tick */
+  maxCatchUpBatches: number;
   /** delete distilled raw messages older than this many days; 0 disables */
   rawRetentionDays: number;
 }
@@ -28,6 +33,8 @@ export const DEFAULT_SCHEDULE: ScheduleConfig = {
   hour: 3,
   stalenessHours: 24,
   tickMs: 15 * 60 * 1000,
+  batchEntries: 40,
+  maxCatchUpBatches: 4,
   rawRetentionDays: 90,
 };
 
@@ -47,6 +54,8 @@ export interface SpaceState {
   lastDreamAt?: number;
   /** whether the space has any pending (un-ingested) raw entries */
   hasPending: boolean;
+  /** creation time of the oldest admitted pending Raw, when known */
+  oldestPendingAt?: number;
 }
 
 export interface RuntimeLoopHealth {
@@ -58,12 +67,21 @@ export interface RuntimeLoopHealth {
   lastFailureAt?: number;
   lastReason?: string;
   lastError?: string;
+  /** Dream batches completed during the latest tick. */
+  lastBatchesRun?: number;
+  /** admitted Raw handled by Dream batches during the latest tick. */
+  lastProcessedRaw?: number;
+  /** admitted Raw still pending across all Spaces after the latest tick. */
+  lastPendingRaw?: number;
+  /** whether at least one Space reached the per-tick catch-up bound. */
+  lastBacklogLimited?: boolean;
 }
 
 /**
  * Decide whether to run a dream cycle for a space right now. Runs when:
  *   - there is pending raw AND
  *     - the space has never been distilled, OR
+ *     - an admitted pending Raw predates the latest completed cycle, OR
  *     - its last dream is older than stalenessHours (catch-up after downtime), OR
  *     - it's at/after the nightly hour and it hasn't been distilled today.
  * No pending raw => never run (nothing to do; saves cost).
@@ -75,6 +93,12 @@ export function shouldRunSpace(
 ): boolean {
   if (!state.hasPending) return false;
   if (state.lastDreamAt === undefined) return true;
+  // A Raw older than the last completed cycle was already waiting when that
+  // cycle finished. Treat it as durable carry-over instead of waiting a day.
+  if (
+    state.oldestPendingAt !== undefined
+    && state.oldestPendingAt <= state.lastDreamAt
+  ) return true;
 
   const ageMs = now.getTime() - state.lastDreamAt;
   if (ageMs >= cfg.stalenessHours * 3600_000) return true;
@@ -114,6 +138,10 @@ export class Scheduler {
   private lastFailureAt?: number;
   private lastReason?: string;
   private lastError?: string;
+  private lastBatchesRun?: number;
+  private lastProcessedRaw?: number;
+  private lastPendingRaw?: number;
+  private lastBacklogLimited?: boolean;
 
   constructor(engine: KnowledgeEngine, cfg: Partial<ScheduleConfig> = {}) {
     this.engine = engine;
@@ -172,6 +200,10 @@ export class Scheduler {
       lastFailureAt: this.lastFailureAt,
       lastReason: this.lastReason,
       lastError: this.lastError,
+      lastBatchesRun: this.lastBatchesRun,
+      lastProcessedRaw: this.lastProcessedRaw,
+      lastPendingRaw: this.lastPendingRaw,
+      lastBacklogLimited: this.lastBacklogLimited,
     };
   }
 
@@ -184,28 +216,75 @@ export class Scheduler {
     const cfg = this.effectiveConfig();
     const ran: SpaceId[] = [];
     const errors: string[] = [];
+    let batchesRun = 0;
+    let processedRaw = 0;
+    let pendingRaw = 0;
+    let backlogLimited = false;
     try {
       for (const meta of this.engine.registry.list()) {
         const idx = this.engine.registry.store(meta.id).index();
+        const oldestPending = idx.listRaw({ onlyPending: true, limit: 1 })[0];
         const state: SpaceState = {
           id: meta.id,
           lastDreamAt: meta.lastDreamAt,
-          hasPending: idx.countRaw(true) > 0,
+          hasPending: oldestPending !== undefined,
+          oldestPendingAt: oldestPending?.createdAt,
         };
-        if (!shouldRunSpace(state, now, cfg)) continue;
+        if (!shouldRunSpace(state, now, cfg)) {
+          pendingRaw += idx.countRaw(true);
+          continue;
+        }
         log.info("scheduling dream cycle", { space: meta.id, reason });
+        const model = this.engine.agentForSpace(meta.id)?.model || undefined;
+        const maxBatches = Math.max(1, Math.floor(cfg.maxCatchUpBatches));
+        const batchEntries = Math.max(1, Math.floor(cfg.batchEntries));
+        let spaceBatches = 0;
+        let spaceFailed = false;
         try {
-          // Per-space agent model (management backend), if assigned.
-          const model = this.engine.agentForSpace(meta.id)?.model || undefined;
-          await this.engine.scheduleBackgroundRun(
-            `background:dream:${meta.id}:${now.getTime()}`,
-            meta.id,
-            () => this.engine.runDreamCycle(meta.id, { model }),
-          );
-          ran.push(meta.id);
+          for (let batch = 0; batch < maxBatches && idx.countRaw(true) > 0; batch += 1) {
+            const pendingBefore = idx.countRaw(true);
+            const report = await this.engine.scheduleBackgroundRun(
+              `background:dream:${meta.id}:${now.getTime()}:${batch}`,
+              meta.id,
+              () => this.engine.runDreamCycle(meta.id, { model, maxEntries: batchEntries }),
+            );
+            batchesRun += 1;
+            spaceBatches += 1;
+            processedRaw += report.processedRawIds.length;
+            if (!ran.includes(meta.id)) ran.push(meta.id);
+            if (report.errors.length > 0) {
+              spaceFailed = true;
+              const detail = report.errors.join("; ").slice(0, 400);
+              errors.push(`${meta.id}: ${detail}`);
+              log.error("scheduled dream batch failed", {
+                space: meta.id,
+                batch: batch + 1,
+                err: detail,
+              });
+              break;
+            }
+            const pendingAfter = idx.countRaw(true);
+            if (pendingAfter >= pendingBefore) {
+              spaceFailed = true;
+              const detail = `提炼批次没有处理任何 Raw（仍有 ${pendingAfter} 条待提炼）`;
+              errors.push(`${meta.id}: ${detail}`);
+              log.error("scheduled dream batch made no progress", {
+                space: meta.id,
+                batch: batch + 1,
+                pendingRaw: pendingAfter,
+              });
+              break;
+            }
+          }
         } catch (err) {
+          spaceFailed = true;
           errors.push(`${meta.id}: ${String(err)}`);
           log.error("scheduled dream failed", { space: meta.id, err: String(err) });
+        }
+        const remaining = idx.countRaw(true);
+        pendingRaw += remaining;
+        if (!spaceFailed && remaining > 0 && spaceBatches >= maxBatches) {
+          backlogLimited = true;
         }
       }
       const retention = await this.engine.pruneRawMessages(cfg.rawRetentionDays, now.getTime());
@@ -220,6 +299,10 @@ export class Scheduler {
       throw err;
     } finally {
       this.running = false;
+      this.lastBatchesRun = batchesRun;
+      this.lastProcessedRaw = processedRaw;
+      this.lastPendingRaw = pendingRaw;
+      this.lastBacklogLimited = backlogLimited;
       if (errors.length === 0) {
         this.lastSuccessAt = Date.now();
         this.lastStatus = "ok";

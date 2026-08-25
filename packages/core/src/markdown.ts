@@ -95,6 +95,7 @@ const PAGE_TYPES: PageType[] = [
   "overview",
   "log",
   "glossary",
+  "map",
   "entity",
   "concept",
   "source",

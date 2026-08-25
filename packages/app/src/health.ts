@@ -21,6 +21,7 @@ export interface SystemHealthSources {
   connectorHealth: () => ConnectorHealth;
   feishuLocallyDisabled?: () => boolean;
   dreamSchedulerHealth: () => RuntimeLoopHealth | undefined;
+  maintenanceSchedulerHealth?: () => RuntimeLoopHealth | undefined;
   taskSchedulerHealth: () => RuntimeLoopHealth | undefined;
   workContinuationSchedulerHealth?: () => RuntimeLoopHealth | undefined;
   reminderSchedulerHealth?: () => RuntimeLoopHealth | undefined;
@@ -145,19 +146,28 @@ export function createSystemHealthReporter(
 
     try {
       const quality = sources.engine.qualitySnapshot();
+      const agentKnowledgeFeedback = (
+        core.details?.agentKnowledgeFeedback as Record<string, unknown> | undefined
+      ) ?? {};
+      const openAgentFeedback = typeof agentKnowledgeFeedback.open === "number"
+        ? agentKnowledgeFeedback.open
+        : 0;
       const negativeFeedback = quality.feedback.unhelpful + quality.feedback.citationError;
       const negativeRate = quality.feedback.total === 0
         ? 0
         : negativeFeedback / quality.feedback.total;
-      const degraded = quality.feedback.total >= 5 && negativeRate >= 0.3;
+      const degraded = (quality.feedback.total >= 5 && negativeRate >= 0.3)
+        || openAgentFeedback >= 5;
+      const answerSummary = quality.feedback.total === 0
+        ? `${quality.answers.total} 次回答，暂无人工反馈`
+        : `${quality.feedback.total} 条反馈，${quality.feedback.helpful} 条有帮助，${negativeFeedback} 条需改进`;
       components.aiQuality = {
         status: degraded ? "degraded" : "ok",
-        summary: quality.feedback.total === 0
-          ? `${quality.answers.total} 次回答，暂无人工反馈`
-          : `${quality.feedback.total} 条反馈，${quality.feedback.helpful} 条有帮助，${negativeFeedback} 条需改进`,
+        summary: `${answerSummary}，${openAgentFeedback} 条 Agent 知识反馈待处理`,
         details: {
           ...quality,
           negativeFeedbackRate: negativeRate,
+          agentKnowledgeFeedback,
         },
       };
     } catch (err) {
@@ -329,6 +339,37 @@ export function createSystemHealthReporter(
       details: { runs: dreamCycles },
     };
 
+    const maintenanceCycles =
+      (core.details?.maintenanceCycles as Array<Record<string, unknown>> | undefined) ?? [];
+    const runningMaintenance = maintenanceCycles.filter((cycle) => cycle.running === true);
+    const failedMaintenance = maintenanceCycles.filter((cycle) => cycle.lastStatus === "error");
+    const maintenanceIssueCount = maintenanceCycles.reduce(
+      (sum, cycle) => sum + (
+        typeof cycle.lastIssueCount === "number" ? cycle.lastIssueCount : 0
+      ),
+      0,
+    );
+    const truncatedMaintenance = maintenanceCycles.filter(
+      (cycle) => cycle.lastTruncated === true,
+    );
+    components.maintenanceCycles = {
+      status: failedMaintenance.length > 0
+        || maintenanceIssueCount > 0
+        || truncatedMaintenance.length > 0
+        ? "degraded"
+        : "ok",
+      summary: runningMaintenance.length > 0
+        ? `${runningMaintenance.length} 个 Wiki Maintenance cycle 运行中`
+        : failedMaintenance.length > 0
+          ? `${failedMaintenance.length} 个空间最近维护检查失败`
+          : maintenanceIssueCount > 0
+            ? `Wiki Maintenance 最近发现 ${maintenanceIssueCount} 项问题`
+            : truncatedMaintenance.length > 0
+              ? `${truncatedMaintenance.length} 个空间的维护报告被截断`
+              : "Wiki Maintenance 无近期问题",
+      details: { runs: maintenanceCycles },
+    };
+
     const tasks = (core.details?.tasks as Array<Record<string, unknown>> | undefined) ?? [];
     const runningTasks = tasks.filter((task) => task.running === true);
     const failedTasks = tasks.filter((task) => task.lastStatus === "error");
@@ -361,10 +402,26 @@ export function createSystemHealthReporter(
     };
 
     const dreamLoop = probeLoopComponent("Dream Cycle 调度器", sources.dreamSchedulerHealth);
+    const maintenanceLoop = sources.maintenanceSchedulerHealth
+      ? probeLoopComponent("Wiki Maintenance 调度器", sources.maintenanceSchedulerHealth)
+      : undefined;
     const taskLoop = probeLoopComponent("任务调度器", sources.taskSchedulerHealth);
     const dreamHealth = dreamLoop.health;
     const taskHealth = taskLoop.health;
+    if (
+      dreamHealth?.lastStatus !== "error"
+      && dreamHealth?.lastBacklogLimited === true
+      && typeof dreamHealth.lastPendingRaw === "number"
+      && dreamHealth.lastPendingRaw > 0
+    ) {
+      const processed = typeof dreamHealth.lastProcessedRaw === "number"
+        ? dreamHealth.lastProcessedRaw
+        : 0;
+      dreamLoop.component.status = "degraded";
+      dreamLoop.component.summary = `本轮已处理 ${processed} 条 Raw，仍有 ${dreamHealth.lastPendingRaw} 条提炼积压，将在下一轮继续`;
+    }
     components.dreamScheduler = dreamLoop.component;
+    if (maintenanceLoop) components.maintenanceScheduler = maintenanceLoop.component;
     components.taskScheduler = taskLoop.component;
     const workContinuationLoop = sources.workContinuationSchedulerHealth
       ? probeLoopComponent("工作续跑调度器", sources.workContinuationSchedulerHealth)
@@ -406,6 +463,10 @@ export function createSystemHealthReporter(
       providerReady &&
       dreamHealth?.started === true &&
       dreamHealth.lastStatus !== "error" &&
+      (!maintenanceLoop || (
+        maintenanceLoop.health?.started === true
+        && maintenanceLoop.health.lastStatus !== "error"
+      )) &&
       taskHealth?.started === true &&
       taskHealth.lastStatus !== "error" &&
       (!workContinuationLoop || (

@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetConfig } from "@homeagent/shared";
-import { spentToday } from "./budget.ts";
+import { localDay, spentToday } from "./budget.ts";
 import { complete, completeJSON } from "./gateway.ts";
 
 test("gateway exposes reported tokens with explicitly estimated cost", async () => {
@@ -45,6 +45,45 @@ test("gateway exposes reported tokens with explicitly estimated cost", async () 
     else process.env.HOMEAGENT_DATA_DIR = previous.dataDir;
     if (previous.budget === undefined) delete process.env.HOMEAGENT_DAILY_BUDGET_USD;
     else process.env.HOMEAGENT_DAILY_BUDGET_USD = previous.budget;
+    if (previous.baseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = previous.baseUrl;
+    if (previous.token === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;
+    else process.env.ANTHROPIC_AUTH_TOKEN = previous.token;
+    resetConfig();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("gateway accounting persistence failures never override the Provider result", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ha-gateway-accounting-failure-"));
+  const previousFetch = globalThis.fetch;
+  const previous = {
+    dataDir: process.env.HOMEAGENT_DATA_DIR,
+    baseUrl: process.env.ANTHROPIC_BASE_URL,
+    token: process.env.ANTHROPIC_AUTH_TOKEN,
+  };
+  try {
+    process.env.HOMEAGENT_DATA_DIR = directory;
+    process.env.ANTHROPIC_BASE_URL = "https://gateway.invalid";
+    process.env.ANTHROPIC_AUTH_TOKEN = "test-token";
+    resetConfig();
+    mkdirSync(join(directory, "logs", `llm-${localDay()}.jsonl`), { recursive: true });
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      content: [{ type: "text", text: "stable answer" }],
+      usage: { input_tokens: 100, output_tokens: 20 },
+      model: "claude-sonnet-5",
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })) as unknown as typeof fetch;
+
+    await expect(complete({ prompt: "hello", retries: 0 })).resolves.toMatchObject({
+      text: "stable answer",
+    });
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previous.dataDir === undefined) delete process.env.HOMEAGENT_DATA_DIR;
+    else process.env.HOMEAGENT_DATA_DIR = previous.dataDir;
     if (previous.baseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
     else process.env.ANTHROPIC_BASE_URL = previous.baseUrl;
     if (previous.token === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;

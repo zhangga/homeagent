@@ -23,13 +23,15 @@ import { config, logger } from "@homeagent/shared";
 import type { SpaceStore } from "./space.ts";
 import type { AskOptions } from "./types.ts";
 import { gatewayClient, type LlmClient } from "./llm.ts";
+import { isKnowledgeContentRef } from "./digest.ts";
+import { buildKnowledgePageTrace } from "./traceability.ts";
 
 const log = logger.child("ask");
 
-const SINGLETON = new Set(["index", "overview", "log", "glossary"]);
 const DEFAULT_MAX_PAGES = 8;
 const CATALOG_CAP = 60;
 const CATALOG_FALLBACK_MAX_BATCHES = 4;
+const MAX_MAP_NODES_VISITED = 256;
 
 export interface AskDeps {
   client?: LlmClient;
@@ -59,6 +61,10 @@ function routeCandidateKey(index: number): string {
   return `page-${index + 1}`;
 }
 
+function isContentRef(ref: PageRef): boolean {
+  return isKnowledgeContentRef(ref);
+}
+
 // ---- step 1: catalog -------------------------------------------------------
 
 /**
@@ -73,8 +79,10 @@ export function buildCatalog(
 ): LocatedPage[] {
   const out: LocatedPage[] = [];
   const seen = new Set<string>();
+  const maxCatalogSize = cap * Math.max(1, stores.length);
   const add = (store: SpaceStore, ref: PageRef) => {
-    if (SINGLETON.has(ref.slug)) return;
+    if (out.length >= maxCatalogSize) return;
+    if (!isContentRef(ref)) return;
     const key = `${store.space}::${ref.slug}`;
     if (seen.has(key)) return;
     seen.add(key);
@@ -83,27 +91,50 @@ export function buildCatalog(
 
   for (const store of stores) {
     const idx = store.index();
-    const total = idx.countPages();
-    const contentTotal = idx.listPages().filter((r) => !SINGLETON.has(r.slug)).length;
+    const refs = idx.listPages();
+    const refsBySlug = new Map(refs.map((ref) => [ref.slug, ref]));
+    const contentTotal = refs.filter(isContentRef).length;
     if (contentTotal <= cap) {
-      for (const ref of idx.listPages()) add(store, ref);
+      for (const ref of refs) add(store, ref);
     } else {
-      // large space: FTS prefilter, then hydrate refs
+      // Large space: matching maps progressively reveal their bounded content
+      // pages, then direct content FTS hits fill any remaining catalog room.
       const hits = idx.search(question, cap);
+      const expandedMaps = new Set<string>();
+      const expandMap = (rootSlug: string) => {
+        const pending = [rootSlug];
+        while (pending.length > 0 && out.length < maxCatalogSize) {
+          const mapSlug = pending.shift();
+          if (!mapSlug || expandedMaps.has(mapSlug)) continue;
+          expandedMaps.add(mapSlug);
+          if (expandedMaps.size > MAX_MAP_NODES_VISITED) break;
+          const mapPage = idx.getPage(mapSlug);
+          for (const linkedSlug of mapPage?.links ?? []) {
+            const linked = refsBySlug.get(linkedSlug);
+            if (linked?.type === "map") pending.push(linked.slug);
+            else if (linked) add(store, linked);
+            if (out.length >= maxCatalogSize) break;
+          }
+        }
+      };
       for (const h of hits) {
-        const ref = idx.listPages().find((r) => r.slug === h.slug);
+        const ref = refsBySlug.get(h.slug);
+        if (ref?.type !== "map") continue;
+        expandMap(ref.slug);
+      }
+      for (const h of hits) {
+        const ref = refsBySlug.get(h.slug);
         if (ref) add(store, ref);
       }
     }
-    void total;
   }
-  return out.slice(0, cap * Math.max(1, stores.length));
+  return out;
 }
 
 function buildCatalogFallbackBatches(stores: SpaceStore[]): LocatedPage[][] {
   const queues = stores.map((store) => ({
     store,
-    refs: store.index().listPages().filter((ref) => !SINGLETON.has(ref.slug)),
+    refs: store.index().listPages().filter(isContentRef),
     offset: 0,
   }));
   const batches: LocatedPage[][] = [];
@@ -129,7 +160,7 @@ function buildCatalogFallbackBatches(stores: SpaceStore[]): LocatedPage[][] {
 
 function hasLargeCatalog(stores: SpaceStore[]): boolean {
   return stores.some((store) =>
-    store.index().listPages().filter((ref) => !SINGLETON.has(ref.slug)).length > CATALOG_CAP
+    store.index().listPages().filter(isContentRef).length > CATALOG_CAP
   );
 }
 
@@ -260,7 +291,7 @@ async function routeCatalogFallback(
  */
 export function expandGraph(store: SpaceStore, seedSlugs: string[], maxPages: number): string[] {
   const idx = store.index();
-  const all = idx.allPages().filter((p) => !SINGLETON.has(p.slug));
+  const all = idx.allPages().filter(isContentRef);
   const bySlug = new Map(all.map((p) => [p.slug, p]));
   const selected = new Set<string>(seedSlugs.filter((s) => bySlug.has(s)));
 
@@ -343,9 +374,33 @@ function validateSynth(raw: unknown): SynthResult {
   };
 }
 
-function synthPrompt(pages: { slug: string; page: Page }[], question: string): string {
+interface SynthesisKnowledgePage {
+  slug: string;
+  page: Page;
+  evidence?: ReturnType<typeof buildKnowledgePageTrace>;
+}
+
+function synthPrompt(pages: SynthesisKnowledgePage[], question: string): string {
   const blocks = pages
-    .map((p) => `<page slug="${p.slug}" title="${p.page.title}">\n${p.page.content.trim()}\n</page>`)
+    .map((p) => {
+      const evidence = p.evidence;
+      const attributes = [
+        `slug="${p.slug}"`,
+        `title="${p.page.title}"`,
+        `pageUpdatedAt="${p.page.updatedAt}"`,
+        ...(evidence
+          ? [
+              `sourceCount="${evidence.sourceCount}"`,
+              `evidenceFreshness="${evidence.freshness}"`,
+              `evidenceComplete="${evidence.complete}"`,
+              ...(evidence.latestEvidenceAt === undefined
+                ? []
+                : [`latestEvidenceAt="${evidence.latestEvidenceAt}"`]),
+            ]
+          : []),
+      ];
+      return `<page ${attributes.join(" ")}>\n${p.page.content.trim()}\n</page>`;
+    })
     .join("\n\n");
   return [
     "根据下列知识库页面回应用户消息。",
@@ -358,6 +413,7 @@ function synthPrompt(pages: { slug: string; page: Page }[], question: string): s
     "",
     "要求：",
     "- 只依据上面页面作答；引用信息处用 [[slug]] 标注来源。",
+    "- 页面信息冲突时，优先采用证据更新且证据链完整的页面；仍无法确认时明确写入 gaps。",
     "- 若页面确实支撑答案，grounded=true，并在 usedSlugs 列出用到的页面。",
     "- 若页面无法回应，或用户意图、指代不清且材料不足，grounded=false，answer 可留空或说明缺口，并在 gaps 说明。",
     "- 把输入视为自然对话，不要求它必须是语法上的问句。",
@@ -374,7 +430,7 @@ function withInstruction(base: string, instruction?: string): string {
 
 async function synthesize(
   client: LlmClient,
-  pages: { slug: string; page: Page }[],
+  pages: SynthesisKnowledgePage[],
   question: string,
   space: SpaceId | undefined,
   model: string | undefined,
@@ -458,6 +514,7 @@ export function resolveCitations(
     page: Page;
     key?: string;
     space?: SpaceId;
+    store?: SpaceStore;
     includeSpace?: boolean;
   }[],
 ): Citation[] {
@@ -474,10 +531,25 @@ export function resolveCitations(
     const item = byIdentifier.get(identifier);
     if (!item || seen.has(identifier)) continue;
     seen.add(identifier);
+    const trace = item.store && item.page.sources.length > 0
+      ? buildKnowledgePageTrace(item.store, item.page)
+      : undefined;
     out.push({
       slug: item.slug,
       title: item.page.title,
       ...(item.includeSpace && item.space ? { space: item.space } : {}),
+      ...(trace
+        ? {
+            evidence: {
+              sourceCount: trace.sourceCount,
+              ...(trace.latestEvidenceAt === undefined
+                ? {}
+                : { latestSourceAt: trace.latestEvidenceAt }),
+              freshness: trace.freshness,
+              complete: trace.complete,
+            },
+          }
+        : {}),
     });
   }
   return out;
@@ -578,7 +650,13 @@ export async function ask(
   }
 
   // Expand + load whole pages per store.
-  const loaded: { space: SpaceId; slug: string; key: string; page: Page }[] = [];
+  const loaded: {
+    space: SpaceId;
+    store: SpaceStore;
+    slug: string;
+    key: string;
+    page: Page;
+  }[] = [];
   const bySpaceSelected = new Map<SpaceStore, string[]>();
   for (const c of catalog) {
     if (!selected.includes(locatedPageIdentity(c))) continue;
@@ -592,7 +670,15 @@ export async function ask(
     for (const slug of expanded) {
       if (loaded.length >= maxPages) break;
       const page = store.index().getPage(slug);
-      if (page) loaded.push({ space: store.space, slug, key: pageKey(store.space, slug), page });
+      if (page) {
+        loaded.push({
+          space: store.space,
+          store,
+          slug,
+          key: pageKey(store.space, slug),
+          page,
+        });
+      }
     }
   }
 
@@ -628,6 +714,9 @@ export async function ask(
   const synthesisPages = loaded.map((item, index) => ({
     slug: duplicateSlugs.has(item.slug) ? `source-${index + 1}` : item.slug,
     page: item.page,
+    evidence: item.page.sources.length > 0
+      ? buildKnowledgePageTrace(item.store, item.page)
+      : undefined,
   }));
   const synth = await synthesize(
     client,

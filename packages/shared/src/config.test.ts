@@ -47,6 +47,8 @@ describe("editable settings overlay", () => {
     expect(cfg.chatTimeoutMinutes).toBe(10);
     expect(cfg.webHost).toBe("127.0.0.1");
     expect(cfg.webAdminToken).toBeUndefined();
+    expect(cfg.agentReadToken).toBeUndefined();
+    expect(cfg.agentFeedbackToken).toBeUndefined();
   });
 
   test("web exposure settings are env-only", () => {
@@ -54,10 +56,14 @@ describe("editable settings overlay", () => {
       ...process.env,
       HOMEAGENT_WEB_HOST: "0.0.0.0",
       HOMEAGENT_WEB_ADMIN_TOKEN: "admin-secret",
+      HOMEAGENT_AGENT_READ_TOKEN: "agent-read-secret",
+      HOMEAGENT_AGENT_FEEDBACK_TOKEN: "agent-feedback-secret",
       HOMEAGENT_RAW_RETENTION_DAYS: "45",
     });
     expect(cfg.webHost).toBe("0.0.0.0");
     expect(cfg.webAdminToken).toBe("admin-secret");
+    expect(cfg.agentReadToken).toBe("agent-read-secret");
+    expect(cfg.agentFeedbackToken).toBe("agent-feedback-secret");
     expect(cfg.rawRetentionDays).toBe(45);
     expect(readSettings(dir)).toEqual({});
   });

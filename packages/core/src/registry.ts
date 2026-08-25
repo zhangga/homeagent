@@ -1,7 +1,7 @@
 /**
  * Registry of known spaces and their metadata (plan §6: bindings stored under
  * data/config). Keeps a cache of open SpaceStore instances and persists a small
- * JSON registry so the scheduler knows each space's lastDreamAt across restarts.
+ * JSON registry so schedulers keep lightweight per-Space completion state across restarts.
  *
  * The markdown/DB on disk is authoritative for knowledge; this registry only
  * tracks lightweight operational metadata and space existence.
@@ -143,6 +143,25 @@ export class SpaceRegistry {
     const m = this.meta.get(space);
     if (m) {
       m.lastDreamAt = at;
+      this.persist();
+    }
+  }
+
+  setLastMaintenance(
+    space: SpaceId,
+    result: {
+      finishedAt: number;
+      scannedPages: number;
+      issueCount: number;
+      truncated: boolean;
+    },
+  ): void {
+    const m = this.meta.get(space);
+    if (m) {
+      m.lastMaintenanceAt = result.finishedAt;
+      m.lastMaintenanceScannedPages = result.scannedPages;
+      m.lastMaintenanceIssueCount = result.issueCount;
+      m.lastMaintenanceTruncated = result.truncated;
       this.persist();
     }
   }

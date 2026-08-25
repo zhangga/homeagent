@@ -167,8 +167,26 @@ import {
   retryQuarantinedDreamOperation,
   runDreamCycle as distillSpace,
 } from "./dream.ts";
-import { refreshDigest } from "./digest.ts";
+import { isKnowledgeContentRef, refreshDigest } from "./digest.ts";
+import {
+  runWikiMaintenanceCycle as inspectWiki,
+  type WikiMaintenanceOptions,
+  type WikiMaintenanceReport,
+} from "./maintenance.ts";
 import { ask as askImpl } from "./ask.ts";
+import {
+  buildKnowledgePageTrace,
+  type KnowledgePageTrace,
+} from "./traceability.ts";
+import {
+  AgentKnowledgeFeedbackError,
+  KnowledgeConsumptionFeedbackStore,
+  type AgentKnowledgeFeedback,
+  type AgentKnowledgeFeedbackQuery,
+  type AgentKnowledgeFeedbackSummary,
+  type ResolveAgentKnowledgeFeedbackInput,
+  type SubmitAgentKnowledgeFeedbackInput,
+} from "./knowledge-consumption-feedback.ts";
 import type { LlmClient } from "./llm.ts";
 import { makeCliClient, type RunProviderFn } from "./cli-client.ts";
 import { observeLlmUsage, RunUsageAccumulator } from "./usage.ts";
@@ -1334,6 +1352,19 @@ interface DreamCycleHealth {
   lastPagesWritten?: number;
 }
 
+interface MaintenanceCycleHealth {
+  space: SpaceId;
+  running: boolean;
+  lastStatus?: "ok" | "error";
+  lastStartedAt?: number;
+  lastSuccessAt?: number;
+  lastFailureAt?: number;
+  lastError?: string;
+  lastScannedPages?: number;
+  lastIssueCount?: number;
+  lastTruncated?: boolean;
+}
+
 export class KnowledgeEngine implements Knowledge {
   readonly registry: SpaceRegistry;
   readonly feishuBindings: FeishuGroupBindingStore;
@@ -1355,6 +1386,7 @@ export class KnowledgeEngine implements Knowledge {
   private learningResearch?: LearningResearchProvider;
   private providerRuns = new Map<ProviderId, ProviderRunHealth>();
   private dreamCycles = new Map<SpaceId, DreamCycleHealth>();
+  private maintenanceCycles = new Map<SpaceId, MaintenanceCycleHealth>();
   private activeTaskRuns = new Map<string, string>();
   private taskRunControllers = new Map<string, AbortController>();
   private deliveringTaskRunNotifications = new Set<string>();
@@ -1391,6 +1423,17 @@ export class KnowledgeEngine implements Knowledge {
     });
     this.reconcileTaskRunHealth();
     this.reconcileWorkContinuationState();
+    for (const meta of this.registry.list()) {
+      try {
+        const store = this.registry.store(meta.id);
+        if (store.index().listPages().some(isKnowledgeContentRef)) refreshDigest(store);
+      } catch (error) {
+        log.warn("knowledge map startup refresh failed", {
+          space: meta.id,
+          error: String(error).slice(0, 500),
+        });
+      }
+    }
     this.reminders = new ReminderStore(this.dataDir);
     this.learning = new LearningPlanStore(this.dataDir);
     this.quality = new QualityStore(this.dataDir);
@@ -3995,6 +4038,43 @@ export class KnowledgeEngine implements Knowledge {
     return this.serializer.run(space, async () => this.executeDreamCycle(space, opts));
   }
 
+  async runWikiMaintenanceCycle(
+    space: SpaceId,
+    opts: WikiMaintenanceOptions = {},
+  ): Promise<WikiMaintenanceReport> {
+    if (!this.registry.has(space)) throw new Error(`unknown space: ${space}`);
+    return this.serializer.run(space, async () => {
+      if (!this.registry.has(space)) throw new Error(`unknown space: ${space}`);
+      const health = this.maintenanceCycles.get(space) ?? { space, running: false };
+      health.running = true;
+      health.lastStartedAt = Date.now();
+      this.maintenanceCycles.set(space, health);
+      try {
+        const report = inspectWiki(this.registry.store(space), opts);
+        this.registry.setLastMaintenance(space, {
+          finishedAt: report.finishedAt,
+          scannedPages: report.scannedPages,
+          issueCount: report.issues.length,
+          truncated: report.truncated,
+        });
+        health.lastSuccessAt = report.finishedAt;
+        health.lastStatus = "ok";
+        health.lastError = undefined;
+        health.lastScannedPages = report.scannedPages;
+        health.lastIssueCount = report.issues.length;
+        health.lastTruncated = report.truncated;
+        return report;
+      } catch (error) {
+        health.lastFailureAt = Date.now();
+        health.lastStatus = "error";
+        health.lastError = String(error).slice(0, 500);
+        throw error;
+      } finally {
+        health.running = false;
+      }
+    });
+  }
+
   /** Execute while the caller holds the per-space serializer. */
   private async executeDreamCycle(
     space: SpaceId,
@@ -4256,6 +4336,7 @@ export class KnowledgeEngine implements Knowledge {
         reminders,
         learning: this.learning.exportBySpace(space),
         governanceAudit: listKnowledgeGovernanceAudit(store),
+        agentKnowledgeFeedback: new KnowledgeConsumptionFeedbackStore(store).exportArchive(),
       };
     });
   }
@@ -4375,6 +4456,9 @@ export class KnowledgeEngine implements Knowledge {
           || archive.workContinuationPolicies.length > 0;
         qualityRestoreReceipt = this.quality.restoreArchive(archive.quality);
         restoreKnowledgeGovernanceAudit(store, archive.governanceAudit);
+        new KnowledgeConsumptionFeedbackStore(store).restoreArchive(
+          archive.agentKnowledgeFeedback,
+        );
         this.registry.restoreMeta({
           ...archive.space,
           agentId: archive.space.agentId,
@@ -4531,6 +4615,7 @@ export class KnowledgeEngine implements Knowledge {
         throw err;
       }
       this.dreamCycles.delete(space);
+      this.maintenanceCycles.delete(space);
       return {
         status: "deleted",
         space,
@@ -6112,7 +6197,11 @@ export class KnowledgeEngine implements Knowledge {
           outcome: "succeeded",
           source: result.source,
           answer: result.answer,
-          citations: result.citations,
+          citations: result.citations.map(({ slug, title, space }) => ({
+            slug,
+            title,
+            ...(space ? { space } : {}),
+          })),
           execution: traceExecution,
           retrievalPages,
           usage: usage.snapshot(),
@@ -6265,6 +6354,55 @@ export class KnowledgeEngine implements Knowledge {
     return this.registry.store(space).index().getPage(slug);
   }
 
+  async getKnowledgePageTrace(space: SpaceId, slug: string): Promise<KnowledgePageTrace | null> {
+    if (!this.registry.has(space)) return null;
+    const store = this.registry.store(space);
+    const page = store.index().getPage(slug);
+    return page ? buildKnowledgePageTrace(store, page) : null;
+  }
+
+  async submitAgentKnowledgeFeedback(
+    space: SpaceId,
+    input: SubmitAgentKnowledgeFeedbackInput,
+  ): Promise<AgentKnowledgeFeedback> {
+    if (!this.registry.has(space)) {
+      throw new AgentKnowledgeFeedbackError("not_found", "feedback Space was not found");
+    }
+    return this.serializer.run(space, async () => (
+      new KnowledgeConsumptionFeedbackStore(this.registry.store(space)).submit(input)
+    ));
+  }
+
+  listAgentKnowledgeFeedback(
+    space: SpaceId,
+    query: AgentKnowledgeFeedbackQuery = {},
+  ): AgentKnowledgeFeedback[] {
+    if (!this.registry.has(space)) {
+      throw new AgentKnowledgeFeedbackError("not_found", "feedback Space was not found");
+    }
+    return new KnowledgeConsumptionFeedbackStore(this.registry.store(space)).list(query);
+  }
+
+  agentKnowledgeFeedbackSummary(space: SpaceId): AgentKnowledgeFeedbackSummary {
+    if (!this.registry.has(space)) {
+      throw new AgentKnowledgeFeedbackError("not_found", "feedback Space was not found");
+    }
+    return new KnowledgeConsumptionFeedbackStore(this.registry.store(space)).summary();
+  }
+
+  async resolveAgentKnowledgeFeedback(
+    space: SpaceId,
+    id: string,
+    input: ResolveAgentKnowledgeFeedbackInput,
+  ): Promise<AgentKnowledgeFeedback> {
+    if (!this.registry.has(space)) {
+      throw new AgentKnowledgeFeedbackError("not_found", "feedback Space was not found");
+    }
+    return this.serializer.run(space, async () => (
+      new KnowledgeConsumptionFeedbackStore(this.registry.store(space)).resolve(id, input)
+    ));
+  }
+
   async upsertPage(space: SpaceId, page: Page): Promise<void> {
     await this.serializer.run(space, async () => {
       const store = this.registry.ensure(space);
@@ -6288,9 +6426,30 @@ export class KnowledgeEngine implements Knowledge {
   async health(): Promise<HealthReport> {
     const spaces = this.registry.list();
     let ok = true;
+    const agentKnowledgeFeedback = {
+      total: 0,
+      open: 0,
+      resolved: 0,
+      byKind: {
+        helpful: 0,
+        not_found: 0,
+        incorrect: 0,
+        stale: 0,
+        conflicting: 0,
+        hard_to_reuse: 0,
+      },
+    } satisfies AgentKnowledgeFeedbackSummary;
     const spaceDetails = spaces.map((space) => {
       try {
-        const index = this.registry.store(space.id).index();
+        const store = this.registry.store(space.id);
+        const index = store.index();
+        const feedback = new KnowledgeConsumptionFeedbackStore(store).summary();
+        agentKnowledgeFeedback.total += feedback.total;
+        agentKnowledgeFeedback.open += feedback.open;
+        agentKnowledgeFeedback.resolved += feedback.resolved;
+        for (const kind of Object.keys(feedback.byKind) as Array<keyof typeof feedback.byKind>) {
+          agentKnowledgeFeedback.byKind[kind] += feedback.byKind[kind];
+        }
         return {
           id: space.id,
           ok: true,
@@ -6300,6 +6459,8 @@ export class KnowledgeEngine implements Knowledge {
           excludedRaw: index.countRawByAdmission("excluded"),
           quarantined: listQuarantineRecords(this.registry.store(space.id)).length,
           lastDreamAt: space.lastDreamAt,
+          lastMaintenanceAt: space.lastMaintenanceAt,
+          agentFeedbackOpen: feedback.open,
         };
       } catch (err) {
         ok = false;
@@ -6332,6 +6493,26 @@ export class KnowledgeEngine implements Knowledge {
           .sort((a, b) => a.provider.localeCompare(b.provider)),
         dreamCycles: [...this.dreamCycles.values()]
           .map((cycle) => ({ ...cycle }))
+          .sort((a, b) => a.space.localeCompare(b.space)),
+        maintenanceCycles: [...new Set<SpaceId>([
+          ...spaces
+            .filter((space) => space.lastMaintenanceAt !== undefined)
+            .map((space) => space.id),
+          ...this.maintenanceCycles.keys(),
+        ])]
+          .map((spaceId): MaintenanceCycleHealth => {
+            const space = this.registry.get(spaceId);
+            return {
+              space: spaceId,
+              running: false,
+              lastStatus: "ok",
+              lastSuccessAt: space?.lastMaintenanceAt,
+              lastScannedPages: space?.lastMaintenanceScannedPages,
+              lastIssueCount: space?.lastMaintenanceIssueCount,
+              lastTruncated: space?.lastMaintenanceTruncated,
+              ...this.maintenanceCycles.get(spaceId),
+            };
+          })
           .sort((a, b) => a.space.localeCompare(b.space)),
         tasks: this.tasks.list().map((task) => {
           const activeRunId = this.activeTaskRunId(task.id);
@@ -6374,6 +6555,7 @@ export class KnowledgeEngine implements Knowledge {
           ).length,
         },
         quality: this.quality.snapshot(),
+        agentKnowledgeFeedback,
         spaces: spaceDetails,
       },
     };

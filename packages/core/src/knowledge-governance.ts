@@ -165,8 +165,8 @@ export function assertGovernablePageSlug(slug: string): string {
   ) {
     throw new Error("知识页 slug 不安全");
   }
-  if (["index", "overview", "log", "glossary"].includes(normalized)) {
-    throw new Error("自动生成的索引页不能人工删除或重新生成");
+  if (["index", "overview", "log", "glossary"].includes(normalized) || normalized.startsWith("maps/")) {
+    throw new Error("自动生成的导航页不能人工删除或重新生成");
   }
   return normalized;
 }

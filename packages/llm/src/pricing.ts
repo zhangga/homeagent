@@ -1,7 +1,7 @@
 /**
  * Token pricing for cost governance. Prices are USD per million tokens and are
  * deliberately approximate — the gateway bills internally, but homeagent still
- * needs a local estimate to enforce a daily budget and rank model tiers.
+ * needs a local estimate for daily cost visibility and model-tier comparison.
  *
  * If a model id is unknown we fall back to the default tier's price rather than
  * throwing, so an unrecognized gateway model never blocks a request outright.

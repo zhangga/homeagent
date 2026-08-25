@@ -53,6 +53,7 @@ describe("system health reporter", () => {
         ],
       }),
       dreamSchedulerHealth: () => loopHealth,
+      maintenanceSchedulerHealth: () => loopHealth,
       taskSchedulerHealth: () => loopHealth,
       reminderSchedulerHealth: () => loopHealth,
       learningSchedulerHealth: () => loopHealth,
@@ -86,6 +87,7 @@ describe("system health reporter", () => {
         reminders: expect.objectContaining({ status: "ok" }),
         learning: expect.objectContaining({ status: "ok" }),
         dreamScheduler: expect.objectContaining({ status: "ok" }),
+        maintenanceScheduler: expect.objectContaining({ status: "ok" }),
         taskScheduler: expect.objectContaining({ status: "ok" }),
         reminderScheduler: expect.objectContaining({ status: "ok" }),
         learningScheduler: expect.objectContaining({ status: "ok" }),
@@ -349,6 +351,56 @@ describe("system health reporter", () => {
     }));
     expect(JSON.stringify(snapshot)).not.toContain("private question");
     expect(JSON.stringify(snapshot)).not.toContain("private answer");
+    engine.close();
+  });
+
+  test("reports the Agent knowledge governance backlog without exposing feedback content", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-agent-feedback-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    const space = "team/oc_agent_feedback_health" as const;
+    engine.ensureSpace(space);
+    await engine.submitAgentKnowledgeFeedback(space, {
+      idempotencyKey: "health-run:feedback-1",
+      consumer: "health-agent",
+      kind: "not_found",
+      target: { kind: "search", query: "私密检索词" },
+      note: "私密反馈说明",
+    });
+    await engine.submitAgentKnowledgeFeedback(space, {
+      idempotencyKey: "health-run:feedback-2",
+      consumer: "health-agent",
+      kind: "helpful",
+      target: { kind: "search", query: "另一个私密检索词" },
+    });
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" },
+      ],
+      requiredProviderIds: () => ["codex"],
+    });
+
+    const snapshot = await reportHealth();
+
+    expect(snapshot.components.aiQuality).toEqual(expect.objectContaining({
+      status: "ok",
+      summary: expect.stringContaining("1 条 Agent 知识反馈待处理"),
+      details: expect.objectContaining({
+        agentKnowledgeFeedback: expect.objectContaining({ total: 2, open: 1, resolved: 1 }),
+      }),
+    }));
+    expect(JSON.stringify(snapshot)).not.toContain("私密");
     engine.close();
   });
 
@@ -768,6 +820,95 @@ describe("system health reporter", () => {
     expect(snapshot.components.dreamScheduler).toEqual(
       expect.objectContaining({ status: "degraded" }),
     );
+    engine.close();
+  });
+
+  test("a bounded Dream catch-up exposes remaining backlog without failing readiness", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-dream-backlog-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => ({
+        ...loopHealth,
+        lastStatus: "ok",
+        lastBatchesRun: 4,
+        lastProcessedRaw: 160,
+        lastPendingRaw: 12,
+        lastBacklogLimited: true,
+      }),
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" },
+      ],
+      requiredProviderIds: () => ["codex"],
+    });
+
+    const snapshot = await reportHealth();
+
+    expect(snapshot.ready).toBe(true);
+    expect(snapshot.status).toBe("degraded");
+    expect(snapshot.components.dreamScheduler).toEqual(expect.objectContaining({
+      status: "degraded",
+      summary: "本轮已处理 160 条 Raw，仍有 12 条提炼积压，将在下一轮继续",
+    }));
+    engine.close();
+  });
+
+  test("Wiki Maintenance findings degrade health without blocking readiness", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-maintenance-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    const space = "team/oc_health" as const;
+    engine.ensureSpace(space, { chatId: "oc_health" });
+    await engine.upsertPage(space, {
+      slug: "concepts/maintenance",
+      type: "concept",
+      title: "Maintenance",
+      summary: "维护检查",
+      aliases: [],
+      tags: [],
+      sources: [],
+      links: ["concepts/missing"],
+      content: "# Maintenance\n",
+      updatedAt: 1,
+      contentHash: "maintenance",
+    });
+    await engine.runWikiMaintenanceCycle(space);
+    const reportHealth = createSystemHealthReporter({
+      engine,
+      connectorHealth: () => ({
+        name: "feishu",
+        ready: true,
+        consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+        ],
+      }),
+      dreamSchedulerHealth: () => loopHealth,
+      maintenanceSchedulerHealth: () => loopHealth,
+      taskSchedulerHealth: () => loopHealth,
+      detectProviders: async () => [
+        { id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" },
+      ],
+      requiredProviderIds: () => ["codex"],
+    });
+
+    const snapshot = await reportHealth();
+    expect(snapshot.ready).toBe(true);
+    expect(snapshot.status).toBe("degraded");
+    expect(snapshot.components.maintenanceCycles).toEqual(expect.objectContaining({
+      status: "degraded",
+      summary: expect.stringContaining("发现"),
+    }));
     engine.close();
   });
 

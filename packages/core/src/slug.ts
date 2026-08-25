@@ -1,14 +1,15 @@
 /**
  * Slug helpers for wiki pages. A content page slug is `<folder>/<name>` where
- * folder groups by type (entities/, concepts/, sources/, analysis/) and name is
- * a url-safe, lowercased identifier. Top-level singletons (index/overview/log/
- * glossary) have no folder. Centralizing this keeps the LLM's free-form slug
+ * folder groups by type (entities/, concepts/, sources/, analysis/); generated
+ * maps live under maps/. Top-level singletons (index/overview/log/glossary)
+ * have no folder. Centralizing this keeps the LLM's free-form slug
  * suggestions from producing unsafe or inconsistent paths.
  */
 import type { PageType } from "@homeagent/shared";
 
 /** Folder each content type lives in. */
 export const TYPE_FOLDER: Record<Exclude<PageType, "index" | "overview" | "log" | "glossary">, string> = {
+  map: "maps",
   entity: "entities",
   concept: "concepts",
   source: "sources",

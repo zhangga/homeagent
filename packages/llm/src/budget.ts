@@ -1,18 +1,17 @@
 /**
- * Call logging + daily budget enforcement.
+ * Call logging + daily cost observability.
  *
  * Every gateway or local-CLI call appends one JSON line to data/logs/llm-YYYY-MM-DD.jsonl.
- * The budget tracker sums today's estimated spend and blocks new calls once the
- * cap is hit. Blocking is *advisory by purpose*: the orchestrator passes a
- * `purpose` so that answering (user-facing) can be prioritized while distillation
- * (deferrable) is shed first when the budget is tight.
+ * The tracker sums today's known spend and reports incomplete accounting. Cost
+ * references are deliberately observe-only: Provider calls must not be rejected
+ * because a configured amount was reached.
  */
 import { appendFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "@homeagent/shared";
 import type { CompletionUsage, ProviderId } from "./providers.ts";
 
-/** Why a call is being made — drives budget prioritization. */
+/** Why a call is being made — groups cost observations by workload. */
 export type CallPurpose = "ask" | "distill" | "classify" | "other";
 
 export interface CallRecord {
@@ -30,7 +29,7 @@ export interface CallRecord {
   ms: number;
 }
 
-/** Local YYYY-MM-DD in Asia/Shanghai, the operating timezone for the budget day. */
+/** Local YYYY-MM-DD in Asia/Shanghai, the operating timezone for the accounting day. */
 export function localDay(d = new Date()): string {
   // en-CA gives ISO-like YYYY-MM-DD formatting.
   return new Intl.DateTimeFormat("en-CA", {
@@ -101,6 +100,9 @@ export function spentToday(day = localDay(), dataDir = config().dataDir): number
 
 export interface BudgetDecision {
   allowed: boolean;
+  /** True only for a compatibility decision supplied by an external enforcing client. */
+  enforced: boolean;
+  referenceExceeded: boolean;
   spent: number;
   budget: number;
   unknownCostCalls: number;
@@ -110,12 +112,11 @@ export interface BudgetDecision {
 }
 
 /**
- * Decide whether a call of `purpose` may proceed under today's budget.
+ * Report the current daily cost reference without gating a Provider call.
  *
- * Deferrable purposes (distill) are shed at the full cap. User-facing purposes
- * (ask, classify) get a grace multiplier so a conversation is never cut off
- * mid-answer purely by the soft budget — the cap primarily throttles the
- * expensive batch distillation.
+ * The historical purpose thresholds remain visible for cost diagnosis, but
+ * `allowed` is always true. Runtime stability and completion take priority over
+ * cost admission until an explicit enforcement mode is designed and enabled.
  */
 export function checkBudget(
   purpose: CallPurpose,
@@ -126,31 +127,37 @@ export function checkBudget(
   const spent = spend.knownCostUsd;
   const deferrable = purpose === "distill" || purpose === "other";
   const limit = deferrable ? budget : budget * 1.5;
+  const referenceExceeded = budget > 0 && spent >= limit;
+  const warnings = [
+    spend.unknownCostCalls > 0
+      ? `${spend.unknownCostCalls} call(s) have unknown cost; daily cost accounting is incomplete`
+      : undefined,
+    referenceExceeded
+      ? `daily cost reference exceeded: $${spent.toFixed(4)} >= $${limit.toFixed(2)} for purpose=${purpose}`
+      : undefined,
+  ].filter((warning): warning is string => warning !== undefined);
   const coverage = {
     unknownCostCalls: spend.unknownCostCalls,
     accountingComplete: spend.unknownCostCalls === 0,
-    ...(spend.unknownCostCalls > 0
-      ? { warning: `${spend.unknownCostCalls} call(s) have unknown cost; the USD budget is not fully enforceable` }
-      : {}),
+    ...(warnings.length > 0 ? { warning: warnings.join("; ") } : {}),
   };
-  if (spent >= limit) {
-    return {
-      allowed: false,
-      spent,
-      budget,
-      ...coverage,
-      reason: `daily budget ${deferrable ? "" : "(grace) "}exhausted: $${spent.toFixed(
-        4,
-      )} >= $${limit.toFixed(2)} for purpose=${purpose}`,
-    };
-  }
-  return { allowed: true, spent, budget, ...coverage };
+  return {
+    allowed: true,
+    enforced: false,
+    referenceExceeded,
+    spent,
+    budget,
+    ...coverage,
+  };
 }
 
-/** Raised when a call is blocked by the budget. Callers may downgrade/defer. */
+/**
+ * Compatibility error for an external or legacy enforcing client. HomeAgent's
+ * built-in clients never raise it from the observe-only daily cost reference.
+ */
 export class BudgetExceededError extends Error {
   constructor(public decision: BudgetDecision) {
-    super(decision.reason ?? "daily budget exceeded");
+    super(decision.reason ?? "provider cost admission rejected");
     this.name = "BudgetExceededError";
   }
 }

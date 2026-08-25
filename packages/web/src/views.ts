@@ -33,6 +33,7 @@ import type {
   LearningSession,
   LearningSource,
   KnowledgeGovernanceSnapshot,
+  KnowledgePageTrace,
   RawGovernanceDetail,
   QuarantineRecord,
   AnswerFeedbackReview,
@@ -43,11 +44,14 @@ import type {
   WorkItem,
   WorkAction,
   WorkContinuationPolicy,
+  AgentKnowledgeFeedback,
+  AgentKnowledgeFeedbackManualResolutionKind,
 } from "@homeagent/core";
 import {
   ANSWER_FEEDBACK_KINDS,
   AGENT_PERMISSIONS,
   DEFAULT_TASK_TIMEOUT_MINUTES,
+  isKnowledgeContentRef,
   resolveGroupParticipationLevel,
   MAX_TASK_NOTIFICATION_ATTEMPTS,
   TASK_CADENCES,
@@ -82,6 +86,22 @@ const ANSWER_FEEDBACK_LABELS = {
   unhelpful: "没帮助",
   citation_error: "引用有误",
 } as const satisfies Record<(typeof ANSWER_FEEDBACK_KINDS)[number], string>;
+const AGENT_KNOWLEDGE_FEEDBACK_LABELS = {
+  helpful: "有帮助",
+  not_found: "没有找到",
+  incorrect: "内容不正确",
+  stale: "内容已过时",
+  conflicting: "知识有冲突",
+  hard_to_reuse: "难以复用",
+} as const;
+const AGENT_KNOWLEDGE_RESOLUTION_LABELS = {
+  helpful_acknowledged: "正向信号已确认",
+  knowledge_changed: "知识页已变更",
+  knowledge_confirmed: "人工复核后确认有效",
+  coverage_recorded: "已记录知识覆盖计划",
+  duplicate: "重复反馈",
+  not_actionable: "无需处理",
+} as const;
 const SINGLETON = new Set(["index", "overview", "log", "glossary"]);
 const GROUP_PARTICIPATION_LABELS = {
   reserved: "稳重",
@@ -97,6 +117,25 @@ export interface QualityReviewViewItem {
 function fmtTime(ms?: number): string {
   if (!ms) return "—";
   return new Date(ms).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+}
+
+function citationEvidenceView(citation: Citation): HtmlEscapedString | Promise<HtmlEscapedString> | string {
+  const evidence = citation.evidence;
+  if (!evidence) return "";
+  const hasValidTime = typeof evidence.latestSourceAt === "number"
+    && Number.isFinite(evidence.latestSourceAt)
+    && Math.abs(evidence.latestSourceAt) <= 8_640_000_000_000_000;
+  const freshness = {
+    recent: "证据较新",
+    aging: "证据较久",
+    stale: "证据陈旧",
+    unknown: "证据时间未知",
+  }[evidence.freshness];
+  const sourceCount = Number.isInteger(evidence.sourceCount) && evidence.sourceCount >= 0
+    ? `${evidence.sourceCount} 条 Raw`
+    : "Raw 数量未知";
+  return html`<span>（${hasValidTime ? html`最新证据：${fmtTime(evidence.latestSourceAt)}` : "证据时间未知"}
+    · ${freshness} · ${sourceCount}${evidence.complete ? "" : " · 证据链不完整"}）</span>`;
 }
 
 function flash(msg?: string): HtmlEscapedString | Promise<HtmlEscapedString> | string {
@@ -167,8 +206,13 @@ export function spaceDetailView(
   meta?: SpaceMeta,
   agents: Agent[] = [],
   flashMsg?: string,
+  topLevelMapLinks?: string[],
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
-  const content = pages.filter((p) => !SINGLETON.has(p.slug));
+  const topLevelMapSlugs = new Set(topLevelMapLinks ?? []);
+  const maps = pages.filter((page) =>
+    page.type === "map" && (topLevelMapSlugs.size === 0 || topLevelMapSlugs.has(page.slug))
+  );
+  const content = pages.filter((page) => page.type !== "map" && !SINGLETON.has(page.slug));
   const enc = encodeURIComponent(space);
   const isTeam = space.startsWith("team/");
   const pageRows = content.length
@@ -180,6 +224,11 @@ export function spaceDetailView(
         </tr>`,
       )
     : [html`<tr><td colspan="3" class="empty">暂无知识页，运行提炼后生成。</td></tr>`];
+  const mapRows = maps.map((page) => html`<tr>
+    <td><a href="/spaces/${enc}/pages/${encodeURIComponent(page.slug)}">${page.title}</a>
+      <div class="muted">${page.slug}</div></td>
+    <td class="muted">${page.summary}</td>
+  </tr>`);
 
   const groupSettingsLink = isTeam
     ? html` · <a href="/integrations">群设置</a>`
@@ -204,7 +253,11 @@ export function spaceDetailView(
     <p class="subtitle">${space}</p>
     ${flash(flashMsg)}
     <div class="card">
-      <div class="muted">绑定群：${meta?.chatId ?? "—"} · 上次提炼：${fmtTime(meta?.lastDreamAt)}</div>
+      <div class="muted">绑定群：${meta?.chatId ?? "—"} · 上次提炼：${fmtTime(meta?.lastDreamAt)}
+        · 上次 Wiki 维护：${fmtTime(meta?.lastMaintenanceAt)}
+        ${meta?.lastMaintenanceIssueCount === undefined
+          ? ""
+          : `（${meta.lastMaintenanceIssueCount} 项问题${meta.lastMaintenanceTruncated ? "，报告已截断" : ""}）`}</div>
       <div style="margin-top:10px" class="actions">
         <a href="/spaces/${enc}/raw">原始条目（${rawCount}）</a> ·
         <a href="/spaces/${enc}/quarantine">提炼失败（${quarantineCount}）</a> ·
@@ -212,6 +265,9 @@ export function spaceDetailView(
         <a href="/spaces/${enc}/ask">问答测试</a>${groupSettingsLink} ·
         <form method="post" action="/spaces/${enc}/dream" class="inline-form">
           <button type="submit">手动触发提炼</button>
+        </form> ·
+        <form method="post" action="/spaces/${enc}/maintenance" class="inline-form">
+          <button type="submit" class="secondary">运行 Wiki 维护检查</button>
         </form>
       </div>
     </div>
@@ -245,6 +301,13 @@ export function spaceDetailView(
         </div>
       </form>
     </section>
+    ${maps.length > 0
+      ? html`<h2>知识地图（${maps.length}）</h2>
+        <table>
+          <tr><th>主题</th><th>范围</th></tr>
+          ${mapRows}
+        </table>`
+      : ""}
     <h2>知识页（${content.length}）</h2>
     <table>
       <tr><th>标题</th><th>类型</th><th>摘要</th></tr>
@@ -353,6 +416,7 @@ export function pageView(
   space: SpaceId,
   page: Page,
   flashMsg?: string,
+  trace?: KnowledgePageTrace,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const enc = encodeURIComponent(space);
   const aliases = page.aliases.length ? html`<div class="muted">别名：${page.aliases.join("、")}</div>` : "";
@@ -365,6 +429,63 @@ export function pageView(
   const sourceLinks = page.sources.length
     ? page.sources.map((sourceId) => html`<a href="/spaces/${enc}/raw/${encodeURIComponent(sourceId)}">${sourceId}</a> `)
     : "—";
+  const freshnessLabel = trace
+    ? {
+        recent: "证据较新",
+        aging: "证据较久",
+        stale: "证据陈旧",
+        unknown: "证据时间未知",
+      }[trace.freshness]
+    : "证据时间未知";
+  const evidenceRows = trace?.sources.map((source) => html`<tr>
+    <td><a href="/spaces/${enc}/raw/${encodeURIComponent(source.id)}">${source.id}</a></td>
+    <td><span class="tag">${source.source}</span></td>
+    <td>${fmtTime(source.createdAt)}</td>
+    <td>${source.author ?? "—"}</td>
+    <td>${source.admission === "ready" ? "已准入" : source.admission}</td>
+  </tr>`) ?? [];
+  const evidence = trace && isKnowledgeContentRef(page)
+    ? html`<h2>证据链与时效性</h2>
+      <div class="card">
+        <div><strong>${freshnessLabel}</strong> · 最新证据：${fmtTime(trace.latestEvidenceAt)} ·
+          ${trace.sourceCount} 条 Raw · 证据链${trace.complete ? "完整" : "不完整"}</div>
+        <p class="muted">时效等级依据最新 Raw 的记录时间计算，只表示证据新旧，不代表事实自动失效。</p>
+        ${evidenceRows.length > 0
+          ? html`<table>
+              <tr><th>Raw</th><th>来源</th><th>记录时间</th><th>作者</th><th>准入</th></tr>
+              ${evidenceRows}
+            </table>`
+          : html`<div class="empty">没有可读取的 Raw 证据。</div>`}
+        ${trace.missingSourceIds.length > 0
+          ? html`<p class="muted">缺失来源：${trace.missingSourceIds.join("、")}</p>`
+          : ""}
+        ${trace.truncated ? html`<p class="muted">证据链较长，此处只显示前 100 条。</p>` : ""}
+      </div>`
+    : "";
+  const governance = page.type === "map"
+    ? html`<h2>导航页说明</h2>
+      <div class="card muted">这是系统自动生成的导航页，会随知识页变化增量更新；请在其链接的知识页上进行纠错或治理。</div>`
+    : html`<h2>人工治理</h2>
+      <div class="card">
+        <div class="actions">
+          <form method="post" action="/spaces/${enc}/pages/regenerate" class="inline-form">
+            <input type="hidden" name="slug" value="${page.slug}" />
+            <button type="submit">重新生成知识页</button>
+          </form>
+          <form method="post" action="/spaces/${enc}/pages/delete" class="inline-form">
+            <input type="hidden" name="slug" value="${page.slug}" />
+            <button type="submit" class="danger" onclick="return confirm('确定删除这张知识页？原始来源会保留。')">删除知识页</button>
+          </form>
+        </div>
+        <form method="post" action="/spaces/${enc}/pages/correct" style="margin-top:18px">
+          <input type="hidden" name="slug" value="${page.slug}" />
+          <div class="field">
+            <label>人工纠错 <span class="hint">纠错会保存为 manual 原始来源，再重新生成当前页。</span></label>
+            <textarea name="correction" required placeholder="说明哪一项事实有误，以及正确内容是什么。"></textarea>
+          </div>
+          <button type="submit">提交人工纠错</button>
+        </form>
+      </div>`;
   return html`<h1>${page.title} <span class="tag">${page.type}</span></h1>
     ${flash(flashMsg)}
     <div class="card">
@@ -375,27 +496,8 @@ export function pageView(
     </div>
     <h2>正文</h2>
     <div class="contentbox">${page.content}</div>
-    <h2>人工治理</h2>
-    <div class="card">
-      <div class="actions">
-        <form method="post" action="/spaces/${enc}/pages/regenerate" class="inline-form">
-          <input type="hidden" name="slug" value="${page.slug}" />
-          <button type="submit">重新生成知识页</button>
-        </form>
-        <form method="post" action="/spaces/${enc}/pages/delete" class="inline-form">
-          <input type="hidden" name="slug" value="${page.slug}" />
-          <button type="submit" class="danger" onclick="return confirm('确定删除这张知识页？原始来源会保留。')">删除知识页</button>
-        </form>
-      </div>
-      <form method="post" action="/spaces/${enc}/pages/correct" style="margin-top:18px">
-        <input type="hidden" name="slug" value="${page.slug}" />
-        <div class="field">
-          <label>人工纠错 <span class="hint">纠错会保存为 manual 原始来源，再重新生成当前页。</span></label>
-          <textarea name="correction" required placeholder="说明哪一项事实有误，以及正确内容是什么。"></textarea>
-        </div>
-        <button type="submit">提交人工纠错</button>
-      </form>
-    </div>`;
+    ${evidence}
+    ${governance}`;
 }
 
 function rawStatusLabel(raw: RawRecord): string {
@@ -497,7 +599,8 @@ export function askView(
       : html`<span class="badge general">通用</span>`;
     const cites = result.citations.length
       ? html`<div class="muted" style="margin-top:8px">引用：${result.citations.map(
-          (c) => html`<a href="/spaces/${enc}/pages/${encodeURIComponent(c.slug)}">${c.title}</a> `,
+          (c) => html`<a href="/spaces/${enc}/pages/${encodeURIComponent(c.slug)}">${c.title}</a>
+            ${citationEvidenceView(c)} `,
         )}</div>`
       : "";
     const feedback = result.traceId
@@ -612,6 +715,10 @@ export function qualityView(
     <p class="subtitle">检查没帮助和引用有误的回答；问题、回答和评测候选只保存在本机。</p>
     ${flash(flashMsg)}
     <div class="actions" style="margin-bottom:14px">
+      <a class="btn" href="/quality">问答反馈</a>
+      <a class="btn secondary" href="/quality/agent-feedback">Agent 知识反馈</a>
+    </div>
+    <div class="actions" style="margin-bottom:14px">
       <a class="btn ${status === "open" ? "" : "secondary"}" href="/quality">待处理</a>
       <a class="btn ${status === "resolved" ? "" : "secondary"}" href="/quality?status=resolved">已解决</a>
     </div>
@@ -624,6 +731,104 @@ export function qualityView(
     ${cards.length > 0
       ? cards
       : html`<div class="empty">当前没有${status === "open" ? "待处理" : "已解决"}的负面反馈。</div>`}`;
+}
+
+function agentFeedbackResolutionOptions(
+  feedback: AgentKnowledgeFeedback,
+): Array<{ kind: AgentKnowledgeFeedbackManualResolutionKind; label: string }> {
+  if (feedback.target.kind === "search") {
+    return [
+      { kind: "coverage_recorded", label: "已记录知识覆盖计划" },
+      { kind: "duplicate", label: "重复反馈" },
+      { kind: "not_actionable", label: "无需处理" },
+    ];
+  }
+  return [
+    { kind: "knowledge_changed", label: "知识页已修正（系统验证 revision 已变化）" },
+    { kind: "knowledge_confirmed", label: "人工复核后确认当前知识有效" },
+    { kind: "duplicate", label: "重复反馈" },
+    { kind: "not_actionable", label: "无需处理" },
+  ];
+}
+
+export function agentKnowledgeFeedbackView(
+  feedbackRecords: AgentKnowledgeFeedback[],
+  status: "open" | "resolved",
+  flashMsg?: string,
+): HtmlEscapedString | Promise<HtmlEscapedString> {
+  const cards = feedbackRecords.map((feedback) => {
+    const target = feedback.target.kind === "page"
+      ? html`<div>
+          <strong>知识页：</strong>
+          <a href="/spaces/${encodeURIComponent(feedback.space)}/pages/${encodeURIComponent(feedback.target.slug)}">${feedback.target.slug}</a>
+          <div class="muted">Agent 消费 revision：<code>${feedback.target.revision}</code></div>
+          ${feedback.currentRevisionAtSubmission
+            ? html`<div class="muted">提交时 revision：<code>${feedback.currentRevisionAtSubmission}</code></div>`
+            : ""}
+        </div>`
+      : html`<div><strong>未命中搜索：</strong><code>${feedback.target.query}</code></div>`;
+    const resolution = feedback.resolution
+      ? html`<div class="contentbox" style="margin-top:12px">
+          <strong>${AGENT_KNOWLEDGE_RESOLUTION_LABELS[feedback.resolution.kind]}</strong>
+          <div>${feedback.resolution.note}</div>
+          <div class="muted">${feedback.resolution.actor} · ${fmtTime(feedback.resolution.resolvedAt)}</div>
+          ${feedback.resolution.currentRevision
+            ? html`<div class="muted">处置后 revision：<code>${feedback.resolution.currentRevision}</code></div>`
+            : ""}
+        </div>`
+      : "";
+    const resolutionForm = status === "open"
+      ? html`<form method="post" action="/quality/agent-feedback/${encodeURIComponent(feedback.space)}/${encodeURIComponent(feedback.id)}/resolve" style="margin-top:14px">
+          <div class="field">
+            <label>处置结果 <span class="hint">关闭只记录治理结论，不会自动写入 Raw/Wiki 或触发 Dream cycle。</span></label>
+            <select name="kind" required>
+              ${agentFeedbackResolutionOptions(feedback).map((option) =>
+                html`<option value="${option.kind}">${option.label}</option>`
+              )}
+            </select>
+          </div>
+          <div class="field">
+            <label>处理说明</label>
+            <textarea name="note" required placeholder="说明核验过程、修正内容或不处理原因。"></textarea>
+          </div>
+          <button type="submit">验证并关闭</button>
+        </form>`
+      : "";
+    return html`<div class="card">
+      <div class="row">
+        <div>
+          <span class="badge ${feedback.kind === "helpful" ? "ok" : "degraded"}">${AGENT_KNOWLEDGE_FEEDBACK_LABELS[feedback.kind]}</span>
+          ${status === "resolved" ? html`<span class="badge ok">已解决</span>` : ""}
+          <span class="muted">${feedback.space} · ${fmtTime(feedback.createdAt)}</span>
+        </div>
+        <span class="muted">${feedback.consumer}</span>
+      </div>
+      <div style="margin-top:14px">${target}</div>
+      ${feedback.note
+        ? html`<div class="contentbox" style="margin-top:12px">${feedback.note}</div>`
+        : ""}
+      ${resolution}
+      ${resolutionForm}
+    </div>`;
+  });
+  return html`<h1>Agent 知识反馈</h1>
+    <p class="subtitle">集中处理本机其他 Agent 在复用 Wiki 时提交的问题；反馈本身不是 Raw，也不会直接改写知识。</p>
+    ${flash(flashMsg)}
+    <div class="actions" style="margin-bottom:14px">
+      <a class="btn secondary" href="/quality">问答反馈</a>
+      <a class="btn" href="/quality/agent-feedback">Agent 知识反馈</a>
+    </div>
+    <div class="actions" style="margin-bottom:14px">
+      <a class="btn ${status === "open" ? "" : "secondary"}" href="/quality/agent-feedback">待处理</a>
+      <a class="btn ${status === "resolved" ? "" : "secondary"}" href="/quality/agent-feedback?status=resolved">已解决</a>
+    </div>
+    <div class="card">
+      <strong>${feedbackRecords.length} 条${status === "open" ? "待处理" : "已解决"}</strong>
+      <div class="muted">页面反馈绑定 Agent 消费时的 revision；“知识页已变更”会在关闭前重新验证。</div>
+    </div>
+    ${cards.length > 0
+      ? cards
+      : html`<div class="empty">当前没有${status === "open" ? "待处理" : "已解决"}的 Agent 知识反馈。</div>`}`;
 }
 
 export function logsView(logs: { day: string; lines: string[] }[]): HtmlEscapedString | Promise<HtmlEscapedString> {
@@ -650,12 +855,15 @@ export function healthView(
     providers: "本机 CLI",
     feishu: "飞书事件消费者",
     dreamCycles: "Dream Cycle",
+    maintenanceCycles: "Wiki Maintenance",
     tasks: "任务执行",
     reminders: "提醒",
     learning: "学习计划",
     aiQuality: "AI 质量反馈",
     aiRuntime: "AI 运行指标",
     dreamScheduler: "Dream Cycle 调度器",
+    maintenanceScheduler: "Wiki Maintenance 调度器",
+    workContinuationScheduler: "工作续跑调度器",
     taskScheduler: "任务调度器",
     reminderScheduler: "提醒调度器",
     learningScheduler: "学习调度器",
@@ -751,7 +959,7 @@ export function governanceView(
     </div>
     <div class="card">
       <h2 style="margin-top:0">恢复空间</h2>
-      <p class="muted">接受 homeagent.space v1–v16 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态；已有同名空间不会被覆盖。</p>
+      <p class="muted">接受 homeagent.space v1–v18 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录；已有同名空间不会被覆盖。</p>
       <form method="post" action="/governance/restore" enctype="multipart/form-data" class="actions">
         <input type="file" name="archive" accept="application/json,.json" required />
         <button type="submit">上传并恢复</button>
@@ -3218,17 +3426,17 @@ export function settingsView(
 
       <fieldset class="settings-section">
         <legend>运行策略</legend>
-        <p class="settings-section-description">控制调用预算和每日提炼任务的执行时间。</p>
+        <p class="settings-section-description">展示调用成本参考，并控制每日提炼任务的执行时间。</p>
         <div class="grid2">
           <div class="field">
-            <label for="daily-budget">每日预算</label>
+            <label for="daily-budget">每日成本参考线</label>
             <div class="input-with-unit">
               <input id="daily-budget" type="number" step="0.01" min="0" name="dailyBudgetUsd" value="${values.dailyBudgetUsd}"
                 aria-describedby="${describedBy("dailyBudgetUsd", "daily-budget-help", "daily-budget-error")}"
                 aria-invalid="${errors.dailyBudgetUsd ? "true" : "false"}" />
               <span class="input-unit">USD / 天</span>
             </div>
-            <p class="field-help" id="daily-budget-help">只对能报告或估算 USD 成本的调用生效；未知成本会明确记录，但无法按 USD 限额拦截。</p>
+            <p class="field-help" id="daily-budget-help">只用于成本观察，不会暂停或拒绝任何 Provider 调用；未知成本仍会明确记录。</p>
             ${errorMessage("dailyBudgetUsd", "daily-budget-error")}
           </div>
           <div class="field">

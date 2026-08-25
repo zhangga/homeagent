@@ -146,7 +146,7 @@ export class SpaceStore {
     this.index().deletePage(slug);
   }
 
-  /** Enumerate every wiki/*.md file's slug (relative path without extension). */
+  /** Enumerate every nested wiki Markdown slug (relative path without extension). */
   listPageFiles(): string[] {
     const slugs: string[] = [];
     const walk = (dir: string, prefix: string) => {
@@ -178,7 +178,7 @@ export class SpaceStore {
   /**
    * Rebuild the SQLite index from the markdown files on disk. Corrupt pages
    * (unparseable frontmatter) are skipped and returned so callers can quarantine
-   * them. This makes the index fully derivable from wiki/*.md.
+   * them. This makes the index fully derivable from nested wiki Markdown files.
    */
   rebuildIndex(): { rebuilt: number; corrupt: string[] } {
     const corrupt: string[] = [];

@@ -36,6 +36,7 @@ bun test \
   packages/core/src/usage.test.ts \
   packages/llm/src/budget.test.ts \
   packages/llm/src/providers.test.ts \
+  packages/app/src/scheduler.test.ts \
   packages/app/src/task-scheduler.test.ts \
   packages/web/src/app.test.ts
 ```
@@ -136,6 +137,66 @@ launchctl kill SIGKILL "gui/$(id -u)/com.homeagent.agent"
 KeepAlive 应自动启动新 PID。随后检查 `/readyz`，并使用第 3 节记录的名称或 ID 确认原始知识、
 任务配置、待发送提醒和学习进度均仍存在。将前后 PID、四类记录的检查结果写入发布记录。
 
+在测试空间页手动运行一次 Wiki Maintenance，记录完成时间、扫描页数、问题数和截断状态；再次
+`SIGKILL` 并重启后，运行状态页必须保留同一份有界摘要，且一周内的启动 catch-up 不得重复扫描。
+`/readyz` 必须包含独立 Maintenance 调度器：调度器未启动或最近失败时返回 503；仅发现断链、孤立页、
+重复标识、超大页或无效 provenance 时整体可为 degraded，但仍可服务。
+
+Dream 调度的积压回归必须确认：单批仍有 40 条 Raw 上限，一次 tick 最多追赶 4 批；超过上限的
+遗留 Raw 会在下一次 tick 继续，而正常新 Raw 仍等待每日窗口。批次失败或没有处理任何 Raw 时，本轮
+必须立即停止该 Space 的追赶且运行状态可见错误，不能在同一 tick 重复调用 Provider；仅因达到追赶
+上限而仍有积压时整体可为 degraded，但 `/readyz` 仍可服务。
+
+分层知识地图回归必须使用一个超过 24 个标签且至少有一个主题超过 100 页的测试空间：确认 `index.md`
+只链接一级地图，长尾页面全部进入按类型划分的兜底地图，大主题递归拆成每页最多 100 项的下级地图；重启旧
+数据目录会补齐地图，内容移动后旧地图会删除，未变化时不会重写。问答检索可沿命中地图逐层展开，但送入
+LLM 路由的仍只能是最多 60 个普通知识页，地图本身不能成为引用证据或触发额外 Provider 调用。管理后台
+应把一级地图与普通知识页分开展示，并拒绝对地图执行人工纠错、重新生成或删除；新生成的 Space
+`AGENTS.md` 应指引外部 agent 按 `overview → maps → 内容页 → 有界 Raw` 的顺序读取。
+
+可追溯性与时效性回归必须准备三类普通知识页：最新完整 Raw 证据、最新完整证据超过 365 天、来源 Raw
+缺失或未准入。页面详情必须显示最新证据时间、时效等级、来源数、完整性及可打开的本地 Raw 元数据，
+而系统生成地图不得显示或参与证据链；超过 365 天只能提示复核，不能自动删除页面或断言事实失效。
+问答引用必须显示同一份有界证据摘要；综合调用面对冲突页时应收到最新证据时间与完整性并优先采用更新、
+完整的证据，但 Prompt 和对外回答不得泄露 Raw id 或额外 Raw 正文。检查 Provider 调用记录，追溯展示和
+Maintenance 不得增加调用次数。Wiki Maintenance 必须分别报告无 Raw 来源的不可追溯页和最新完整证据
+超过 365 天的陈旧页，缺失或未准入来源仍按既有 invalid provenance 报告；以上检查均不得自动改写 Wiki。
+
+本地 Agent 只读接口回归必须在 HomeAgent 服务运行时完成：
+
+1. 用打包可执行文件执行 `homeagent mcp`，完成 `initialize`、`notifications/initialized` 和
+   `tools/list`；必须稳定列出 `list_spaces`、`get_overview`、`list_maps`、`search_knowledge`、
+   `get_page`、`get_page_trace` 六个工具，且全部声明 read-only、non-destructive、idempotent、closed-world。
+2. 按 `Space → overview → map/search → page` 调用完整链路，确认每次内容查询都要求一个显式 Space，
+   搜索最多返回 20 个普通知识页且不把 Knowledge map 当作搜索证据；未知工具、额外参数、危险 slug、
+   畸形 JSON 和超大请求必须固定失败，不能触发治理动作。
+3. `get_page` 只能返回正文和证据摘要，不得返回 Raw id 或内容摘要哈希；只有显式
+   `get_page_trace` 可返回有界 Raw 元数据，且不得包含 Raw 正文、Raw 的 `chatId`/`messageId`、工作归属字段
+   或跨 Space 来源；显式 SpaceId 仍应保留。
+   超过 200,000 字符的页面必须截断并返回 `contentTruncated=true`，不能静默伪装成完整页面。
+4. 同时配置不同的 `HOMEAGENT_WEB_ADMIN_TOKEN` 与 `HOMEAGENT_AGENT_READ_TOKEN`：read token 调用
+   `POST /api/agent/v1/query` 应成功，访问任意管理页面或写接口必须返回 401；凭据不得进入 URL、stdout、
+   日志或设置文件。未鉴权默认模式仍必须拒绝非回环请求。
+5. 分别运行 `homeagent knowledge list_spaces` 与一个带 Space 的 JSON 查询；停止 HomeAgent 后两者必须
+   明确报告服务不可用，不能自行打开或迁移数据目录。MCP stdout 只能包含逐行 JSON-RPC 协议消息。
+6. 对比调用前后的 Raw journal、Knowledge page、运行记录和 Provider 用量：必须没有持久化变化、Provider
+   调用或 token 增量。最后用 DMG 中的可执行文件重复 MCP 与 JSON CLI smoke，仓库内源码命令不能代替该门禁。
+
+本地 Agent 消费反馈闭环另做以下回归：
+
+1. 配置与管理/read token 均不同的 `HOMEAGENT_AGENT_FEEDBACK_TOKEN`。feedback token 调用
+   `POST /api/agent/v1/feedback` 应成功，调用查询端点或管理页面必须返回 401；read token 调用反馈端点也必须返回 401。
+2. `get_page` 返回稳定 opaque revision；用 `slug + revision` 提交 `incorrect/stale/conflicting/hard_to_reuse`
+   页面反馈，用有界 query 提交 `not_found`。相同 idempotency key + 相同内容只能生成一条记录，相同 key 改内容必须冲突。
+3. 在「AI 质量 → Agent 知识反馈」核验队列、Space 隔离、consumer、目标和说明。页面未变化时选择“知识页已修正”
+   必须返回冲突；通过页面纠错形成新 revision 后才能关闭。搜索反馈只能使用覆盖计划、重复或无需处理等适用结论。
+4. `helpful` 应自动确认且不进入人工待处理队列。任何反馈提交或关闭都不得自动创建 Raw、改写 Wiki、触发
+   Dream/Maintenance Provider 调用或增加 token；运行状态只显示聚合计数，不得泄露 query/note/正文。
+5. 启用反馈写入口后 MCP 应额外声明 `submit_knowledge_feedback` 为 non-destructive、idempotent、closed-world，
+   但不是 read-only；未启用时仍只能看到六个读取工具。分别 smoke MCP 与 `homeagent feedback` JSON CLI。
+6. 导出 `homeagent.space v18` 并恢复到全新目录，确认 open/resolved 状态、revision、处置说明与幂等键保持；
+   v1–v17 归档应归一化为空反馈集合，跨 Space、伪造处置关系或超过 5000 条反馈的 v18 归档必须 fail-closed。
+
 ### 4.1 Agent 发布与 Skill 执行边界验收
 
 在发布机的 Agents 工作台完成一次生命周期与本机 Skill 验收：
@@ -154,30 +215,30 @@ KeepAlive 应自动启动新 PID。随后检查 `/readyz`，并使用第 3 节�
 6. 临时修改 Pinned Skill 目录中的一个非 `SKILL.md` 资源文件，再运行先前已排队的显式任务；必须因完整目录树摘要变化而
    fail-closed，不能只校验入口文件或静默使用新内容。恢复目录并重新创建 Run 后才允许执行。
 7. 在工作上下文中配置两个下一动作，手动续作第一个并确认 Task Run 成功后先生成“结果 / 检查 / 证据”验收报告；`read-only` 仅在 Raw 已落盘、输出未截断且 Provider 返回严格 JSON 报告（`outcome=completed`、无 blocker、全部检查通过）时自动验收。普通文本或畸形报告必须停在人工验收，结构化 `blocked` 必须形成 blocker 且不得消费动作；`write/full` 即使执行前已审批，执行后仍必须人工接受。接受后才写入 checkpoint、消费当前首个动作；驳回必须填写原因，保留动作和证据并允许从同一边界重试。修改计划后可显式放弃旧的受阻动作，确认系统 blocker 被清除且新的首个动作可继续。待验收时自动续跑暂停，旧 Run 页面不能决定新重试结果。失败应转为阻塞，取消不得消费动作；重启后排队动作按冻结计划恢复，已中断的运行中动作只转为阻塞、不得重放。
-8. 导出并恢复该空间，确认格式为 `homeagent.space v16`，Agent 发布历史、运行所引用的 revision、完整 Skill 证据、跳过原因、工作上下文、WorkAction/checkpoint/验收审计、自动续作策略及 Raw 准入状态保持不变；待验收动作必须阻止导出与删除。验收前 Raw 必须为 `held` 且不能被 Dream、强制重跑、隔离重试或人工重新提炼读取；接受后才变为 `ready`，驳回、取消或失败后必须为 `excluded`。
+8. 导出并恢复该空间，确认格式为 `homeagent.space v18`，Agent 发布历史、运行所引用的 revision、完整 Skill 证据、跳过原因、工作上下文、WorkAction/checkpoint/验收审计、自动续作策略、Raw 准入状态、分层知识地图、本地 Agent 知识反馈及 Wiki Maintenance 最近完成时间/有界摘要保持不变；待验收动作必须阻止导出与删除。验收前 Raw 必须为 `held` 且不能被 Dream、强制重跑、隔离重试或人工重新提炼读取；接受后才变为 `ready`，驳回、取消或失败后必须为 `excluded`。
 
 这里验收的是当前 native Skill 冻结与执行链。`ManagedSkillStore` 仍是未接入 Provider 运行时的安全基础设施；不得把 Git/URL
 导入、Managed release 执行或 Skill 市场写成已发布能力。
 
-### 4.2 v10–v15 真实归档迁移验收
+### 4.2 v10–v17 真实归档迁移验收
 
-从对应历史版本各准备一份脱敏的真实 `homeagent.space v10`、v11、v12、v13、v14、v15 归档；不得只修改 JSON 的 `version` 字段伪造。
+从对应历史版本各准备一份脱敏的真实 `homeagent.space v10`、v11、v12、v13、v14、v15、v16、v17 归档；不得只修改 JSON 的 `version` 字段伪造。
 每份归档使用独立的全新数据目录执行以下步骤，避免同名空间相互覆盖：
 
 1. 先只读保存原归档、文件摘要和来源版本，再通过管理后台导入；导入失败时保留原文件和错误，不手改历史审计绕过校验。
 2. v10 确认冻结执行计划仍可查看；v11 确认 Agent 发布历史和已有审批审计仍在；v12 确认审批期限与通知审计仍在；
    v13 确认用量、失败分类和自动重试关系仍在；v14 确认 Chat 评测 Trace 与已结束重评审计仍在；v15 确认工作上下文、WorkAction、checkpoint 与验收审计仍在，且历史 WorkAction Raw 按事实迁移为 `ready/excluded`，引用非准入来源的污染页被移除。旧版本本来没有的字段应保持 legacy/未知，不得补成虚假的成功、0 成本或已审批。
 3. 对缺少可验证审批或执行计划的历史 `write/full` 活动运行做负向检查：恢复必须 fail-closed，不能用当前 Agent 配置继续执行。
-4. 将迁移后的空间重新导出，确认版本为 `homeagent.space v16`；重启 HomeAgent 后再次导出，比对知识、Agent revision、Task/Chat Run、工作上下文、WorkAction/checkpoint、Raw 准入状态、自动续作策略、
+4. 将迁移后的空间重新导出，确认版本为 `homeagent.space v18`；重启 HomeAgent 后再次导出，比对知识及分层地图、Agent revision、Task/Chat Run、工作上下文、WorkAction/checkpoint、Raw 准入状态、自动续作策略、
    审批/通知/重试/用量审计、提醒和学习数据的数量与关键 ID。
-5. 把该 v16 归档导入第二个全新数据目录，确认没有重复通知、自动续跑、重复动作 checkpoint、重复原始材料、悬空工作关联、未验收 Raw 污染 Wiki 或悬空质量 trace。把原归档摘要、两次 v16
+5. 把该 v18 归档导入第二个全新数据目录，确认没有重复通知、自动续跑、重复动作 checkpoint、重复原始材料、悬空工作关联、未验收 Raw 污染 Wiki 或悬空质量 trace。把原归档摘要、两次 v18
    导出摘要及逐项结果附到发布记录。
 
 ### 4.3 用量与质量重新评测验收
 
 1. 分别打开一条 Chat Run、一条 Task Run 和一次质量 trace，确认调用次数、token 可见数、成本可见数和记账覆盖率一致。
    CLI 未报告成本时必须显示“成本未知”，且持久化审计满足 `unknownCostCalls > 0`、`knownCostCalls < calls`；不能显示为 `$0`。
-   对应每日预算摘要必须为 `accountingComplete=false`，美元硬门禁只约束已知成本。
+   对应每日成本参考摘要必须为 `accountingComplete=false`；已知成本超出参考线或存在未知成本时，Provider 调用都应继续执行，不能出现成本准入拒绝。
 2. 在一条已完成 Chat Run 的详情页执行“重新评测”，确认生成独立 candidate trace、记录本次用量，并且不向飞书再次发送回复。
 3. 确认重新评测使用原问题和冻结计划；若原引用空间已不存在则应 fail-closed。它是一次可审计的 re-evaluation，输出允许变化，
    不得在发布记录中称为 deterministic replay。
@@ -365,7 +426,7 @@ metadata，不得包含消息正文、Instruction、Prompt、凭据或完整模�
 1. 创建启用通知的 `read-only` 定时任务，在主题中要求输出且通知原样包含一个不超过 120 字符的单行唯一标记，并记下下一次
    触发时间；手动“立即运行”不符合自动重试条件，不能替代本场景。
 2. 经批准后，在任务到期前短暂断开测试机网络。只有首条 Run 的详情明确记录 Provider 阶段、`retryable=true` 的
-   `overloaded`、`rate_limited` 或 `transient_provider` 失败并进入等待重试，才算成功触发；认证、配置、预算、超时、Skill、
+   `overloaded`、`rate_limited` 或 `transient_provider` 失败并进入等待重试，才算成功触发；认证、配置、外部 Provider 成本准入、超时、Skill、
    Workdir、取消或已有输出的失败都不得自动重试。
 3. 首条 Run 进入等待后立即恢复网络。约 60 秒后确认系统原子创建且只创建一条关联子 Run，子 Run 的 `trigger=retry`、
    `retryOf=<父 Run ID>`、attempt 和冻结执行计划均正确。
@@ -384,7 +445,7 @@ metadata，不得包含消息正文、Instruction、Prompt、凭据或完整模�
 - 两个架构的签名、公证和 DMG smoke 全绿；
 - 至少一个全新用户环境完成无终端安装；
 - 自动与真实崩溃恢复均通过；
-- v10、v11、v12、v13、v14、v15 六份真实归档均完成独立迁移、v16 再导出、重启和二次恢复，比对记录已归档；
+- v10、v11、v12、v13、v14、v15、v16、v17 八份真实归档均完成独立迁移、v18 再导出、重启和二次恢复，比对记录已归档；
 - Agent 草稿/发布/回滚、`write/full` 审批与过期、定时只读自动重试三个真实飞书灰度场景全部通过；
 - 普通调用的 Claude strict no-tools 或 Codex 临时只读、native Skill `no_tools_context` 跳过、TRAE 安全拒绝和图片输入边界均有真实消息证据；
 - 用量页面没有把未知成本显示为 0，质量重新评测没有外发副作用且被标记为 re-evaluation 而非 deterministic replay；

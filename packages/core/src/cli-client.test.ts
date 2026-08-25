@@ -1,9 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetConfig } from "@homeagent/shared";
-import { ProviderRunError, spentToday } from "@homeagent/llm";
+import { localDay, ProviderRunError, spentToday } from "@homeagent/llm";
 import { CliCompletionError, extractJson, makeCliClient } from "./cli-client.ts";
 import { observeLlmUsage, RunUsageAccumulator } from "./usage.ts";
 
@@ -126,7 +126,7 @@ describe("makeCliClient", () => {
     expect(result).not.toHaveProperty("costUsd");
   });
 
-  test("known CLI cost is recorded and blocks the next deferrable call at the daily budget", async () => {
+  test("known CLI cost is recorded without blocking a later deferrable call", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ha-cli-budget-"));
     const previousBudget = process.env.HOMEAGENT_DAILY_BUDGET_USD;
     let calls = 0;
@@ -151,8 +151,9 @@ describe("makeCliClient", () => {
 
       expect(spentToday(undefined, directory)).toBeCloseTo(0.02, 8);
       await expect(cli.complete({ prompt: "second", purpose: "other" }))
-        .rejects.toThrow(/budget/i);
-      expect(calls).toBe(1);
+        .resolves.toEqual(expect.objectContaining({ text: "answer" }));
+      expect(calls).toBe(2);
+      expect(spentToday(undefined, directory)).toBeCloseTo(0.04, 8);
     } finally {
       if (previousBudget === undefined) delete process.env.HOMEAGENT_DAILY_BUDGET_USD;
       else process.env.HOMEAGENT_DAILY_BUDGET_USD = previousBudget;
@@ -161,7 +162,7 @@ describe("makeCliClient", () => {
     }
   });
 
-  test("completeJSON participates in the same usage accounting and budget preflight", async () => {
+  test("completeJSON keeps accounting after the daily cost reference is exceeded", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ha-cli-json-budget-"));
     const previousBudget = process.env.HOMEAGENT_DAILY_BUDGET_USD;
     let calls = 0;
@@ -191,12 +192,34 @@ describe("makeCliClient", () => {
 
       expect(first.result.usage?.costUsd).toBe(0.02);
       expect(spentToday(undefined, directory)).toBeCloseTo(0.02, 8);
-      await expect(cli.completeJSON(options)).rejects.toThrow(/budget/i);
-      expect(calls).toBe(1);
+      await expect(cli.completeJSON(options)).resolves.toEqual(
+        expect.objectContaining({ value: { intent: "question" } }),
+      );
+      expect(calls).toBe(2);
+      expect(spentToday(undefined, directory)).toBeCloseTo(0.04, 8);
     } finally {
       if (previousBudget === undefined) delete process.env.HOMEAGENT_DAILY_BUDGET_USD;
       else process.env.HOMEAGENT_DAILY_BUDGET_USD = previousBudget;
       resetConfig();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("usage accounting read failures never block a Provider call", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ha-cli-accounting-failure-"));
+    const logs = join(directory, "logs");
+    mkdirSync(join(logs, `llm-${localDay()}.jsonl`), { recursive: true });
+    let calls = 0;
+    const cli = makeCliClient("claude", "sonnet", directory, async () => {
+      calls += 1;
+      return "stable answer";
+    });
+
+    try {
+      await expect(cli.complete({ prompt: "keep running", purpose: "distill" }))
+        .resolves.toEqual(expect.objectContaining({ text: "stable answer" }));
+      expect(calls).toBe(1);
+    } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   });

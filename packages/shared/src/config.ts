@@ -29,6 +29,7 @@ export interface Config {
   modelFast: string;
   /** heavy model reserved for complex synthesis (opt-in) */
   modelHeavy: string;
+  /** observe-only daily cost reference; never gates Provider calls */
   dailyBudgetUsd: number;
   /** maximum provider runtime for an interactive chat answer */
   chatTimeoutMinutes: number;
@@ -37,6 +38,10 @@ export interface Config {
   webPort: number;
   /** env-only credential required when webHost is not loopback */
   webAdminToken?: string;
+  /** env-only credential limited to the local Agent read-only API */
+  agentReadToken?: string;
+  /** env-only credential limited to local Agent feedback submission */
+  agentFeedbackToken?: string;
   /** local hour (Asia/Shanghai) for the nightly dream cycle */
   dreamHour: number;
   /** days to retain distilled raw messages; 0 keeps them forever */
@@ -199,6 +204,8 @@ export function loadConfig(env = process.env): Config {
     webHost: brandedEnv(env, "WEB_HOST")?.trim() || "127.0.0.1",
     webPort: num(env, "WEB_PORT", 3000),
     webAdminToken: brandedEnv(env, "WEB_ADMIN_TOKEN")?.trim() || undefined,
+    agentReadToken: brandedEnv(env, "AGENT_READ_TOKEN")?.trim() || undefined,
+    agentFeedbackToken: brandedEnv(env, "AGENT_FEEDBACK_TOKEN")?.trim() || undefined,
     dreamHour: num(env, "DREAM_HOUR", 3),
     rawRetentionDays: nonnegativeInt(num(env, "RAW_RETENTION_DAYS", 90), 90),
     defaultProvider: brandedEnv(env, "DEFAULT_PROVIDER") || "claude",
