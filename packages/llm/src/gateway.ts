@@ -12,7 +12,12 @@
  *   - There is no embeddings endpoint; the knowledge layer intentionally uses
  *     FTS plus LLM routing.
  */
-import { config, logger, type Logger } from "@homeagent/shared";
+import {
+  AI_GENERATION_MAX_TOKENS,
+  config,
+  logger,
+  type Logger,
+} from "@homeagent/shared";
 import { estimateCost } from "./pricing.ts";
 import type { CompletionUsage } from "./providers.ts";
 import {
@@ -187,7 +192,7 @@ export async function complete(opts: CompleteOptions): Promise<CompleteResult> {
 
   const body: Record<string, unknown> = {
     model,
-    max_tokens: opts.maxTokens ?? 1024,
+    max_tokens: opts.maxTokens ?? AI_GENERATION_MAX_TOKENS,
     messages: buildMessages(opts),
   };
   if (opts.system) body.system = opts.system;
@@ -262,7 +267,7 @@ export async function completeJSON<T = unknown>(opts: JSONOptions<T>): Promise<{
   const toolName = "extract";
   const body: Record<string, unknown> = {
     model,
-    max_tokens: opts.maxTokens ?? 2048,
+    max_tokens: opts.maxTokens ?? AI_GENERATION_MAX_TOKENS,
     messages: buildMessages(opts),
     tools: [
       {

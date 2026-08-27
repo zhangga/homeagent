@@ -19,7 +19,12 @@
  * flagged as not-in-knowledge-base.
  */
 import type { AskResult, Citation, Page, PageRef, SpaceId } from "@homeagent/shared";
-import { config, logger } from "@homeagent/shared";
+import {
+  AI_GENERATION_MAX_TOKENS,
+  AI_ROUTING_MAX_TOKENS,
+  config,
+  logger,
+} from "@homeagent/shared";
 import type { SpaceStore } from "./space.ts";
 import type { AskOptions } from "./types.ts";
 import { gatewayClient, type LlmClient } from "./llm.ts";
@@ -250,7 +255,7 @@ async function route(
     prompt: routePrompt(catalog, question),
     schema: ROUTE_SCHEMA as unknown as Record<string, unknown>,
     validate: validateRoute,
-    maxTokens: 512,
+    maxTokens: AI_ROUTING_MAX_TOKENS,
     purpose: "ask",
     space,
     model: config().modelFast,
@@ -443,7 +448,7 @@ async function synthesize(
     images,
     schema: SYNTH_SCHEMA as unknown as Record<string, unknown>,
     validate: validateSynth,
-    maxTokens: 2048,
+    maxTokens: AI_GENERATION_MAX_TOKENS,
     purpose: "ask",
     space,
     model,
@@ -491,7 +496,7 @@ async function generalFallback(
     ),
     prompt: question,
     images,
-    maxTokens: 1024,
+    maxTokens: AI_GENERATION_MAX_TOKENS,
     purpose: "ask",
     model: model ?? config().model,
   });

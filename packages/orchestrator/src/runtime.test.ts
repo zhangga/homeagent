@@ -3,7 +3,12 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProviderRunError, type JSONOptions } from "@homeagent/llm";
-import { resetConfig, saveSettings, type SpaceId } from "@homeagent/shared";
+import {
+  AI_OPERATION_TIMEOUT_MS,
+  resetConfig,
+  saveSettings,
+  type SpaceId,
+} from "@homeagent/shared";
 import { KnowledgeEngine, FakeLlm, type AgentInput, type LlmClient } from "@homeagent/core";
 import { CliConnector, type Connector } from "@homeagent/connectors";
 import { Orchestrator } from "./runtime.ts";
@@ -2660,7 +2665,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     await cliOrch.start();
     await cliConnector.sendGroup("Alice 今天更新了后端服务。", false);
 
-    expect(participationTimeout).toBe(30_000);
+    expect(participationTimeout).toBe(AI_OPERATION_TIMEOUT_MS);
     expect(cliConnector.sent).toHaveLength(0);
   });
 
@@ -2798,7 +2803,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("CLI-only runtime reports the frozen timeout instead of a hard-coded 120 seconds", async () => {
-    saveSettings({ chatTimeoutMinutes: 7 }, dir);
+    saveSettings({ chatTimeoutMinutes: 420 }, dir);
     resetConfig();
     const cliEngine = new KnowledgeEngine({
       dataDir: dir,
@@ -2816,14 +2821,14 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     await cliConnector.sendP2P("谁负责后端服务");
 
     expect(cliConnector.sent[0]!.markdown).toContain("回答超时");
-    expect(cliConnector.sent[0]!.markdown).toContain("7 分钟");
+    expect(cliConnector.sent[0]!.markdown).toContain("420 分钟");
     expect(cliConnector.sent[0]!.markdown).not.toContain("120 秒");
     expect(cliConnector.sent[0]!.markdown).toContain("gpt-5.6-luna");
     expect(cliConnector.sent[0]!.markdown).not.toContain("未配置");
   });
 
   test("CLI-only runtime freezes the configured chat timeout and passes it to the provider", async () => {
-    saveSettings({ chatTimeoutMinutes: 7 }, dir);
+    saveSettings({ chatTimeoutMinutes: 420 }, dir);
     resetConfig();
     const providerTimeouts: Array<number | undefined> = [];
     const cliEngine = new KnowledgeEngine({
@@ -2842,8 +2847,8 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     await cliOrch.start();
     await cliConnector.sendP2P("请解释一个复杂技术方案");
 
-    expect(providerTimeouts).toEqual([7 * 60_000]);
-    expect(cliEngine.chatRuns.list()[0]?.timeoutMs).toBe(7 * 60_000);
+    expect(providerTimeouts).toEqual([420 * 60_000]);
+    expect(cliEngine.chatRuns.list()[0]?.timeoutMs).toBe(420 * 60_000);
   });
 
   test("CLI-only runtime enforces the frozen timeout across the whole answer", async () => {

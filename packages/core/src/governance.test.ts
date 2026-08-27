@@ -2577,7 +2577,7 @@ describe("space data governance", () => {
     const parsed = parseSpaceArchive(archive);
 
     expect(parsed.version).toBe(18);
-    expect(parsed.tasks[0]?.timeoutMinutes).toBe(12);
+    expect(parsed.tasks[0]?.timeoutMinutes).toBe(360);
     expect(parsed.tasks[0]?.dayOfWeek).toBe(1);
     expect(parsed.taskRuns).toEqual([
       expect.objectContaining({

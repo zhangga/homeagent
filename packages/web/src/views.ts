@@ -51,6 +51,8 @@ import {
   ANSWER_FEEDBACK_KINDS,
   AGENT_PERMISSIONS,
   DEFAULT_TASK_TIMEOUT_MINUTES,
+  MAX_TASK_TIMEOUT_MINUTES,
+  MIN_TASK_TIMEOUT_MINUTES,
   isKnowledgeContentRef,
   resolveGroupParticipationLevel,
   MAX_TASK_NOTIFICATION_ATTEMPTS,
@@ -1625,7 +1627,7 @@ export function tasksView(
             </div>
             <div class="field">
               <label>最长运行时间 <span class="hint">分钟，超时会终止 CLI 进程</span></label>
-              <input type="number" min="1" max="60" name="timeoutMinutes" value="${timeoutMinutes}" />
+              <input type="number" min="${MIN_TASK_TIMEOUT_MINUTES}" max="${MAX_TASK_TIMEOUT_MINUTES}" name="timeoutMinutes" value="${timeoutMinutes}" />
             </div>
           </div>
           <div class="toggle-row">

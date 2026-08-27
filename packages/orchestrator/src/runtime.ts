@@ -20,7 +20,14 @@
  * per-space serialization still applies underneath.
  */
 import type { SpaceId } from "@homeagent/shared";
-import { Serializer, config, logger, type SerializerSnapshot } from "@homeagent/shared";
+import {
+  AI_OPERATION_TIMEOUT_MS,
+  AI_QUEUE_TIMEOUT_MS,
+  Serializer,
+  config,
+  logger,
+  type SerializerSnapshot,
+} from "@homeagent/shared";
 import { isProviderTimeoutError } from "@homeagent/llm";
 import {
   resolveGroupParticipationLevel,
@@ -85,15 +92,15 @@ import {
 const log = logger.child("orchestrator");
 const RETRACTION_COMMANDS = new Set(["别记这条", "撤回这条", "删掉这条", "不要记这条"]);
 const REMINDER_CONFIRMATION_TTL_MS = 15 * 60_000;
-const GROUP_PARTICIPATION_TIMEOUT_MS = 30_000;
+const GROUP_PARTICIPATION_TIMEOUT_MS = AI_OPERATION_TIMEOUT_MS;
 const MAX_VISION_IMAGES = 4;
 const MAX_VISION_BYTES = 20 * 1024 * 1024;
 const MAX_REPLY_SOURCE_CHARS = 50_000;
 const RECENT_CONTEXT_LOOKBACK_MS = 24 * 60 * 60_000;
 const RECENT_CONTEXT_SCAN_LIMIT = 50;
 const RECENT_ANSWER_SAMPLE_SIZE = 50;
-const CHAT_QUEUE_TIMEOUT_MS = 2 * 60_000;
-const LEGACY_CHAT_PROVIDER_TIMEOUT_MS = 2 * 60_000;
+const CHAT_QUEUE_TIMEOUT_MS = AI_QUEUE_TIMEOUT_MS;
+const LEGACY_CHAT_PROVIDER_TIMEOUT_MS = AI_OPERATION_TIMEOUT_MS;
 
 class ChatRunCancelledError extends Error {
   constructor() {

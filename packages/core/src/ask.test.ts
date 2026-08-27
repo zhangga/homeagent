@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { JSONOptions } from "@homeagent/llm";
 import type { Page, SpaceId } from "@homeagent/shared";
-import { resetConfig } from "@homeagent/shared";
+import {
+  AI_GENERATION_MAX_TOKENS,
+  AI_ROUTING_MAX_TOKENS,
+  resetConfig,
+} from "@homeagent/shared";
 import { SpaceStore } from "./space.ts";
 import { ask, buildCatalog, expandGraph, resolveCitations } from "./ask.ts";
 import { makeCliClient } from "./cli-client.ts";
@@ -200,6 +204,8 @@ describe("ask pipeline", () => {
     expect(res.source).toBe("knowledge");
     expect(res.citations).toEqual([{ slug: "entities/alice", title: "Alice" }]);
     expect(res.answer).toContain("Alice");
+    expect(fake.calls.filter((call) => call.kind === "json").map((call) => call.opts.maxTokens))
+      .toEqual([AI_ROUTING_MAX_TOKENS, AI_GENERATION_MAX_TOKENS]);
   });
 
   test("grounded citations expose bounded Raw provenance and evidence freshness", async () => {

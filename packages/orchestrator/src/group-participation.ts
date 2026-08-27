@@ -1,5 +1,5 @@
 import type { GroupParticipationLevel, LlmClient } from "@homeagent/core";
-import { config, logger } from "@homeagent/shared";
+import { AI_ROUTING_MAX_TOKENS, config, logger } from "@homeagent/shared";
 import { prefilterQuestion } from "./conversation-interpreter.ts";
 
 const log = logger.child("group-participation");
@@ -99,7 +99,7 @@ export async function decideGroupParticipation(
       prompt: `判断下面这条群消息是否值得机器人主动回答：\n"""\n${text.trim()}\n"""`,
       schema: PARTICIPATION_SCHEMA as unknown as Record<string, unknown>,
       validate,
-      maxTokens: 128,
+      maxTokens: AI_ROUTING_MAX_TOKENS,
       purpose: "classify",
     });
     const respond =

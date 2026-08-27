@@ -20,7 +20,12 @@
  * are refreshed and a log entry is appended.
  */
 import type { DreamReport, Page, RawRecord } from "@homeagent/shared";
-import { config, logger } from "@homeagent/shared";
+import {
+  AI_GENERATION_MAX_TOKENS,
+  AI_ROUTING_MAX_TOKENS,
+  config,
+  logger,
+} from "@homeagent/shared";
 import type { SpaceStore } from "./space.ts";
 import type {
   DreamOptions,
@@ -171,7 +176,7 @@ async function analyze(
     prompt: analyzePrompt(store, batch),
     schema: ANALYZE_SCHEMA as unknown as Record<string, unknown>,
     validate: validateAnalyze,
-    maxTokens: 2048,
+    maxTokens: AI_ROUTING_MAX_TOKENS,
     purpose: "distill",
     space: store.space,
   });
@@ -377,7 +382,7 @@ async function generate(
       prompt: generatePrompt(store, op, slug, current, group),
       schema: GENERATE_SCHEMA as unknown as Record<string, unknown>,
       validate: validateGenerate,
-      maxTokens: 4096,
+      maxTokens: AI_GENERATION_MAX_TOKENS,
       purpose: "distill",
       space: store.space,
     });

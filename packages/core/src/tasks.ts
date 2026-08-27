@@ -21,15 +21,19 @@ import {
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { SpaceId } from "@homeagent/shared";
-import { isSpaceId } from "@homeagent/shared";
+import {
+  AI_MAX_CONFIGURABLE_TIMEOUT_MINUTES,
+  AI_OPERATION_TIMEOUT_MINUTES,
+  isSpaceId,
+} from "@homeagent/shared";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 
 /** How often a task runs. */
 export type TaskCadence = "hourly" | "daily" | "weekly";
 export const TASK_CADENCES: TaskCadence[] = ["hourly", "daily", "weekly"];
-export const DEFAULT_TASK_TIMEOUT_MINUTES = 12;
-export const MIN_TASK_TIMEOUT_MINUTES = 1;
-export const MAX_TASK_TIMEOUT_MINUTES = 60;
+export const DEFAULT_TASK_TIMEOUT_MINUTES = AI_OPERATION_TIMEOUT_MINUTES;
+export const MIN_TASK_TIMEOUT_MINUTES = AI_OPERATION_TIMEOUT_MINUTES;
+export const MAX_TASK_TIMEOUT_MINUTES = AI_MAX_CONFIGURABLE_TIMEOUT_MINUTES;
 
 /** Outcome of the last run, for display + scheduling. */
 export type TaskStatus = "ok" | "error";

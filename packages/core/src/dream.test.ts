@@ -11,7 +11,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpaceId } from "@homeagent/shared";
-import { resetConfig } from "@homeagent/shared";
+import {
+  AI_GENERATION_MAX_TOKENS,
+  AI_ROUTING_MAX_TOKENS,
+  resetConfig,
+} from "@homeagent/shared";
 import { SpaceStore } from "./space.ts";
 import { regeneratePageFromSources, runDreamCycle, isCacheHit } from "./dream.ts";
 import { FakeLlm } from "./testing.ts";
@@ -167,6 +171,8 @@ describe("runDreamCycle", () => {
     expect(page!.sources).toContain(id); // provenance recorded
     expect(page!.title).toBe("Alice");
     const generationPrompt = fake.calls.filter((call) => call.kind === "json")[1]?.opts.prompt;
+    expect(fake.calls.filter((call) => call.kind === "json").map((call) => call.opts.maxTokens))
+      .toEqual([AI_ROUTING_MAX_TOKENS, AI_GENERATION_MAX_TOKENS]);
     expect(generationPrompt).toContain("aliases 只填写来源或既有页面明确支持");
     expect(generationPrompt).toContain("输出更新后的完整集合");
     expect(generationPrompt).toContain("不要为了提高检索召回而臆造");

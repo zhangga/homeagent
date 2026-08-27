@@ -1,5 +1,5 @@
 /** Conservative LLM fallback for reminder requests the deterministic parser cannot resolve. */
-import { config } from "@homeagent/shared";
+import { AI_ROUTING_MAX_TOKENS, config } from "@homeagent/shared";
 import type { LlmClient } from "@homeagent/core";
 import type { ReminderDraft } from "./reminder-commands.ts";
 
@@ -117,7 +117,7 @@ export async function inferReminderRequest(
     ].join("\n"),
     schema: REMINDER_INFERENCE_SCHEMA as unknown as Record<string, unknown>,
     validate: validateInference,
-    maxTokens: 256,
+    maxTokens: AI_ROUTING_MAX_TOKENS,
     temperature: 0,
     purpose: "classify",
   });

@@ -30,7 +30,7 @@ describe("TaskStore", () => {
     expect(t!.enabled).toBe(true);
     expect(t!.notify).toBe(true);
     expect(t!.distillOnRun).toBe(true); // default on
-    expect(t!.timeoutMinutes).toBe(12);
+    expect(t!.timeoutMinutes).toBe(360);
 
     const path = join(dir, "config", "tasks.json");
     expect(existsSync(path)).toBe(true);
@@ -57,11 +57,11 @@ describe("TaskStore", () => {
     expect(c!.dayOfWeek).toBe(7);
   });
 
-  test("timeout minutes are configurable and clamped to a safe range", () => {
+  test("timeout minutes use the stability-first range", () => {
     const store = new TaskStore(dir);
-    expect(store.create({ name: "fast", space: SPACE, timeoutMinutes: 0 })?.timeoutMinutes).toBe(1);
-    expect(store.create({ name: "normal", space: SPACE, timeoutMinutes: 12 })?.timeoutMinutes).toBe(12);
-    expect(store.create({ name: "bounded", space: SPACE, timeoutMinutes: 999 })?.timeoutMinutes).toBe(60);
+    expect(store.create({ name: "legacy", space: SPACE, timeoutMinutes: 12 })?.timeoutMinutes).toBe(360);
+    expect(store.create({ name: "normal", space: SPACE, timeoutMinutes: 420 })?.timeoutMinutes).toBe(420);
+    expect(store.create({ name: "bounded", space: SPACE, timeoutMinutes: 9_999 })?.timeoutMinutes).toBe(1_440);
   });
 
   test("older persisted tasks backfill the weekly weekday", () => {

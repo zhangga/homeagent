@@ -98,6 +98,12 @@ files. Add or extend a public export when a cross-package seam is genuinely need
   boundary. Deep-clone mutable input/output at store seams.
 - Preserve safe idempotency for message delivery, notifications, retries, and
   external actions. A persistence failure after delivery must not duplicate effects.
+- Treat AI latency and output length as reliability concerns. Production Provider,
+  Chat, Task, Dream, and learning paths use the centralized stability-first limits
+  in `packages/shared/src/ai-limits.ts`; do not introduce a shorter AI timeout or
+  token ceiling without an explicit product requirement, a documented reason, and
+  a regression test. Prefer explicit cancellation, bounded inputs/artifacts,
+  concurrency control, and health reporting over short arbitrary deadlines.
 - User-facing product copy and operational documentation default to Simplified
   Chinese. Keep identifiers, stable schema fields, and code comments consistent
   with the surrounding file.

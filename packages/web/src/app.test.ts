@@ -4436,7 +4436,7 @@ describe("management backend (read-write)", () => {
     expect(view).toContain('<label for="dream-hour">提炼时刻</label>');
     expect(view).toContain('<option value="3" selected>03:00</option>');
     expect(view).toContain('<label for="chat-timeout-minutes">聊天最长回答时间</label>');
-    expect(view).toContain('name="chatTimeoutMinutes" value="10"');
+    expect(view).toContain('name="chatTimeoutMinutes" value="360"');
     expect(view).toContain('<label for="daily-budget">每日成本参考线</label>');
     expect(view).toContain("只用于成本观察，不会暂停或拒绝任何 Provider 调用");
     expect(view).toContain('data-settings-form');
@@ -4574,7 +4574,7 @@ describe("management backend (read-write)", () => {
     expect(readSettings(dir)).toEqual({});
   });
 
-  test("settings POST rejects a chat timeout outside 1 through 60 minutes", async () => {
+  test("settings POST rejects a chat timeout outside 360 through 1440 minutes", async () => {
     const response = await app.request("/settings", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -4582,7 +4582,7 @@ describe("management backend (read-write)", () => {
         defaultProvider: "claude",
         defaultModel: "",
         dailyBudgetUsd: "5",
-        chatTimeoutMinutes: "61",
+        chatTimeoutMinutes: "359",
         dreamHour: "3",
         webPort: "3000",
         rawRetentionDays: "90",
@@ -4591,8 +4591,8 @@ describe("management backend (read-write)", () => {
 
     expect(response.status).toBe(400);
     const view = await response.text();
-    expect(view).toContain("聊天最长回答时间必须是 1 到 60 的整数");
-    expect(view).toContain('name="chatTimeoutMinutes" value="61"');
+    expect(view).toContain("聊天最长回答时间必须是 360 到 1440 的整数");
+    expect(view).toContain('name="chatTimeoutMinutes" value="359"');
     expect(readSettings(dir)).toEqual({});
   });
 
@@ -4601,7 +4601,7 @@ describe("management backend (read-write)", () => {
       defaultProvider: "claude",
       defaultModel: "sonnet",
       dailyBudgetUsd: "12",
-      chatTimeoutMinutes: "25",
+      chatTimeoutMinutes: "420",
       dreamHour: "5",
       webPort: "3000",
       rawRetentionDays: "30",
@@ -4620,8 +4620,8 @@ describe("management backend (read-write)", () => {
     expect(view).toContain('value="5"');
     expect(view).toContain('name="rawRetentionDays"');
     expect(view).toContain('value="30"');
-    expect(view).toContain('name="chatTimeoutMinutes" value="25"');
-    expect(readSettings(dir).chatTimeoutMinutes).toBe(25);
+    expect(view).toContain('name="chatTimeoutMinutes" value="420"');
+    expect(readSettings(dir).chatTimeoutMinutes).toBe(420);
   });
 
   test("settings schedules a confirmed external data-directory migration", async () => {
@@ -5097,7 +5097,7 @@ describe("management backend (read-write)", () => {
     const home = await (await app.request("/tasks")).text();
     expect(home).toContain("任务");
     expect(home).toContain("新建任务");
-    expect(home).toContain('name="timeoutMinutes" value="12"');
+    expect(home).toContain('name="timeoutMinutes" value="360"');
     expect(home).toContain('<option value="weekly"');
     expect(home).toContain('name="dayOfWeek"');
 
@@ -5107,7 +5107,7 @@ describe("management backend (read-write)", () => {
       topic: "大模型进展",
       cadence: "daily",
       hour: "9",
-      timeoutMinutes: "12",
+      timeoutMinutes: "420",
     });
     form.append("enabled", "on");
     form.append("notify", "on");
@@ -5124,7 +5124,7 @@ describe("management backend (read-write)", () => {
     expect(created?.hour).toBe(9);
     expect(created?.enabled).toBe(true);
     expect(created?.distillOnRun).toBe(false); // omitted checkbox
-    expect(created?.timeoutMinutes).toBe(12);
+    expect(created?.timeoutMinutes).toBe(420);
 
     // editor renders the task + the distill toggle
     const editor = await (await app.request(`/tasks/${encodeURIComponent(created!.id)}`)).text();
@@ -5132,7 +5132,7 @@ describe("management backend (read-write)", () => {
     expect(editor).toContain("立即运行");
     expect(editor).toContain("完成后立即提炼");
     expect(editor).toContain('name="timeoutMinutes"');
-    expect(editor).toContain('value="12"');
+    expect(editor).toContain('value="420"');
   });
 
   test("tasks: create and render a weekly schedule", async () => {

@@ -14,10 +14,14 @@
 import { resolve, join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { brandedEnv } from "./brand.ts";
+import {
+  AI_MAX_CONFIGURABLE_TIMEOUT_MINUTES,
+  AI_OPERATION_TIMEOUT_MINUTES,
+} from "./ai-limits.ts";
 
-export const DEFAULT_CHAT_TIMEOUT_MINUTES = 10;
-export const MIN_CHAT_TIMEOUT_MINUTES = 1;
-export const MAX_CHAT_TIMEOUT_MINUTES = 60;
+export const DEFAULT_CHAT_TIMEOUT_MINUTES = AI_OPERATION_TIMEOUT_MINUTES;
+export const MIN_CHAT_TIMEOUT_MINUTES = AI_OPERATION_TIMEOUT_MINUTES;
+export const MAX_CHAT_TIMEOUT_MINUTES = AI_MAX_CONFIGURABLE_TIMEOUT_MINUTES;
 
 export interface Config {
   gatewayBaseUrl: string;

@@ -63,7 +63,7 @@ describe("handleTaskCommand", () => {
     expect(tasks.length).toBe(1);
     expect(tasks[0]!.topic).toBe("大模型 Agent 进展");
     expect(tasks[0]!.cadence).toBe("daily");
-    expect(tasks[0]!.timeoutMinutes).toBe(12);
+    expect(tasks[0]!.timeoutMinutes).toBe(360);
   });
 
   test("new without a topic asks for one", async () => {

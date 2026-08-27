@@ -18,7 +18,7 @@
  * The built-in "gateway" provider (the Anthropic network gateway) is handled by
  * gateway.ts, not here; it is always available and is the default.
  */
-import { brandedEnv, logger } from "@homeagent/shared";
+import { AI_OPERATION_TIMEOUT_MS, brandedEnv, logger } from "@homeagent/shared";
 import {
   lstatSync,
   mkdtempSync,
@@ -842,7 +842,7 @@ function readCodexFinalOutput(path: string, maxTokens?: number): string {
 export async function runProviderDetailed(
   id: ProviderId,
   input: RunInput,
-  timeoutMs = 120_000,
+  timeoutMs = AI_OPERATION_TIMEOUT_MS,
   signal?: AbortSignal,
 ): Promise<ProviderRunResult> {
   const spec = specById.get(id);
@@ -944,7 +944,7 @@ export async function runProviderDetailed(
 export async function runProvider(
   id: ProviderId,
   input: RunInput,
-  timeoutMs = 120_000,
+  timeoutMs = AI_OPERATION_TIMEOUT_MS,
   signal?: AbortSignal,
 ): Promise<string> {
   return (await runProviderDetailed(id, input, timeoutMs, signal)).text;

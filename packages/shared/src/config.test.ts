@@ -44,7 +44,7 @@ describe("editable settings overlay", () => {
     expect(cfg.defaultProvider).toBe("claude");
     expect(cfg.defaultModel).toBe("");
     expect(cfg.rawRetentionDays).toBe(90);
-    expect(cfg.chatTimeoutMinutes).toBe(10);
+    expect(cfg.chatTimeoutMinutes).toBe(360);
     expect(cfg.webHost).toBe("127.0.0.1");
     expect(cfg.webAdminToken).toBeUndefined();
     expect(cfg.agentReadToken).toBeUndefined();
@@ -120,7 +120,7 @@ describe("editable settings overlay", () => {
       dreamHour: 5,
       dailyBudgetUsd: 12,
       rawRetentionDays: 30,
-      chatTimeoutMinutes: 25,
+      chatTimeoutMinutes: 420,
     }, dir);
     const path = join(dir, "config", "settings.json");
     expect(existsSync(path)).toBe(true);
@@ -132,7 +132,12 @@ describe("editable settings overlay", () => {
     expect(cfg.dreamHour).toBe(5);
     expect(cfg.dailyBudgetUsd).toBe(12);
     expect(cfg.rawRetentionDays).toBe(30);
-    expect(cfg.chatTimeoutMinutes).toBe(25);
+    expect(cfg.chatTimeoutMinutes).toBe(420);
+  });
+
+  test("raises legacy short chat deadlines to the stability-first minimum", () => {
+    saveSettings({ chatTimeoutMinutes: 10 }, dir);
+    expect(loadConfig().chatTimeoutMinutes).toBe(360);
   });
 
   test("persisted settings win over env defaults", () => {

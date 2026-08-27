@@ -6103,10 +6103,14 @@ describe("Knowledge seam contract", () => {
       timeoutMs: 10,
     }));
 
-    taskEngine.tasks.update(task.id, { timeoutMinutes: 12 });
+    taskEngine.tasks.update(task.id, { timeoutMinutes: 420 });
     const retried = taskEngine.retryTaskRun(timedOut.runId);
-    expect(retried.run.timeoutMs).toBe(12 * 60_000);
+    expect(retried.run.timeoutMs).toBe(420 * 60_000);
     expect((await retried.completion).status).toBe("succeeded");
+
+    const longOverride = taskEngine.startTaskRun(task.id, { timeoutMs: 420 * 60_000 });
+    expect(longOverride.run.timeoutMs).toBe(420 * 60_000);
+    expect((await longOverride.completion).status).toBe("succeeded");
     taskEngine.close();
   });
 

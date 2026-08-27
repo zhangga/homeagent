@@ -22,7 +22,17 @@ import type {
 } from "@homeagent/shared";
 import { realpathSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { Serializer, canonicalModelId, config, logger } from "@homeagent/shared";
+import {
+  AI_GENERATION_MAX_TOKENS,
+  AI_MAX_CONFIGURABLE_TIMEOUT_MINUTES,
+  AI_OPERATION_TIMEOUT_MS,
+  AI_QUEUE_TIMEOUT_MS,
+  AI_ROUTING_MAX_TOKENS,
+  Serializer,
+  canonicalModelId,
+  config,
+  logger,
+} from "@homeagent/shared";
 import {
   BudgetExceededError,
   isCliProvider,
@@ -383,7 +393,10 @@ function throwIfTaskRunAborted(signal?: AbortSignal): void {
 
 function normalizeTaskRunTimeoutMs(value: number | undefined, fallback: number): number {
   if (value === undefined || !Number.isFinite(value) || value <= 0) return fallback;
-  return Math.max(1, Math.min(60 * 60_000, Math.trunc(value)));
+  return Math.max(
+    1,
+    Math.min(AI_MAX_CONFIGURABLE_TIMEOUT_MINUTES * 60_000, Math.trunc(value)),
+  );
 }
 
 async function awaitTaskRunStep<T>(
@@ -425,8 +438,8 @@ async function awaitTaskRunStep<T>(
     );
   });
 }
-const LEARNING_TIMEOUT_MS = 300_000;
-const LEARNING_RESEARCH_TIMEOUT_MS = 120_000;
+const LEARNING_TIMEOUT_MS = AI_OPERATION_TIMEOUT_MS;
+const LEARNING_RESEARCH_TIMEOUT_MS = AI_OPERATION_TIMEOUT_MS;
 
 const TOPIC_ROUTE_SCHEMA = {
   type: "object",
@@ -3322,7 +3335,7 @@ export class KnowledgeEngine implements Knowledge {
     id: string,
     space: SpaceId,
     execute: () => Promise<T>,
-    queueTimeoutMs = 60 * 60_000,
+    queueTimeoutMs = AI_QUEUE_TIMEOUT_MS,
   ): Promise<T> {
     const snapshot = this.agentRunExecutionSnapshot(space, false);
     this.backgroundRunCounts.set(
@@ -3550,7 +3563,7 @@ export class KnowledgeEngine implements Knowledge {
         schema: TOPIC_ROUTE_SCHEMA as unknown as Record<string, unknown>,
         validate: validateTopicRoute,
         model: agent?.model || undefined,
-        maxTokens: 1500,
+        maxTokens: AI_ROUTING_MAX_TOKENS,
         purpose: "distill",
         space: input.space,
       });
@@ -3592,7 +3605,7 @@ export class KnowledgeEngine implements Knowledge {
         schema: LEARNING_ASSESSMENT_SCHEMA as unknown as Record<string, unknown>,
         validate: validateLearningAssessment,
         model: agent?.model || undefined,
-        maxTokens: 2500,
+        maxTokens: AI_GENERATION_MAX_TOKENS,
         purpose: "distill",
         space: plan.space,
       });
@@ -3675,7 +3688,7 @@ export class KnowledgeEngine implements Knowledge {
           schema: LEARNING_RESEARCH_SCHEMA as unknown as Record<string, unknown>,
           validate: validateLearningResearch,
           model: agent?.model || undefined,
-          maxTokens: 2500,
+          maxTokens: AI_GENERATION_MAX_TOKENS,
           purpose: "distill",
           space: plan.space,
         });
@@ -3885,7 +3898,7 @@ export class KnowledgeEngine implements Knowledge {
           schema: READING_FEEDBACK_SCHEMA as unknown as Record<string, unknown>,
           validate: validateReadingFeedback,
           model: agent?.model || undefined,
-          maxTokens: 1800,
+          maxTokens: AI_GENERATION_MAX_TOKENS,
           purpose: "distill",
           space: plan.space,
         });
