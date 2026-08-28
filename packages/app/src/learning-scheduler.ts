@@ -60,10 +60,27 @@ export function shouldRunLearningPlan(
   if (plan.status !== "active") return false;
   if (plan.mode === "topic" && plan.profile?.status === "assessing") return false;
   if (current?.status === "prepared") return true;
-  if (current?.status === "awaiting_reply") return false;
+  if (current?.status === "awaiting_reply") {
+    return shouldAdvanceUnansweredLearningPlan(plan, current, now);
+  }
   if (localHour(now) < plan.hour) return false;
   return plan.lastDeliveredAt === undefined
     || dayKey(new Date(plan.lastDeliveredAt)) !== dayKey(now);
+}
+
+export function shouldAdvanceUnansweredLearningPlan(
+  plan: LearningPlan,
+  current: LearningSession | undefined,
+  now: Date,
+): boolean {
+  if (
+    plan.status !== "active"
+    || (plan.mode === "topic" && plan.profile?.status === "assessing")
+    || current?.status !== "awaiting_reply"
+    || current.deliveredAt === undefined
+    || localHour(now) < plan.hour
+  ) return false;
+  return dayKey(new Date(current.deliveredAt)) !== dayKey(now);
 }
 
 export function shouldFollowUpLearningPlan(
@@ -92,7 +109,10 @@ export function learningNotification(
     "",
     session.guide,
     "",
-    "读完后回复并 @我，以“学习回答：”开头；如需跳过，发送 `/learn skip <计划名称或序号>`。",
+    `想提交反馈时回复并 @我：学习回答：[${plan.name}] <你的回答>`,
+    "不回答也不会阻塞明天的新课；本课会在下一次课程推送前归档为跳过。",
+    "只有想调整下一课时，再另起一行写：下一课要求：<你的要求>",
+    `如需立即跳过，发送 \`/learn skip ${plan.name}\`。`,
   ].join("\n");
   const warning = formatSkillWarnings(skillWarnings);
   return warning ? `${message}\n\n${warning}` : message;
@@ -108,7 +128,7 @@ export function learningFollowUpNotification(
     `当前停在：${session.sectionTitle}`,
     `可以先用几句话说说你对“${focus}”的理解，我会根据你的回答调整后面的路线。`,
     "",
-    "继续：回复并 @我，以“学习回答：”开头",
+    `继续：回复并 @我，发送“学习回答：[${plan.name}] <你的回答>”`,
     `暂时跳过：发送 \`/learn skip ${plan.name}\``,
   ].join("\n");
 }
@@ -186,7 +206,8 @@ export class LearningScheduler {
     try {
       for (const plan of this.engine.learning.list()) {
         const current = this.engine.learning.currentSession(plan.id);
-        if (shouldFollowUpLearningPlan(plan, current, now)) {
+        const shouldRun = shouldRunLearningPlan(plan, current, now);
+        if (!shouldRun && shouldFollowUpLearningPlan(plan, current, now)) {
           try {
             if (!this.followUp) throw new Error("learning follow-up transport is unavailable");
             const advanced = await this.engine.deliverLearningFollowUp(
@@ -210,27 +231,32 @@ export class LearningScheduler {
           }
           continue;
         }
-        if (!shouldRunLearningPlan(plan, current, now)) continue;
+        if (!shouldRun) continue;
         try {
           const advanced = await this.engine.scheduleBackgroundRun(
             `background:learning:${plan.id}:${now.getTime()}`,
             plan.space,
-            () => this.engine.deliverLearningSession(
-              plan.id,
-              now.getTime(),
-              async (currentPlan, source, session, skillWarnings) => {
-                if (!this.notify) {
-                  throw new Error("learning notification transport is unavailable");
-                }
-                await this.notify(
-                  currentPlan,
-                  source,
-                  session,
-                  skillWarnings,
-                  learningLessonIdempotencyKey(session),
-                );
-              },
-            ),
+            async () => {
+              if (shouldAdvanceUnansweredLearningPlan(plan, current, now)) {
+                this.engine.learning.advanceUnanswered(plan.id, current!.id, now.getTime());
+              }
+              return this.engine.deliverLearningSession(
+                plan.id,
+                now.getTime(),
+                async (currentPlan, source, session, skillWarnings) => {
+                  if (!this.notify) {
+                    throw new Error("learning notification transport is unavailable");
+                  }
+                  await this.notify(
+                    currentPlan,
+                    source,
+                    session,
+                    skillWarnings,
+                    learningLessonIdempotencyKey(session),
+                  );
+                },
+              );
+            },
           );
           if (advanced) delivered.push(plan.id);
         } catch (error) {

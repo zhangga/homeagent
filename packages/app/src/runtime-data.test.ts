@@ -14,6 +14,7 @@ import { dataMigrationBackupPath } from "./data-migration.ts";
 import {
   applyPendingDataDirectoryMigration,
   DATA_GITIGNORE,
+  dataDirectoryWasUninitialized,
   readRuntimeDataSettings,
   runtimeDataSettingsPath,
   scheduleDataDirectoryMigration,
@@ -54,6 +55,22 @@ describe("runtime data directory settings", () => {
       platform: "darwin",
       env: {},
     })).toBe(join(root, "home", "Library", "Preferences", "HomeAgent", "runtime.json"));
+  });
+
+  test("recognizes missing and launchd-prepared roots as uninitialized", () => {
+    const missing = join(root, "missing-data");
+    expect(dataDirectoryWasUninitialized(missing)).toBeTrue();
+
+    const runtimeOnly = join(root, "runtime-only");
+    mkdirSync(join(runtimeOnly, "logs"), { recursive: true });
+    mkdirSync(join(runtimeOnly, "run"), { recursive: true });
+    writeFileSync(join(runtimeOnly, "logs", "service.stdout.log"), "", "utf8");
+    writeFileSync(join(runtimeOnly, "AGENTS.md"), "# Local guide\n", "utf8");
+    expect(dataDirectoryWasUninitialized(runtimeOnly)).toBeTrue();
+
+    mkdirSync(join(runtimeOnly, "config"));
+    expect(dataDirectoryWasUninitialized(runtimeOnly)).toBeFalse();
+    expect(dataDirectoryWasUninitialized(source)).toBeFalse();
   });
 
   test("schedules an absolute empty destination without touching either data tree", () => {

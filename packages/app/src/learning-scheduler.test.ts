@@ -12,6 +12,7 @@ import {
   LearningScheduler,
   learningFollowUpNotification,
   learningNotification,
+  shouldAdvanceUnansweredLearningPlan,
   shouldFollowUpLearningPlan,
   shouldRunLearningPlan,
 } from "./learning-scheduler.ts";
@@ -57,7 +58,7 @@ function session(overrides: Partial<LearningSession> = {}): LearningSession {
 }
 
 describe("shouldRunLearningPlan", () => {
-  test("runs once after the configured hour and waits for an answer", () => {
+  test("runs once after the configured hour and rolls an unanswered lesson on the next day", () => {
     expect(shouldRunLearningPlan(plan(), undefined, NOW)).toBe(true);
     expect(shouldRunLearningPlan(plan({ hour: 11 }), undefined, NOW)).toBe(false);
     expect(shouldRunLearningPlan(
@@ -67,6 +68,17 @@ describe("shouldRunLearningPlan", () => {
     )).toBe(false);
     expect(shouldRunLearningPlan(plan(), session({ status: "prepared" }), NOW)).toBe(true);
     expect(shouldRunLearningPlan(plan(), session({ status: "awaiting_reply" }), NOW)).toBe(false);
+    const yesterday = new Date("2026-07-14T08:00:00+08:00").getTime();
+    expect(shouldRunLearningPlan(
+      plan({ lastDeliveredAt: yesterday }),
+      session({ status: "awaiting_reply", deliveredAt: yesterday }),
+      NOW,
+    )).toBe(true);
+    expect(shouldAdvanceUnansweredLearningPlan(
+      plan({ lastDeliveredAt: yesterday }),
+      session({ status: "awaiting_reply", deliveredAt: yesterday }),
+      NOW,
+    )).toBe(true);
     expect(shouldRunLearningPlan(plan({ status: "paused" }), undefined, NOW)).toBe(false);
     expect(shouldRunLearningPlan(plan({
       mode: "topic",
@@ -163,6 +175,23 @@ describe("LearningScheduler", () => {
     expect(engine.learning.currentSession(created.id)?.status).toBe("awaiting_reply");
   });
 
+  test("archives an unanswered lesson and delivers the next day's lesson", async () => {
+    const created = seedPlan(engine);
+    llm.queueText("## 今日目标\n理解第一章");
+    const scheduler = new LearningScheduler(engine, { notify: async () => {} });
+
+    expect(await scheduler.tick("day-one", NOW)).toEqual([created.id]);
+    const first = engine.learning.currentSession(created.id)!;
+    llm.queueText("## 今日目标\n理解下一段");
+    const tomorrow = new Date("2026-07-16T10:00:00+08:00");
+
+    expect(await scheduler.tick("day-two", tomorrow)).toEqual([created.id]);
+    expect(engine.learning.sessionsForPlan(created.id)).toEqual([
+      expect.objectContaining({ id: first.id, status: "skipped" }),
+      expect.objectContaining({ sequence: 2, status: "awaiting_reply" }),
+    ]);
+  });
+
   test("retries the same prepared lesson after delivery failure", async () => {
     const created = seedPlan(engine);
     llm.queueText("## 今日目标\n理解第一章");
@@ -223,6 +252,7 @@ describe("LearningScheduler", () => {
       },
     });
     await scheduler.tick("deliver", NOW);
+    engine.learning.update(created.id, undefined, { hour: 23 }, NOW.getTime() + 1);
     const current = engine.learning.currentSession(created.id)!;
     const later = new Date(NOW.getTime() + 25 * 60 * 60 * 1000);
 
@@ -243,6 +273,7 @@ describe("LearningScheduler", () => {
       followUp: async () => { throw new Error("network unavailable"); },
     });
     await scheduler.tick("deliver", NOW);
+    engine.learning.update(created.id, undefined, { hour: 23 }, NOW.getTime() + 1);
     const later = new Date(NOW.getTime() + 25 * 60 * 60 * 1000);
 
     expect(await scheduler.tick("follow-up", later)).toEqual([]);
@@ -268,6 +299,7 @@ describe("LearningScheduler", () => {
       },
     });
     await scheduler.tick("deliver", NOW);
+    engine.learning.update(created.id, undefined, { hour: 23 }, NOW.getTime() + 1);
     engine.learning.markFollowedUp = (...args) => {
       commitAttempts += 1;
       return commitAttempts === 1 ? undefined : persistFollowUp(...args);
@@ -299,6 +331,7 @@ describe("LearningScheduler", () => {
       },
     });
     await scheduler.tick("deliver", NOW);
+    engine.learning.update(created.id, undefined, { hour: 23 }, NOW.getTime() + 1);
     const later = new Date(NOW.getTime() + 25 * 60 * 60 * 1000);
 
     const tick = scheduler.tick("follow-up", later);
@@ -346,7 +379,9 @@ describe("LearningScheduler", () => {
     const message = learningNotification(plan(), session());
     expect(message).toContain("📖 读原则 · 第 1 课");
     expect(message).toContain("## 今日原文\n今日原文");
-    expect(message).toContain("学习回答：");
+    expect(message).toContain("学习回答：[读原则]");
+    expect(message).toContain("不回答也不会阻塞明天的新课");
+    expect(message).toContain("下一课要求：");
   });
 
   test("labels a topic step and its supplied references without calling them book text", () => {
@@ -393,7 +428,7 @@ function seedPlan(engine: KnowledgeEngine): LearningPlan {
     creatorId: "ou_me",
     chatId: "oc_p2p",
     sourceTitle: "原则",
-    sourceContent: `# 第一章\n\n${"正文".repeat(300)}`,
+    sourceContent: `# 第一章\n\n${"正文".repeat(350)}\n\n# 第二章\n\n${"后文".repeat(350)}`,
     sourceRawIds: ["raw_book"],
     sourceMessageId: "om_book",
     hour: 8,

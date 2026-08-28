@@ -274,6 +274,8 @@ describe("LearningPlanStore", () => {
       feedback: "还需要区分 Future 与线程",
       mastery: "review",
       nextFocus: "Future 的惰性轮询",
+      adjustNextLesson: true,
+      nextLessonRequest: "下一课继续补强 Future 的惰性轮询",
       completedAt: NOW + 3,
     });
     expect(store.get(plan.id)).toEqual(expect.objectContaining({
@@ -301,6 +303,8 @@ describe("LearningPlanStore", () => {
       feedback: "已经掌握",
       mastery: "ready",
       nextFocus: "executor 如何调度 Future",
+      adjustNextLesson: true,
+      nextLessonRequest: "下一课衔接 executor",
       completedAt: NOW + 6,
     });
 
@@ -380,6 +384,8 @@ describe("LearningPlanStore", () => {
           { title: "运行时诊断", objective: "使用 tracing 排查阻塞" },
         ],
       },
+      adjustNextLesson: true,
+      nextLessonRequest: "下一课进入 Waker",
       completedAt: NOW + 3,
     });
 
@@ -468,6 +474,8 @@ describe("LearningPlanStore", () => {
         routeAdjustment: "转入 MVCC。",
         upcomingSteps: [{ title: "MVCC", objective: "理解版本可见性" }],
       },
+      adjustNextLesson: true,
+      nextLessonRequest: "下一课进入 MVCC",
       completedAt: NOW + 4,
     });
 
@@ -544,6 +552,8 @@ describe("LearningPlanStore", () => {
           { title: "运行时", objective: "理解调度机制" },
         ],
       },
+      adjustNextLesson: true,
+      nextLessonRequest: "下一课进入 Waker",
       completedAt: NOW + 4,
     });
 
@@ -634,6 +644,32 @@ describe("LearningPlanStore", () => {
       status: "active",
     }));
     expect(reopened.currentSession(plan.id)).toBeUndefined();
+  });
+
+  test("atomically archives an unanswered lesson so the next lesson can be prepared", () => {
+    const store = new LearningPlanStore(dir);
+    const plan = createPlan(store);
+    const session = store.prepareSession(plan.id, {
+      startOffset: 0,
+      endOffset: 4,
+      sectionTitle: "第一章",
+      excerpt: "正文内容",
+      guide: "导读",
+      preparedAt: NOW,
+    })!;
+    store.markDelivered(session.id, NOW + 1);
+
+    expect(store.advanceUnanswered(plan.id, "wrong-session", NOW + 2)).toBeUndefined();
+    expect(store.advanceUnanswered(plan.id, session.id, NOW + 2)).toEqual(
+      expect.objectContaining({ id: session.id, status: "skipped", completedAt: NOW + 2 }),
+    );
+
+    const reopened = new LearningPlanStore(dir);
+    expect(reopened.get(plan.id)).toEqual(expect.objectContaining({ cursor: 4, status: "active" }));
+    expect(reopened.currentSession(plan.id)).toBeUndefined();
+    expect(reopened.sessionsForPlan(plan.id)).toEqual([
+      expect.objectContaining({ id: session.id, status: "skipped" }),
+    ]);
   });
 
   test("enforces chat ownership while allowing explicit administrative updates", () => {

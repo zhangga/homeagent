@@ -4,6 +4,7 @@ import {
   constants,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -82,6 +83,33 @@ export const DATA_GITIGNORE = `# HomeAgent runtime-only and rebuildable files
 **/*.tmp-*
 /migration-v*.json
 `;
+
+const FIRST_RUN_IGNORED_ROOT_ENTRIES = new Set([
+  ".DS_Store",
+  ".git",
+  ".gitattributes",
+  ".gitignore",
+  ".obsidian",
+  "AGENTS.md",
+  "bin",
+  "logs",
+  "run",
+]);
+
+/**
+ * launchd prepares log files before the app starts, so mere directory
+ * existence cannot distinguish a fresh install from an initialized data root.
+ */
+export function dataDirectoryWasUninitialized(directory: string): boolean {
+  if (!existsSync(directory)) return true;
+  try {
+    if (!statSync(directory).isDirectory()) return false;
+    return readdirSync(directory).every((entry) => FIRST_RUN_IGNORED_ROOT_ENTRIES.has(entry));
+  } catch {
+    // Fail closed: an unreadable directory must not be treated as a fresh one.
+    return false;
+  }
+}
 
 /** Root metadata that can be safely preserved when adopting an existing repository. */
 export function isSupportedDestinationMetadata(entry: MigrationDirectoryEntry): boolean {

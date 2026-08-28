@@ -478,7 +478,13 @@ describe("guided learning engine", () => {
       mastery: "review",
       nextFocus: "比较不同一致性模型",
     });
-    await engine.answerLearningSession(plan.id, "ou_me", "还不清楚", NOW + 3);
+    await engine.answerLearningSession(
+      plan.id,
+      "ou_me",
+      "还不清楚",
+      NOW + 3,
+      { nextLessonRequest: "下一课继续比较同一步骤，并轮换材料片段" },
+    );
     llm.queueText(topicGuide("[材料1] 继续比较不同一致性模型"));
     const retry = await engine.prepareLearningSession(plan.id, NOW + 4);
 
@@ -535,6 +541,15 @@ describe("guided learning engine", () => {
 
     await expect(engine.answerLearningSession(plan.id, "ou_other", "我的回答", NOW + 2))
       .rejects.toThrow("只有学习计划创建者可以提交回答");
+    const callsBeforeOversizedRequest = llm.calls.length;
+    await expect(engine.answerLearningSession(
+      plan.id,
+      "ou_me",
+      "我的回答",
+      NOW + 2,
+      { nextLessonRequest: "甲".repeat(1_001) },
+    )).rejects.toThrow("下一课要求不能超过 1000 个字符");
+    expect(llm.calls).toHaveLength(callsBeforeOversizedRequest);
     llm.queueJSON({
       feedback: "## 回应点评\n理解正确\n\n## 需要澄清\n无\n\n## 今日总结\n掌握重点\n\n## 下一步\n继续阅读",
       mastery: "ready",
@@ -562,7 +577,7 @@ describe("guided learning engine", () => {
     }));
   });
 
-  test("keeps a reading segment active and out of Raw until understanding is demonstrated", async () => {
+  test("only repeats a reading segment after an explicit next-lesson request", async () => {
     const plan = engine.learning.create({
       name: "读原则",
       space: SPACE,
@@ -586,6 +601,7 @@ describe("guided learning engine", () => {
       "ou_me",
       "我还说不清楚",
       NOW + 2,
+      { nextLessonRequest: "下一课请换一个生活案例继续讲这一段" },
     );
 
     expect(reviewed.rawId).toBeUndefined();
@@ -604,10 +620,53 @@ describe("guided learning engine", () => {
       status: "active",
       adaptiveFocus: "用生活案例区分原则与规则",
     }));
+    expect(engine.learning.sessionsForPlan(plan.id)).toEqual([
+      expect.objectContaining({
+        nextLessonAdjusted: true,
+        nextLessonRequest: "下一课请换一个生活案例继续讲这一段",
+      }),
+    ]);
     llm.queueText("## 今日目标\n换一个案例补强第一章");
     const retry = await engine.prepareLearningSession(plan.id, NOW + 3);
     expect(retry.excerpt).toBe("# 第一章\n\n短正文");
     expect(llm.calls.at(-1)?.opts.prompt).toContain("用生活案例区分原则与规则");
+  });
+
+  test("continues the reading plan after ordinary review feedback", async () => {
+    const plan = engine.learning.create({
+      name: "读原则",
+      space: SPACE,
+      creatorId: "ou_me",
+      chatId: "oc_p2p",
+      sourceTitle: "原则",
+      sourceContent: `# 第一章\n\n${"甲".repeat(600)}\n\n# 第二章\n\n${"乙".repeat(600)}`,
+      sourceRawIds: ["raw_book"],
+      sourceMessageId: "om_book",
+      dailyCharacters: 500,
+    }, NOW);
+    llm.queueText("## 今日目标\n理解第一章");
+    await engine.deliverLearningSession(plan.id, NOW + 1, async () => {});
+    const first = engine.learning.currentSession(plan.id)!;
+    llm.queueJSON({
+      feedback: "## 回应点评\n仍需复习\n\n## 需要澄清\n核心概念\n\n## 今日总结\n尚未掌握\n\n## 下一步\n自行回顾",
+      mastery: "review",
+      nextFocus: "回顾第一章核心概念",
+    });
+
+    const reviewed = await engine.answerLearningSession(
+      plan.id,
+      "ou_me",
+      "我还说不清楚",
+      NOW + 2,
+    );
+
+    expect(reviewed.session).toEqual(expect.objectContaining({
+      mastery: "review",
+      nextLessonAdjusted: false,
+    }));
+    expect(reviewed.plan.cursor).toBe(first.endOffset);
+    expect(reviewed.plan.adaptiveFocus).toBeUndefined();
+    expect(reviewed.rawId).toBeUndefined();
   });
 
   test("uses verified learning records for spaced retrieval in a later topic lesson", async () => {
@@ -651,6 +710,46 @@ describe("guided learning engine", () => {
     expect(prompt).toContain("间隔提取");
   });
 
+  test("keeps the original topic route unless the learner requests an adjustment", async () => {
+    const plan = engine.learning.createTopic({
+      name: "Rust 异步",
+      topic: "Rust 异步编程",
+      space: SPACE,
+      creatorId: "ou_me",
+      chatId: "oc_p2p",
+      route: [
+        { title: "Future", objective: "理解 Future 的惰性轮询" },
+        { title: "运行时", objective: "理解 executor" },
+      ],
+    }, NOW);
+    llm.queueText(topicGuide());
+    await engine.deliverLearningSession(plan.id, NOW + 1, async () => {});
+    llm.queueJSON({
+      feedback: "## 回应点评\n把 Future 和线程混淆了\n\n## 今日总结\n需要自行复习",
+      mastery: "review",
+      nextFocus: "回顾 Future 的 poll 过程",
+    });
+
+    const result = await engine.answerLearningSession(
+      plan.id,
+      "ou_me",
+      "Future 就是一个后台线程",
+      NOW + 2,
+    );
+
+    expect(result.session.nextLessonAdjusted).toBe(false);
+    expect(result.plan).toEqual(expect.objectContaining({
+      routeIndex: 1,
+      routeVersion: 1,
+      adaptiveFocus: undefined,
+    }));
+    expect(result.plan.route.map((step) => [step.title, step.status])).toEqual([
+      ["Future", "skipped"],
+      ["运行时", "active"],
+    ]);
+    expect(result.plan.profile).toEqual(expect.objectContaining({ revision: 0 }));
+  });
+
   test("uses structured mastery feedback to adapt the next topic lesson", async () => {
     llm.queueJSON({
       name: "Rust 异步",
@@ -692,11 +791,14 @@ describe("guided learning engine", () => {
       "ou_me",
       "Future 就是一个后台线程",
       NOW + 2,
+      { nextLessonRequest: "下一课请用状态机重讲，并在运行时之前加入 Waker" },
     );
 
     expect(result.session).toEqual(expect.objectContaining({
       mastery: "review",
       nextFocus: "用状态机解释 Future 的 poll 过程",
+      nextLessonAdjusted: true,
+      nextLessonRequest: "下一课请用状态机重讲，并在运行时之前加入 Waker",
     }));
     expect(result.plan).toEqual(expect.objectContaining({
       routeIndex: 0,

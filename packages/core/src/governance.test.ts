@@ -2503,6 +2503,34 @@ describe("space data governance", () => {
     })!;
     source.learning.markDelivered(session.id, 103);
     source.learning.markFollowedUp(session.id, 104);
+    const readingPlan = source.learning.create({
+      name: "阅读计划",
+      space: SPACE,
+      creatorId: "ou_me",
+      chatId: "oc_p2p",
+      sourceTitle: "阅读材料",
+      sourceContent: "第一段正文。第二段正文。",
+      sourceRawIds: ["raw_reading"],
+      sourceMessageId: "om_reading",
+    }, 105);
+    const readingSession = source.learning.prepareSession(readingPlan.id, {
+      startOffset: 0,
+      endOffset: 6,
+      sectionTitle: "第一段",
+      excerpt: "第一段正文",
+      guide: "阅读导引",
+      preparedAt: 106,
+    })!;
+    source.learning.markDelivered(readingSession.id, 107);
+    source.learning.completeSession(readingSession.id, {
+      learnerReply: "还需要一个例子",
+      feedback: "继续补强",
+      mastery: "review",
+      nextFocus: "用图示解释",
+      adjustNextLesson: true,
+      nextLessonRequest: "下一课请增加图示",
+      completedAt: 108,
+    });
 
     const archive = await source.exportSpace(SPACE);
     source.close();
@@ -2531,10 +2559,22 @@ describe("space data governance", () => {
       followUpCount: 1,
       lastFollowUpAt: 104,
     }));
+    expect(parsed.learning.sessions.find((item) => item.id === readingSession.id)).toEqual(
+      expect.objectContaining({
+        nextLessonAdjusted: true,
+        nextLessonRequest: "下一课请增加图示",
+      }),
+    );
 
     const unsafe = JSON.parse(JSON.stringify(archive));
     unsafe.learning.plans[0].onlineResources[0].url = "javascript:alert(1)";
     expect(() => parseSpaceArchive(unsafe)).toThrow("onlineResources");
+    const oversizedRequest = JSON.parse(JSON.stringify(archive));
+    const storedReadingSession = oversizedRequest.learning.sessions.find(
+      (item: { id?: string }) => item.id === readingSession.id,
+    );
+    storedReadingSession.nextLessonRequest = "甲".repeat(1_001);
+    expect(() => parseSpaceArchive(oversizedRequest)).toThrow("nextLessonRequest");
   });
 
   test("accepts version 4 governance archives with no task run history", async () => {

@@ -8,7 +8,11 @@ import {
   type DetectedProvider,
 } from "@homeagent/llm";
 import type { FeishuRuntimeStatus } from "./integrations.ts";
-import type { SetupSnapshot, SetupStep } from "./setup.ts";
+import type {
+  SetupDataDirectoryStatus,
+  SetupSnapshot,
+  SetupStep,
+} from "./setup.ts";
 import {
   feishuProvisioningPollScript,
   isFeishuProvisioningActive,
@@ -35,10 +39,12 @@ export interface SetupViewInput {
     installError?: string;
     login: CodexLoginSession;
   };
+  dataDirectory?: SetupDataDirectoryStatus;
   flashMsg?: string;
 }
 
 const STEP_LABELS = {
+  storage: "数据位置",
   ai: "连接 AI",
   feishu: "创建机器人",
   activate: "激活监听",
@@ -112,6 +118,16 @@ const SETUP_STYLE = `
   .consent input { width:18px; height:18px; margin:1px 0 0; accent-color:var(--moss); }
   .command { margin-top:10px; padding:10px; border-radius:9px; background:var(--ink); color:#e9efe9;
     overflow:auto; font:11px/1.45 ui-monospace,SFMono-Regular,monospace; user-select:all; }
+  .path-card { position:relative; overflow:hidden; margin:22px 0; padding:17px 18px; border:1px solid var(--line);
+    border-radius:16px; background:rgba(255,255,255,.48); }
+  .path-card:after { content:""; position:absolute; width:90px; height:90px; right:-38px; top:-48px;
+    border:20px solid rgba(47,104,76,.08); border-radius:50%; }
+  .path-label { display:block; margin-bottom:7px; color:var(--moss); font-size:11px; font-weight:800;
+    letter-spacing:.1em; text-transform:uppercase; }
+  .path-value { position:relative; z-index:1; display:block; overflow-wrap:anywhere;
+    font:12px/1.6 ui-monospace,SFMono-Regular,monospace; }
+  .storage-note { margin:16px 0 0; padding-left:14px; border-left:2px solid var(--sun);
+    color:var(--muted); font-size:12px; line-height:1.65; }
   details { margin-top:28px; padding-top:18px; border-top:1px solid var(--line); }
   summary { cursor:pointer; color:var(--muted); font-size:13px; }
   .waiting { padding:18px; border-radius:16px; background:var(--moss-soft); }
@@ -176,6 +192,42 @@ function progress(snapshot: SetupSnapshot): HtmlEscapedString | Promise<HtmlEsca
   </aside>`;
 }
 
+function storageStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
+  const data = input.dataDirectory;
+  if (!data) {
+    return html`<div class="eyebrow">01 · Data</div><h1 class="setup-title">数据位置暂不可用</h1>
+      <p class="lede">请重新启动 HomeAgent；如果问题持续出现，可在运行状态中查看诊断信息。</p>`;
+  }
+  if (data.pendingMigration) {
+    return html`<div class="eyebrow">01 · Data</div><h1 class="setup-title">新位置已经记下</h1>
+      <p class="lede">HomeAgent 会在下次启动前复制并校验首次启动文件。旧位置会原样保留，不会被删除。</p>
+      <div class="waiting"><strong>等待安全重启</strong>
+        <span class="muted">${data.restartable ? "后台服务即将自动重新连接。" : "回到启动 HomeAgent 的终端，按 Ctrl+C 停止，然后重新执行 bun start。"}</span>
+        <div class="path-card"><span class="path-label">新的数据位置</span><code class="path-value">${data.pendingMigration.destination}</code></div>
+      </div>`;
+  }
+  return html`<div class="eyebrow">01 · Data</div><h1 class="setup-title">先为记忆选一个家</h1>
+    <p class="lede">配置、原始记录和知识页都会保存在同一个本地目录。现在选好位置，之后仍可在设置中安全迁移。</p>
+    ${data.migrationError ? html`<div class="flash">上次更改未完成：${data.migrationError}</div>` : ""}
+    <div class="path-card"><span class="path-label">当前默认位置</span><code class="path-value">${data.currentPath}</code></div>
+    <form method="post" action="/setup/data-directory">
+      <div class="field"><label for="setup-data-directory">使用其他位置</label>
+        <input id="setup-data-directory" name="dataDirectory" type="text" required autocomplete="off"
+          placeholder="/Users/你的名字/HomeAgentData" />
+        <span class="muted">请输入绝对路径；目录可以不存在或为空。</span>
+      </div>
+      ${data.gitAvailable ? html`<label class="consent"><input type="checkbox" name="initializeGit" />
+        <span>在新位置初始化 Git 仓库，方便自行管理版本。HomeAgent 不会提交或推送数据。</span></label>` : ""}
+      <label class="consent"><input type="checkbox" name="confirmMigration" required />
+        <span>我确认 HomeAgent 会复制首次启动文件，成功后保留当前默认目录供回滚。</span></label>
+      <div class="actions"><button class="primary-action">使用新位置</button></div>
+    </form>
+    <form method="post" action="/setup/data-directory/keep" class="actions">
+      <button class="secondary-action">继续使用默认位置</button>
+    </form>
+    <p class="storage-note">数据只保存在本机。若将目录放入云盘或 Git 仓库，请先确认其中可能包含群消息、附件文字和内部知识。</p>`;
+}
+
 function managedCodexSetup(
   input: SetupViewInput,
   primary = false,
@@ -232,7 +284,7 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
       : input.codex.login.state === "verifying"
         ? "正在确认 ChatGPT 登录…"
         : "请在浏览器中确认登录";
-    return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">正在准备 Codex</h1>
+    return html`<div class="eyebrow">02 · AI</div><h1 class="setup-title">正在准备 Codex</h1>
       <p class="lede">登录授权由 OpenAI 页面处理，HomeAgent 不会接触你的密码。登录后可用于普通聊天和任务，并自动获得全部兼容 Skills。</p>
       <div class="waiting"><strong>${title}</strong>
         <span class="muted">${input.codex.installing ? "正在下载并校验 OpenAI 官方 Codex" : input.codex.login.message}</span>
@@ -242,21 +294,21 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
   }
   if (available.length === 0) {
     if (input.codex.enabled && input.codex.canInstall) {
-      return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">用 ChatGPT 唤醒 HomeAgent</h1>
+      return html`<div class="eyebrow">02 · AI</div><h1 class="setup-title">用 ChatGPT 唤醒 HomeAgent</h1>
         ${input.codex.installed
           ? html`<p class="lede">Codex 已安装，尚未连接 ChatGPT。无需打开终端，点击下方按钮后在 OpenAI 官方页面完成登录。</p>`
           : html`<p class="lede">无需打开终端。HomeAgent 会在你确认后下载并校验 OpenAI 官方 Codex，再打开官方页面完成 ChatGPT 登录。</p>`}
         ${managedCodexSetup(input, true)}
         ${advancedProviderSetup(taskOnlyAvailable)}`;
     }
-    return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">先连接 Claude Code 或 Codex</h1>
+    return html`<div class="eyebrow">02 · AI</div><h1 class="setup-title">先连接 Claude Code 或 Codex</h1>
       <p class="lede">安装并登录任一可用 AI 后回来重新检测。普通聊天和任务可按 Agent 配置使用完整兼容 Skills；提炼与后台学习保持 no-tools。</p>
       <div class="choice-grid"><div class="choice"><strong>Claude Code</strong><small>普通聊天和任务可使用 Skills，提炼与后台学习使用 no-tools 模式</small><div class="command">npm install -g @anthropic-ai/claude-code && claude auth login</div></div></div>
       ${taskOnlyAvailable.length > 0 ? html`<p class="muted">已检测到 ${taskOnlyAvailable.map((provider) => provider.name).join("、")}，但它目前只能用于显式任务。</p>` : ""}
       <form method="post" action="/setup/providers/refresh" class="actions"><button class="primary-action">重新检测</button></form>
       ${managedCodexSetup(input)}`;
   }
-  return html`<div class="eyebrow">01 · AI</div><h1 class="setup-title">先连接一个 AI</h1>
+  return html`<div class="eyebrow">02 · AI</div><h1 class="setup-title">先连接一个 AI</h1>
     <p class="lede">检测到本机已有可用的 AI。它负责理解消息、整理知识和回答问题，账号仍由你自己掌控。</p>
     ${available.some((provider) => provider.id === "codex")
       ? html`<p class="muted">Codex 普通聊天和任务会自动获得全部兼容 Skills，并按绑定 Agent 的 Permission / Workdir 执行；提炼与后台学习仍保持 no-tools。</p>`
@@ -319,7 +371,7 @@ function feishuStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEsca
         <input type="hidden" name="brand" value="feishu" />
         <div class="actions"><button class="primary-action">一键创建飞书机器人</button></div>
       </form>`;
-  return html`<div class="eyebrow">02 · Feishu</div><h1 class="setup-title">让记忆住进飞书</h1>
+  return html`<div class="eyebrow">03 · Feishu</div><h1 class="setup-title">让记忆住进飞书</h1>
     <p class="lede">HomeAgent 会通过飞书官方流程创建专属机器人。首次确认会一次申请消息收发、群消息读取、附件与表情、群信息，以及接收消息和机器人入群事件。企业管理员可能需要在这次创建确认中批准“接收群内全部消息”敏感权限；创建完成后不需要进入开放平台逐项配置。凭据由系统钥匙串保管。</p>
     ${failure}${primary}
     <details><summary>手动输入 App ID</summary>
@@ -359,7 +411,7 @@ function activateStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEs
         : failureNotice
       : html`<div class="waiting"><strong>正在建立消息连接…</strong><span class="muted">通常只需几秒，不需要再次重启。</span></div>
           <script>setTimeout(function () { location.reload(); }, 2000);</script>`;
-  return html`<div class="eyebrow">03 · Activate</div><h1 class="setup-title">让机器人开始接收消息</h1>
+  return html`<div class="eyebrow">04 · Activate</div><h1 class="setup-title">让机器人开始接收消息</h1>
     <p class="lede">机器人身份已经确认。最后重启一次后台服务，让新的消息通道正式接管。</p>
     <div class="status-list">${rows}</div>${action}
     <details><summary>如果重启后仍未就绪</summary><p class="muted">请先在运行状态确认服务进程和消息消费者状态，再检查网络连接、飞书应用权限以及企业是否有待审批授权。HomeAgent 会保留当前进度，不必重新创建机器人。</p></details>`;
@@ -367,7 +419,7 @@ function activateStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEs
 
 function doneStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
   const botName = input.lark.botName ?? "HomeAgent";
-  return html`<div class="eyebrow">04 · Ready</div><h1 class="setup-title">一切就绪，记忆开始生长</h1>
+  return html`<div class="eyebrow">05 · Ready</div><h1 class="setup-title">一切就绪，记忆开始生长</h1>
     <p class="lede">机器人和消息监听已经就绪。现在可以进入 HomeAgent；群聊连接不再阻塞首次设置。</p>
     <div class="bot-token"><span>●</span><strong>${botName}</strong></div>
     <div class="status-list">
@@ -389,10 +441,11 @@ function setupBrand(): HtmlEscapedString | Promise<HtmlEscapedString> {
 }
 
 export function setupView(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
-  const content = input.snapshot.current === "ai" ? aiStep(input)
-    : input.snapshot.current === "feishu" ? feishuStep(input)
-      : input.snapshot.current === "activate" ? activateStep(input)
-        : doneStep(input);
+  const content = input.snapshot.current === "storage" ? storageStep(input)
+    : input.snapshot.current === "ai" ? aiStep(input)
+      : input.snapshot.current === "feishu" ? feishuStep(input)
+        : input.snapshot.current === "activate" ? activateStep(input)
+          : doneStep(input);
   return html`<div class="shell">
     ${setupBrand()}
     ${progress(input.snapshot)}
@@ -402,12 +455,12 @@ export function setupView(input: SetupViewInput): HtmlEscapedString | Promise<Ht
 
 export function restartingView(
   instanceId: string,
-  options: { destination?: string; title?: string; message?: string } = {},
+  options: { destination?: string; eyebrow?: string; title?: string; message?: string } = {},
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const destination = options.destination ?? "/setup";
   return setupLayout(html`<div class="shell">${setupBrand()}
     <aside class="progress"><div class="progress-kicker">Applying connection</div></aside>
-    <main class="stage"><div class="eyebrow">03 · Activate</div><h1 class="setup-title">${options.title ?? "正在唤醒机器人"}</h1>
+    <main class="stage"><div class="eyebrow">${options.eyebrow ?? "04 · Activate"}</div><h1 class="setup-title">${options.title ?? "正在唤醒机器人"}</h1>
       <p class="lede">${options.message ?? "服务会短暂离线，然后自动回到这里。请不要关闭这个页面。"}</p><div id="restart-status" data-instance="${instanceId}" data-destination="${destination}" class="waiting"><strong>重新连接中…</strong></div>
     </main></div><script>
       (function () {

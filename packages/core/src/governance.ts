@@ -71,7 +71,10 @@ import type {
   LearningSession,
   LearningSource,
 } from "./learning.ts";
-import { MAX_LEARNING_SOURCE_CHARACTERS } from "./learning.ts";
+import {
+  MAX_LEARNING_NEXT_LESSON_REQUEST_CHARACTERS,
+  MAX_LEARNING_SOURCE_CHARACTERS,
+} from "./learning.ts";
 import {
   normalizeLearningResource,
   type LearningResource,
@@ -1733,6 +1736,23 @@ function parseLearningSession(value: unknown, index: number, version: number): L
   if (mastery !== undefined && !["review", "ready"].includes(mastery)) {
     throw new Error(`learning.sessions[${index}].mastery is invalid`);
   }
+  const nextLessonAdjusted = item.nextLessonAdjusted === undefined
+    ? undefined
+    : boolean(item.nextLessonAdjusted, `learning.sessions[${index}].nextLessonAdjusted`);
+  const nextLessonRequest = optionalText(
+    item.nextLessonRequest,
+    `learning.sessions[${index}].nextLessonRequest`,
+  );
+  if (
+    nextLessonAdjusted === undefined
+      ? nextLessonRequest !== undefined
+      : nextLessonAdjusted
+        ? !nextLessonRequest
+          || nextLessonRequest.length > MAX_LEARNING_NEXT_LESSON_REQUEST_CHARACTERS
+        : nextLessonRequest !== undefined
+  ) {
+    throw new Error(`learning.sessions[${index}].nextLessonRequest is invalid`);
+  }
   return {
     id: nonemptyText(item.id, `learning.sessions[${index}].id`),
     planId: nonemptyText(item.planId, `learning.sessions[${index}].planId`),
@@ -1777,6 +1797,8 @@ function parseLearningSession(value: unknown, index: number, version: number): L
           }
           return count;
         })(),
+    nextLessonRequest,
+    nextLessonAdjusted,
     completedAt: item.completedAt === undefined
       ? undefined
       : finiteNumber(item.completedAt, `learning.sessions[${index}].completedAt`),

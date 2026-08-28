@@ -9,10 +9,11 @@ const providers = [
 ];
 
 function snapshot(current: SetupStep): SetupSnapshot {
-  const order: SetupStep[] = ["ai", "feishu", "activate", "done"];
+  const order: SetupStep[] = ["storage", "ai", "feishu", "activate", "done"];
   return {
     current,
     completed: order.slice(0, order.indexOf(current)),
+    storageReady: current !== "storage",
     selectedProviderReady: current !== "ai",
     larkReady: ["activate", "done"].includes(current),
     runtimeReady: current === "done",
@@ -54,6 +55,53 @@ function render(current: SetupStep, overrides: Partial<Parameters<typeof setupVi
 }
 
 describe("guided setup view", () => {
+  test("offers a first-run data location before connecting external services", () => {
+    const body = render("storage", {
+      dataDirectory: {
+        currentPath: "/Users/test/project/data",
+        available: true,
+        lockedByEnvironment: false,
+        gitAvailable: true,
+        gitRepository: false,
+        restartable: false,
+      },
+    });
+
+    expect(body).toContain("先为记忆选一个家");
+    expect(body).toContain("/Users/test/project/data");
+    expect(body).toContain('action="/setup/data-directory"');
+    expect(body).toContain('name="dataDirectory"');
+    expect(body).toContain('name="confirmMigration"');
+    expect(body).toContain("使用新位置");
+    expect(body).toContain('action="/setup/data-directory/keep"');
+    expect(body).toContain("继续使用默认位置");
+    expect(body).not.toContain("安装并连接 ChatGPT");
+    expect(body).not.toContain("一键创建飞书机器人");
+  });
+
+  test("explains the source restart after a first-run data move is scheduled", () => {
+    const body = render("storage", {
+      dataDirectory: {
+        currentPath: "/Users/test/project/data",
+        available: true,
+        lockedByEnvironment: false,
+        gitAvailable: true,
+        gitRepository: false,
+        restartable: false,
+        pendingMigration: {
+          destination: "/Users/test/HomeAgentData",
+          initializeGit: false,
+          requestedAt: 1,
+        },
+      },
+    });
+
+    expect(body).toContain("新位置已经记下");
+    expect(body).toContain("/Users/test/HomeAgentData");
+    expect(body).toContain("Ctrl+C");
+    expect(body).toContain("bun start");
+  });
+
   test("offers Codex for ordinary conversations with automatic Skills", () => {
     const body = render("ai");
 

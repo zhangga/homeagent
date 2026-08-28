@@ -30,6 +30,7 @@ export const MAX_LEARNING_MATERIALS = 24;
 export const MAX_LEARNING_ROUTE_STEPS = 12;
 export const MAX_LEARNING_PROFILE_ITEMS = 12;
 export const MAX_LEARNING_RESOURCES = 5;
+export const MAX_LEARNING_NEXT_LESSON_REQUEST_CHARACTERS = 1_000;
 
 export interface LearningMaterial {
   title: string;
@@ -181,6 +182,8 @@ export interface LearningSession {
   deliveredAt?: number;
   lastFollowUpAt?: number;
   followUpCount?: number;
+  nextLessonRequest?: string;
+  nextLessonAdjusted?: boolean;
   completedAt?: number;
 }
 
@@ -680,6 +683,14 @@ function validSession(value: unknown): value is LearningSession {
     && (session.lastFollowUpAt === undefined || finite(session.lastFollowUpAt))
     && (session.followUpCount === undefined
       || (finite(session.followUpCount) && Number.isInteger(session.followUpCount) && session.followUpCount >= 0))
+    && (session.nextLessonAdjusted === undefined
+      ? session.nextLessonRequest === undefined
+      : typeof session.nextLessonAdjusted === "boolean"
+        && (session.nextLessonAdjusted
+          ? typeof session.nextLessonRequest === "string"
+            && session.nextLessonRequest.trim().length > 0
+            && session.nextLessonRequest.length <= MAX_LEARNING_NEXT_LESSON_REQUEST_CHARACTERS
+          : session.nextLessonRequest === undefined))
     && (session.completedAt === undefined || finite(session.completedAt));
 }
 
@@ -1236,6 +1247,8 @@ export class LearningPlanStore {
       mastery?: LearningMastery;
       nextFocus?: string;
       adaptive?: AdaptiveTopicUpdateInput;
+      adjustNextLesson?: boolean;
+      nextLessonRequest?: string;
       completedAt: number;
     },
   ): LearningSession | undefined {
@@ -1244,6 +1257,8 @@ export class LearningPlanStore {
     const feedback = input.feedback.trim();
     const plan = session ? this.plans.get(session.planId) : undefined;
     const nextFocus = input.nextFocus?.trim();
+    const adjustNextLesson = input.adjustNextLesson === true;
+    const nextLessonRequest = input.nextLessonRequest?.trim();
     if (
       !session || !plan || session.status !== "awaiting_reply" || !learnerReply || !feedback
       || !finite(input.completedAt)
@@ -1257,6 +1272,10 @@ export class LearningPlanStore {
         || normalizeRouteInput(input.adaptive.upcomingSteps).length
           !== input.adaptive.upcomingSteps.length
       ))
+      || (adjustNextLesson
+        ? !nextLessonRequest
+          || nextLessonRequest.length > MAX_LEARNING_NEXT_LESSON_REQUEST_CHARACTERS
+        : nextLessonRequest !== undefined || input.adaptive !== undefined)
     ) return undefined;
 
     const candidatePlans = cloneMap(this.plans, clonePlan);
@@ -1268,11 +1287,13 @@ export class LearningPlanStore {
     updatedSession.mastery = input.mastery;
     updatedSession.nextFocus = nextFocus;
     updatedSession.routeAdjustment = input.adaptive?.routeAdjustment.trim();
+    updatedSession.nextLessonAdjusted = adjustNextLesson;
+    updatedSession.nextLessonRequest = adjustNextLesson ? nextLessonRequest : undefined;
     updatedSession.completedAt = input.completedAt;
     const updatedPlan = candidatePlans.get(updatedSession.planId)!;
     const wasPaused = updatedPlan.status === "paused";
-    advancePlan(updatedPlan, updatedSession, input.completedAt);
-    if (input.adaptive) {
+    advancePlan(updatedPlan, updatedSession, input.completedAt, adjustNextLesson);
+    if (adjustNextLesson && input.adaptive) {
       adaptTopicPlan(updatedPlan, updatedSession, input.adaptive, input.completedAt, wasPaused);
     }
     this.persist(candidatePlans, this.sources, candidateSessions);
@@ -1354,6 +1375,31 @@ export class LearningPlanStore {
     this.plans = candidatePlans;
     this.sessions = candidateSessions;
     return updatedSession;
+  }
+
+  advanceUnanswered(
+    planId: string,
+    sessionId: string,
+    completedAt = Date.now(),
+  ): LearningSession | undefined {
+    const plan = this.plans.get(planId);
+    const session = this.currentSession(planId);
+    if (
+      !plan || plan.status !== "active" || !session || session.id !== sessionId
+      || session.status !== "awaiting_reply" || !finite(completedAt)
+    ) return undefined;
+
+    const candidatePlans = cloneMap(this.plans, clonePlan);
+    const candidateSessions = cloneMap(this.sessions, cloneSession);
+    const updatedSession = candidateSessions.get(session.id)!;
+    updatedSession.status = "skipped";
+    updatedSession.completedAt = completedAt;
+    const updatedPlan = candidatePlans.get(planId)!;
+    advancePlan(updatedPlan, updatedSession, completedAt, false);
+    this.persist(candidatePlans, this.sources, candidateSessions);
+    this.plans = candidatePlans;
+    this.sessions = candidateSessions;
+    return cloneSession(updatedSession);
   }
 
   remove(id: string, actorId?: string): boolean {
@@ -1498,7 +1544,12 @@ export class LearningPlanStore {
   }
 }
 
-function advancePlan(plan: LearningPlan, session: LearningSession, completedAt: number): void {
+function advancePlan(
+  plan: LearningPlan,
+  session: LearningSession,
+  completedAt: number,
+  adjustNextLesson = false,
+): void {
   const wasPaused = plan.status === "paused";
   if (plan.mode === "topic") {
     const step = plan.route[plan.routeIndex];
@@ -1507,12 +1558,14 @@ function advancePlan(plan: LearningPlan, session: LearningSession, completedAt: 
     }
     step.attempts += 1;
     plan.currentSessionId = undefined;
-    plan.adaptiveFocus = session.nextFocus;
-    if (session.status === "completed" && session.mastery === "review") {
+    plan.adaptiveFocus = adjustNextLesson ? session.nextFocus : undefined;
+    if (session.status === "completed" && session.mastery === "review" && adjustNextLesson) {
       step.status = "active";
       plan.status = wasPaused ? "paused" : "active";
     } else {
-      step.status = session.status === "skipped" ? "skipped" : "completed";
+      step.status = session.status === "skipped" || session.mastery === "review"
+        ? "skipped"
+        : "completed";
       plan.routeIndex += 1;
       const next = plan.route[plan.routeIndex];
       if (next) next.status = "active";
@@ -1522,8 +1575,8 @@ function advancePlan(plan: LearningPlan, session: LearningSession, completedAt: 
     return;
   }
   plan.currentSessionId = undefined;
-  if (session.mastery !== undefined) plan.adaptiveFocus = session.nextFocus;
-  if (session.status === "completed" && session.mastery === "review") {
+  plan.adaptiveFocus = adjustNextLesson ? session.nextFocus : undefined;
+  if (session.status === "completed" && session.mastery === "review" && adjustNextLesson) {
     plan.status = wasPaused ? "paused" : "active";
     plan.updatedAt = completedAt;
     return;

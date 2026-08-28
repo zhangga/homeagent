@@ -1,5 +1,10 @@
 /** Explicit chat controls for durable guided-learning plans. */
-import { learningProgress, type KnowledgeEngine, type LearningPlan } from "@homeagent/core";
+import {
+  MAX_LEARNING_NEXT_LESSON_REQUEST_CHARACTERS,
+  learningProgress,
+  type KnowledgeEngine,
+  type LearningPlan,
+} from "@homeagent/core";
 import type { SpaceId } from "@homeagent/shared";
 import { formatSkillWarnings } from "./format.ts";
 import { LEARNING_HELP } from "./messages.ts";
@@ -79,6 +84,52 @@ export function parseLearningAnswer(text: string): string | null {
   const match = withoutMentions(text).match(/^学习回答\s*[：:]\s*(.+)$/isu);
   const answer = match?.[1]?.trim();
   return answer || null;
+}
+
+interface LearningAnswerDetails {
+  answer: string;
+  planQuery?: string;
+  nextLessonRequest?: string;
+  error?: string;
+}
+
+function learningAnswerDetails(input: string): LearningAnswerDetails {
+  const lines = input.trim().split(/\r?\n/u);
+  let nextLessonRequest: string | undefined;
+  const answerLines: string[] = [];
+  for (const line of lines) {
+    const request = line.match(/^下一课要求\s*[：:]\s*(.*)$/u);
+    if (!request) {
+      answerLines.push(line);
+      continue;
+    }
+    if (nextLessonRequest !== undefined) {
+      return { answer: "", error: "每次回答只能填写一条下一课要求。" };
+    }
+    nextLessonRequest = (request[1] ?? "").trim();
+  }
+  if (nextLessonRequest !== undefined && !nextLessonRequest) {
+    return { answer: "", error: "下一课要求不能为空。" };
+  }
+  if (
+    nextLessonRequest
+    && nextLessonRequest.length > MAX_LEARNING_NEXT_LESSON_REQUEST_CHARACTERS
+  ) {
+    return {
+      answer: "",
+      error: `下一课要求不能超过 ${MAX_LEARNING_NEXT_LESSON_REQUEST_CHARACTERS} 个字符。`,
+    };
+  }
+
+  const body = answerLines.join("\n").trim();
+  const selected = body.match(/^\[([^\]\n]{1,200})\]\s*(.*)$/su);
+  const answer = (selected?.[2] ?? body).trim();
+  if (!answer) return { answer: "", error: "学习回答不能为空。" };
+  return {
+    answer,
+    planQuery: selected?.[1]?.trim(),
+    nextLessonRequest,
+  };
 }
 
 function ownedPlans(engine: KnowledgeEngine, context: LearningCommandContext): LearningPlan[] {
@@ -282,20 +333,36 @@ export async function handleLearningAnswer(
   answer: string,
   context: Omit<LearningCommandContext, "sourceMessageId">,
 ): Promise<string> {
+  const details = learningAnswerDetails(answer);
+  if (details.error) return details.error;
   const assessing = ownedPlans(engine, context)
     .filter((plan) => plan.mode === "topic" && plan.profile?.status === "assessing");
   const awaiting = ownedPlans(engine, context)
     .filter((plan) => engine.learning.currentSession(plan.id)?.status === "awaiting_reply");
   const candidates = [...assessing, ...awaiting];
   if (candidates.length === 0) return "当前没有等待你回答的学习课程或入学诊断。";
-  if (candidates.length > 1) {
-    return `有多个学习计划正在等待回答，请先处理到只剩一个：${candidates.map((plan) => plan.name).join("、")}`;
+  let target: LearningPlan | undefined;
+  if (details.planQuery) {
+    target = findPlan(candidates, details.planQuery);
+    if (!target) {
+      return `没有找到正在等待回答的学习计划「${details.planQuery}」。请发送 \`/learn\` 查看计划。`;
+    }
+  } else if (candidates.length > 1) {
+    return [
+      "有多个学习计划正在等待回答，请在回答中注明计划：",
+      ...candidates.map((plan, index) =>
+        `- 学习回答：[${plan.name}] <你的回答>（也可用序号 [${index + 1}]）`
+      ),
+      "如需调整下一课，另起一行写：下一课要求：<你的要求>",
+    ].join("\n");
+  } else {
+    target = candidates[0];
   }
-  if (assessing.length === 1) {
+  if (assessing.some((plan) => plan.id === target!.id)) {
     const assessed = await engine.answerLearningAssessment(
-      assessing[0]!.id,
+      target!.id,
       context.actorId,
-      answer,
+      details.answer,
     );
     const profile = assessed.profile!;
     return withSkillWarnings([
@@ -314,18 +381,25 @@ export async function handleLearningAnswer(
       `下一课将在每天 ${assessed.hour}:00 推送；你也可以发送 \`/learn route ${assessed.name}\` 随时查看变化。`,
     ].filter(Boolean).join("\n"), engine, context.space);
   }
-  const target = awaiting[0]!;
-  const result = await engine.answerLearningSession(target.id, context.actorId, answer);
+  const result = await engine.answerLearningSession(
+    target!.id,
+    context.actorId,
+    details.answer,
+    Date.now(),
+    { nextLessonRequest: details.nextLessonRequest },
+  );
   const completion = result.plan.status === "completed"
     ? result.plan.mode === "topic"
       ? "\n\n🎉 这个主题的学习路线已完成。"
       : "\n\n🎉 这本书的计划已完成。"
-    : result.session.mastery === "review"
+    : result.session.mastery === "review" && result.session.nextLessonAdjusted
       ? `\n\n🔁 下一课将继续当前步骤，重点补强：${result.session.nextFocus}`
-      : "";
+      : result.session.mastery === "review"
+        ? "\n\n📅 本次反馈不会阻塞或修改明天的课程；你可以按自己的节奏回顾。"
+        : "";
   const recordStatus = result.rawId
-    ? `✅ 已记录「${target.name}」第 ${result.session.sequence} 课，并形成一条已验证学习记录。`
-    : `🧭 已完成「${target.name}」第 ${result.session.sequence} 课反馈；当前证据还不足，暂不写入知识空间。`;
+    ? `✅ 已记录「${target!.name}」第 ${result.session.sequence} 课，并形成一条已验证学习记录。`
+    : `🧭 已完成「${target!.name}」第 ${result.session.sequence} 课反馈；当前证据还不足，暂不写入知识空间。`;
   return withSkillWarnings(
     `${recordStatus}\n\n${result.feedback}${completion}`,
     engine,

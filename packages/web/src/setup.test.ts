@@ -18,6 +18,21 @@ const codexProvider = {
 };
 
 describe("buildSetupSnapshot", () => {
+  test("starts with data location when a fresh runtime has not chosen one", () => {
+    const result = buildSetupSnapshot({
+      defaultProvider: "claude",
+      providers: [provider],
+      lark: { state: "unconfigured", verified: false, message: "missing" },
+      runtime: { ready: false, consumers: [] },
+      restartRequired: false,
+      storageReady: false,
+    });
+
+    expect(result.current).toBe("storage");
+    expect(result.completed).toEqual([]);
+    expect(result.storageReady).toBeFalse();
+  });
+
   test("treats an available Codex CLI as ready for ordinary HomeAgent conversations", () => {
     expect(buildSetupSnapshot({
       defaultProvider: "codex",

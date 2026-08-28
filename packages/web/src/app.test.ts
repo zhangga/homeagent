@@ -196,6 +196,95 @@ describe("web backend (read-only)", () => {
     expect((await fresh.request("/setup")).status).toBe(200);
   });
 
+  test("fresh source installs choose a data location before AI setup", async () => {
+    const firstRun = createWebApp({
+      engine,
+      dataDirectoryWasUninitializedAtStartup: true,
+      dataDirectory: {
+        status: () => ({
+          currentPath: dir,
+          available: true,
+          lockedByEnvironment: false,
+          gitAvailable: true,
+          gitRepository: false,
+          restartable: false,
+        }),
+        scheduleMigration: () => {},
+      },
+      detectProviders: async () => [],
+      providerModels: async () => ({}),
+    });
+
+    const page = await firstRun.request("/setup");
+    const body = await page.text();
+    expect(body).toContain("先为记忆选一个家");
+    expect(body).toContain(dir);
+    expect(body).not.toContain("先连接 Claude Code 或 Codex");
+    expect(readSettings(dir).onboardingStartedAt).toBeUndefined();
+
+    const keep = await firstRun.request("/setup/data-directory/keep", { method: "POST" });
+    expect(keep.headers.get("location")).toBe("/setup");
+    expect(readSettings(dir).onboardingStartedAt).toEqual(expect.any(Number));
+    expect(await (await firstRun.request("/setup")).text()).toContain(
+      "先连接 Claude Code 或 Codex",
+    );
+  });
+
+  test("fresh setup schedules a confirmed data move and waits for a source restart", async () => {
+    let scheduled: { destination: string; initializeGit: boolean } | undefined;
+    let pending = false;
+    const destination = join(dir, "..", "chosen-homeagent-data");
+    const firstRun = createWebApp({
+      engine,
+      dataDirectoryWasUninitializedAtStartup: true,
+      dataDirectory: {
+        status: () => ({
+          currentPath: dir,
+          available: true,
+          lockedByEnvironment: false,
+          gitAvailable: true,
+          gitRepository: false,
+          restartable: false,
+          ...(pending
+            ? {
+                pendingMigration: {
+                  destination,
+                  initializeGit: true,
+                  requestedAt: 1,
+                },
+              }
+            : {}),
+        }),
+        scheduleMigration: (input) => {
+          scheduled = input;
+          pending = true;
+        },
+      },
+      detectProviders: async () => [],
+      providerModels: async () => ({}),
+    });
+
+    const response = await firstRun.request("/setup/data-directory", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        dataDirectory: destination,
+        initializeGit: "on",
+        confirmMigration: "on",
+      }).toString(),
+    });
+
+    expect(response.status).toBe(302);
+    expect(scheduled).toEqual({ destination, initializeGit: true });
+    expect(decodeURIComponent(response.headers.get("location") ?? "")).toContain(
+      "请停止后重新运行 bun start",
+    );
+    expect(readSettings(dir).onboardingStartedAt).toBeUndefined();
+    const pendingPage = await (await firstRun.request("/setup")).text();
+    expect(pendingPage).toContain("新位置已经记下");
+    expect(pendingPage).toContain(destination);
+  });
+
   test("fresh bundled setup makes managed Codex the zero-terminal primary path", async () => {
     const fresh = createWebApp({
       engine,
@@ -5605,7 +5694,17 @@ describe("management backend (read-write)", () => {
       endOffset: plan.sourceLength,
       sectionTitle: "第一章",
       excerpt: "# 第一章\n\n书籍正文",
-      guide: "## 思考题\n为什么？",
+      guide: [
+        "## 今日目标",
+        "理解这节课的 **核心原则**。",
+        "",
+        "- 原则一",
+        "- 原则二",
+        "",
+        "## 思考题",
+        "<script>alert('lesson')</script>",
+        "[危险链接](javascript:alert(1))",
+      ].join("\n"),
       preparedAt: 2,
     })!;
     engine.learning.markDelivered(session.id, 3);
@@ -5622,6 +5721,13 @@ describe("management backend (read-write)", () => {
     expect(detail).toContain("ou_reader");
     expect(detail).toContain("oc_web");
     expect(detail).toContain("等待回答");
+    expect(detail).toContain('class="lesson-sheet"');
+    expect(detail).toContain("<h2>今日目标</h2>");
+    expect(detail).toContain("<strong>核心原则</strong>");
+    expect(detail).toContain("<li>原则一</li>");
+    expect(detail).toContain("&lt;script&gt;alert(&#39;lesson&#39;)&lt;/script&gt;");
+    expect(detail).not.toContain("<script>alert('lesson')</script>");
+    expect(detail).not.toContain('href="javascript:');
     expect(detail).toContain('name="dailyCharacters"');
     expect(detail).not.toContain('name="actorId"');
 
@@ -5714,9 +5820,11 @@ describe("management backend (read-write)", () => {
     engine.learning.markDelivered(session.id, 5);
     engine.learning.completeSession(session.id, {
       learnerReply: "Waker 会通知 executor 任务可以再次 poll",
-      feedback: "需要补强",
+      feedback: "## 回应点评\n你已理解 **唤醒通知**，还需要补强实际 poll。",
       mastery: "review",
       nextFocus: "区分唤醒通知和实际 poll",
+      adjustNextLesson: true,
+      nextLessonRequest: "下一课请区分唤醒通知和实际 poll",
       completedAt: 6,
     });
     engine.learning.replaceOnlineResources(plan.id, 2, {
@@ -5739,6 +5847,9 @@ describe("management backend (read-write)", () => {
     expect(body).toContain("待补齐");
     expect(body).toContain("学习使命与成功标准");
     expect(body).toContain("已验证学习记录");
+    expect(body).toContain("<h2>回应点评</h2>");
+    expect(body).toContain("<strong>唤醒通知</strong>");
+    expect(body).not.toContain("## 回应点评");
     expect(body).toContain("需复习");
     expect(body).toContain("路线已迭代");
     expect(body).toContain("主题学习");

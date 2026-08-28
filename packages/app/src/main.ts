@@ -52,6 +52,7 @@ import { launchDesktop } from "./desktop.ts";
 import { createDefaultService, runServiceCli } from "./service-cli.ts";
 import {
   applyPendingDataDirectoryMigration,
+  dataDirectoryWasUninitialized,
   dataDirectoryIsGitRepository,
   gitIsAvailable,
   readRuntimeDataSettings,
@@ -135,7 +136,11 @@ function teamBindingIsInactive(
     || (activeAppId !== undefined && binding.boundAppId !== activeAppId);
 }
 
-async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Promise<void> {
+async function run(
+  cfg: ReturnType<typeof config>,
+  processLock: ProcessLock,
+  options: { dataDirectoryWasUninitializedAtStartup?: boolean } = {},
+): Promise<void> {
   const runtimePaths = resolveRuntimePaths();
   const runtimeSettingsPath = runtimeDataSettingsPath({
     bundled: runtimePaths.bundled,
@@ -399,6 +404,7 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
         });
       },
     },
+    dataDirectoryWasUninitializedAtStartup: options.dataDirectoryWasUninitializedAtStartup,
     onServiceRestart: () => {
       setTimeout(() => process.kill(process.pid, "SIGTERM"), 250);
     },
@@ -505,12 +511,14 @@ async function run(cfg: ReturnType<typeof config>, processLock: ProcessLock): Pr
   await new Promise<void>(() => {});
 }
 
-export async function serve(): Promise<void> {
+export async function serve(
+  options: { dataDirectoryWasUninitializedAtStartup?: boolean } = {},
+): Promise<void> {
   const cfg = config();
   assertSafeWebBinding(cfg.webHost, cfg.webAdminToken);
   const processLock = acquireProcessLock({ dataDir: cfg.dataDir });
   try {
-    await run(cfg, processLock);
+    await run(cfg, processLock, options);
   } catch (err) {
     processLock.release();
     throw err;
@@ -539,6 +547,8 @@ export function selectAppCommand(args: string[], bundled: boolean): AppCommand {
 export async function runEntrypoint(args = process.argv.slice(2)): Promise<number> {
   let paths = resolveRuntimePaths();
   const command = selectAppCommand(args, paths.bundled);
+  const dataDirectoryWasUninitializedAtStartup = command === "serve"
+    && dataDirectoryWasUninitialized(paths.dataDir);
   const externalDataDirectory = brandedEnv(process.env, "DATA_DIR") !== undefined
     && process.env.HOMEAGENT_SERVICE_MANAGED !== "1";
   if (command === "serve" && !externalDataDirectory) {
@@ -587,7 +597,7 @@ export async function runEntrypoint(args = process.argv.slice(2)): Promise<numbe
     return runFeedbackCli(args.slice(1), { caller: client });
   }
   if (command === "serve") {
-    await serve();
+    await serve({ dataDirectoryWasUninitializedAtStartup });
     return 0;
   }
   if (command === "desktop") {

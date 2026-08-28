@@ -79,7 +79,10 @@ import {
 import type { CodexSetupPort, FeishuRuntimeStatus, LarkSetupPort } from "./integrations.ts";
 import type { FeishuIntegrationService } from "./feishu-integration-service.ts";
 import { FeishuIntegrationError } from "./feishu-integration-service.ts";
-import { buildSetupSnapshot } from "./setup.ts";
+import {
+  buildSetupSnapshot,
+  type SetupDataDirectoryStatus,
+} from "./setup.ts";
 import { localMaterialRawContent, prepareLocalMaterials } from "./local-materials.ts";
 import { restartingView, setupLayout, setupView } from "./setup-view.ts";
 import {
@@ -192,21 +195,11 @@ export interface WebOptions {
   onServiceRestart?: () => void;
   /** Persistent bootstrap storage used to move the data root on a safe restart. */
   dataDirectory?: DataDirectoryPort;
+  /** The selected data root had no durable HomeAgent state before startup. */
+  dataDirectoryWasUninitializedAtStartup?: boolean;
 }
 
-export interface DataDirectoryStatus {
-  currentPath: string;
-  available: boolean;
-  lockedByEnvironment: boolean;
-  gitAvailable: boolean;
-  gitRepository: boolean;
-  restartable: boolean;
-  migrationError?: string;
-  pendingMigration?: {
-    destination: string;
-    initializeGit: boolean;
-    requestedAt: number;
-  };
+export interface DataDirectoryStatus extends SetupDataDirectoryStatus {
   lastMigration?: {
     source: string;
     destination: string;
@@ -886,7 +879,21 @@ export function createWebApp(opts: WebOptions): Hono {
     );
     return { setupIdentity, restartRequired };
   };
+  const getFirstRunDataDirectory = async (): Promise<DataDirectoryStatus | undefined> => {
+    const cfg = config();
+    if (
+      opts.dataDirectoryWasUninitializedAtStartup !== true
+      || !opts.dataDirectory
+      || cfg.onboardingStartedAt
+      || cfg.onboardingCompletedAt
+    ) {
+      return undefined;
+    }
+    const status = await opts.dataDirectory.status();
+    return status.available && !status.lockedByEnvironment ? status : undefined;
+  };
   const getSetupContext = async () => {
+    const dataDirectory = await getFirstRunDataDirectory();
     let lark = await getLarkStatus();
     const provisioning = getProvisioning();
     const codexLogin = getCodexLogin();
@@ -901,7 +908,7 @@ export function createWebApp(opts: WebOptions): Hono {
       lark = await getLarkStatus();
     }
     let cfg = config();
-    if (!cfg.onboardingCompletedAt && !cfg.onboardingStartedAt) {
+    if (!cfg.onboardingCompletedAt && !cfg.onboardingStartedAt && !dataDirectory) {
       saveSettings({ onboardingStartedAt: Date.now() });
       cfg = config();
     }
@@ -924,7 +931,9 @@ export function createWebApp(opts: WebOptions): Hono {
         lark,
         runtime,
         restartRequired,
+        storageReady: dataDirectory === undefined,
       }),
+      dataDirectory,
       providers,
       lark,
       provisioning,
@@ -1141,6 +1150,42 @@ export function createWebApp(opts: WebOptions): Hono {
         }),
       ),
     );
+  });
+
+  app.post("/setup/data-directory/keep", async (c) => {
+    const status = await getFirstRunDataDirectory();
+    if (!status) return c.redirect("/setup");
+    saveSettings({ onboardingStartedAt: Date.now() });
+    return c.redirect("/setup");
+  });
+
+  app.post("/setup/data-directory", async (c) => {
+    const status = await getFirstRunDataDirectory();
+    if (!status || !opts.dataDirectory) return c.redirect("/setup");
+    const body = await c.req.parseBody();
+    if (!checkbox(body, "confirmMigration")) {
+      return c.redirect(`/setup?ok=${encodeURIComponent("请选择确认项后再更改数据位置")}`);
+    }
+    try {
+      await opts.dataDirectory.scheduleMigration({
+        destination: str(body, "dataDirectory"),
+        initializeGit: checkbox(body, "initializeGit"),
+      });
+      const next = await opts.dataDirectory.status();
+      if (next.restartable && opts.onServiceRestart) {
+        opts.onServiceRestart();
+        return c.html(await restartingView(instanceId, {
+          destination: "/setup",
+          eyebrow: "01 · Data",
+          title: "正在准备新的数据位置",
+          message: "服务会安全停止，复制并校验首次启动文件，然后从新位置继续设置。",
+        }));
+      }
+      return c.redirect(`/setup?ok=${encodeURIComponent("新位置已保存；请停止后重新运行 bun start")}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return c.redirect(`/setup?ok=${encodeURIComponent(`无法使用新位置：${message}`)}`);
+    }
   });
 
   app.post("/setup/providers/refresh", (c) => {

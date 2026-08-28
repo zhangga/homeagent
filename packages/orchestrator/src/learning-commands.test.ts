@@ -295,7 +295,7 @@ describe("learning command handling", () => {
     expect(engine.learning.get(plan.id)).toBeUndefined();
   });
 
-  test("submits an answer only when exactly one owned lesson is awaiting", async () => {
+  test("submits a legacy bare answer when exactly one owned lesson is awaiting", async () => {
     const plan = seedAwaitingPlan(engine, "ou_me");
     llm.queueJSON({
       feedback: "## 回应点评\n很好\n\n## 需要澄清\n无\n\n## 今日总结\n完成\n\n## 下一步\n继续",
@@ -319,11 +319,82 @@ describe("learning command handling", () => {
     expect(reply).toContain("## 回应点评");
     expect(engine.learning.currentSession(plan.id)).toBeUndefined();
   });
+
+  test("targets one named plan when several lessons are awaiting", async () => {
+    const first = seedAwaitingPlan(engine, "ou_me", "计划甲");
+    const second = seedAwaitingPlan(engine, "ou_me", "计划乙");
+    const context = {
+      space: "personal/ou_me" as const,
+      chatId: "oc_p2p",
+      actorId: "ou_me",
+    };
+
+    const ambiguous = await handleLearningAnswer(engine, "我的理解", context);
+    expect(ambiguous).toContain("请在回答中注明计划");
+    expect(ambiguous).toContain("学习回答：[计划甲]");
+    expect(ambiguous).toContain("学习回答：[计划乙]");
+
+    llm.queueJSON({
+      feedback: "## 回应点评\n很好\n\n## 需要澄清\n无\n\n## 今日总结\n完成\n\n## 下一步\n继续",
+      mastery: "ready",
+      nextFocus: "继续下一段阅读",
+      learningRecord: {
+        title: "掌握计划乙要点",
+        summary: "能够概括计划乙的正文。",
+        evidence: "回答与计划乙原文一致。",
+        implications: [],
+      },
+    });
+    const reply = await handleLearningAnswer(engine, "[计划乙] 我的理解", context);
+
+    expect(reply).toContain("已记录「计划乙」");
+    expect(engine.learning.currentSession(first.id)?.status).toBe("awaiting_reply");
+    expect(engine.learning.currentSession(second.id)).toBeUndefined();
+  });
+
+  test("adjusts the next lesson only with an explicit bounded request", async () => {
+    const plan = seedAwaitingPlan(engine, "ou_me", "读书计划");
+    llm.queueJSON({
+      feedback: "## 回应点评\n还需要复习\n\n## 需要澄清\n核心概念\n\n## 今日总结\n尚未掌握\n\n## 下一步\n换一种方式",
+      mastery: "review",
+      nextFocus: "用图示重新解释核心概念",
+    });
+    const context = {
+      space: "personal/ou_me" as const,
+      chatId: "oc_p2p",
+      actorId: "ou_me",
+    };
+
+    const reply = await handleLearningAnswer(
+      engine,
+      "[读书计划] 我还不理解\n下一课要求：请用图示重新讲解",
+      context,
+    );
+
+    expect(reply).toContain("下一课将继续当前步骤");
+    expect(engine.learning.get(plan.id)?.adaptiveFocus).toBe("用图示重新解释核心概念");
+    expect(engine.learning.sessionsForPlan(plan.id)).toEqual([
+      expect.objectContaining({
+        nextLessonAdjusted: true,
+        nextLessonRequest: "请用图示重新讲解",
+      }),
+    ]);
+
+    seedAwaitingPlan(engine, "ou_me", "过长要求");
+    const callsBefore = llm.calls.length;
+    const rejected = await handleLearningAnswer(
+      engine,
+      `[过长要求] 回答\n下一课要求：${"甲".repeat(1_001)}`,
+      context,
+    );
+    expect(rejected).toContain("不能超过 1000 个字符");
+    expect(llm.calls).toHaveLength(callsBefore);
+  });
 });
 
-function seedAwaitingPlan(engine: KnowledgeEngine, creatorId: string) {
+function seedAwaitingPlan(engine: KnowledgeEngine, creatorId: string, name = "读书") {
   const plan = engine.learning.create({
-    name: "读书",
+    name,
     space: "personal/ou_me",
     creatorId,
     chatId: "oc_p2p",

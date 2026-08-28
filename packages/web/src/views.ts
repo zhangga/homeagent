@@ -82,6 +82,7 @@ import {
   isFeishuProvisioningFailure,
 } from "./feishu-provisioning-view.ts";
 import { safeLarkVerificationUrl } from "./verification-url.ts";
+import { learningMarkdownHtml } from "./learning-markdown.ts";
 
 const ANSWER_FEEDBACK_LABELS = {
   helpful: "有帮助",
@@ -2177,15 +2178,62 @@ const LEARNING_STUDIO_STYLE = `
   .learning-studio .step-attempts { color:var(--ink-soft); font-size:10px; padding-top:7px; white-space:nowrap; }
   .learning-studio .current-card {
     display:grid; grid-template-columns:1fr auto; gap:16px; border:1px solid rgba(15,92,77,.2);
-    background:linear-gradient(135deg,rgba(220,235,227,.84),rgba(255,255,255,.48)); padding:17px 18px; border-radius:4px 18px 18px 18px; margin-bottom:23px;
+    background:linear-gradient(135deg,rgba(220,235,227,.84),rgba(255,255,255,.48)); padding:17px 18px; border-radius:4px 18px 18px 18px; margin-bottom:11px;
   }
   .learning-studio .current-card h3 { font-family:"Songti SC","STSong",serif; margin:0 0 4px; font-size:18px; }
   .learning-studio .current-card p { margin:0; color:var(--ink-soft); font-size:12px; }
   .learning-studio .follow-count { align-self:center; color:var(--forest); font-size:11px; font-weight:800; }
+  .learning-studio .lesson-sheet {
+    overflow:hidden; margin:0 0 25px; border:1px solid rgba(23,43,42,.18); border-radius:4px 19px 19px 19px;
+    background:rgba(255,253,247,.8); box-shadow:0 12px 28px rgba(46,54,44,.08);
+  }
+  .learning-studio .lesson-mast {
+    display:flex; align-items:center; justify-content:space-between; gap:14px; padding:12px 20px;
+    border-bottom:1px solid var(--line); background:rgba(247,229,200,.48); color:var(--ink-soft); font-size:11px;
+  }
+  .learning-studio .lesson-mast strong { color:var(--ink); font-size:12px; }
+  .learning-studio .lesson-sequence { color:#8a511c; font-weight:800; letter-spacing:.1em; text-transform:uppercase; }
+  .learning-studio .lesson-content { padding:24px 26px 18px; color:#253936; font-size:14px; line-height:1.78; }
+  .learning-studio .lesson-content > :first-child { margin-top:0; padding-top:0; border-top:0; }
+  .learning-studio .lesson-content > :last-child { margin-bottom:0; }
+  .learning-studio .lesson-content h1,
+  .learning-studio .lesson-content h2,
+  .learning-studio .lesson-content h3,
+  .learning-studio .lesson-content h4 { font-family:"Songti SC","STSong",Georgia,serif; color:var(--ink); line-height:1.25; }
+  .learning-studio .lesson-content h1 { margin:0 0 16px; font-size:25px; }
+  .learning-studio .lesson-content h2 { margin:28px 0 10px; padding-top:20px; border-top:1px solid var(--line); font-size:20px; }
+  .learning-studio .lesson-content h3 { margin:21px 0 8px; font-size:17px; }
+  .learning-studio .lesson-content h4 { margin:18px 0 7px; font-size:15px; }
+  .learning-studio .lesson-content p { margin:0 0 13px; }
+  .learning-studio .lesson-content ul,
+  .learning-studio .lesson-content ol { margin:7px 0 16px; padding-left:24px; }
+  .learning-studio .lesson-content li { margin:5px 0; padding-left:3px; }
+  .learning-studio .lesson-content blockquote { margin:15px 0; padding:11px 15px; border-left:4px solid var(--amber); background:var(--amber-soft); color:#65451f; }
+  .learning-studio .lesson-content blockquote p { margin:0; }
+  .learning-studio .lesson-content code,
+  .learning-studio .history-copy code { padding:2px 5px; border-radius:4px; background:rgba(23,43,42,.08); font:12px ui-monospace,"SFMono-Regular",Consolas,monospace; }
+  .learning-studio .lesson-content pre { margin:14px 0 18px; padding:15px 17px; border-radius:4px 12px 12px 12px; background:#172b2a; color:#eef4eb; overflow:auto; font-size:12px; line-height:1.6; }
+  .learning-studio .lesson-content pre code { padding:0; background:transparent; color:inherit; }
+  .learning-studio .lesson-content a { color:var(--forest); font-weight:700; text-decoration:underline; text-underline-offset:3px; }
+  .learning-studio .lesson-answer {
+    display:flex; align-items:center; justify-content:space-between; gap:14px; padding:13px 20px;
+    border-top:1px solid var(--line); background:rgba(220,235,227,.5); color:var(--ink-soft); font-size:12px;
+  }
+  .learning-studio .lesson-answer code { white-space:nowrap; color:var(--forest); }
   .learning-studio .history-stack { display:grid; gap:9px; }
   .learning-studio .history-note { border:1px solid var(--line); background:rgba(255,255,255,.5); padding:13px 15px; border-radius:4px 13px 13px 13px; }
   .learning-studio .history-head { display:flex; justify-content:space-between; gap:10px; font-size:12px; }
   .learning-studio .history-note p { color:var(--ink-soft); font-size:12px; margin:7px 0 0; white-space:pre-wrap; }
+  .learning-studio .history-copy { margin-top:8px; color:var(--ink-soft); font-size:12px; line-height:1.62; }
+  .learning-studio .history-copy h1,
+  .learning-studio .history-copy h2,
+  .learning-studio .history-copy h3,
+  .learning-studio .history-copy h4 { margin:11px 0 5px; color:var(--ink); font-family:"Songti SC","STSong",serif; font-size:14px; }
+  .learning-studio .history-copy p { margin:5px 0 0; white-space:normal; }
+  .learning-studio .history-copy ul,
+  .learning-studio .history-copy ol { margin:6px 0 0; padding-left:20px; }
+  .learning-studio .history-copy blockquote { margin:7px 0; padding-left:10px; border-left:3px solid var(--amber); }
+  .learning-studio .history-copy pre { margin:7px 0; padding:10px; font-size:11px; }
   .learning-studio .material-strip { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:22px; }
   .learning-studio .material-card { padding:8px 10px; border:1px solid var(--line); background:rgba(255,255,255,.48); border-radius:3px 11px 11px 11px; font-size:11px; }
   .learning-studio .online-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-bottom:22px; }
@@ -2220,6 +2268,10 @@ const LEARNING_STUDIO_STYLE = `
     .learning-studio .online-grid { grid-template-columns:1fr; }
     .learning-studio .profile-card.level { grid-row:auto; }
     .learning-studio .settings-facts { grid-template-columns:1fr; }
+    .learning-studio .lesson-content { padding:20px 18px 16px; }
+    .learning-studio .lesson-mast,
+    .learning-studio .lesson-answer { align-items:flex-start; flex-direction:column; padding-left:18px; padding-right:18px; }
+    .learning-studio .lesson-answer code { white-space:normal; }
   }
 `;
 
@@ -2262,6 +2314,12 @@ function verifiedLearningRecord(session: LearningSession): string {
   if (marked) return marked.slice(0, 600);
   const summary = feedback.match(/## 今日总结\s+([\s\S]*?)(?=\n## |$)/u)?.[1]?.trim();
   return (summary || "已达到本课目标，后续课程可在此基础上继续。").slice(0, 600);
+}
+
+function learningFeedback(feedback: string): string {
+  const marker = "## 已验证学习记录";
+  const markerIndex = feedback.indexOf(marker);
+  return (markerIndex >= 0 ? feedback.slice(0, markerIndex) : feedback).trim().slice(0, 2_400);
 }
 
 export function learningView(
@@ -2379,8 +2437,22 @@ export function learningView(
                   </div>
                   <div class="follow-count">${currentSession.followUpCount
                     ? `已友好跟进 ${currentSession.followUpCount} 次`
-                    : "等待你的反馈"}</div>
+                    : "可选反馈 · 不阻塞明天课程"}</div>
                 </div>
+                <article class="lesson-sheet">
+                  <header class="lesson-mast">
+                    <span class="lesson-sequence">Lesson ${currentSession.sequence}</span>
+                    <strong>第 ${currentSession.sequence} 课 · ${currentSession.sectionTitle}</strong>
+                  </header>
+                  <div class="lesson-content">${learningMarkdownHtml(currentSession.guide)}</div>
+                  <footer class="lesson-answer">
+                    <span>${currentSession.status === "awaiting_reply"
+                      ? "读完可回到本课投递的飞书聊天回复；不回答也会按时继续下一课。"
+                      : "课程将在计划时间投递到飞书；你也可以先在这里预览。"}</span>
+                    <code>学习回答：[${selected.name}] 你的回答</code>
+                    <span>想改变下一课时，另起一行写“下一课要求：你的要求”。</span>
+                  </footer>
+                </article>
               </section>`
             : selected.adaptiveFocus
               ? html`<div class="route-note"><strong>下一课重点：${selected.adaptiveFocus}</strong>课程会围绕这个缺口继续设计。</div>`
@@ -2440,7 +2512,7 @@ export function learningView(
                     <strong>第 ${session.sequence} 课 · ${session.sectionTitle}</strong>
                     <span>已掌握 · ${fmtTime(session.completedAt ?? session.preparedAt)}</span>
                   </div>
-                  <p>${verifiedLearningRecord(session)}</p>
+                  <div class="history-copy">${learningMarkdownHtml(verifiedLearningRecord(session))}</div>
                 </div>`)}</div>`
               : html`<div class="material-card">尚无已验证记录。只有能被回答证据支持的理解才会进入知识空间；仅仅读过或做过不计为掌握。</div>`}
           </section>
@@ -2453,10 +2525,15 @@ export function learningView(
                     <span>${session.mastery === "ready" ? "已掌握" : session.mastery === "review" ? "需复习" : LEARNING_SESSION_LABELS[session.status]} · ${fmtTime(session.completedAt ?? session.deliveredAt ?? session.preparedAt)}</span>
                   </div>
                   ${session.learnerReply ? html`<p><strong>学习回答：</strong>${session.learnerReply}</p>` : ""}
-                  ${session.feedback ? html`<p>${session.feedback.slice(0, 360)}</p>` : ""}
+                  ${session.feedback
+                    ? html`<div class="history-copy">${learningMarkdownHtml(learningFeedback(session.feedback))}</div>`
+                    : ""}
                   ${session.routeAdjustment ? html`<p><strong>路线变化：</strong>${session.routeAdjustment}</p>` : ""}
+                  ${session.nextLessonRequest
+                    ? html`<p><strong>下一课要求：</strong>${session.nextLessonRequest}</p>`
+                    : ""}
                 </div>`)}</div>`
-              : html`<div class="material-card">还没有课程记录。第一份回答会成为画像和路线迭代的起点。</div>`}
+              : html`<div class="material-card">还没有课程记录。回答会形成反馈；只有明确填写“下一课要求”才会调整后续课程。</div>`}
           </section>
           <details class="plan-settings">
             <summary>计划设置与管理信息</summary>

@@ -76,7 +76,8 @@ export const LEARNING_HELP = [
   "· `/learn resume <名称或序号>` — 恢复计划",
   "· `/learn skip <名称或序号>` — 跳过当前一课",
   "· `/learn delete <名称或序号>` — 删除计划",
-  "· `学习回答：<内容>` — 回答当前课程并获取点评",
+  "· `学习回答：[计划名称或序号] <内容>` — 回答指定计划；仅一个待答计划时可省略方括号",
+  "· `下一课要求：<要求>` — 仅在回答后另起一行填写，明确调整下一课",
 ].join("\n");
 
 export function coldStartNote(): string {
