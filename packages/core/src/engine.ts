@@ -71,6 +71,7 @@ import {
 } from "./quarantine.ts";
 import { SpaceRegistry } from "./registry.ts";
 import { normalizeSearchLimit } from "./sqlite.ts";
+import type { RawSourceCapture, RawSourceDownload } from "./raw-source-files.ts";
 import { FeishuGroupBindingStore } from "./feishu-bindings.ts";
 import {
   AgentStore,
@@ -3443,37 +3444,121 @@ export class KnowledgeEngine implements Knowledge {
     }).client;
   }
 
+  private rememberSerialized(entry: RawEntry): string {
+    const requestedWorkItem = entry.workItemId
+      ? this.workItems.get(entry.workItemId)
+      : this.workItems.activeForSpace(entry.space);
+    if (entry.workItemId && (!requestedWorkItem || requestedWorkItem.space !== entry.space)) {
+      throw new Error(`work item does not belong to space: ${entry.workItemId}`);
+    }
+    const store = this.registry.ensure(entry.space, { chatId: entry.chatId });
+    const index = store.index();
+    if (
+      entry.chatId &&
+      entry.messageId &&
+      index.getMessageRetraction(entry.chatId, entry.messageId)
+    ) {
+      log.info("ignored redelivery of retracted message", {
+        space: entry.space,
+        chatId: entry.chatId,
+        messageId: entry.messageId,
+      });
+      return `retracted:${entry.messageId}`;
+    }
+    const normalizedEntry: RawEntry = requestedWorkItem
+      ? { ...entry, workItemId: requestedWorkItem.id }
+      : entry;
+    const id = index.insertRaw(normalizedEntry);
+    if (requestedWorkItem) this.workItems.attachRaw(requestedWorkItem.id, id);
+    log.debug("remembered raw entry", { space: entry.space, source: entry.source, id });
+    return id;
+  }
+
   async remember(entry: RawEntry): Promise<string> {
     // Capture is a write; serialize per space so it never races distillation.
+    return this.serializer.run(entry.space, async () => this.rememberSerialized(entry));
+  }
+
+  async rememberFile(
+    entry: RawEntry,
+    file: RawSourceCapture,
+  ): Promise<string> {
     return this.serializer.run(entry.space, async () => {
-      const requestedWorkItem = entry.workItemId
-        ? this.workItems.get(entry.workItemId)
-        : this.workItems.activeForSpace(entry.space);
-      if (entry.workItemId && (!requestedWorkItem || requestedWorkItem.space !== entry.space)) {
-        throw new Error(`work item does not belong to space: ${entry.workItemId}`);
-      }
       const store = this.registry.ensure(entry.space, { chatId: entry.chatId });
-      const index = store.index();
       if (
-        entry.chatId &&
-        entry.messageId &&
-        index.getMessageRetraction(entry.chatId, entry.messageId)
+        entry.chatId
+        && entry.messageId
+        && store.index().getMessageRetraction(entry.chatId, entry.messageId)
       ) {
-        log.info("ignored redelivery of retracted message", {
-          space: entry.space,
-          chatId: entry.chatId,
-          messageId: entry.messageId,
-        });
         return `retracted:${entry.messageId}`;
       }
-      const normalizedEntry: RawEntry = requestedWorkItem
-        ? { ...entry, workItemId: requestedWorkItem.id }
-        : entry;
-      const id = index.insertRaw(normalizedEntry);
-      if (requestedWorkItem) this.workItems.attachRaw(requestedWorkItem.id, id);
-      log.debug("remembered raw entry", { space: entry.space, source: entry.source, id });
-      return id;
+      if (file.attachment.sourceDigest !== undefined) {
+        throw new Error("sourceDigest is assigned by HomeAgent storage");
+      }
+      const stored = "bytes" in file
+        ? store.rawSourceFiles.write(file.bytes)
+        : store.rawSourceFiles.writeFromPath(file.localPath);
+      try {
+        return this.rememberSerialized({
+          ...entry,
+          attachments: [
+            ...(entry.attachments ?? []).map((attachment) => ({ ...attachment })),
+            {
+              ...file.attachment,
+              sourceDigest: stored.digest,
+              sourceSizeBytes: stored.sizeBytes,
+            },
+          ],
+        });
+      } catch (error) {
+        this.removeUnreferencedRawSources(entry.space, new Set([stored.digest]));
+        throw error;
+      }
     });
+  }
+
+  getRawSource(
+    space: SpaceId,
+    rawId: string,
+    attachmentIndex: number,
+  ): RawSourceDownload | null {
+    if (!this.registry.has(space) || !Number.isSafeInteger(attachmentIndex) || attachmentIndex < 0) {
+      return null;
+    }
+    const store = this.registry.store(space);
+    const attachment = store.index().getRaw(rawId)?.attachments?.[attachmentIndex];
+    if (!attachment?.sourceDigest || attachment.sourceSizeBytes === undefined) return null;
+    const stored = store.rawSourceFiles.read(attachment.sourceDigest);
+    if (stored.sizeBytes !== attachment.sourceSizeBytes) {
+      throw new Error(`stored raw source size mismatch: ${attachment.sourceDigest}`);
+    }
+    return {
+      ...stored,
+      name: attachment.name ?? "原文件",
+      kind: attachment.kind,
+    };
+  }
+
+  private removeUnreferencedRawSources(space: SpaceId, candidates: ReadonlySet<string>): void {
+    if (candidates.size === 0 || !this.registry.has(space)) return;
+    const store = this.registry.store(space);
+    const referenced = new Set(store.index().listRaw({}).flatMap((entry) =>
+      (entry.attachments ?? []).flatMap((attachment) =>
+        attachment.sourceDigest ? [attachment.sourceDigest] : []
+      )
+    ));
+    for (const digest of candidates) {
+      if (referenced.has(digest)) continue;
+      try {
+        store.rawSourceFiles.remove(digest);
+      } catch (error) {
+        log.warn("failed to remove unreferenced raw source", {
+          space,
+          digest,
+          err: String(error),
+        });
+      }
+    }
   }
 
   async attributeRawToAgent(
@@ -4015,6 +4100,11 @@ export class KnowledgeEngine implements Knowledge {
         return resultFor("forbidden");
       }
       const removedSourceIds = new Set(matchingRawRecords.map((rawRecord) => rawRecord.id));
+      const removedFileDigests = new Set(matchingRawRecords.flatMap((rawRecord) =>
+        (rawRecord.attachments ?? []).flatMap((attachment) =>
+          attachment.sourceDigest ? [attachment.sourceDigest] : []
+        )
+      ));
 
       const store = this.registry.store(space);
       const affectedPages = index
@@ -4061,6 +4151,7 @@ export class KnowledgeEngine implements Knowledge {
       // matching operational copy before deleting its raw provenance.
       this.chatRuns.removeByRawIds(removedSourceIds);
       for (const rawRecord of matchingRawRecords) index.deleteRaw(rawRecord.id);
+      this.removeUnreferencedRawSources(space, removedFileDigests);
       index.markPending([...survivingSourceIds]);
       if (affectedPages.length > 0) refreshDigest(store);
       this.syncWorkItemPages(space);
@@ -4352,6 +4443,28 @@ export class KnowledgeEngine implements Knowledge {
       }
       const taskIds = new Set(tasks.map((task) => task.id));
       const workActionIds = new Set(workContinuation.actions.map((action) => action.id));
+      const raw = index.listRaw({});
+      const sourceDigests = [...new Set(raw.flatMap((entry) =>
+        (entry.attachments ?? []).flatMap((attachment) =>
+          attachment.sourceDigest ? [attachment.sourceDigest] : []
+        )
+      ))].sort();
+      const sourceFiles = sourceDigests.map((digest) => {
+        const bytes = store.rawSourceFiles.readBytes(digest);
+        const referencedSizes = raw.flatMap((entry) =>
+          (entry.attachments ?? [])
+            .filter((attachment) => attachment.sourceDigest === digest)
+            .map((attachment) => attachment.sourceSizeBytes)
+        );
+        if (referencedSizes.some((size) => size !== bytes.byteLength)) {
+          throw new Error(`stored raw source size does not match Raw metadata: ${digest}`);
+        }
+        return {
+          digest,
+          sizeBytes: bytes.byteLength,
+          contentBase64: Buffer.from(bytes).toString("base64"),
+        };
+      });
       return {
         format: SPACE_ARCHIVE_FORMAT,
         version: SPACE_ARCHIVE_VERSION,
@@ -4367,7 +4480,8 @@ export class KnowledgeEngine implements Knowledge {
         purpose: store.purpose(),
         schema: store.schema(),
         pages: store.listPagesFromDisk(),
-        raw: index.listRaw({}),
+        raw,
+        sourceFiles,
         retractions: index.listMessageRetractions(),
         tasks,
         taskRuns: taskRuns.filter((run) =>
@@ -4481,6 +4595,12 @@ export class KnowledgeEngine implements Knowledge {
         const store = this.registry.ensure(space, { chatId: archive.space.chatId });
         store.setPurpose(archive.purpose);
         store.setSchema(archive.schema);
+        for (const sourceFile of archive.sourceFiles) {
+          store.rawSourceFiles.write(
+            Buffer.from(sourceFile.contentBase64, "base64"),
+            sourceFile.digest,
+          );
+        }
         const index = store.index();
         for (const raw of archive.raw) index.restoreRaw(raw);
         for (const record of archive.retractions) index.restoreMessageRetraction(record);
@@ -4731,12 +4851,21 @@ export class KnowledgeEngine implements Knowledge {
             )
             .map((raw) => raw.id),
         );
+        const expiredFileDigests = new Set(
+          index.listRaw({})
+            .filter((raw) => expiredRawIds.has(raw.id))
+            .flatMap((raw) => (raw.attachments ?? []).flatMap((attachment) =>
+              attachment.sourceDigest ? [attachment.sourceDigest] : []
+            )),
+        );
         const removedChatRuns = this.chatRuns.list(meta.id).filter(
           (run) => run.rawId && expiredRawIds.has(run.rawId),
         );
         this.chatRuns.removeByRawIds(expiredRawIds);
         try {
-          return index.deleteExpiredRawMessages(cutoff, protectedRawIds);
+          const deleted = index.deleteExpiredRawMessages(cutoff, protectedRawIds);
+          this.removeUnreferencedRawSources(meta.id, expiredFileDigests);
+          return deleted;
         } catch (error) {
           if (removedChatRuns.length > 0) this.chatRuns.restore(removedChatRuns);
           throw error;

@@ -21,12 +21,16 @@ export type RawSource = "message" | "doc" | "manual" | "task" | "learning";
 /** Whether a captured Raw input may enter knowledge distillation. */
 export type RawAdmission = "ready" | "held" | "excluded";
 
-/** A single attachment reference captured but (in MVP) not distilled. */
+/** A single attachment reference captured with optional immutable source evidence. */
 export interface Attachment {
   kind: "image" | "pdf" | "audio" | "file";
   /** local path or feishu file key */
   ref: string;
   name?: string;
+  /** SHA-256 key of the exact original bytes under this Space's raw/sources/. */
+  sourceDigest?: string;
+  /** Exact stored byte length, paired with sourceDigest. */
+  sourceSizeBytes?: number;
 }
 
 /**

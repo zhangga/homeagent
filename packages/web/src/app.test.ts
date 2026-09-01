@@ -1369,7 +1369,7 @@ describe("web backend (read-only)", () => {
     expect(body).toContain(`action="/spaces/${encodeURIComponent(SPACE)}/materials"`);
     expect(body).toContain('enctype="multipart/form-data"');
     expect(body).toContain('name="material"');
-    expect(body).toContain('accept=".txt,.md,.markdown,.csv,.json,.log"');
+    expect(body).not.toContain('accept=".txt,.md,.markdown,.csv,.json,.log"');
     expect(body).toContain("multiple required");
     expect(body).toContain('name="distillNow"');
     expect(body).toContain("单个文件不超过 20 MiB");
@@ -1995,48 +1995,53 @@ describe("management backend (read-write)", () => {
     expect(body).toContain("状态：待提炼");
   });
 
-  test("rejects an unsupported local material without creating Raw", async () => {
-    const before = await (await app.request(`/spaces/${encodeURIComponent(SPACE)}`)).text();
-    expect(before).toContain("原始条目（1）");
+  test("preserves an unsupported local material without pretending it has extractable text", async () => {
+    const original = new Uint8Array([0x4d, 0x5a, 0x00, 0xff]);
     const form = new FormData();
     form.set(
       "material",
-      new File(["not really a document"], "payload.exe", {
+      new File([original], "payload.exe", {
         type: "application/octet-stream",
       }),
     );
 
-    const rejected = await app.request(
+    const imported = await app.request(
       `/spaces/${encodeURIComponent(SPACE)}/materials`,
       { method: "POST", body: form },
     );
 
-    expect([302, 303]).toContain(rejected.status);
-    expect(decodeURIComponent(rejected.headers.get("location") ?? ""))
-      .toContain("导入失败：不支持 .exe 文件");
-    const after = await (await app.request(`/spaces/${encodeURIComponent(SPACE)}`)).text();
-    expect(after).toContain("原始条目（1）");
+    expect([302, 303]).toContain(imported.status);
+    const detailLocation = imported.headers.get("location") ?? "";
+    const detail = await app.request(detailLocation);
+    const detailBody = await detail.text();
+    expect(detailBody).toContain("payload.exe");
+    expect(detailBody).toContain("没有可供提炼的文本");
+    const location = new URL(detailLocation, "http://localhost");
+    const download = await app.request(`${location.pathname}/attachments/0`);
+    expect(new Uint8Array(await download.arrayBuffer())).toEqual(original);
   });
 
-  test("rejects a non-UTF-8 local material without creating Raw", async () => {
+  test("preserves a non-UTF-8 local material without creating replacement text", async () => {
+    const original = new Uint8Array([0xff, 0xfe, 0xfd]);
     const form = new FormData();
     form.set(
       "material",
-      new File([new Uint8Array([0xff, 0xfe, 0xfd])], "broken.txt", {
+      new File([original], "broken.txt", {
         type: "text/plain",
       }),
     );
 
-    const rejected = await app.request(
+    const imported = await app.request(
       `/spaces/${encodeURIComponent(SPACE)}/materials`,
       { method: "POST", body: form },
     );
 
-    expect([302, 303]).toContain(rejected.status);
-    expect(decodeURIComponent(rejected.headers.get("location") ?? ""))
-      .toContain("导入失败：文件不是有效的 UTF-8 文本");
-    const after = await (await app.request(`/spaces/${encodeURIComponent(SPACE)}`)).text();
-    expect(after).toContain("原始条目（1）");
+    expect([302, 303]).toContain(imported.status);
+    const location = new URL(imported.headers.get("location") ?? "", "http://localhost");
+    const detail = await app.request(location.pathname);
+    expect(await detail.text()).toContain("没有可供提炼的文本");
+    const download = await app.request(`${location.pathname}/attachments/0`);
+    expect(new Uint8Array(await download.arrayBuffer())).toEqual(original);
   });
 
   test("rejects a local material larger than 20 MiB before creating Raw", async () => {
@@ -2129,27 +2134,30 @@ describe("management backend (read-write)", () => {
     expect(rawList).toContain("beta.txt");
   });
 
-  test("rejects an empty local material without creating Raw", async () => {
+  test("preserves an empty local material as an original file", async () => {
     const form = new FormData();
-    form.set("material", new File(["  \n"], "empty.md", { type: "text/markdown" }));
+    form.set("material", new File([], "empty.md", { type: "text/markdown" }));
 
-    const rejected = await app.request(
+    const imported = await app.request(
       `/spaces/${encodeURIComponent(SPACE)}/materials`,
       { method: "POST", body: form },
     );
 
-    expect([302, 303]).toContain(rejected.status);
-    expect(decodeURIComponent(rejected.headers.get("location") ?? ""))
-      .toContain("导入失败：empty.md 没有可提炼的文本");
-    const after = await (await app.request(`/spaces/${encodeURIComponent(SPACE)}`)).text();
-    expect(after).toContain("原始条目（1）");
+    expect([302, 303]).toContain(imported.status);
+    const location = new URL(imported.headers.get("location") ?? "", "http://localhost");
+    const detail = await app.request(location.pathname);
+    expect(await detail.text()).toContain("没有可供提炼的文本");
+    const download = await app.request(`${location.pathname}/attachments/0`);
+    expect(download.status).toBe(200);
+    expect((await download.arrayBuffer()).byteLength).toBe(0);
   });
 
-  test("bounds long local material text while retaining a visible truncation notice", async () => {
+  test("keeps the exact original file when extracted text is bounded", async () => {
+    const original = `${"甲".repeat(200_000)}TAIL_MARKER`;
     const form = new FormData();
     form.set(
       "material",
-      new File([`${"甲".repeat(200_000)}TAIL_MARKER`], "long-notes.md", {
+      new File([original], "long-notes.md", {
         type: "text/markdown",
       }),
     );
@@ -2163,6 +2171,13 @@ describe("management backend (read-write)", () => {
     const body = await detail.text();
     expect(body).toContain("正文超过限制，仅保留前 200000 个字符");
     expect(body).not.toContain("TAIL_MARKER");
+    expect(body).toContain("下载原文件");
+
+    const location = new URL(imported.headers.get("location") ?? "", "http://localhost");
+    const download = await app.request(`${location.pathname}/attachments/0`);
+    expect(download.status).toBe(200);
+    expect(download.headers.get("content-disposition")).toContain("long-notes.md");
+    expect(await download.text()).toBe(original);
   });
 
   test("rejects more than 20 local materials in one request", async () => {
@@ -2191,9 +2206,10 @@ describe("management backend (read-write)", () => {
     const governanceBody = await governance.text();
     expect(governanceBody).toContain("数据治理");
     expect(governanceBody).toContain("原始消息保留");
-    expect(governanceBody).toContain("homeagent.space v1–v18");
+    expect(governanceBody).toContain("homeagent.space v1–v19");
     expect(governanceBody).toContain("v17 包含系统生成的分层知识地图");
     expect(governanceBody).toContain("v18 包含本地 Agent 知识消费反馈及处置记录");
+    expect(governanceBody).toContain("v19 包含按 SHA-256 校验的完整原文件");
 
     const exported = await app.request(`/spaces/${encodeURIComponent(SPACE)}/export`);
     expect(exported.status).toBe(200);
@@ -2202,7 +2218,8 @@ describe("management backend (read-write)", () => {
     expect(JSON.parse(archiveText)).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 18,
+        version: 19,
+        sourceFiles: [],
         agentKnowledgeFeedback: [],
         agentRevisions: [],
         learning: { plans: [], sources: [], sessions: [] },

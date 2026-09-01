@@ -2140,6 +2140,8 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   });
 
   test("shows thinking while a reply-bound attachment is still downloading", async () => {
+    const slowPath = join(dir, "slow.txt");
+    writeFileSync(slowPath, "x", "utf8");
     const events: string[] = [];
     let markDownloadStarted!: () => void;
     let releaseDownload!: () => void;
@@ -2174,7 +2176,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
         await downloadGate;
         return [{
           attachment: { kind: "file" as const, ref: "file_slow", name: "slow.txt" },
-          localPath: "/tmp/slow.txt",
+          localPath: slowPath,
           sizeBytes: 1,
           cleanup: () => {
             events.push("cleanup");
@@ -2402,7 +2404,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     const attachmentDownloader = async () => [{
       attachment: { kind: "file" as const, ref: "file_1", name: "notes.txt" },
       localPath,
-      sizeBytes: 27,
+      sizeBytes: 24,
       cleanup: () => {
         cleaned = true;
         rmSync(attachmentDir, { recursive: true, force: true });
@@ -2451,15 +2453,78 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
         chatId: "oc_team",
         messageId: "om_attachment",
         content: "# 附件：notes.txt\n\n项目代号是北极星",
-        attachments: [{ kind: "file", ref: "file_1", name: "notes.txt" }],
+        attachments: [expect.objectContaining({
+          kind: "file",
+          ref: "file_1",
+          name: "notes.txt",
+          sourceDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+          sourceSizeBytes: 24,
+        })],
       }),
     ]));
+    const attachmentRaw = archive.raw.find((raw) => raw.attachments?.length === 1)!;
+    const stored = engine.getRawSource("team/oc_team", attachmentRaw.id, 0);
+    expect(stored).toEqual(expect.objectContaining({ name: "notes.txt", sizeBytes: 24 }));
+    expect(await Bun.file(stored!.path).text()).toBe("项目代号是北极星");
     expect(cleaned).toBe(true);
     expect(existsSync(attachmentDir)).toBe(false);
 
     await connector.sendGroup("@小强Bot 别记这条", true);
     const retracted = await engine.exportSpace("team/oc_team");
     expect(retracted.raw.filter((raw) => raw.messageId === "om_attachment")).toEqual([]);
+    expect(existsSync(stored!.path)).toBe(false);
+  });
+
+  test("an explicit reply request preserves the original file from the replied message", async () => {
+    const attachmentDir = mkdtempSync(join(tmpdir(), "hb-runtime-reply-file-"));
+    const localPath = join(attachmentDir, "resource.bin");
+    const original = new Uint8Array([0, 1, 2, 3, 255]);
+    writeFileSync(localPath, original);
+    let downloadedMessageId = "";
+    const reactive = connector as CliConnector & Connector;
+    reactive.resolveReplyTarget = async () => ({
+      messageId: "om_original_file",
+      senderId: "ou_me",
+      messageType: "file",
+    });
+    orch = new Orchestrator({
+      engine,
+      connector,
+      llm: fake,
+      attachmentDownloader: async (messageId) => {
+        downloadedMessageId = messageId;
+        return [{
+          attachment: { kind: "file", ref: "file_original", name: "evidence.bin" },
+          localPath,
+          sizeBytes: original.byteLength,
+          cleanup: () => rmSync(attachmentDir, { recursive: true, force: true }),
+        }];
+      },
+      attachmentExtractor: async () => null,
+    });
+    await orch.start();
+
+    await connector.inject({
+      kind: "message",
+      eventId: "remember-original-file",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_me",
+      text: "@小强Bot 请记录这个原文件",
+      messageId: "om_remember_command",
+      messageType: "text",
+      mentionsBot: true,
+      createdAt: Date.now(),
+    });
+
+    expect(downloadedMessageId).toBe("om_original_file");
+    const raw = (await engine.exportSpace("team/oc_team")).raw.find(
+      (entry) => entry.attachments?.[0]?.name === "evidence.bin",
+    );
+    expect(raw).toBeDefined();
+    const stored = engine.getRawSource("team/oc_team", raw!.id, 0);
+    expect(new Uint8Array(await Bun.file(stored!.path).arrayBuffer())).toEqual(original);
+    expect(existsSync(attachmentDir)).toBe(false);
   });
 
   test("attachment download failure leaves the original message captured", async () => {
@@ -2496,7 +2561,9 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     ]);
   });
 
-  test("attachment extraction failure cleans up and leaves the original message captured", async () => {
+  test("attachment extraction failure still preserves the original file", async () => {
+    const brokenPath = join(dir, "broken.txt");
+    writeFileSync(brokenPath, "x", "utf8");
     let cleaned = false;
     orch = new Orchestrator({
       engine,
@@ -2504,7 +2571,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       llm: fake,
       attachmentDownloader: async () => [{
         attachment: { kind: "file", ref: "file_broken", name: "broken.txt" },
-        localPath: "/tmp/broken.txt",
+        localPath: brokenPath,
         sizeBytes: 1,
         cleanup: () => {
           cleaned = true;
@@ -2530,24 +2597,33 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     });
 
     const archive = await engine.exportSpace("team/oc_team");
-    expect(archive.raw).toEqual([
+    expect(archive.raw).toEqual(expect.arrayContaining([
       expect.objectContaining({
         source: "message",
         messageId: "om_extraction_failure",
         content: "[文件] broken.txt",
       }),
-    ]);
+      expect.objectContaining({
+        source: "message",
+        messageId: "om_extraction_failure",
+        content: "# 附件：broken.txt\n\n原文件已完整保存，可从原始记录详情下载。",
+        attachments: [expect.objectContaining({ sourceDigest: expect.any(String) })],
+      }),
+    ]));
+    expect(archive.sourceFiles).toHaveLength(1);
     expect(cleaned).toBe(true);
   });
 
   test("attachment cleanup failure does not mask successful ingestion", async () => {
+    const cleanupPath = join(dir, "cleanup.txt");
+    writeFileSync(cleanupPath, "x", "utf8");
     orch = new Orchestrator({
       engine,
       connector,
       llm: fake,
       attachmentDownloader: async () => [{
         attachment: { kind: "file", ref: "file_cleanup", name: "cleanup.txt" },
-        localPath: "/tmp/cleanup.txt",
+        localPath: cleanupPath,
         sizeBytes: 1,
         cleanup: () => {
           throw new Error("cleanup unavailable");

@@ -31,6 +31,7 @@ import type {
 } from "@homeagent/shared";
 import type { MessageRetractionRecord } from "./governance.ts";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
+import { MAX_RAW_SOURCE_BYTES, RAW_SOURCE_DIGEST_PATTERN } from "./raw-source-files.ts";
 
 const RAW_JOURNAL_FORMAT = "homeagent.raw-journal";
 const RAW_JOURNAL_VERSION = 1;
@@ -119,12 +120,31 @@ function parseAttachments(value: unknown, label: string): Attachment[] {
     if (!["image", "pdf", "audio", "file"].includes(kind)) {
       throw new Error(`${label}[${index}].kind is invalid`);
     }
+    const sourceDigest = optionalString(item.sourceDigest, `${label}[${index}].sourceDigest`);
+    const sourceSizeBytes = item.sourceSizeBytes === undefined || item.sourceSizeBytes === null
+      ? undefined
+      : finiteNumber(item.sourceSizeBytes, `${label}[${index}].sourceSizeBytes`);
+    if ((sourceDigest === undefined) !== (sourceSizeBytes === undefined)) {
+      throw new Error(`${label}[${index}] stored source metadata must be complete`);
+    }
+    if (sourceDigest !== undefined && !RAW_SOURCE_DIGEST_PATTERN.test(sourceDigest)) {
+      throw new Error(`${label}[${index}].sourceDigest is invalid`);
+    }
+    if (
+      sourceSizeBytes !== undefined
+      && (!Number.isSafeInteger(sourceSizeBytes)
+        || sourceSizeBytes < 0
+        || sourceSizeBytes > MAX_RAW_SOURCE_BYTES)
+    ) {
+      throw new Error(`${label}[${index}].sourceSizeBytes is invalid`);
+    }
     return {
       kind,
       ref: requiredString(item.ref, `${label}[${index}].ref`),
       ...(optionalString(item.name, `${label}[${index}].name`) === undefined
         ? {}
         : { name: optionalString(item.name, `${label}[${index}].name`) }),
+      ...(sourceDigest === undefined ? {} : { sourceDigest, sourceSizeBytes }),
     };
   });
 }

@@ -14,7 +14,7 @@ const MAX_CHARACTERS = 200_000;
 const MAX_FILES = 20;
 
 interface LocalMaterialUpload {
-  name: string;
+  name?: string;
   size: number;
   arrayBuffer(): Promise<ArrayBuffer>;
 }
@@ -22,7 +22,8 @@ interface LocalMaterialUpload {
 export interface PreparedLocalMaterial {
   name: string;
   digest: string;
-  content: string;
+  bytes: Uint8Array;
+  content: string | null;
   truncated: boolean;
 }
 
@@ -42,25 +43,24 @@ export async function prepareLocalMaterials(input: unknown): Promise<PreparedLoc
   for (const upload of uploads) {
     const name = safeUploadName(upload.name);
     const extension = extname(name).toLowerCase();
-    if (!TEXT_EXTENSIONS.has(extension)) {
-      throw new Error(`不支持 ${extension || "无扩展名"} 文件`);
-    }
     if (upload.size > MAX_BYTES) throw new Error("单个文件不能超过 20 MiB");
 
     const bytes = new Uint8Array(await upload.arrayBuffer());
-    let decoded: string;
-    try {
-      decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes).trim();
-    } catch {
-      throw new Error("文件不是有效的 UTF-8 文本");
+    let decoded: string | null = null;
+    if (TEXT_EXTENSIONS.has(extension)) {
+      try {
+        decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes).trim() || null;
+      } catch {
+        decoded = null;
+      }
     }
-    if (!decoded) throw new Error(`${name} 没有可提炼的文本`);
 
     materials.push({
       name,
       digest: createHash("sha256").update(bytes).digest("hex"),
-      content: decoded.slice(0, MAX_CHARACTERS),
-      truncated: decoded.length > MAX_CHARACTERS,
+      bytes,
+      content: decoded?.slice(0, MAX_CHARACTERS) ?? null,
+      truncated: decoded !== null && decoded.length > MAX_CHARACTERS,
     });
   }
   return materials;
@@ -75,20 +75,23 @@ export function localMaterialRawContent(material: PreparedLocalMaterial): string
     ...(material.truncated
       ? ["正文超过限制，仅保留前 200000 个字符。", ""]
       : []),
-    material.content,
+    material.content ?? "没有可供提炼的文本；原文件已完整保存，可从原始记录详情下载。",
   ].join("\n");
 }
 
 function isLocalMaterialUpload(value: unknown): value is LocalMaterialUpload {
   return typeof value === "object"
     && value !== null
-    && typeof (value as Partial<LocalMaterialUpload>).name === "string"
+    && (
+      (value as Partial<LocalMaterialUpload>).name === undefined
+      || typeof (value as Partial<LocalMaterialUpload>).name === "string"
+    )
     && typeof (value as Partial<LocalMaterialUpload>).size === "number"
     && typeof (value as Partial<LocalMaterialUpload>).arrayBuffer === "function";
 }
 
-function safeUploadName(input: string): string {
-  const leaf = input.split(/[\\/]/u).at(-1) ?? "";
+function safeUploadName(input: string | undefined): string {
+  const leaf = input?.split(/[\\/]/u).at(-1) ?? "";
   const cleaned = leaf.replace(/[\u0000-\u001f\u007f]/gu, " ").trim().slice(0, 255);
   return cleaned || "未命名资料";
 }

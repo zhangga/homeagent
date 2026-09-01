@@ -22,6 +22,7 @@ import { spaceToDir } from "@homeagent/shared";
 import { SpaceIndex } from "./sqlite.ts";
 import { markdownToPage, pageToMarkdown } from "./markdown.ts";
 import { ensureSpaceAgentGuide } from "./agent-guides.ts";
+import { RawSourceFileStore } from "./raw-source-files.ts";
 
 export const DEFAULT_PURPOSE = `# 空间意图 (purpose)
 
@@ -44,6 +45,7 @@ export class SpaceStore {
   readonly root: string;
   readonly wikiDir: string;
   readonly rawSourcesDir: string;
+  readonly rawSourceFiles: RawSourceFileStore;
   readonly dbPath: string;
   private _index: SpaceIndex | null = null;
 
@@ -52,13 +54,14 @@ export class SpaceStore {
     this.root = join(dataDir, "workspaces", spaceToDir(space));
     this.wikiDir = join(this.root, "wiki");
     this.rawSourcesDir = join(this.root, "raw", "sources");
+    this.rawSourceFiles = new RawSourceFileStore(this.rawSourcesDir);
     this.dbPath = join(this.root, ".index.db");
   }
 
   /** Create the directory scaffold and seed purpose/schema if absent. */
   ensure(): void {
     mkdirSync(this.wikiDir, { recursive: true });
-    mkdirSync(this.rawSourcesDir, { recursive: true });
+    this.rawSourceFiles.ensure();
     this.ensureAgentGuide();
     const purpose = join(this.root, "purpose.md");
     if (!existsSync(purpose)) writeFileSync(purpose, DEFAULT_PURPOSE, "utf8");

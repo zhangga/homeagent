@@ -743,6 +743,38 @@ export class Orchestrator {
         await this.syncAttachments(msg, writeSpace);
       }
 
+      if (
+        decision.capture
+        && this.attachmentDownloader
+        && this.connector.resolveReplyTarget
+        && interpretConversation(msg.text).disposition === "remember"
+      ) {
+        try {
+          const target = await this.connector.resolveReplyTarget(msg.messageId);
+          if (
+            target?.messageType
+            && ["image", "file", "audio", "media"].includes(target.messageType)
+          ) {
+            const alreadyStored = this.engine.registry.store(writeSpace).index().listRaw({})
+              .some((raw) =>
+                raw.messageId === target.messageId
+                && raw.attachments?.some((attachment) => attachment.sourceDigest)
+              );
+            if (!alreadyStored) {
+              await this.syncAttachments(msg, writeSpace, {
+                messageId: target.messageId,
+                author: target.senderId ?? msg.senderId,
+              });
+            }
+          }
+        } catch (err) {
+          log.warn("reply attachment preservation failed", {
+            messageId: msg.messageId,
+            err: String(err),
+          });
+        }
+      }
+
       // Source sync: pull allowlisted Feishu documents and internal articles.
       if (this.docFetcher && msg.docLinks && msg.docLinks.length > 0) {
         sourceSync = await this.syncDocs(msg, writeSpace);
@@ -1590,38 +1622,61 @@ export class Orchestrator {
     };
   }
 
-  private async syncAttachments(msg: InboundMessage, writeSpace: SpaceId): Promise<void> {
+  private async syncAttachments(
+    msg: InboundMessage,
+    writeSpace: SpaceId,
+    source: { messageId?: string; author?: string } = {},
+  ): Promise<void> {
+    const sourceMessageId = source.messageId ?? msg.messageId;
     let downloads: DownloadedAttachment[];
     try {
-      downloads = await this.attachmentDownloader!(msg.messageId);
+      downloads = await this.attachmentDownloader!(sourceMessageId);
     } catch (err) {
-      log.warn("attachment download failed", { messageId: msg.messageId, err: String(err) });
+      log.warn("attachment download failed", { messageId: sourceMessageId, err: String(err) });
       return;
     }
 
     for (const download of downloads) {
       try {
-        const extracted = await this.attachmentExtractor(download);
-        if (!extracted?.trim()) continue;
         const name = download.attachment.name ?? download.attachment.ref;
-        await this.engine.remember({
-          space: writeSpace,
-          source: "message",
-          author: msg.senderId,
-          chatId: msg.chatId,
-          messageId: msg.messageId,
-          content: `# 附件：${name}\n\n${extracted.trim()}`,
-          attachments: [download.attachment],
-          createdAt: msg.createdAt,
-        });
+        let extracted: string | null = null;
+        try {
+          extracted = await this.attachmentExtractor(download);
+        } catch (err) {
+          log.warn("attachment extraction failed", {
+            messageId: sourceMessageId,
+            err: String(err),
+          });
+        }
+        const content = extracted?.trim()
+          ? `# 附件：${name}\n\n${extracted.trim()}`
+          : `# 附件：${name}\n\n原文件已完整保存，可从原始记录详情下载。`;
+        await this.engine.rememberFile(
+          {
+            space: writeSpace,
+            source: "message",
+            author: source.author ?? msg.senderId,
+            chatId: msg.chatId,
+            messageId: sourceMessageId,
+            content,
+            createdAt: msg.createdAt,
+          },
+          {
+            attachment: download.attachment,
+            localPath: download.localPath,
+          },
+        );
       } catch (err) {
-        log.warn("attachment extraction failed", { messageId: msg.messageId, err: String(err) });
+        log.warn("attachment preservation failed", {
+          messageId: sourceMessageId,
+          err: String(err),
+        });
       } finally {
         try {
           download.cleanup();
         } catch (cleanupErr) {
           log.warn("attachment cleanup failed", {
-            messageId: msg.messageId,
+            messageId: sourceMessageId,
             err: String(cleanupErr),
           });
         }

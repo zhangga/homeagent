@@ -280,7 +280,7 @@ export function spaceDetailView(
         <div>
           <div class="material-kicker">INGEST / LOCAL</div>
           <h2 id="material-import-title">导入本地资料</h2>
-          <p>文件会先成为可追溯的 Raw，再由 Dream Cycle 判断如何整理进 Wiki。</p>
+          <p>原文件会按字节完整保存在本 Space，Raw 提炼文本再由 Dream Cycle 判断如何整理进 Wiki。</p>
         </div>
         <ol class="material-flow" aria-label="导入流程">
           <li><span>1</span>选择资料</li>
@@ -292,8 +292,8 @@ export function spaceDetailView(
         <div class="field">
           <label for="local-material-${enc}">资料文件</label>
           <input class="material-file-input" id="local-material-${enc}" name="material" type="file"
-            accept=".txt,.md,.markdown,.csv,.json,.log" multiple required />
-          <p class="field-help">可一次选择最多 20 份 UTF-8 文本、Markdown、CSV、JSON 或日志；单个文件不超过 20 MiB。</p>
+            multiple required />
+          <p class="field-help">可一次选择最多 20 份任意类型文件；单个文件不超过 20 MiB。原文件都会完整保存，可从 Raw 详情页下载；能识别的文本才会进入提炼。</p>
         </div>
         <div class="material-import-actions">
           <label class="checkbox-row">
@@ -540,8 +540,10 @@ export function rawGovernanceDetailView(
     <a href="/spaces/${enc}/pages/${encodeURIComponent(page.slug)}">${page.title}</a>
     <span class="muted">${page.slug}</span>
   </li>`);
-  const attachmentRows = attachments.map((attachment) => html`<li>
-    ${attachment.name ?? attachment.ref}
+  const attachmentRows = attachments.map((attachment, index) => html`<li>
+    ${attachment.sourceDigest
+      ? html`<a href="/spaces/${enc}/raw/${rawId}/attachments/${index}">下载原文件：${attachment.name ?? attachment.ref}</a>`
+      : attachment.name ?? attachment.ref}
     <span class="muted">${attachment.kind} · ${attachment.ref}</span>
   </li>`);
   const agentResponse = detail.raw.source !== "message"
@@ -962,7 +964,7 @@ export function governanceView(
     </div>
     <div class="card">
       <h2 style="margin-top:0">恢复空间</h2>
-      <p class="muted">接受 homeagent.space v1–v18 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录；已有同名空间不会被覆盖。</p>
+      <p class="muted">接受 homeagent.space v1–v19 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录，v19 包含按 SHA-256 校验的完整原文件；已有同名空间不会被覆盖。</p>
       <form method="post" action="/governance/restore" enctype="multipart/form-data" class="actions">
         <input type="file" name="archive" accept="application/json,.json" required />
         <button type="submit">上传并恢复</button>
