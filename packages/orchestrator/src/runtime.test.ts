@@ -2878,6 +2878,33 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(cliConnector.sent[0]!.markdown).toContain("回答 Agent 暂时不可用");
   });
 
+  test("CLI-only runtime reports an allowlisted model-capacity error without blaming CLI setup", async () => {
+    const cliEngine = new KnowledgeEngine({
+      dataDir: dir,
+      runProvider: async () => {
+        throw new ProviderRunError(
+          "codex",
+          "provider codex returned Selected model is at capacity. Please try a different model.",
+          { costBasis: "unavailable", source: "codex-jsonl" },
+        );
+      },
+    });
+    const { connector: cliConnector, orchestrator: cliOrch } = makeCliOnlyRuntime(
+      cliEngine,
+      "personal/ou_me",
+      { name: "繁忙模型助手", provider: "codex", model: "gpt-5.6-sol" },
+    );
+
+    await cliOrch.start();
+    await cliConnector.sendP2P("谁负责后端服务");
+
+    expect(cliConnector.sent[0]!.markdown).toContain("当前模型容量已满");
+    expect(cliConnector.sent[0]!.markdown).toContain(
+      "Selected model is at capacity. Please try a different model.",
+    );
+    expect(cliConnector.sent[0]!.markdown).not.toContain("本机 CLI 未配置");
+  });
+
   test("CLI-only runtime reports the frozen timeout instead of a hard-coded 120 seconds", async () => {
     saveSettings({ chatTimeoutMinutes: 420 }, dir);
     resetConfig();

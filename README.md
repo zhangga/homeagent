@@ -304,6 +304,7 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 > **注意事项**：
 > - 第 3、4 种会 **spawn 真 claude/trae-cli**：慢、有开销，且 CLI **用它自己的鉴权和模型**，不一定尊重 homeagent 里选的 model；想快速点功能用第 2 种。
 > - 本机 `codex` 之前探测不可用（WSL 无 Linux node），`claude`/`trae-cli` 可用；后台每次启动**实时探测**，以界面显示为准。
+> - Provider 返回已识别且可安全公开的运行错误（例如模型容量已满）时，飞书回复会说明具体原因并附上对应的原始提示；其他诊断仍使用固定、脱敏的兜底文案。
 
 ## 管理后台（mew 风格，可读写）
 

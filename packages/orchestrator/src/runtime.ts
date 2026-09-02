@@ -1242,9 +1242,9 @@ export class Orchestrator {
           run.agentId,
         );
       } catch (err) {
-        // No runnable provider (unset agent + no usable default CLI), or the CLI
-        // failed to answer. Tell the user to configure, rather than fail silently.
-        log.warn("ask failed; prompting to configure a provider", {
+        // Surface a bounded, classified notice when possible; unclassified
+        // provider diagnostics stay behind the fixed safe fallback.
+        log.warn("ask failed; sending a bounded provider notice", {
           space: writeSpace,
           err: String(err),
         });

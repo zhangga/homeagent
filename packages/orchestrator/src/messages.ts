@@ -7,12 +7,20 @@ import { isProviderTimeoutError } from "@homeagent/llm";
 
 /**
  * Shown when a message can't be answered because no runnable LLM provider is
- * configured (no agent assigned and no usable default CLI), or the CLI errored.
- * Directs the operator to the management backend rather than failing silently.
+ * configured (no agent assigned and no usable default CLI), or a provider error
+ * has no safe public classification. Directs the operator to the management
+ * backend rather than failing silently or exposing arbitrary diagnostics.
  */
 export const NO_PROVIDER_NOTICE = [
   "⚠️ 回答 Agent 暂时不可用，可能是本机 CLI 未配置、鉴权失败或服务不可达。",
   "请在管理后台检查当前空间的 Agent，或在设置里更换默认的本机 CLI。",
+].join("\n");
+
+/** Safe, fixed copy for the canonical capacity error returned by Codex. */
+export const MODEL_CAPACITY_NOTICE = [
+  "⚠️ 当前模型容量已满，暂时无法完成这次回答。",
+  "Provider 原始提示：Selected model is at capacity. Please try a different model.",
+  "请稍后重试，或在管理后台为当前 Agent 选择其他模型。",
 ].join("\n");
 
 export function providerTimeoutNotice(error: unknown): string {
@@ -51,6 +59,9 @@ export function providerNotice(error: unknown): string {
   }
   if (/cannot provide a no-tools execution mode/i.test(message)) {
     return NO_TOOLS_MODE_NOTICE;
+  }
+  if (/selected model is at capacity/i.test(message)) {
+    return MODEL_CAPACITY_NOTICE;
   }
   return isProviderTimeoutError(error) ? providerTimeoutNotice(error) : NO_PROVIDER_NOTICE;
 }
