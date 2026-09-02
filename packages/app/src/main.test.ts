@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { KnowledgeEngine } from "@homeagent/core";
 import {
-  isUsableManagedExecutable,
+  configureRuntimeEnvironment,
   prepareFeishuStartup,
   selectAppCommand,
 } from "./main.ts";
@@ -32,18 +32,18 @@ describe("compiled app command dispatch", () => {
     expect(selectAppCommand(["wat"], true)).toBe("unknown");
   });
 
-  test("treats empty or non-executable managed provider files as damaged", () => {
-    const dir = mkdtempSync(join(tmpdir(), "homeagent-managed-bin-"));
-    temporary.push(dir);
-    const binary = join(dir, "codex");
-    writeFileSync(binary, "");
-    chmodSync(binary, 0o755);
-    expect(isUsableManagedExecutable(binary)).toBeFalse();
-    writeFileSync(binary, "binary");
-    chmodSync(binary, 0o644);
-    expect(isUsableManagedExecutable(binary)).toBe(process.platform === "win32");
-    chmodSync(binary, 0o755);
-    expect(isUsableManagedExecutable(binary)).toBeTrue();
+  test("keeps bundled Provider executables on the machine PATH", () => {
+    const environment: NodeJS.ProcessEnv = {};
+
+    configureRuntimeEnvironment({
+      bundled: true,
+      dataDir: "/Users/test/HomeAgentData",
+      logDir: "/Users/test/Library/Logs/HomeAgent",
+    }, environment);
+
+    expect(environment.HOMEAGENT_DATA_DIR).toBe("/Users/test/HomeAgentData");
+    expect(environment.HOMEAGENT_LOG_DIR).toBe("/Users/test/Library/Logs/HomeAgent");
+    expect(environment.HOMEAGENT_CODEX_BIN).toBeUndefined();
   });
 
   test("prepares legacy bindings before deciding whether consumers may start", async () => {

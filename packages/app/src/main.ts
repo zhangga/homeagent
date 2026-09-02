@@ -16,10 +16,9 @@ import {
   saveSettings,
   type LarkSetupStatus,
 } from "@homeagent/shared";
-import { accessSync, constants, statSync } from "node:fs";
 import { join } from "node:path";
 import { KnowledgeEngine, type TaskRun } from "@homeagent/core";
-import { CodexProviderSetup, CodexReleaseInstaller } from "@homeagent/llm";
+import { CodexProviderSetup } from "@homeagent/llm";
 import {
   ByteTechArticleFetcher,
   FeishuConnector,
@@ -47,6 +46,7 @@ import { createSystemHealthReporter } from "./health.ts";
 import {
   homeAgentFeishuAvatarPath,
   resolveRuntimePaths,
+  type RuntimePaths,
 } from "./runtime-paths.ts";
 import { launchDesktop } from "./desktop.ts";
 import { createDefaultService, runServiceCli } from "./service-cli.ts";
@@ -72,15 +72,12 @@ import { runFeedbackCli } from "./feedback-cli.ts";
 
 const log = logger.child("app");
 
-export function isUsableManagedExecutable(path: string): boolean {
-  try {
-    const info = statSync(path);
-    if (!info.isFile() || info.size === 0) return false;
-    accessSync(path, constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
+export function configureRuntimeEnvironment(
+  paths: Pick<RuntimePaths, "bundled" | "dataDir" | "logDir">,
+  environment: NodeJS.ProcessEnv = process.env,
+): void {
+  environment.HOMEAGENT_DATA_DIR = paths.dataDir;
+  if (paths.bundled) environment.HOMEAGENT_LOG_DIR ??= paths.logDir;
 }
 
 export interface FeishuStartupPreparation {
@@ -294,12 +291,9 @@ async function run(
   });
 
   // 2. management web backend
-  const managedCodexBin = join(runtimePaths.dataDir, "bin", "codex");
+  const codexBin = brandedEnv(process.env, "CODEX_BIN")?.trim() || "codex";
   const codexProviderSetup = runtimePaths.bundled
-    ? new CodexProviderSetup({ codexBin: managedCodexBin })
-    : undefined;
-  const codexInstaller = runtimePaths.bundled
-    ? new CodexReleaseInstaller({ dataDir: runtimePaths.dataDir })
+    ? new CodexProviderSetup({ codexBin })
     : undefined;
   const feishuIntegration = new FeishuIntegrationService({
     engine,
@@ -330,13 +324,9 @@ async function run(
     agentFeedbackToken: cfg.agentFeedbackToken,
     health: reportHealth,
     larkSetup,
-    codexSetup: codexProviderSetup && codexInstaller
+    codexSetup: codexProviderSetup
       ? {
-          canInstall: true,
-          isInstalled: () => isUsableManagedExecutable(managedCodexBin),
-          install: async (consented) => {
-            await codexInstaller.installAfterConsent(consented);
-          },
+          isInstalled: () => Bun.which(codexBin) !== null,
           startDeviceLogin: () => codexProviderSetup.startDeviceLogin(),
           deviceLoginStatus: () => codexProviderSetup.deviceLoginStatus(),
           cancelDeviceLogin: () => codexProviderSetup.cancelDeviceLogin(),
@@ -573,11 +563,7 @@ export async function runEntrypoint(args = process.argv.slice(2)): Promise<numbe
     paths = resolveRuntimePaths();
   }
   process.env.HOMEAGENT_DATA_DIR_LOCKED = externalDataDirectory ? "1" : "0";
-  process.env.HOMEAGENT_DATA_DIR = paths.dataDir;
-  if (paths.bundled) {
-    process.env.HOMEAGENT_LOG_DIR ??= paths.logDir;
-    process.env.HOMEAGENT_CODEX_BIN ??= join(paths.dataDir, "bin", "codex");
-  }
+  configureRuntimeEnvironment(paths);
   if (command === "mcp" || command === "knowledge" || command === "feedback") {
     const cfg = config();
     const client = new LocalAgentApiClient({

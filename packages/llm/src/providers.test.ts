@@ -211,12 +211,7 @@ function writeCodexStatusProvider(
   directory: string,
   name: string,
   statusExitCode: number,
-  statusArgs: readonly string[] = [
-    "-c",
-    'cli_auth_credentials_store="keyring"',
-    "login",
-    "status",
-  ],
+  statusArgs: readonly string[] = ["login", "status"],
 ): string {
   const script = join(directory, `${name}.js`);
   const calls = join(directory, `${name}.calls.jsonl`);
@@ -1135,7 +1130,7 @@ describe("provider detection", () => {
         },
         500,
       );
-      expect(output).toContain("cli_auth_credentials_store");
+      expect(output).not.toContain("cli_auth_credentials_store");
       expect(output).toContain(
         "exec --ephemeral --ignore-user-config --ignore-rules --json --sandbox read-only",
       );
@@ -1207,7 +1202,7 @@ describe("provider detection", () => {
     ).rejects.toThrow("at most 4 images");
   });
 
-  test("honors managed binary overrides for detection and execution", async () => {
+  test("honors explicit binary overrides without changing CLI authentication", async () => {
     const keys = [
       "HOMEAGENT_CODEX_BIN",
       "HOMEAGENT_CLAUDE_BIN",
@@ -1230,7 +1225,7 @@ describe("provider detection", () => {
         { prompt: "hello", execution: READ_ONLY_EXECUTION },
         500,
       );
-      expect(defaultRun).toContain("cli_auth_credentials_store");
+      expect(defaultRun).not.toContain("cli_auth_credentials_store");
       expect(defaultRun).toContain(
         "exec --ephemeral --ignore-user-config --ignore-rules --json --sandbox read-only --skip-git-repo-check -- -",
       );
@@ -1381,7 +1376,7 @@ describe("provider detection", () => {
       }));
       expect(providerProbeCalls(directory, name)).toEqual([
         ["--version"],
-        ["-c", 'cli_auth_credentials_store="keyring"', "login", "status"],
+        ["login", "status"],
       ]);
     } finally {
       if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
@@ -1517,7 +1512,7 @@ describe("provider detection", () => {
     }
   });
 
-  test("accepts pre-rename managed binary overrides", async () => {
+  test("accepts pre-rename binary overrides without changing CLI authentication", async () => {
     const canonical = process.env.HOMEAGENT_CODEX_BIN;
     const legacy = process.env.HOMEBRAIN_CODEX_BIN;
     const directory = mkdtempSync(join(tmpdir(), "ha-provider-legacy-"));
@@ -1532,9 +1527,7 @@ describe("provider detection", () => {
         "codex",
         { prompt: "legacy", execution: READ_ONLY_EXECUTION },
         500,
-      )).toContain(
-        "cli_auth_credentials_store",
-      );
+      )).not.toContain("cli_auth_credentials_store");
     } finally {
       if (canonical === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
       else process.env.HOMEAGENT_CODEX_BIN = canonical;

@@ -142,24 +142,25 @@ HomeAgent 会拒绝把它配置成管理/read token 的同一密钥。MCP/JSON �
 
 ## 普通用户安装（macOS 13+）
 
-正式发布体验是：普通用户只需下载与 Mac 架构对应的 DMG，把 `HomeAgent.app` 拖入“应用程序”并双击。
-候选版本按下面的无终端主路径验收：
+HomeAgent 应用本体通过对应 Mac 架构的 DMG 安装；机器上的 Agent CLI 是独立的外部前置条件。
+把 `HomeAgent.app` 拖入“应用程序”并双击后，向导会检测这些机器程序。
+候选版本按下面的机器 Provider 主路径验收：
 
 1. HomeAgent 自动安装并启动当前用户的后台服务，然后在默认浏览器打开设置向导。若数据目录尚未初始化，
    向导会先展示默认位置，也允许选择一个不存在或为空的绝对路径；确认后通过安全重启切换，再继续后续设置。
-2. 设置向导以“安装并连接 ChatGPT”为普通用户主路径：获得明确同意后，HomeAgent 下载并校验 OpenAI
-   官方 Codex，安装到 HomeAgent 专用数据目录，再打开 OpenAI 官方页面完成登录，全程不需要终端。
-   Codex 普通会话使用 `ephemeral + ignore config/rules + read-only` 限制模式，并以绑定 Agent 的
-   Workdir（如已配置）作为只读上下文根目录。已自行安装并登录的 Claude Code 是可选高级 Provider，
-   使用严格 no-tools 模式，但不会出现在首次安装主路径中要求普通用户手动安装。
+2. 在这台机器上安装并登录至少一个受支持的 Agent CLI（`codex` 或 `claude`），确保 HomeAgent 后台服务的
+   `PATH` 可以解析它。设置向导只负责检测机器程序；HomeAgent 不下载 Provider、不把 Provider 复制到数据目录，
+   也不接管升级。Codex 可从向导发起官方设备登录；普通会话使用
+   `ephemeral + ignore config/rules + read-only` 限制模式，并以绑定 Agent 的 Workdir（如已配置）作为只读上下文根目录。
 3. 点击“一键创建飞书机器人”，在飞书页面确认。HomeAgent 会自动申请运行权限、验证机器人身份，并引导完成消息监听。
 4. 消息监听就绪后首次设置即完成。之后把机器人加入企业内部群聊，群主或管理员按群内提示发送
    “@HomeAgent 启用群聊”；确认前 HomeAgent 不会读取或记录该群消息。
 5. 如需加入外部群，完成首次设置后在“飞书连接”的可选对外共享配置中打开当前应用；完成飞书版本发布和管理员审批后，用一条真实外部群消息验证。
 
-应用包已自带 Bun 运行时、`lark-cli` 和 macOS 附件提取助手，用户不需要安装 Git、Bun、Node、npm 或
-Homebrew；首次设置通过受托管的 Codex 安装与 ChatGPT 登录完成 AI 连接，不依赖预装 Claude。
-Claude Code 和 TRAE CLI 仍是需要用户自行管理的可选高级 Provider。知识数据保存在
+应用包已自带 Bun 运行时、`lark-cli` 和 macOS 附件提取助手，HomeAgent 自身不依赖全局 Git、Bun 或
+`lark-cli`。Agent CLI 及其安装工具链由用户或机器管理员自行准备、登录和升级；后台服务会合并
+`~/.local/bin`、`~/.bun/bin`、`/opt/homebrew/bin`、`/usr/local/bin` 等常见机器目录后进行探测。
+Claude Code、Codex 和 TRAE CLI 都不会安装到 HomeAgent 数据目录。知识数据保存在
 `~/Library/Application Support/HomeAgent`，日志保存在
 `~/Library/Logs/HomeAgent`；替换应用版本不会覆盖知识数据。
 
@@ -442,9 +443,8 @@ bun run packages/app/src/repl.ts       # 启动横幅列出全部命令
 
 1. 普通用户双击 `HomeAgent.app`；源码开发者运行 `bun start`。全新数据目录会自动进入 `/setup`，
    首步可确认默认数据位置或选择新的绝对路径，不需要预先设置 `HOMEAGENT_DATA_DIR`。
-2. 打包应用以“安装并连接 ChatGPT”为主操作：HomeAgent 在用户确认后下载、校验并安装 OpenAI 官方
-   Codex，再进入官方登录；登录后 Codex 可用于普通问答和显式任务。已经自行安装并登录的 Claude Code
-   可从高级选项重新检测并选用；TRAE 仍只用于显式任务。源码运行则由开发者自行准备可用的 Claude 或 Codex CLI。
+2. 在机器上安装并登录 `codex` 或 `claude`，然后让设置向导重新检测；HomeAgent 只使用服务 `PATH` 中的
+   Provider 程序，不会下载或复制到数据目录。已安装但未连接的 Codex 可从向导进入官方设备登录；TRAE 仍只用于显式任务。
 3. 点击“一键创建飞书机器人”，在飞书官方页面确认。HomeAgent 通过官方 Node SDK 显式提交完整授权清单，
    一次申请私聊、群内 @、群内全部消息、消息读取/发送、附件、表情、群信息、机器人进群权限和两条事件订阅。
    App Secret 只通过 stdin 写入 `lark-cli` 的系统钥匙串，不进入 HomeAgent 设置、页面或日志。

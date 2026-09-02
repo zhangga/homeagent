@@ -78,18 +78,20 @@ GitHub `macos-release` environment 必须配置：
 Developer ID 签名、公证、staple、DMG 挂载 smoke，并把产物上传到 **Draft Prerelease**。Draft 只供维护者和
 受控测试人员完成下面的外部门禁；在第 6 节全部通过前不得公开。
 
-## 3. DMG 与无终端安装验收
+## 3. DMG 与机器 Provider 验收
 
-arm64 和 Intel 架构至少各完成一次；测试机不得依赖仓库 checkout、全局 Bun、Node、npm、
-Homebrew 或 lark-cli。
+arm64 和 Intel 架构至少各完成一次；测试机不得依赖仓库 checkout、全局 Bun 或 lark-cli。测试前需在机器上
+安装并登录至少一个受支持的 `codex` 或 `claude`，记录其绝对路径和版本；该 Provider 是明确的外部前置条件，
+不能来自 HomeAgent 数据目录。
 
 1. 由有仓库权限的测试人员从 Draft Prerelease 下载对应架构的 DMG；不要先公开 Release。
 2. 验证 Gatekeeper 未提示“开发者无法验证”或已损坏。
 3. 将 `HomeAgent.app` 拖入 `/Applications`，双击启动。
 4. 确认应用自动安装并启动 LaunchAgent，然后自动打开 `/setup`。
-5. 验证普通调用 Provider。Claude CLI 必须使用 strict no-tools 模式；Codex / ChatGPT 登录可直接用于普通问答，
-   但必须记录 `ephemeral`、忽略用户配置/规则、`approval_policy=never` 与 `read-only` sandbox 证据。若所选 Provider 仍要求用户打开终端补齐安装或登录，本轮“无终端安装”应记为失败；
-   内部 Soak 可预装 Claude 继续硬化，但不得拿它代替新用户门禁。
+5. 重启 LaunchAgent 后确认后台仍能从服务 `PATH` 解析预装 Provider；删除或保持不存在的
+   `<dataDir>/bin/codex` 不得影响探测。验证普通调用：Claude CLI 必须使用 strict no-tools 模式；Codex 必须记录
+   `ephemeral`、忽略用户配置/规则、`approval_policy=never` 与 `read-only` sandbox 证据。Provider 安装、登录和升级
+   由机器所有者管理，HomeAgent 不得下载或替换该程序。
 6. 创建或连接飞书机器人，确认两个事件消费者就绪。
 7. 加入测试群，确认机器人只登记待确认并发送一次提示；由群主或管理员发送“@HomeAgent 启用群聊”，
    再发送真实消息完成首次知识收录并记下原始记录 ID。
@@ -443,7 +445,7 @@ metadata，不得包含消息正文、Instruction、Prompt、凭据或完整模�
 - push / PR CI 在 Linux 和 macOS 全绿；
 - `bun run verify:brand` 全绿，且 Finder、Dock、DMG 与飞书圆形头像的人工视觉记录已归档；
 - 两个架构的签名、公证和 DMG smoke 全绿；
-- 至少一个全新用户环境完成无终端安装；
+- 至少一个全新用户环境在预装机器 Provider 的前提下完成 DMG、LaunchAgent、Provider 探测和首次设置验收；
 - 自动与真实崩溃恢复均通过；
 - v10、v11、v12、v13、v14、v15、v16、v17 八份真实归档均完成独立迁移、v18 再导出、重启和二次恢复，比对记录已归档；
 - Agent 草稿/发布/回滚、`write/full` 审批与过期、定时只读自动重试三个真实飞书灰度场景全部通过；

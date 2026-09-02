@@ -173,7 +173,7 @@ export interface WebOptions {
   /** Configure and verify the local lark-cli application without persisting its secret. */
   larkSetup?: LarkSetupPort;
   feishuIntegration?: FeishuIntegrationService;
-  /** App-managed Codex installation and ChatGPT authorization. */
+  /** Machine Codex ChatGPT authorization. */
   codexSetup?: CodexSetupPort;
   /** Send the setup wizard's explicit test message to a Feishu chat. */
   onIntegrationTest?: (chatId: string, text: string) => Promise<void>;
@@ -631,8 +631,7 @@ export function createWebApp(opts: WebOptions): Hono {
   };
   let providerCache: DetectedProvider[] | null = null;
   let modelCache: Record<string, string[]> | null = null;
-  let codexInstalling = false;
-  let codexInstallError: string | undefined;
+  let codexLoginError: string | undefined;
   const getProviders = async (): Promise<DetectedProvider[]> => {
     if (!providerCache) providerCache = await detect();
     return providerCache;
@@ -758,9 +757,9 @@ export function createWebApp(opts: WebOptions): Hono {
   };
   const startCodexLogin = (): void => {
     if (!opts.codexSetup) return;
-    codexInstallError = undefined;
+    codexLoginError = undefined;
     void opts.codexSetup.startDeviceLogin().then(persistReadyCodex).catch(() => {
-      codexInstallError = "ChatGPT 登录未完成，请重试";
+      codexLoginError = "ChatGPT 登录未完成，请重试";
     });
   };
   const getLarkStatus = async (): Promise<LarkSetupStatus> => {
@@ -943,11 +942,10 @@ export function createWebApp(opts: WebOptions): Hono {
       restartable,
       codex: {
         enabled: opts.codexSetup !== undefined,
-        canInstall: opts.codexSetup?.canInstall ?? false,
         installed: isCodexInstalled(),
-        installing: codexInstalling,
-        ...(codexInstallError ? { installError: codexInstallError } : {}),
-        login: codexLogin,
+        login: codexLoginError
+          ? { state: "failed" as const, message: codexLoginError }
+          : codexLogin,
       },
     };
   };
@@ -1193,29 +1191,6 @@ export function createWebApp(opts: WebOptions): Hono {
     return c.redirect("/setup");
   });
 
-  app.post("/setup/ai/codex/install", async (c) => {
-    if (!opts.codexSetup?.canInstall) {
-      return c.redirect(`/setup?ok=${encodeURIComponent("当前运行方式不支持自动安装 Codex")}`);
-    }
-    const body = await c.req.parseBody();
-    if (!checkbox(body, "consent")) {
-      return c.redirect(`/setup?ok=${encodeURIComponent("需要确认后才能安装 Codex")}`);
-    }
-    if (!codexInstalling) {
-      codexInstalling = true;
-      codexInstallError = undefined;
-      void opts.codexSetup.install(true).then(() => {
-        codexInstalling = false;
-        providerCache = null;
-        startCodexLogin();
-      }).catch(() => {
-        codexInstalling = false;
-        codexInstallError = "Codex 安装未完成，请重试";
-      });
-    }
-    return c.redirect(`/setup?ok=${encodeURIComponent("正在准备 Codex")}`);
-  });
-
   app.post("/setup/ai/codex/login", (c) => {
     if (!opts.codexSetup) {
       return c.redirect(`/setup?ok=${encodeURIComponent("当前运行方式未接入 ChatGPT 登录")}`);
@@ -1226,10 +1201,7 @@ export function createWebApp(opts: WebOptions): Hono {
 
   app.get("/setup/ai/codex/session", (c) => {
     c.header("cache-control", "no-store");
-    if (codexInstalling) {
-      return c.json({ state: "installing", message: "正在下载并校验 OpenAI 官方 Codex" });
-    }
-    if (codexInstallError) return c.json({ state: "failed", message: codexInstallError });
+    if (codexLoginError) return c.json({ state: "failed", message: codexLoginError });
     const session = getCodexLogin();
     persistReadyCodex(session);
     return c.json(session);

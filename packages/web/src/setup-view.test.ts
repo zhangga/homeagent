@@ -45,9 +45,7 @@ function render(current: SetupStep, overrides: Partial<Parameters<typeof setupVi
     restartable: true,
     codex: {
       enabled: false,
-      canInstall: false,
       installed: false,
-      installing: false,
       login: { state: "idle", message: "尚未连接" },
     },
     ...overrides,
@@ -127,34 +125,43 @@ describe("guided setup view", () => {
     expect((body.match(/class="primary-action"/g) ?? []).length).toBe(1);
   });
 
-  test("managed Codex is the zero-terminal primary path for a fresh install", () => {
-    const install = render("ai", {
+  test("guides machine CLI installation and keeps Codex login available", () => {
+    const missing = render("ai", {
       providers: [],
       codex: {
         enabled: true,
-        canInstall: true,
         installed: false,
-        installing: false,
         login: { state: "idle", message: "尚未连接" },
       },
     });
-    expect(install).toContain("用 ChatGPT 唤醒 HomeAgent");
-    expect(install).toContain("无需打开终端");
-    expect(install).toContain("安装并连接 ChatGPT");
-    expect(install).toContain("普通聊天和任务");
-    expect(install).toContain("自动获得全部兼容 Skills");
-    expect(install).toContain('name="consent"');
-    expect(install).toContain("高级选项：使用其他本机 Provider");
-    expect(install).toContain("Claude Code");
-    expect(install).not.toContain("npm install");
+    expect(missing).toContain("先连接 Claude Code 或 Codex");
+    expect(missing).toContain("npm install -g @openai/codex");
+    expect(missing).toContain("npm install -g @anthropic-ai/claude-code");
+    expect(missing).toContain("重新检测");
+    expect(missing).not.toContain("HomeAgent 专用目录");
+    expect(missing).not.toContain('name="consent"');
+
+    const login = render("ai", {
+      providers: [
+        { id: "codex", name: "Codex", bin: "codex", available: false, detail: "ChatGPT 尚未连接" },
+        { id: "claude", name: "Claude Code", bin: "claude", available: true, detail: "ready" },
+      ],
+      models: { claude: ["sonnet"] },
+      codex: {
+        enabled: true,
+        installed: true,
+        login: { state: "idle", message: "尚未连接" },
+      },
+    });
+    expect(login).toContain("Claude Code");
+    expect(login).toContain('action="/setup/ai/codex/login"');
+    expect(login).toContain("连接 ChatGPT");
 
     const waiting = render("ai", {
       providers: [],
       codex: {
         enabled: true,
-        canInstall: true,
         installed: true,
-        installing: false,
         login: {
           state: "waiting_for_user",
           verificationUrl: "https://auth.openai.com/device",
@@ -169,19 +176,6 @@ describe("guided setup view", () => {
     expect(waiting).toContain("正在准备 Codex");
     expect(waiting).toContain("登录后可用于普通聊天和任务");
     expect(waiting).toContain("自动获得全部兼容 Skills");
-
-    const repair = render("ai", {
-      providers: [],
-      codex: {
-        enabled: true,
-        canInstall: true,
-        installed: true,
-        installing: false,
-        login: { state: "failed", message: "ChatGPT 登录未完成，请重试" },
-      },
-    });
-    expect(repair).toContain("重新安装 Codex");
-    expect(repair).toContain("替换 HomeAgent 专用目录");
   });
 
   test("Feishu step makes one-click provisioning primary and manual credentials secondary", () => {

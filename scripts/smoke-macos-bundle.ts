@@ -259,6 +259,7 @@ export async function smokeMacOSBundle(appPath: string, timeoutMs = 20_000): Pro
     HOMEAGENT_WEB_HOST: "127.0.0.1",
     HOMEAGENT_WEB_PORT: String(port),
     HOMEAGENT_SERVICE_MANAGED: "0",
+    PATH: "/usr/bin:/bin",
     HOMEAGENT_CODEX_BIN: join(root, "missing-codex"),
     HOMEAGENT_CLAUDE_BIN: join(root, "missing-claude"),
     HOMEAGENT_TRAE_BIN: join(root, "missing-trae"),
@@ -293,19 +294,19 @@ export async function smokeMacOSBundle(appPath: string, timeoutMs = 20_000): Pro
       if (!body.includes("homeagent") || !body.includes("设置进度")) {
         throw new Error("standalone setup page did not render the guided flow");
       }
-      const managedInstall = body.indexOf('action="/setup/ai/codex/install"');
-      const primaryLabel = body.indexOf("安装并连接 ChatGPT");
-      const advancedProvider = body.indexOf("高级选项：使用其他本机 Provider");
+      const machineProviderGuidance = body.indexOf("先连接 Claude Code 或 Codex");
+      const codexInstallCommand = body.indexOf("npm install -g @openai/codex");
+      const claudeInstallCommand = body.indexOf("npm install -g @anthropic-ai/claude-code");
+      const refreshAction = body.indexOf('action="/setup/providers/refresh"');
       if (
-        managedInstall < 0
-        || primaryLabel < 0
-        || advancedProvider < 0
-        || managedInstall > advancedProvider
-        || primaryLabel > advancedProvider
-        || body.includes("先连接 Claude Code 或 Codex")
-        || body.includes("npm install")
+        machineProviderGuidance < 0
+        || codexInstallCommand < 0
+        || claudeInstallCommand < 0
+        || refreshAction < 0
+        || body.includes('action="/setup/ai/codex/install"')
+        || body.includes("安装并连接 ChatGPT")
       ) {
-        throw new Error("standalone setup did not expose managed Codex as the zero-terminal primary AI flow");
+        throw new Error("standalone setup did not require Provider CLIs from the machine PATH");
       }
     } finally {
       await stopProcess(

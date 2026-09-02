@@ -15,7 +15,7 @@ import {
   truncateSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import { brandedEnv } from "@homeagent/shared";
 
@@ -513,8 +513,15 @@ export class LaunchAgentService {
   }
 
   private plist(): string {
-    const path = this.options.environment.PATH
-      || `${join(this.options.homeDir, ".local", "bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`;
+    const path = [...new Set([
+      ...(this.options.environment.PATH ?? "").split(delimiter).filter(Boolean),
+      join(this.options.homeDir, ".local", "bin"),
+      join(this.options.homeDir, ".bun", "bin"),
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      "/usr/bin",
+      "/bin",
+    ])].join(delimiter);
     const main = join(this.options.repoRoot, "packages", "app", "src", "main.ts");
     const programArguments = this.options.bundled
       ? `    <string>${xml(this.options.executablePath ?? process.execPath)}</string>\n    <string>serve</string>`

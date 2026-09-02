@@ -29,7 +29,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MANAGED_CODEX_AUTH_ARGS } from "./provider-setup.ts";
 import type { ImageInput } from "./gateway.ts";
 
 const log = logger.child("providers");
@@ -387,12 +386,6 @@ const MAX_CLAUDE_AUTH_STATUS_BYTES = 16 * 1024;
 const CLAUDE_AUTH_UNAVAILABLE_DETAIL = "Claude 认证不可用";
 const CODEX_AUTH_UNAVAILABLE_DETAIL = "ChatGPT 尚未连接";
 
-function codexAuthArgsForCurrentBinary(): readonly string[] {
-  return brandedEnv(process.env, "CODEX_BIN")?.trim()
-    ? MANAGED_CODEX_AUTH_ARGS
-    : [];
-}
-
 function missingClaudeOrdinaryFlags(help: string): string[] {
   const flags = new Set(help.match(/--?[a-zA-Z][a-zA-Z0-9-]*/gu) ?? []);
   return CLAUDE_ORDINARY_REQUIRED_FLAGS.filter((flag) => !flags.has(flag));
@@ -497,7 +490,7 @@ export async function detectProviders(timeoutMs = 6000): Promise<DetectedProvide
           try {
             authProbe = await runCmd(
               bin,
-              [...codexAuthArgsForCurrentBinary(), "login", "status"],
+              ["login", "status"],
               timeoutMs,
             );
           } catch {
@@ -882,7 +875,6 @@ export async function runProviderDetailed(
         : {}),
     };
     const args = spec.buildRun(providerInput);
-    if (id === "codex") args.unshift(...codexAuthArgsForCurrentBinary());
     const bin = providerBin(spec);
     log.info("running local provider", { id, bin });
     const { code, stdout, stderr, timedOut, aborted } = await runCmd(

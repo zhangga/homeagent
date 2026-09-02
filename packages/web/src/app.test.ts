@@ -285,15 +285,13 @@ describe("web backend (read-only)", () => {
     expect(pendingPage).toContain(destination);
   });
 
-  test("fresh bundled setup makes managed Codex the zero-terminal primary path", async () => {
+  test("fresh bundled setup requires a Provider CLI from the machine PATH", async () => {
     const fresh = createWebApp({
       engine,
       detectProviders: async () => [],
       providerModels: async () => ({ codex: ["gpt-5.6-luna"] }),
       codexSetup: {
-        canInstall: true,
         isInstalled: () => false,
-        install: async () => {},
         startDeviceLogin: async () => ({ state: "idle", message: "尚未连接" }),
         deviceLoginStatus: () => ({ state: "idle", message: "尚未连接" }),
         cancelDeviceLogin: () => ({ state: "cancelled", message: "已取消" }),
@@ -303,15 +301,13 @@ describe("web backend (read-only)", () => {
     const response = await fresh.request("/setup");
     expect(response.status).toBe(200);
     const body = await response.text();
-    expect(body).toContain("安装并连接 ChatGPT");
-    expect(body).toContain('action="/setup/ai/codex/install"');
-    expect(body).toContain("高级选项");
+    expect(body).toContain("先连接 Claude Code 或 Codex");
+    expect(body).toContain("npm install -g @openai/codex");
+    expect(body).toContain("npm install -g @anthropic-ai/claude-code");
+    expect(body).toContain('action="/setup/providers/refresh"');
     expect(body).toContain("Claude Code");
-    expect(body.indexOf("安装并连接 ChatGPT")).toBeLessThan(
-      body.indexOf("Claude Code"),
-    );
-    expect(body).not.toContain("先连接 Claude Code 或 Codex");
-    expect(body).not.toContain("npm install");
+    expect(body).not.toContain('action="/setup/ai/codex/install"');
+    expect(body).not.toContain("HomeAgent 专用目录");
   });
 
   test("installed but disconnected Codex stays on the ChatGPT connection step", async () => {
@@ -321,15 +317,13 @@ describe("web backend (read-only)", () => {
       detectProviders: async () => [{
         id: "codex",
         name: "Codex",
-        bin: "/managed/codex",
+        bin: "codex",
         available: false,
         detail: "ChatGPT 尚未连接",
       }],
       providerModels: async () => ({ codex: ["gpt-5.4"] }),
       codexSetup: {
-        canInstall: true,
         isInstalled: () => true,
-        install: async () => {},
         startDeviceLogin: async () => {
           loginStarts += 1;
           return { state: "waiting_for_user", message: "等待确认" };
@@ -922,34 +916,26 @@ describe("web backend (read-only)", () => {
     }));
   });
 
-  test("connects managed Codex without changing the default until the user selects it", async () => {
-    let installed = false;
-    let installCalls = 0;
+  test("connects machine Codex without changing the default until the user selects it", async () => {
     let loginStarts = 0;
     let session: import("@homeagent/llm").CodexLoginSession = {
       state: "idle",
       message: "尚未连接",
     };
-    const managed = createWebApp({
+    const machine = createWebApp({
       engine,
       detectProviders: async () => [
         {
           id: "codex",
           name: "Codex",
-          bin: "/managed/codex",
-          available: installed,
-          detail: installed ? "ready" : "missing",
+          bin: "codex",
+          available: session.state === "ready",
+          detail: session.state === "ready" ? "ready" : "ChatGPT 尚未连接",
         },
       ],
       providerModels: async () => ({ codex: ["gpt-5.4"] }),
       codexSetup: {
-        canInstall: true,
-        isInstalled: () => installed,
-        install: async (consented) => {
-          expect(consented).toBeTrue();
-          installCalls += 1;
-          installed = true;
-        },
+        isInstalled: () => true,
         startDeviceLogin: async () => {
           loginStarts += 1;
           session = {
@@ -965,52 +951,38 @@ describe("web backend (read-only)", () => {
       },
     });
 
-    const refused = await managed.request("/setup/ai/codex/install", {
+    const response = await machine.request("/setup/ai/codex/login", {
       method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: "",
-    });
-    expect(refused.headers.get("location")).toContain("%E9%9C%80%E8%A6%81%E7%A1%AE%E8%AE%A4");
-    expect(installCalls).toBe(0);
-
-    await managed.request("/setup/ai/codex/install", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: "consent=on",
     });
     await Bun.sleep(0);
-    expect(installCalls).toBe(1);
+    expect(response.status).toBe(302);
     expect(loginStarts).toBe(1);
-    expect(await (await managed.request("/setup/ai/codex/session")).json()).toEqual(session);
+    expect(await (await machine.request("/setup/ai/codex/session")).json()).toEqual(session);
 
     session = { state: "ready", message: "ChatGPT 已连接" };
-    expect((await managed.request("/setup/ai/codex/session")).status).toBe(200);
+    expect((await machine.request("/setup/ai/codex/session")).status).toBe(200);
     expect(readSettings(dir).defaultProvider).not.toBe("codex");
   });
 
-  test("sanitizes managed Codex installation failures", async () => {
-    const secret = "raw download URL and token";
+  test("sanitizes machine Codex login failures", async () => {
+    const secret = "raw provider output and token";
     const broken = createWebApp({
       engine,
       detectProviders: async () => [],
       providerModels: async () => ({}),
       codexSetup: {
-        canInstall: true,
-        isInstalled: () => false,
-        install: async () => { throw new Error(secret); },
-        startDeviceLogin: async () => ({ state: "failed", message: "失败" }),
+        isInstalled: () => true,
+        startDeviceLogin: async () => { throw new Error(secret); },
         deviceLoginStatus: () => ({ state: "idle", message: "尚未连接" }),
         cancelDeviceLogin: () => ({ state: "cancelled", message: "已取消" }),
       },
     });
-    await broken.request("/setup/ai/codex/install", {
+    await broken.request("/setup/ai/codex/login", {
       method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: "consent=on",
     });
     await Bun.sleep(0);
     const result = JSON.stringify(await (await broken.request("/setup/ai/codex/session")).json());
-    expect(result).toContain("Codex 安装未完成");
+    expect(result).toContain("ChatGPT 登录未完成");
     expect(result).not.toContain(secret);
   });
 

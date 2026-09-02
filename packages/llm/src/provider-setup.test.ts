@@ -1,14 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import {
   CodexProviderSetup,
-  CodexReleaseInstaller,
-  GitHubCodexReleaseDiscovery,
-  codexTargetForArchitecture,
-  type CodexInstallFileSystem,
-  type CodexInstallNetwork,
   type CodexLoginProcess,
-  type CodexRelease,
 } from "./provider-setup.ts";
 
 async function* chunks(...values: string[]): AsyncGenerator<Uint8Array> {
@@ -52,7 +45,7 @@ describe("CodexProviderSetup", () => {
     let spawned: string[] | undefined;
     let spawnCount = 0;
     const setup = new CodexProviderSetup({
-      codexBin: "/managed/codex",
+      codexBin: "/usr/local/bin/codex",
       detailWaitMs: 50,
       ttlMs: 1_000,
       spawner: {
@@ -81,9 +74,7 @@ describe("CodexProviderSetup", () => {
     const duplicate = await setup.startDeviceLogin();
 
     expect(spawned).toEqual([
-      "/managed/codex",
-      "-c",
-      'cli_auth_credentials_store="keyring"',
+      "/usr/local/bin/codex",
       "login",
       "--device-auth",
     ]);
@@ -128,7 +119,7 @@ describe("CodexProviderSetup", () => {
     const exited = deferred<number>();
     const commands: string[][] = [];
     const setup = new CodexProviderSetup({
-      codexBin: "/managed/codex",
+      codexBin: "/usr/local/bin/codex",
       detailWaitMs: 50,
       ttlMs: 1_000,
       spawner: {
@@ -153,9 +144,7 @@ describe("CodexProviderSetup", () => {
     await eventually(() => expect(setup.deviceLoginStatus().state).toBe("ready"));
 
     expect(commands).toEqual([[
-      "/managed/codex",
-      "-c",
-      'cli_auth_credentials_store="keyring"',
+      "/usr/local/bin/codex",
       "login",
       "status",
     ]]);
@@ -201,191 +190,5 @@ describe("CodexProviderSetup", () => {
     await eventually(() => expect(expired.setup.deviceLoginStatus().state).toBe("expired"));
     expect(expired.setup.deviceLoginStatus().message).toBe("ChatGPT 登录已过期，请重试");
     expect(expired.kills()).toBe(1);
-  });
-});
-
-describe("CodexReleaseInstaller", () => {
-  test("maps supported macOS architectures to official release targets", () => {
-    expect(codexTargetForArchitecture("arm64")).toBe("aarch64-apple-darwin");
-    expect(codexTargetForArchitecture("x64")).toBe("x86_64-apple-darwin");
-    expect(() => codexTargetForArchitecture("ia32")).toThrow("不支持");
-  });
-
-  test("installs a verified official release through staging and atomic rename", async () => {
-    const archive = new TextEncoder().encode("official codex archive");
-    const sha256 = createHash("sha256").update(archive).digest("hex");
-    const release: CodexRelease = {
-      version: "0.144.4",
-      assetName: "codex-aarch64-apple-darwin.tar.gz",
-      downloadUrl:
-        "https://github.com/openai/codex/releases/download/rust-v0.144.4/codex-aarch64-apple-darwin.tar.gz",
-      sha256,
-    };
-    const operations: Array<{ op: string; args: unknown[] }> = [];
-    const files: CodexInstallFileSystem = {
-      mkdir: async (...args) => { operations.push({ op: "mkdir", args }); },
-      writeFile: async (...args) => { operations.push({ op: "writeFile", args }); },
-      extractTarGz: async (...args) => { operations.push({ op: "extractTarGz", args }); },
-      assertRegularFile: async (...args) => { operations.push({ op: "assertRegularFile", args }); },
-      chmod: async (...args) => { operations.push({ op: "chmod", args }); },
-      rename: async (...args) => { operations.push({ op: "rename", args }); },
-      remove: async (...args) => { operations.push({ op: "remove", args }); },
-    };
-    let discoveredTarget: string | undefined;
-    const network: CodexInstallNetwork = {
-      getJson: async () => { throw new Error("unused"); },
-      download: async (url) => {
-        expect(url).toBe(release.downloadUrl);
-        return archive;
-      },
-    };
-    const installer = new CodexReleaseInstaller({
-      dataDir: "/Users/me/Library/Application Support/HomeAgent",
-      architecture: "arm64",
-      network,
-      files,
-      releaseDiscovery: {
-        async latest(target) {
-          discoveredTarget = target;
-          return release;
-        },
-      },
-      stagingId: () => "test-stage",
-      now: () => 1_784_000_000_000,
-    });
-
-    const result = await installer.installAfterConsent(true);
-
-    expect(discoveredTarget).toBe("aarch64-apple-darwin");
-    expect(result).toEqual({
-      path: "/Users/me/Library/Application Support/HomeAgent/bin/codex",
-      version: "0.144.4",
-      sourceUrl: release.downloadUrl,
-      sha256,
-      installedAt: 1_784_000_000_000,
-    });
-    expect(operations).toContainEqual({
-      op: "chmod",
-      args: [
-        "/Users/me/Library/Application Support/HomeAgent/bin/.codex-install-test-stage/codex-aarch64-apple-darwin",
-        0o755,
-      ],
-    });
-    expect(operations).toContainEqual({
-      op: "rename",
-      args: [
-        "/Users/me/Library/Application Support/HomeAgent/bin/.codex-install-test-stage/codex-aarch64-apple-darwin",
-        "/Users/me/Library/Application Support/HomeAgent/bin/codex",
-      ],
-    });
-    expect(operations).toContainEqual({
-      op: "rename",
-      args: [
-        "/Users/me/Library/Application Support/HomeAgent/bin/.codex-install-test-stage/codex-install.json",
-        "/Users/me/Library/Application Support/HomeAgent/bin/codex-install.json",
-      ],
-    });
-    expect(operations.at(-1)).toEqual({
-      op: "remove",
-      args: [
-        "/Users/me/Library/Application Support/HomeAgent/bin/.codex-install-test-stage",
-      ],
-    });
-    const receiptWrite = operations.find(({ op, args }) =>
-      op === "writeFile" && String(args[0]).endsWith("codex-install.json"));
-    expect(receiptWrite).toBeDefined();
-    expect(new TextDecoder().decode(receiptWrite!.args[1] as Uint8Array)).toContain(release.downloadUrl);
-  });
-
-  test("requires consent and rejects checksum or release-origin failures before replacement", async () => {
-    const bytes = new TextEncoder().encode("tampered");
-    let discoveryCalls = 0;
-    let downloadCalls = 0;
-    let renameCalls = 0;
-    const files: CodexInstallFileSystem = {
-      mkdir: async () => {},
-      writeFile: async () => {},
-      extractTarGz: async () => {},
-      assertRegularFile: async () => {},
-      chmod: async () => {},
-      rename: async () => { renameCalls += 1; },
-      remove: async () => {},
-    };
-    const release = (downloadUrl: string): CodexRelease => ({
-      version: "0.144.4",
-      assetName: "codex-aarch64-apple-darwin.tar.gz",
-      downloadUrl,
-      sha256: "0".repeat(64),
-    });
-    let current = release(
-      "https://github.com/openai/codex/releases/download/rust-v0.144.4/codex-aarch64-apple-darwin.tar.gz",
-    );
-    const installer = new CodexReleaseInstaller({
-      dataDir: "/data",
-      architecture: "arm64",
-      files,
-      network: {
-        getJson: async () => ({}),
-        download: async () => { downloadCalls += 1; return bytes; },
-      },
-      releaseDiscovery: {
-        latest: async () => { discoveryCalls += 1; return current; },
-      },
-      stagingId: () => "test",
-    });
-
-    await expect(installer.installAfterConsent(false)).rejects.toMatchObject({
-      code: "consent_required",
-      message: "需要你确认后才能安装 Codex",
-    });
-    expect(discoveryCalls).toBe(0);
-
-    await expect(installer.installAfterConsent(true)).rejects.toMatchObject({
-      code: "checksum_mismatch",
-      message: "Codex 下载校验失败，请重试",
-    });
-    expect(renameCalls).toBe(0);
-
-    current = release("https://attacker.example/codex.tar.gz");
-    await expect(installer.installAfterConsent(true)).rejects.toMatchObject({
-      code: "invalid_release",
-      message: "无法验证 Codex 官方版本",
-    });
-    expect(downloadCalls).toBe(1);
-    expect(renameCalls).toBe(0);
-  });
-
-  test("discovers the exact official asset and GitHub-published digest", async () => {
-    const requested: string[] = [];
-    const network: CodexInstallNetwork = {
-      async getJson(url) {
-        requested.push(url);
-        return {
-          tag_name: "rust-v0.144.4",
-          assets: [
-            {
-              name: "codex-aarch64-apple-darwin.tar.gz",
-              browser_download_url:
-                "https://github.com/openai/codex/releases/download/rust-v0.144.4/codex-aarch64-apple-darwin.tar.gz",
-              digest: `sha256:${"a".repeat(64)}`,
-            },
-          ],
-        };
-      },
-      download: async () => { throw new Error("unused"); },
-    };
-
-    const release = await new GitHubCodexReleaseDiscovery(network).latest(
-      "aarch64-apple-darwin",
-    );
-
-    expect(requested).toEqual(["https://api.github.com/repos/openai/codex/releases/latest"]);
-    expect(release).toEqual({
-      version: "0.144.4",
-      assetName: "codex-aarch64-apple-darwin.tar.gz",
-      downloadUrl:
-        "https://github.com/openai/codex/releases/download/rust-v0.144.4/codex-aarch64-apple-darwin.tar.gz",
-      sha256: "a".repeat(64),
-    });
   });
 });

@@ -29,14 +29,10 @@ export interface FeishuRuntimeStatus {
   }>;
 }
 
-/** App-owned Codex installation/login boundary used by the first-run wizard. */
+/** Machine Codex login boundary used by the first-run wizard. */
 export interface CodexSetupPort {
-  /** True only when HomeAgent can install the official Codex release itself. */
-  canInstall: boolean;
-  /** Whether the app-managed executable is already present. */
+  /** Whether `codex` is present on the service PATH. */
   isInstalled(): boolean;
-  /** Download and verify Codex after explicit user consent. */
-  install(consented: boolean): Promise<void>;
   /** Start the browser/device authorization flow. */
   startDeviceLogin(): Promise<CodexLoginSession>;
   deviceLoginStatus(): CodexLoginSession;

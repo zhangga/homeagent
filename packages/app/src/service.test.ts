@@ -125,6 +125,9 @@ describe("macOS LaunchAgent service", () => {
     expect(plist).not.toContain("packages/app/src/main.ts");
     expect(plist).not.toContain("<key>WorkingDirectory</key>");
     expect(plist).toContain("Library/Application Support/HomeAgent");
+    expect(plist).toContain(
+      `<key>PATH</key>\n  <string>/usr/bin:/bin:${join(homeDir, ".local", "bin")}:${join(homeDir, ".bun", "bin")}:/opt/homebrew/bin:/usr/local/bin</string>`,
+    );
     expect(service.stdoutPath).toBe(join(logDir, "service.stdout.log"));
     expect(service.stderrPath).toBe(join(logDir, "service.stderr.log"));
     expect(statSync(service.stdoutPath).mode & 0o777).toBe(0o600);
