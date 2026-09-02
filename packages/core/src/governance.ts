@@ -8,6 +8,7 @@ import {
   type RawSource,
   type SpaceId,
 } from "@homeagent/shared";
+import { createHash } from "node:crypto";
 import {
   CODEX_REASONING_EFFORTS,
   isCliProvider,
@@ -108,6 +109,7 @@ import {
   MAX_AGENT_KNOWLEDGE_FEEDBACK_RECORDS,
   type AgentKnowledgeFeedback,
 } from "./knowledge-consumption-feedback.ts";
+import { MAX_RAW_SOURCE_BYTES, RAW_SOURCE_DIGEST_PATTERN } from "./raw-source-files.ts";
 
 export const SPACE_ARCHIVE_FORMAT = "homeagent.space" as const;
 export const LEGACY_SPACE_ARCHIVE_FORMAT = "homebrain.space" as const;
@@ -129,7 +131,14 @@ export const WORK_CONTEXT_SPACE_ARCHIVE_VERSION = 15 as const;
 export const RAW_ADMISSION_SPACE_ARCHIVE_VERSION = 16 as const;
 export const KNOWLEDGE_MAPS_SPACE_ARCHIVE_VERSION = 17 as const;
 export const AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION = 18 as const;
-export const SPACE_ARCHIVE_VERSION = AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION;
+export const RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION = 19 as const;
+export const SPACE_ARCHIVE_VERSION = RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION;
+
+export interface RawSourceFileArchive {
+  digest: string;
+  sizeBytes: number;
+  contentBase64: string;
+}
 
 export interface MessageRetractionRecord {
   chatId: string;
@@ -233,8 +242,13 @@ export interface SpaceArchiveV18 extends Omit<SpaceArchiveV17, "version"> {
   agentKnowledgeFeedback: AgentKnowledgeFeedback[];
 }
 
+export interface SpaceArchiveV19 extends Omit<SpaceArchiveV18, "version"> {
+  version: typeof RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION;
+  sourceFiles: RawSourceFileArchive[];
+}
+
 /** Current normalized archive shape returned by export and parsing. */
-export type SpaceArchive = SpaceArchiveV18;
+export type SpaceArchive = SpaceArchiveV19;
 
 export interface SpaceDeleteResult {
   status: "deleted" | "not_found";
@@ -398,10 +412,31 @@ function parseRaw(value: unknown, index: number, space: SpaceId, version: number
     const attachment = record(value, `raw[${index}].attachments[${attachmentIndex}]`);
     const kind = text(attachment.kind, `raw[${index}].attachments[${attachmentIndex}].kind`) as Attachment["kind"];
     if (!ATTACHMENT_KINDS.includes(kind)) throw new Error(`raw[${index}].attachments[${attachmentIndex}].kind is invalid`);
+    const sourceDigest = version < RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION
+      ? undefined
+      : optionalText(
+          attachment.sourceDigest,
+          `raw[${index}].attachments[${attachmentIndex}].sourceDigest`,
+        );
+    const sourceSizeBytes = version < RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION
+      || attachment.sourceSizeBytes === undefined
+      ? undefined
+      : boundedNonNegativeInteger(
+          attachment.sourceSizeBytes,
+          `raw[${index}].attachments[${attachmentIndex}].sourceSizeBytes`,
+          MAX_RAW_SOURCE_BYTES,
+        );
+    if ((sourceDigest === undefined) !== (sourceSizeBytes === undefined)) {
+      throw new Error(`raw[${index}].attachments[${attachmentIndex}] stored source metadata must be complete`);
+    }
+    if (sourceDigest !== undefined && !RAW_SOURCE_DIGEST_PATTERN.test(sourceDigest)) {
+      throw new Error(`raw[${index}].attachments[${attachmentIndex}].sourceDigest is invalid`);
+    }
     return {
       kind,
       ref: text(attachment.ref, `raw[${index}].attachments[${attachmentIndex}].ref`),
       name: optionalText(attachment.name, `raw[${index}].attachments[${attachmentIndex}].name`),
+      ...(sourceDigest === undefined ? {} : { sourceDigest, sourceSizeBytes }),
     };
   });
   const admission = (version < RAW_ADMISSION_SPACE_ARCHIVE_VERSION
@@ -1865,6 +1900,52 @@ function parseLearningArchive(
   return { plans, sources, sessions };
 }
 
+const MAX_RAW_SOURCE_FILES_PER_ARCHIVE = 10_000;
+const MAX_RAW_SOURCE_ARCHIVE_BYTES = 1024 * 1024 * 1024;
+const MAX_RAW_SOURCE_BASE64_CHARACTERS = 4 * Math.ceil(MAX_RAW_SOURCE_BYTES / 3);
+
+function parseRawSourceFiles(value: unknown, version: number): RawSourceFileArchive[] {
+  if (version < RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION) return [];
+  if (!Array.isArray(value)) throw new Error("sourceFiles must be an array");
+  if (value.length > MAX_RAW_SOURCE_FILES_PER_ARCHIVE) {
+    throw new Error(`sourceFiles exceeds ${MAX_RAW_SOURCE_FILES_PER_ARCHIVE} records`);
+  }
+  let totalBytes = 0;
+  const files = value.map((candidate, index) => {
+    const item = record(candidate, `sourceFiles[${index}]`);
+    const digest = text(item.digest, `sourceFiles[${index}].digest`);
+    if (!RAW_SOURCE_DIGEST_PATTERN.test(digest)) {
+      throw new Error(`sourceFiles[${index}].digest is invalid`);
+    }
+    const sizeBytes = boundedNonNegativeInteger(
+      item.sizeBytes,
+      `sourceFiles[${index}].sizeBytes`,
+      MAX_RAW_SOURCE_BYTES,
+    );
+    const contentBase64 = text(item.contentBase64, `sourceFiles[${index}].contentBase64`);
+    if (contentBase64.length > MAX_RAW_SOURCE_BASE64_CHARACTERS) {
+      throw new Error(`sourceFiles[${index}].contentBase64 is too large`);
+    }
+    const bytes = Buffer.from(contentBase64, "base64");
+    if (bytes.toString("base64") !== contentBase64) {
+      throw new Error(`sourceFiles[${index}].contentBase64 is invalid`);
+    }
+    if (bytes.byteLength !== sizeBytes) {
+      throw new Error(`sourceFiles[${index}].sizeBytes does not match content`);
+    }
+    if (createHash("sha256").update(bytes).digest("hex") !== digest) {
+      throw new Error(`sourceFiles[${index}].digest does not match content`);
+    }
+    totalBytes += sizeBytes;
+    if (totalBytes > MAX_RAW_SOURCE_ARCHIVE_BYTES) {
+      throw new Error(`sourceFiles exceeds ${MAX_RAW_SOURCE_ARCHIVE_BYTES} total bytes`);
+    }
+    return { digest, sizeBytes, contentBase64 };
+  });
+  assertUnique(files, (file) => file.digest, "raw source digest");
+  return files;
+}
+
 /** Validate and normalize untrusted JSON before any restore writes occur. */
 export function parseSpaceArchive(value: unknown): SpaceArchive {
   const root = record(value, "archive");
@@ -1890,6 +1971,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       && version !== RAW_ADMISSION_SPACE_ARCHIVE_VERSION
       && version !== KNOWLEDGE_MAPS_SPACE_ARCHIVE_VERSION
       && version !== AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION
+      && version !== RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION
     )
   ) {
     throw new Error("unsupported space archive format or version");
@@ -1965,6 +2047,10 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       version >= AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION
       && !Array.isArray(root.agentKnowledgeFeedback)
     )
+    || (
+      version >= RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION
+      && !Array.isArray(root.sourceFiles)
+    )
   ) {
     throw new Error("archive collections must be arrays");
   }
@@ -1987,6 +2073,32 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
     ?? parseAgentRevisions(root.agentRevisions, agent, version);
   const pages = root.pages.map((page, index) => parsePage(page, index, version));
   const raw = root.raw.map((item, index) => parseRaw(item, index, id, version));
+  const sourceFiles = parseRawSourceFiles(root.sourceFiles, version);
+  const sourceFileByDigest = new Map(sourceFiles.map((file) => [file.digest, file]));
+  for (const [rawIndex, entry] of raw.entries()) {
+    for (const [attachmentIndex, attachment] of (entry.attachments ?? []).entries()) {
+      if (!attachment.sourceDigest) continue;
+      const sourceFile = sourceFileByDigest.get(attachment.sourceDigest);
+      if (!sourceFile) {
+        throw new Error(
+          `raw[${rawIndex}].attachments[${attachmentIndex}].sourceDigest is missing from sourceFiles`,
+        );
+      }
+      if (sourceFile.sizeBytes !== attachment.sourceSizeBytes) {
+        throw new Error(
+          `raw[${rawIndex}].attachments[${attachmentIndex}].sourceSizeBytes does not match sourceFiles`,
+        );
+      }
+    }
+  }
+  const referencedSourceDigests = new Set(
+    raw.flatMap((entry) => (entry.attachments ?? []).flatMap((attachment) =>
+      attachment.sourceDigest ? [attachment.sourceDigest] : []
+    )),
+  );
+  if (sourceFiles.some((file) => !referencedSourceDigests.has(file.digest))) {
+    throw new Error("sourceFiles contains an unreferenced original file");
+  }
   const retractions = root.retractions.map((value, index) => {
     const item = record(value, `retractions[${index}]`);
     return {
@@ -2406,5 +2518,6 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
     learning,
     governanceAudit,
     agentKnowledgeFeedback,
+    sourceFiles,
   };
 }

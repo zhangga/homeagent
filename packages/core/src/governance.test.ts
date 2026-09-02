@@ -40,6 +40,39 @@ afterEach(() => {
 });
 
 describe("space data governance", () => {
+  test("archive v19 validates original files and v18 remains readable", async () => {
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-source-file-archive-") });
+    await source.rememberFile(
+      { space: SPACE, source: "manual", content: "# 本地资料：contract.bin" },
+      {
+        attachment: { kind: "file", ref: "manual:contract.bin", name: "contract.bin" },
+        bytes: new Uint8Array([0, 1, 2, 255]),
+      },
+    );
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+
+    expect(parseSpaceArchive(archive).sourceFiles).toEqual(archive.sourceFiles);
+
+    const missing = structuredClone(archive) as Record<string, any>;
+    missing.sourceFiles = [];
+    expect(() => parseSpaceArchive(missing)).toThrow(/sourceDigest.*missing from sourceFiles/i);
+
+    const corrupt = structuredClone(archive) as Record<string, any>;
+    corrupt.sourceFiles[0].contentBase64 = "AAEC/g==";
+    expect(() => parseSpaceArchive(corrupt)).toThrow(/digest does not match content/i);
+
+    const legacy = structuredClone(archive) as Record<string, any>;
+    legacy.version = 18;
+    delete legacy.sourceFiles;
+    delete legacy.raw[0].attachments[0].sourceDigest;
+    delete legacy.raw[0].attachments[0].sourceSizeBytes;
+    expect(parseSpaceArchive(legacy)).toEqual(expect.objectContaining({
+      version: 19,
+      sourceFiles: [],
+    }));
+  });
+
   test("archive v18 round-trips Space-scoped Agent knowledge feedback", async () => {
     const source = new KnowledgeEngine({ dataDir: tempDir("ha-feedback-archive-") });
     await source.upsertPage(SPACE, {
@@ -71,7 +104,7 @@ describe("space data governance", () => {
     const archive = await source.exportSpace(SPACE);
     source.close();
 
-    expect(archive.version).toBe(18);
+    expect(archive.version).toBe(19);
     expect(archive.agentKnowledgeFeedback).toEqual([feedback]);
     expect(parseSpaceArchive(archive).agentKnowledgeFeedback).toEqual([feedback]);
 
@@ -139,7 +172,7 @@ describe("space data governance", () => {
     const archive = await engine.exportSpace(SPACE);
     engine.close();
 
-    expect(archive.version).toBe(18);
+    expect(archive.version).toBe(19);
     expect(parseSpaceArchive(archive).pages).toContainEqual(
       expect.objectContaining({ slug: "maps/backend", type: "map" }),
     );
@@ -602,7 +635,7 @@ describe("space data governance", () => {
     const archive = await source.exportSpace(SPACE);
     source.close();
 
-    expect(archive.version).toBe(18);
+    expect(archive.version).toBe(19);
     expect(archive.workItems).toEqual([
       expect.objectContaining({ id: workItem.id, rawIds: expect.arrayContaining([rawId]) }),
     ]);
@@ -1019,7 +1052,7 @@ describe("space data governance", () => {
     const archive = await source.exportSpace(SPACE);
     source.close();
 
-    expect(archive.version).toBe(18);
+    expect(archive.version).toBe(19);
     expect(archive.quality).toEqual({ traces: [trace], reruns: [] });
     const llm: LlmClient = {
       async complete() {
@@ -1183,7 +1216,7 @@ describe("space data governance", () => {
 
     const archive = await source.exportSpace(SPACE);
     source.close();
-    expect(archive.version).toBe(18);
+    expect(archive.version).toBe(19);
     const archivedChild = archive.taskRuns.find((item) => item.id === child.id)!;
     expect(archivedChild).toEqual(expect.objectContaining({
       failure: { phase: "provider", kind: "overloaded", retryable: true },
@@ -1282,7 +1315,7 @@ describe("space data governance", () => {
 
     const archive = await source.exportSpace(SPACE);
     source.close();
-    expect(archive.version).toBe(18);
+    expect(archive.version).toBe(19);
     expect(archive.taskRuns[0]).toEqual(expect.objectContaining({
       approval: expect.objectContaining({
         status: "expired",
@@ -1334,7 +1367,7 @@ describe("space data governance", () => {
     const expectedRevisions = source.agents.listRevisions(created.id);
     const archive = await source.exportSpace(SPACE);
     source.close();
-    expect(archive.version).toBe(18);
+    expect(archive.version).toBe(19);
     expect(archive.agentRevisions).toEqual(expectedRevisions);
     expect(archive.taskRuns[0]?.approval).toEqual(expect.objectContaining({
       status: "approved",
@@ -1498,7 +1531,7 @@ describe("space data governance", () => {
     const restarted = new KnowledgeEngine({ dataDir: restoredDir });
     expect(restarted.listTaskRuns(task.id)[0]?.executionPlan).toEqual(expectedPlan);
     const upgraded = await restarted.exportSpace(SPACE);
-    expect(upgraded.version).toBe(18);
+    expect(upgraded.version).toBe(19);
     expect(upgraded.taskRuns[0]?.executionPlan).toEqual(expectedPlan);
     restarted.close();
 
@@ -1814,7 +1847,7 @@ describe("space data governance", () => {
     expect(restarted.agents.listRevisions(agent.id)).toEqual(expectedRevisions);
     expect(restarted.listTaskRuns(task.id)[0]?.approval).toEqual(expectedApproval);
     const upgraded = await restarted.exportSpace(SPACE);
-    expect(upgraded.version).toBe(18);
+    expect(upgraded.version).toBe(19);
     restarted.close();
 
     const fresh = new KnowledgeEngine({ dataDir: tempDir("ha-v11-disk-fresh-") });
@@ -1916,7 +1949,7 @@ describe("space data governance", () => {
       approvalNotification: expectedNotification,
     }));
     const upgraded = await restarted.exportSpace(SPACE);
-    expect(upgraded.version).toBe(18);
+    expect(upgraded.version).toBe(19);
     restarted.close();
 
     const fresh = new KnowledgeEngine({ dataDir: tempDir("ha-v12-disk-fresh-") });
@@ -2046,7 +2079,7 @@ describe("space data governance", () => {
     expect(restarted.getTaskRun(child.id)).toEqual(expectedChild);
     expect(restarted.chatRuns.get(chat.id)?.traceId).toBeUndefined();
     const upgraded = await restarted.exportSpace(SPACE);
-    expect(upgraded.version).toBe(18);
+    expect(upgraded.version).toBe(19);
     expect(upgraded.quality).toEqual({ traces: [], reruns: [] });
     restarted.close();
 
@@ -2258,7 +2291,7 @@ describe("space data governance", () => {
     expect(archive).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 18,
+        version: 19,
         space: expect.objectContaining({
           id: SPACE,
           name: "治理群",
@@ -2363,7 +2396,7 @@ describe("space data governance", () => {
     } = archive;
     const parsed = parseSpaceArchive({ ...withoutLearning, version: 1 });
 
-    expect(parsed.version).toBe(18);
+    expect(parsed.version).toBe(19);
     expect(parsed.learning).toEqual({ plans: [], sources: [], sessions: [] });
     expect(parsed.governanceAudit).toEqual([]);
     expect(parsed.taskRuns).toEqual([]);
@@ -2395,7 +2428,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(18);
+    expect(parsed.version).toBe(19);
     expect(parsed.learning.plans[0]).toEqual(expect.objectContaining({
       id: plan.id,
       mode: "reading",
@@ -2443,7 +2476,7 @@ describe("space data governance", () => {
     expect(target.learning.source(plan.id)?.materials).toEqual([
       expect.objectContaining({ title: "Async Book", rawIds: ["raw_async"] }),
     ]);
-    expect((await target.exportSpace(SPACE)).version).toBe(18);
+    expect((await target.exportSpace(SPACE)).version).toBe(19);
     target.close();
   });
 
@@ -2587,7 +2620,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(18);
+    expect(parsed.version).toBe(19);
     expect(parsed.taskRuns).toEqual([]);
   });
 
@@ -2616,7 +2649,7 @@ describe("space data governance", () => {
 
     const parsed = parseSpaceArchive(archive);
 
-    expect(parsed.version).toBe(18);
+    expect(parsed.version).toBe(19);
     expect(parsed.tasks[0]?.timeoutMinutes).toBe(360);
     expect(parsed.tasks[0]?.dayOfWeek).toBe(1);
     expect(parsed.taskRuns).toEqual([

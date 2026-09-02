@@ -88,11 +88,13 @@ export function prefilterChitchat(text: string): boolean {
 function isExplicitRememberRequest(text: string): boolean {
   const compact = text.replace(/[。.!！]+$/u, "").trim();
   return /^(?:(?:请|帮我)\s*)?(?:记住|记下|记录下来)/u.test(compact)
-    || /(?:^|[，,\s])(?:记住|记下|记录下来)$/u.test(compact)
+    || /^(?:(?:请|帮我)\s*)?(?:记录|收录|保存)(?:这个|这份|该)?(?:原)?(?:文件|附件|资料)/u.test(compact)
+    || /^(?:请\s*)?(?:把\s*)?(?:这个|这份|该)?(?:原)?(?:文件|附件|资料)(?:帮我)?(?:记录|收录|保存)(?:下来)?$/u.test(compact)
+    || /(?:^|[，,\s])(?:记住|记下|记录下来|收录|保存)$/u.test(compact)
     // A user often pastes the material first, then addresses the bot on the
     // final line. Leading-mention normalization cannot see that rendered @,
     // so recognize only a narrow, line-anchored deictic memory command here.
-    || /(?:^|[\r\n])\s*(?:@\S+\s+)?(?:(?:请|帮我)\s*)?(?:记住|记下|记录下来)(?:上面|以上|前面|上述|这些|这条|本条)(?:的)?(?:信息|内容|消息|资料|记录)?\s*$/u.test(compact);
+    || /(?:^|[\r\n])\s*(?:@\S+\s+)?(?:(?:请|帮我)\s*)?(?:记住|记下|记录下来|收录|保存)(?:上面|以上|前面|上述|这些|这条|本条)(?:的)?(?:信息|内容|消息|资料|记录|文件|附件)?\s*$/u.test(compact);
 }
 
 /**

@@ -15,6 +15,10 @@ Raw 的权威、可读存储 module。当前状态按 UTC 创建日期写入
 `raw/records/YYYY/MM/DD.jsonl`，撤回标记写入 `raw/retractions.jsonl`。修改使用同目录临时文件、
 fsync 与原子替换；首次升级从旧 SQLite Raw 回填，之后负责恢复 SQLite projection。
 
+手动上传或对话收录的原文件按 SHA-256 内容寻址，不可变地保存在同一 Space 的 `raw/sources/`；
+Raw attachment 保存摘要、字节数和文件名。提炼文本可以有独立的模型输入上限，但不得截断或替代原文件。
+原文件随 `homeagent.space v19` 归档导出和恢复，Wiki 只保留指向 Raw 的 provenance，不复制文件正文。
+
 ## Knowledge page
 
 Dream cycle 从已准入 Raw 提炼出的 Obsidian-compatible Markdown。知识页保留 Raw id 作为 provenance，

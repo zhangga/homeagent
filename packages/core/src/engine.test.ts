@@ -103,6 +103,8 @@ describe("Knowledge seam contract", () => {
     const k: Knowledge = engine;
     for (const method of [
       "remember",
+      "rememberFile",
+      "getRawSource",
       "getSpaceGovernance",
       "updateSpaceRules",
       "resetSpaceRule",
@@ -3950,6 +3952,42 @@ describe("Knowledge seam contract", () => {
         lastPagesWritten: 1,
       }),
     ]);
+  });
+
+  test("space export and restore retain exact original source files", async () => {
+    const sourceDir = join(dir, "original-source-export");
+    let source = new KnowledgeEngine({ dataDir: sourceDir });
+    const original = new Uint8Array([0, 10, 13, 42, 128, 255]);
+    const rawId = await source.rememberFile(
+      {
+        space: SPACE,
+        source: "manual",
+        content: "# 本地资料：evidence.bin",
+      },
+      {
+        attachment: { kind: "file", ref: "manual:evidence.bin", name: "evidence.bin" },
+        bytes: original,
+      },
+    );
+    source.close();
+    source = new KnowledgeEngine({ dataDir: sourceDir });
+    const archive = await source.exportSpace(SPACE);
+    source.close();
+
+    expect(archive.sourceFiles).toEqual([
+      expect.objectContaining({
+        digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        sizeBytes: original.byteLength,
+        contentBase64: Buffer.from(original).toString("base64"),
+      }),
+    ]);
+    expect(await engine.restoreSpace(archive)).toBe(SPACE);
+    const restored = engine.getRawSource(SPACE, rawId, 0);
+    expect(restored).toEqual(expect.objectContaining({
+      name: "evidence.bin",
+      sizeBytes: original.byteLength,
+    }));
+    expect(new Uint8Array(readFileSync(restored!.path))).toEqual(original);
   });
 
   test("a legacy quarantine upgrades its fixed slug without re-analysis", async () => {

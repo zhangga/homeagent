@@ -36,10 +36,15 @@ import type {
   WikiMaintenanceReport,
 } from "./maintenance.ts";
 import type { KnowledgePageTrace } from "./traceability.ts";
+import type { RawSourceCapture, RawSourceDownload } from "./raw-source-files.ts";
 
 export interface Knowledge {
   /** Cheap capture — persists a raw entry, no LLM call. */
   remember(entry: RawEntry): Promise<string>;
+  /** Capture Raw plus one exact immutable original file in the same Space. */
+  rememberFile(entry: RawEntry, file: RawSourceCapture): Promise<string>;
+  /** Resolve one stored original file through Raw provenance. */
+  getRawSource(space: SpaceId, rawId: string, attachmentIndex: number): RawSourceDownload | null;
 
   /** Read and edit the human-maintained rules and governance history for a space. */
   getSpaceGovernance(space: SpaceId): Promise<KnowledgeGovernanceSnapshot>;

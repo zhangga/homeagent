@@ -130,6 +130,8 @@ describe("conversation interpretation", () => {
   test("only explicit memory language is acknowledged without another model turn", () => {
     expect(interpretConversation("记住：发布流程先灰度再全量").disposition).toBe("remember");
     expect(interpretConversation("记住这个发布流程").disposition).toBe("remember");
+    expect(interpretConversation("请记录这个原文件").disposition).toBe("remember");
+    expect(interpretConversation("请把这个原文件保存下来").disposition).toBe("remember");
     expect(interpretConversation("@agent 张洺汐是男的，2018年生的，记住").disposition).toBe("remember");
     expect(interpretConversation([
       "UE 5.8 Iris 已支持按连接并行 Tick。",

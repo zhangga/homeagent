@@ -1477,17 +1477,22 @@ export function createWebApp(opts: WebOptions): Hono {
     }
     const rawIds: string[] = [];
     for (const material of materials) {
-      rawIds.push(await engine.remember({
-        space,
-        source: "manual",
-        author: LOCAL_GOVERNANCE_ACTOR,
-        content: localMaterialRawContent(material),
-        attachments: [{
-          kind: "file",
-          ref: `sha256:${material.digest}`,
-          name: material.name,
-        }],
-      }));
+      rawIds.push(await engine.rememberFile(
+        {
+          space,
+          source: "manual",
+          author: LOCAL_GOVERNANCE_ACTOR,
+          content: localMaterialRawContent(material),
+        },
+        {
+          attachment: {
+            kind: "file",
+            ref: `sha256:${material.digest}`,
+            name: material.name,
+          },
+          bytes: material.bytes,
+        },
+      ));
     }
     let message = rawIds.length === 1
       ? "资料已导入，等待提炼"
@@ -1705,6 +1710,35 @@ export function createWebApp(opts: WebOptions): Hono {
         "spaces",
       ),
     );
+  });
+
+  app.get("/spaces/:space/raw/:id/attachments/:index", async (c) => {
+    const space = parseSpace(c.req.param("space"));
+    if (!space || !engine.registry.has(space)) return c.notFound();
+    const index = Number(c.req.param("index"));
+    if (!Number.isSafeInteger(index) || index < 0) return c.notFound();
+    let source;
+    try {
+      source = engine.getRawSource(space, c.req.param("id"), index);
+    } catch {
+      return c.notFound();
+    }
+    if (!source) return c.notFound();
+    const asciiName = source.name
+      .replace(/[^\x20-\x7e]/gu, "_")
+      .replace(/["\\]/gu, "_")
+      .slice(0, 255) || "source";
+    const encodedName = encodeURIComponent(
+      source.name.replace(/[\uD800-\uDFFF]/gu, "�").slice(0, 255),
+    );
+    c.header("content-type", "application/octet-stream");
+    c.header(
+      "content-disposition",
+      `attachment; filename="${asciiName}"; filename*=UTF-8''${encodedName}`,
+    );
+    c.header("cache-control", "no-store");
+    c.header("x-content-type-options", "nosniff");
+    return c.body(await Bun.file(source.path).arrayBuffer());
   });
 
   app.post("/spaces/:space/raw/:id/redistill", async (c) => {

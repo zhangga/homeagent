@@ -16,6 +16,7 @@ export * from "./reminders.ts";
 export * from "./work-items.ts";
 export * from "./work-continuation.ts";
 export * from "./space.ts";
+export * from "./raw-source-files.ts";
 export * from "./sqlite.ts";
 export * from "./markdown.ts";
 export * from "./tokenize.ts";
