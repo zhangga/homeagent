@@ -123,6 +123,41 @@ describe("FeishuConnector daemon (fake spawn)", () => {
     expect(msgs.some((m) => m.text === "谁负责后端？")).toBe(true);
   });
 
+  test("preserves Feishu topic identity from lark-cli NDJSON", async () => {
+    const spawner = new FakeSpawner();
+    const events: InboundEvent[] = [];
+    connector = new FeishuConnector({ spawner, runCommand: async () => "{}" });
+    await connector.start((event) => {
+      events.push(event);
+    });
+
+    const proc = await spawner.waitForProc("im.message.receive_v1");
+    proc.emitStderr("[event] ready event_key=im.message.receive_v1");
+    await Bun.sleep(20);
+    proc.emitStdout(JSON.stringify({
+      chat_id: "oc_topic_group",
+      chat_type: "topic_group",
+      content: "继续讨论",
+      event_id: "evt_topic_reply",
+      message_id: "om_topic_reply",
+      sender_id: "ou_topic_member",
+      thread_id: "omt_topic",
+      root_id: "om_topic_root",
+      reply_to: "om_topic_parent",
+    }));
+    await Bun.sleep(30);
+
+    expect(events.find((event) =>
+      event.kind === "message" && event.messageId === "om_topic_reply"
+    )).toEqual(expect.objectContaining({
+      kind: "message",
+      chatType: "group",
+      threadId: "omt_topic",
+      rootMessageId: "om_topic_root",
+      parentMessageId: "om_topic_parent",
+    }));
+  });
+
   test("normalizes a bot_added event from the added consumer", async () => {
     const spawner = new FakeSpawner();
     const events: InboundEvent[] = [];
@@ -583,7 +618,7 @@ describe("FeishuConnector outbound", () => {
     expect(cmd).toContain("bot");
   });
 
-  test("reply retries idempotently and propagates a final delivery failure", async () => {
+  test("reply retries one logical delivery with a bounded opaque idempotency key", async () => {
     const commands: string[][] = [];
     connector = new FeishuConnector({
       spawner: new FakeSpawner(),
@@ -598,6 +633,7 @@ describe("FeishuConnector outbound", () => {
       chatId: "oc_1",
       replyToMessageId: "om_retry",
       markdown: "hello",
+      idempotencyKey: "chat_run_11111111-1111-4111-8111-111111111111",
     })).rejects.toThrow("temporary Feishu delivery failure");
 
     expect(commands).toHaveLength(2);
@@ -607,6 +643,59 @@ describe("FeishuConnector outbound", () => {
     });
     expect(idempotencyKeys[0]).toBeDefined();
     expect(idempotencyKeys[1]).toBe(idempotencyKeys[0]);
+    expect(idempotencyKeys[0]).toMatch(/^ha-reply-[0-9a-f]{32}$/u);
+    expect(idempotencyKeys[0]).not.toContain("chat_run_");
+    expect(idempotencyKeys[0]).not.toContain("hello");
+  });
+
+  test("reply gives different logical deliveries different idempotency keys", async () => {
+    const commands: string[][] = [];
+    connector = new FeishuConnector({
+      spawner: new FakeSpawner(),
+      runCommand: async (cmd) => {
+        commands.push(cmd);
+        return "{}";
+      },
+    });
+
+    await connector.reply({
+      chatId: "oc_1",
+      replyToMessageId: "om_retry",
+      markdown: "first attempt",
+      idempotencyKey: "chat_run_11111111-1111-4111-8111-111111111111",
+    });
+    await connector.reply({
+      chatId: "oc_1",
+      replyToMessageId: "om_retry",
+      markdown: "retry result",
+      idempotencyKey: "chat_run_22222222-2222-4222-8222-222222222222",
+    });
+
+    const idempotencyKeys = commands.map((cmd) => {
+      const keyIndex = cmd.indexOf("--idempotency-key");
+      return keyIndex < 0 ? undefined : cmd[keyIndex + 1];
+    });
+    expect(idempotencyKeys).toHaveLength(2);
+    expect(idempotencyKeys[0]).not.toBe(idempotencyKeys[1]);
+  });
+
+  test("reply rejects an unbounded idempotency identity before invoking lark-cli", async () => {
+    const commands: string[][] = [];
+    connector = new FeishuConnector({
+      spawner: new FakeSpawner(),
+      runCommand: async (cmd) => {
+        commands.push(cmd);
+        return "{}";
+      },
+    });
+
+    await expect(connector.reply({
+      chatId: "oc_1",
+      replyToMessageId: "om_1",
+      markdown: "must not be sent",
+      idempotencyKey: "x".repeat(513),
+    })).rejects.toThrow(/idempotency.*limit/i);
+    expect(commands).toEqual([]);
   });
 
   test("notice uses +messages-send with chat-id", async () => {

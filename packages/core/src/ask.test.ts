@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { JSONOptions } from "@homeagent/llm";
+import type { CompleteOptions } from "@homeagent/llm";
 import type { Page, SpaceId } from "@homeagent/shared";
 import {
   AI_GENERATION_MAX_TOKENS,
@@ -601,6 +602,126 @@ describe("ask pipeline", () => {
     expect(res.source).toBe("general");
     // routing/synthesis should not have been called on an empty KB
     expect(fake.calls.filter((c) => c.kind === "json").length).toBe(0);
+  });
+
+  test("general fallback binds the explicit native session to the final answer", async () => {
+    const sessionId = "11111111-2222-4333-8444-555555555555";
+    const calls: CompleteOptions[] = [];
+    const client = {
+      async complete(opts: CompleteOptions) {
+        calls.push(opts);
+        return { text: "连续回答", model: "fake", nativeSessionId: sessionId };
+      },
+      async completeJSON() {
+        throw new Error("empty knowledge must not route");
+      },
+    };
+
+    const result = await ask(
+      [store],
+      "继续说",
+      { nativeSession: { mode: "start" } },
+      { client },
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.nativeSession).toEqual({ mode: "start" });
+    expect(result.nativeSessionId).toBe(sessionId);
+  });
+
+  test("knowledge routing stays isolated while synthesis advances the native session", async () => {
+    store.writePage(page("entities/alice", "Alice", "Alice 负责后端。"));
+    const parentSessionId = "11111111-2222-4333-8444-555555555555";
+    const forkedSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const seenSessions: unknown[] = [];
+    const client = {
+      async complete() {
+        throw new Error("grounded answer must not use text fallback");
+      },
+      async completeJSON<T>(opts: JSONOptions<T>) {
+        seenSessions.push(opts.nativeSession);
+        const properties = (opts.schema as { properties?: Record<string, unknown> }).properties;
+        if (properties && "relevant" in properties) {
+          return {
+            value: { slugs: ["entities/alice"], relevant: true } as T,
+            result: { text: "", model: "fake" },
+          };
+        }
+        return {
+          value: {
+            answer: "Alice 负责后端。",
+            grounded: true,
+            usedSlugs: ["entities/alice"],
+            gaps: [],
+          } as T,
+          result: { text: "", model: "fake", nativeSessionId: forkedSessionId },
+        };
+      },
+    };
+
+    const result = await ask(
+      [store],
+      "谁负责后端？",
+      { nativeSession: { mode: "fork", id: parentSessionId } },
+      { client },
+    );
+
+    expect(seenSessions).toEqual([
+      undefined,
+      { mode: "fork", id: parentSessionId },
+    ]);
+    expect(result.nativeSessionId).toBe(forkedSessionId);
+  });
+
+  test("native-session synthesis produces the only final answer when knowledge is insufficient", async () => {
+    store.writePage(page("entities/alice", "Alice", "Alice 负责后端。"));
+    const parentSessionId = "11111111-2222-4333-8444-555555555555";
+    const forkedSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const seenSessions: unknown[] = [];
+    const client = {
+      async complete() {
+        throw new Error("a native topic turn must not advance the provider session twice");
+      },
+      async completeJSON<T>(opts: JSONOptions<T>) {
+        seenSessions.push(opts.nativeSession);
+        const properties = (opts.schema as { properties?: Record<string, unknown> }).properties;
+        if (properties && "relevant" in properties) {
+          return {
+            value: { slugs: ["entities/alice"], relevant: true } as T,
+            result: { text: "", model: "fake" },
+          };
+        }
+        expect(String(opts.prompt)).toContain("通用知识");
+        return {
+          value: {
+            answer: "这不在知识库记录中，以下是我的一般性回答：可以先确认目标。",
+            grounded: false,
+            usedSlugs: [],
+            gaps: ["知识库没有相关目标"],
+          } as T,
+          result: { text: "", model: "fake", nativeSessionId: forkedSessionId },
+        };
+      },
+    };
+
+    const result = await ask(
+      [store],
+      "那接下来怎么办？",
+      { nativeSession: { mode: "fork", id: parentSessionId } },
+      { client },
+    );
+
+    expect(seenSessions).toEqual([
+      undefined,
+      { mode: "fork", id: parentSessionId },
+    ]);
+    expect(result).toEqual({
+      answer: "这不在知识库记录中，以下是我的一般性回答：可以先确认目标。",
+      source: "general",
+      citations: [],
+      gaps: ["知识库没有相关目标"],
+      nativeSessionId: forkedSessionId,
+    });
   });
 
   test("general fallback preserves visual inputs from the user turn", async () => {

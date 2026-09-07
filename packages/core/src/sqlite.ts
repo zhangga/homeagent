@@ -484,6 +484,17 @@ export class SpaceIndex {
     return result.changes > 0;
   }
 
+  markRawAgentHandled(id: string): boolean {
+    const current = this.getRaw(id);
+    if (!current || current.source !== "message") return false;
+    if (current.agentHandled === true) return true;
+    this.rawJournal?.replaceMany([{ ...current, agentHandled: true }]);
+    const result = this.db
+      .query(`UPDATE raw SET agent_handled = 1 WHERE id = ? AND source = 'message'`)
+      .run(id);
+    return result.changes > 0;
+  }
+
   recordAgentResponse(
     chatId: string,
     messageId: string,

@@ -205,6 +205,114 @@ describe("makeCliClient", () => {
     }
   });
 
+  test("completeJSON binds only the explicitly requested native session turn", async () => {
+    const sessionId = "11111111-2222-4333-8444-555555555555";
+    let nativeSession: unknown;
+    const cli = makeCliClient(
+      "codex",
+      "gpt-5.6-sol",
+      testAccountingDataDir,
+      async (_provider, input) => {
+        nativeSession = input.nativeSession;
+        return {
+          text: JSON.stringify({ answer: "topic answer" }),
+          nativeSessionId: sessionId,
+          usage: { costBasis: "unavailable", source: "codex-jsonl" },
+        };
+      },
+    );
+
+    const output = await cli.completeJSON<{ answer: string }>({
+      prompt: "answer topic",
+      schema: { type: "object" },
+      nativeSession: { mode: "fork", id: sessionId },
+    });
+
+    expect(nativeSession).toEqual({ mode: "fork", id: sessionId });
+    expect(output.result.nativeSessionId).toBe(sessionId);
+  });
+
+  test("complete() forwards and returns an explicit native session", async () => {
+    const sessionId = "11111111-2222-4333-8444-555555555555";
+    let nativeSession: unknown;
+    const cli = makeCliClient(
+      "codex",
+      "gpt-5.6-sol",
+      testAccountingDataDir,
+      async (_provider, input) => {
+        nativeSession = input.nativeSession;
+        return {
+          text: "topic answer",
+          nativeSessionId: sessionId,
+          usage: { costBasis: "unavailable", source: "codex-jsonl" },
+        };
+      },
+    );
+
+    const result = await cli.complete({
+      prompt: "start topic",
+      nativeSession: { mode: "start" },
+    });
+
+    expect(nativeSession).toEqual({ mode: "start" });
+    expect(result.nativeSessionId).toBe(sessionId);
+  });
+
+  test("a native topic client isolates routing calls and forwards frozen Skill inputs", async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const skillInput = {
+      name: "review",
+      directory: join(testAccountingDataDir, "skills", "review"),
+      skillFile: join(testAccountingDataDir, "skills", "review", "SKILL.md"),
+      bundleHash: "a".repeat(64),
+    };
+    const execution = {
+      permission: "read-only" as const,
+      skills: ["review"],
+      skillMode: "all" as const,
+    };
+    const cli = makeCliClient(
+      "codex",
+      "gpt-5.6-sol",
+      testAccountingDataDir,
+      async (_provider, input) => {
+        seen.push(input as unknown as Record<string, unknown>);
+        return input.outputSchema
+          ? '{"intent":"question"}'
+          : {
+              text: "topic answer",
+              nativeSessionId: "11111111-2222-4333-8444-555555555555",
+              usage: { costBasis: "unavailable", source: "codex-jsonl" },
+            };
+      },
+      undefined,
+      undefined,
+      undefined,
+      execution,
+      ["review"],
+      undefined,
+      [skillInput],
+      true,
+    );
+
+    await cli.completeJSON({ prompt: "classify", schema: { type: "object" } });
+    await cli.complete({ prompt: "answer", nativeSession: { mode: "start" } });
+
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toEqual(expect.objectContaining({
+      nativeSession: undefined,
+      nativeSessionIsolation: true,
+      protectedDataRoot: testAccountingDataDir,
+      skillInputs: [skillInput],
+    }));
+    expect(seen[1]).toEqual(expect.objectContaining({
+      nativeSession: { mode: "start" },
+      nativeSessionIsolation: true,
+      protectedDataRoot: testAccountingDataDir,
+      skillInputs: [skillInput],
+    }));
+  });
+
   test("usage accounting read failures never block a Provider call", async () => {
     const directory = mkdtempSync(join(tmpdir(), "ha-cli-accounting-failure-"));
     const logs = join(directory, "logs");

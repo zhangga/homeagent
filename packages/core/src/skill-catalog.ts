@@ -2,7 +2,13 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
-import { providerSkillReference, type ProviderId } from "@homeagent/llm";
+import {
+  hashProviderSkillBundle,
+  providerCodexHome,
+  providerSkillReference,
+  type ProviderSkillInput,
+  type ProviderId,
+} from "@homeagent/llm";
 import type { SkillWarningView } from "@homeagent/shared";
 
 export type SkillRootKind =
@@ -149,7 +155,10 @@ export interface SkillCatalogOptions {
   };
 }
 
-export function defaultSkillRoots(homeDirectory = homedir()): SkillRoot[] {
+export function defaultSkillRoots(
+  homeDirectory = homedir(),
+  codexHome = providerCodexHome(),
+): SkillRoot[] {
   return [
     {
       kind: "shared-agents",
@@ -158,17 +167,7 @@ export function defaultSkillRoots(homeDirectory = homedir()): SkillRoot[] {
     },
     {
       kind: "codex-user",
-      path: join(homeDirectory, ".codex", "skills"),
-      providerIds: ["codex"],
-    },
-    {
-      kind: "codex-plugin",
-      path: join(homeDirectory, ".codex", "plugins", "cache"),
-      providerIds: ["codex"],
-    },
-    {
-      kind: "codex-vendor",
-      path: join(homeDirectory, ".codex", "vendor_imports", "skills"),
+      path: join(codexHome, "skills"),
       providerIds: ["codex"],
     },
     {
@@ -219,6 +218,9 @@ function normalizedRelativeDir(root: string, directory: string): string {
 function validSkillName(value: string): boolean {
   return /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,79}$/.test(value);
 }
+
+/** Bound the memoized bundle-hash table so a churning corpus cannot grow it. */
+const MAX_BUNDLE_HASH_CACHE_ENTRIES = 4_000;
 
 const providerRootPrecedence: Record<ProviderId, readonly SkillRootKind[]> = {
   gateway: [],
@@ -279,6 +281,59 @@ function catalogEntries(sources: SkillSource[]): SkillCatalogEntry[] {
   );
 }
 
+/**
+ * Bounded metadata key for one Skill bundle. Walking metadata is far cheaper
+ * than reading every byte, and any write changes an entry's size, mode, mtime
+ * or ctime, so an unchanged signature means a previously computed bundle hash
+ * is still valid. This is only ever a cache key: any miss, or any walk failure,
+ * falls through to the authoritative content hash, which keeps the symlink,
+ * escape and size rules of `hashProviderSkillBundle` in force.
+ */
+function skillBundleSignature(skillFile: string, maxEntries: number): string {
+  const root = dirname(skillFile);
+  const parts: string[] = [];
+  const pending = [{ directory: root, relativeDir: "", depth: 0 }];
+  let entries = 0;
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (current.depth > 32) throw new Error("Skill bundle is too deeply nested");
+    const children = readdirSync(current.directory, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const child of children) {
+      entries += 1;
+      if (entries > maxEntries) throw new Error("Skill bundle has too many entries");
+      const fullPath = join(current.directory, child.name);
+      const relativePath = join(current.relativeDir, child.name).split(sep).join("/");
+      const metadata = lstatSync(fullPath);
+      const kind = metadata.isSymbolicLink()
+        ? "l"
+        : metadata.isDirectory()
+        ? "d"
+        : metadata.isFile()
+        ? "f"
+        : "o";
+      parts.push([
+        relativePath,
+        kind,
+        metadata.size,
+        metadata.mode,
+        metadata.mtimeMs,
+        metadata.ctimeMs,
+        metadata.dev,
+        metadata.ino,
+      ].join("\0"));
+      if (kind === "d") {
+        pending.push({
+          directory: fullPath,
+          relativeDir: relativePath,
+          depth: current.depth + 1,
+        });
+      }
+    }
+  }
+  return createHash("sha256").update(parts.join("\n")).digest("hex");
+}
+
 function skillDirectories(root: string, maxDepth: number, maxEntries: number): string[] {
   const pending = [{ directory: root, depth: 0 }];
   const found: string[] = [];
@@ -309,90 +364,6 @@ function skillDirectories(root: string, maxDepth: number, maxEntries: number): s
   return found.sort();
 }
 
-interface SkillBundleFile {
-  path: string;
-  mode: number;
-  content: Buffer;
-}
-
-/**
- * Hash every regular file a native Skill can load. A single-file Skill keeps
- * its historical SKILL.md digest for compatibility; once resources exist the
- * manifest binds path, mode and bytes. Symlinks/junctions and oversized trees
- * fail closed instead of following content outside the selected Skill.
- */
-function hashSkillBundle(
-  skillFile: string,
-  maxEntries: number,
-  maxTotalBytes: number,
-): string {
-  const root = dirname(skillFile);
-  const canonicalRoot = realpathSync(root);
-  if (lstatSync(root).isSymbolicLink()) {
-    throw new Error("Skill bundle root cannot be a symbolic link");
-  }
-  const files: SkillBundleFile[] = [];
-  const pending = [{ directory: root, relativeDir: "", depth: 0 }];
-  let entries = 0;
-  let totalBytes = 0;
-  while (pending.length > 0) {
-    const current = pending.pop()!;
-    if (current.depth > 32) throw new Error("Skill bundle is too deeply nested");
-    const children = readdirSync(current.directory, { withFileTypes: true })
-      .sort((left, right) => left.name.localeCompare(right.name));
-    for (const child of children) {
-      entries += 1;
-      if (entries > maxEntries) throw new Error("Skill bundle has too many entries");
-      const fullPath = join(current.directory, child.name);
-      const metadata = lstatSync(fullPath);
-      if (metadata.isSymbolicLink()) {
-        throw new Error("Skill bundle cannot contain symbolic links");
-      }
-      const canonicalPath = realpathSync(fullPath);
-      const fromRoot = relative(canonicalRoot, canonicalPath);
-      if (
-        fromRoot === ".."
-        || fromRoot.startsWith(`..${sep}`)
-        || isAbsolute(fromRoot)
-      ) {
-        throw new Error("Skill bundle entry escapes its root");
-      }
-      const relativePath = join(current.relativeDir, child.name).split(sep).join("/");
-      if (metadata.isDirectory()) {
-        pending.push({
-          directory: fullPath,
-          relativeDir: relativePath,
-          depth: current.depth + 1,
-        });
-        continue;
-      }
-      if (!metadata.isFile()) throw new Error("Skill bundle contains a non-regular file");
-      totalBytes += metadata.size;
-      if (totalBytes > maxTotalBytes) throw new Error("Skill bundle is too large");
-      const content = readFileSync(fullPath);
-      const after = lstatSync(fullPath);
-      if (
-        after.isSymbolicLink()
-        || after.size !== metadata.size
-        || after.mtimeMs !== metadata.mtimeMs
-      ) {
-        throw new Error("Skill bundle changed while it was being hashed");
-      }
-      files.push({ path: relativePath, mode: metadata.mode & 0o777, content });
-    }
-  }
-  files.sort((left, right) => left.path.localeCompare(right.path));
-  if (files.length === 1 && files[0]!.path === "SKILL.md") {
-    return createHash("sha256").update(files[0]!.content).digest("hex");
-  }
-  const hash = createHash("sha256").update("homeagent-skill-bundle-v1\0");
-  for (const file of files) {
-    hash.update(`${Buffer.byteLength(file.path)}:${file.path}\0${file.mode}\0${file.content.length}\0`);
-    hash.update(file.content);
-  }
-  return hash.digest("hex");
-}
-
 export class SkillCatalog {
   private readonly roots: SkillRoot[];
   private readonly maxDepth: number;
@@ -403,6 +374,15 @@ export class SkillCatalog {
   private readonly cacheTtlMs: number;
   private readonly now: () => number;
   private snapshot?: SkillCatalogSnapshot;
+  /** Bundle hashes produced by the immediately preceding synchronous resolve. */
+  private lastResolvedBundleHashes = new Map<string, string>();
+  /**
+   * Content hashes keyed by canonical path plus a bounded metadata signature.
+   * Reading every bundle byte on each resolve made admission cost scale with
+   * the whole installed Skill corpus; this keeps repeat resolves metadata-only
+   * while still recomputing whenever any entry's metadata changes.
+   */
+  private readonly bundleHashCache = new Map<string, string | null>();
 
   constructor(options: SkillCatalogOptions) {
     this.roots = options.roots.map((root) => ({
@@ -419,6 +399,49 @@ export class SkillCatalog {
     this.maxEntries = Math.max(1, Math.trunc(options.limits?.maxEntries ?? 50_000));
     this.cacheTtlMs = Math.max(0, Math.trunc(options.cacheTtlMs ?? 30_000));
     this.now = options.now ?? Date.now;
+  }
+
+  /**
+   * Authoritative bundle hash, memoized on a bounded metadata signature.
+   * A cache hit still proves nothing was written since the stored hash, and a
+   * miss recomputes through `hashProviderSkillBundle`, so every symlink, escape,
+   * entry-count and size rule keeps failing closed exactly as before.
+   */
+  private bundleHash(skillFile: string): string {
+    let signature: string | undefined;
+    try {
+      signature = `${realpathSync(skillFile)}\u0000${
+        skillBundleSignature(skillFile, this.maxEntries)
+      }`;
+    } catch {
+      // An unreadable or hostile tree must reach the authoritative hash below,
+      // which raises the specific failure the caller already handles.
+      signature = undefined;
+    }
+    if (signature !== undefined) {
+      const cached = this.bundleHashCache.get(signature);
+      // `null` records a bundle that is deterministically unusable for this exact
+      // metadata shape (oversized, symlinked, escaping). Rejecting it from cache
+      // keeps the same fail-closed outcome without re-reading the whole tree.
+      if (cached === null) throw new Error("Skill bundle is invalid or changed");
+      if (cached !== undefined) return cached;
+    }
+    const remember = (value: string | null): void => {
+      if (signature === undefined) return;
+      if (this.bundleHashCache.size >= MAX_BUNDLE_HASH_CACHE_ENTRIES) {
+        this.bundleHashCache.clear();
+      }
+      this.bundleHashCache.set(signature, value);
+    };
+    let hash: string;
+    try {
+      hash = hashProviderSkillBundle(skillFile, this.maxEntries, this.maxTotalBytes);
+    } catch (error) {
+      remember(null);
+      throw error;
+    }
+    remember(hash);
+    return hash;
   }
 
   refresh(): SkillCatalogSnapshot {
@@ -601,19 +624,106 @@ export class SkillCatalog {
       .sort((left, right) =>
         left.name.localeCompare(right.name) || left.sourceKey.localeCompare(right.sourceKey)
       );
-    const requested: SkillRequestSnapshot[] = sources.map((source) => ({
-      kind: "source",
-      sourceKey: source.sourceKey,
-      name: source.name,
-    }));
-    const resolved: ResolvedSkillSnapshot[] = sources.map((source) => ({
-      sourceKey: source.sourceKey,
-      name: source.name,
-      invocationName: source.name,
-      reference: providerSkillReference(provider, source.name)!,
-      skillFileHash: source.skillFileHash,
-    }));
-    return { requested, resolved, skipped: [], warnings: [] };
+    return this.resolve(
+      sources.map((source) => ({
+        sourceKey: source.sourceKey,
+        name: source.name,
+      })),
+      provider,
+    );
+  }
+
+  /**
+   * Convert already-resolved, frozen Skill evidence into per-call filesystem
+   * inputs. Paths are deliberately absent from durable Run state and UI views.
+   * Re-hash here so only the exact bundle admitted immediately before the
+   * Provider call receives a filesystem grant. This gate deliberately bypasses
+   * the metadata-keyed hash cache: it is the last check before granting
+   * filesystem access, so it always reads the bundle's real bytes.
+   */
+  executionInputs(resolved: readonly ResolvedSkillSnapshot[]): ProviderSkillInput[] {
+    const byKey = new Map(this.current().sources.map((source) => [source.sourceKey, source]));
+    return resolved.map((skill) => {
+      const source = byKey.get(skill.sourceKey);
+      let bundleMatches = false;
+      try {
+        bundleMatches = Boolean(
+          source
+          && source.status === "available"
+          && source.name === skill.name
+          && hashProviderSkillBundle(source.skillFile, this.maxEntries, this.maxTotalBytes)
+            === skill.skillFileHash,
+        );
+      } catch {
+        bundleMatches = false;
+      }
+      if (!source || !bundleMatches) {
+        throw new Error(
+          "Queued Run Skill snapshot changed after enqueue; refusing to execute mutable Skill content.",
+        );
+      }
+      try {
+        const directory = realpathSync(dirname(source.skillFile));
+        const skillFile = realpathSync(source.skillFile);
+        if (
+          lstatSync(dirname(source.skillFile)).isSymbolicLink()
+          || lstatSync(source.skillFile).isSymbolicLink()
+          || relative(directory, skillFile) !== "SKILL.md"
+        ) {
+          throw new Error("invalid");
+        }
+        return {
+          name: skill.invocationName,
+          directory,
+          skillFile,
+          bundleHash: skill.skillFileHash,
+        };
+      } catch {
+        throw new Error("Resolved Skill bundle path is invalid.");
+      }
+    });
+  }
+
+  /**
+   * Map paths without hashing every bundle a second time. Call only
+   * immediately after `resolve*` validated the same frozen snapshots.
+   */
+  executionInputsAfterValidation(
+    resolved: readonly ResolvedSkillSnapshot[],
+  ): ProviderSkillInput[] {
+    const byKey = new Map(this.current().sources.map((source) => [source.sourceKey, source]));
+    return resolved.map((skill) => {
+      const source = byKey.get(skill.sourceKey);
+      if (
+        !source
+        || source.status !== "available"
+        || source.name !== skill.name
+        || this.lastResolvedBundleHashes.get(skill.sourceKey) !== skill.skillFileHash
+      ) {
+        throw new Error(
+          "Queued Run Skill snapshot changed after enqueue; refusing to execute mutable Skill content.",
+        );
+      }
+      try {
+        const directory = realpathSync(dirname(source.skillFile));
+        const skillFile = realpathSync(source.skillFile);
+        if (
+          lstatSync(dirname(source.skillFile)).isSymbolicLink()
+          || lstatSync(source.skillFile).isSymbolicLink()
+          || relative(directory, skillFile) !== "SKILL.md"
+        ) {
+          throw new Error("invalid");
+        }
+        return {
+          name: skill.invocationName,
+          directory,
+          skillFile,
+          bundleHash: skill.skillFileHash,
+        };
+      } catch {
+        throw new Error("Resolved Skill bundle path is invalid.");
+      }
+    });
   }
 
   resolve(bindings: readonly SkillBindingRequest[], provider: ProviderId): ResolvedAgentSkills {
@@ -625,6 +735,7 @@ export class SkillCatalog {
       name: binding.name,
     }));
     const resolved: ResolvedSkillSnapshot[] = [];
+    const resolvedBundleHashes = new Map<string, string>();
     const skipped: SkippedSkillSnapshot[] = [];
     for (const binding of bindings) {
       const source = byKey.get(binding.sourceKey);
@@ -723,11 +834,7 @@ export class SkillCatalog {
       }
       let bundleHash: string;
       try {
-        bundleHash = hashSkillBundle(
-          resolvedSource.skillFile,
-          this.maxEntries,
-          this.maxTotalBytes,
-        );
+        bundleHash = this.bundleHash(resolvedSource.skillFile);
       } catch {
         skipped.push({
           ...binding,
@@ -743,7 +850,9 @@ export class SkillCatalog {
         reference,
         skillFileHash: bundleHash,
       });
+      resolvedBundleHashes.set(resolvedSource.sourceKey, bundleHash);
     }
+    this.lastResolvedBundleHashes = resolvedBundleHashes;
     return {
       requested,
       resolved,

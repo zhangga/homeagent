@@ -9,7 +9,14 @@ import {
   saveSettings,
   type SpaceId,
 } from "@homeagent/shared";
-import { KnowledgeEngine, FakeLlm, type AgentInput, type LlmClient } from "@homeagent/core";
+import {
+  KnowledgeEngine,
+  FakeLlm,
+  SkillCatalog,
+  topicNativeSessionCompatibilityKey,
+  type AgentInput,
+  type LlmClient,
+} from "@homeagent/core";
 import { CliConnector, type Connector } from "@homeagent/connectors";
 import { Orchestrator } from "./runtime.ts";
 
@@ -144,7 +151,11 @@ beforeEach(() => {
   process.env.HOMEAGENT_DATA_DIR = dir;
   resetConfig();
   fake = makeFake();
-  engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+  engine = new KnowledgeEngine({
+    dataDir: dir,
+    llm: fake,
+    skillCatalog: new SkillCatalog({ roots: [] }),
+  });
   engine.feishuBindings.connect({
     chatId: "oc_team",
     spaceId: "team/oc_team",
@@ -344,6 +355,37 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
           attempts: 1,
         }),
       }),
+    ]);
+  });
+
+  test("a failed Chat and its new provider retry use different delivery identities", async () => {
+    let providerFails = true;
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    engine.askWithExecutionPlan = async () => {
+      if (providerFails) throw new Error("provider failed before retry");
+      return { answer: "retry succeeded", source: "general", citations: [] };
+    };
+    const agent = engine.agents.create({
+      name: "Delivery identity Agent",
+      provider: "claude",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    await orch.start();
+
+    await connector.sendGroup("@agent 解释量子纠缠", true);
+    const failed = engine.chatRuns.listByAgent(agent.id, 10)[0]!;
+    providerFails = false;
+    const retried = await orch.retryChatRun(failed.id);
+
+    expect(failed.status).toBe("failed");
+    expect(retried).toEqual(expect.objectContaining({
+      retryOf: failed.id,
+      status: "succeeded",
+    }));
+    expect(connector.sent.map((reply) => reply.idempotencyKey)).toEqual([
+      failed.id,
+      retried.id,
     ]);
   });
 
@@ -583,7 +625,9 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     });
     engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
     const deliver = connector.reply.bind(connector);
-    connector.reply = async () => {
+    let failedDeliveryIdentity: string | undefined;
+    connector.reply = async (out) => {
+      failedDeliveryIdentity = out.idempotencyKey;
       throw new Error("Feishu delivery failed");
     };
     await orch.start();
@@ -621,6 +665,8 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       }),
     }));
     expect(connector.sent).toHaveLength(1);
+    expect(failedDeliveryIdentity).toBe(failedDeliveryRun.id);
+    expect(connector.sent[0]!.idempotencyKey).toBe(failedDeliveryIdentity);
   });
 
   test("an in-flight reply keeps its Chat Run audit and blocks space export or deletion", async () => {
@@ -670,10 +716,97 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect((await engine.exportSpace("team/oc_team")).chatRuns).toHaveLength(1);
   });
 
-  test("retrying a failed text Chat creates a linked Run with the current execution", async () => {
+  test("retrying a failed text Chat preserves the original frozen execution", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const originalAgent = engine.agents.create({
+      name: "Original Retry Agent",
+      provider: "codex",
+      model: "gpt-5.4",
+      visibility: "Team",
+    });
+    const frozenExecution = {
+      permission: "read-only" as const,
+      skills: [],
+      skillMode: "all" as const,
+      research: true,
+    };
+    const frozenSkillEvidence = {
+      requested: [{ kind: "legacy-name" as const, name: "frozen-skill" }],
+      resolved: [],
+      skipped: [{
+        name: "frozen-skill",
+        code: "missing_source" as const,
+        message: "Frozen skill was unavailable when the original Run started.",
+      }],
+    };
+    const frozenExecutionPlan = {
+      version: 1 as const,
+      instruction: "Use only the original frozen retry persona.",
+      provider: "codex" as const,
+      model: "gpt-5.4",
+      reasoningEffort: "high" as const,
+      skillMode: "all" as const,
+      execution: frozenExecution,
+    };
+    const previous = engine.chatRuns.start({
+      space: "team/oc_team",
+      chatId: "oc_team",
+      messageId: "om_retry_source",
+      author: "ou_me",
+      input: "请重新给出结论",
+      trigger: "message",
+      agentId: originalAgent.id,
+      provider: "codex",
+      model: "gpt-5.4",
+      reasoningEffort: "high",
+      skillEvidence: frozenSkillEvidence,
+      execution: frozenExecution,
+      executionPlan: frozenExecutionPlan,
+      timeoutMs: 321_000,
+    });
+    engine.chatRuns.fail(previous.id, {
+      finishedAt: previous.startedAt,
+      error: {
+        kind: "provider_unavailable",
+        message: "Provider unavailable",
+      },
+    });
+    const replacementAgent = engine.agents.create({
+      name: "Replacement Retry Agent",
+      instruction: "Use the changed live retry persona.",
+      provider: "claude",
+      model: "claude-current",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: replacementAgent.id });
+
+    const retried = await orch.retryChatRun(previous.id);
+
+    expect(retried).toEqual(expect.objectContaining({
+      id: expect.not.stringMatching(previous.id),
+      retryOf: previous.id,
+      trigger: "retry",
+      agentId: originalAgent.id,
+      provider: "codex",
+      model: "gpt-5.4",
+      reasoningEffort: "high",
+      skillEvidence: frozenSkillEvidence,
+      execution: frozenExecution,
+      executionPlan: frozenExecutionPlan,
+      timeoutMs: 321_000,
+      status: "succeeded",
+      delivery: expect.objectContaining({
+        status: "sent",
+        attempts: 1,
+      }),
+    }));
+    expect(engine.chatRuns.get(previous.id)?.status).toBe("failed");
+  });
+
+  test("retrying a legacy failed Chat without an execution plan fails closed", async () => {
     engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
     const agent = engine.agents.create({
-      name: "Retry Agent",
+      name: "Legacy Retry Agent",
       provider: "claude",
       visibility: "Team",
     });
@@ -681,9 +814,9 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     const previous = engine.chatRuns.start({
       space: "team/oc_team",
       chatId: "oc_team",
-      messageId: "om_retry_source",
+      messageId: "om_legacy_retry_source",
       author: "ou_me",
-      input: "请重新给出结论",
+      input: "旧数据不能借用当前配置重试",
       trigger: "message",
       agentId: agent.id,
       provider: "claude",
@@ -696,21 +829,168 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       },
     });
 
+    await expect(orch.retryChatRun(previous.id)).rejects.toThrow(/execution plan/i);
+
+    expect(engine.chatRuns.list("team/oc_team")).toHaveLength(1);
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  test("retrying a failed Feishu topic Run keeps its frozen native conversation route", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const originalAgent = engine.agents.create({
+      name: "Original Topic Retry Agent",
+      provider: "codex",
+      model: "gpt-5.4",
+      visibility: "Team",
+    });
+    const executionPlan = {
+      version: 1 as const,
+      instruction: "Keep using the original topic context.",
+      provider: "codex" as const,
+      model: "gpt-5.4",
+    };
+    const skillEvidence = { requested: [], resolved: [], skipped: [] };
+    const topicNativeSession = {
+      kind: "feishu-topic" as const,
+      chatId: "oc_team",
+      rootMessageId: "om_topic_retry_root",
+      threadId: "omt_topic_retry",
+      parentMessageId: "om_topic_retry_root",
+      provider: "codex" as const,
+      compatibilityKey: topicNativeSessionCompatibilityKey({
+        agentId: originalAgent.id,
+        executionPlan,
+        skillEvidence,
+      }),
+    };
+    const parentSessionId = "11111111-2222-4333-8444-555555555555";
+    const childSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const seed = engine.chatRuns.start({
+      space: "team/oc_team",
+      chatId: "oc_team",
+      messageId: "om_topic_retry_root",
+      author: "ou_alice",
+      input: "先给出方案",
+      trigger: "message",
+      agentId: originalAgent.id,
+      provider: "codex",
+      model: "gpt-5.4",
+      skillEvidence,
+      executionPlan,
+      timeoutMs: 456_000,
+      topicNativeSession,
+    });
+    engine.chatRuns.begin(seed.id, seed.startedAt);
+    engine.chatRuns.prepareTopicNativeSession(seed.id);
+    engine.chatRuns.succeed(seed.id, {
+      finishedAt: seed.startedAt,
+      output: "seed answer",
+      nativeSessionId: parentSessionId,
+    });
+    engine.chatRuns.deliverySent(seed.id, seed.startedAt);
+    const previous = engine.chatRuns.start({
+      space: "team/oc_team",
+      chatId: "oc_team",
+      messageId: "om_topic_retry_failed",
+      author: "ou_bob",
+      input: "继续展开",
+      trigger: "message",
+      agentId: originalAgent.id,
+      provider: "codex",
+      model: "gpt-5.4",
+      skillEvidence,
+      executionPlan,
+      timeoutMs: 456_000,
+      topicNativeSession,
+    });
+    engine.chatRuns.fail(previous.id, {
+      finishedAt: previous.startedAt,
+      error: {
+        kind: "provider_unavailable",
+        message: "Provider unavailable",
+      },
+    });
+    const replacementAgent = engine.agents.create({
+      name: "Replacement Topic Retry Agent",
+      provider: "claude",
+      model: "claude-current",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: replacementAgent.id });
+    const calls: Array<{
+      nativeSession: unknown;
+      agentId: string | undefined;
+      plan: unknown;
+      evidence: unknown;
+    }> = [];
+    engine.askWithExecutionPlan = async (_spaces, _question, plan, evidence, opts, agentId) => {
+      calls.push({ nativeSession: opts?.nativeSession, agentId, plan, evidence });
+      return {
+        answer: "retried topic answer",
+        source: "general",
+        citations: [],
+        ...(opts?.nativeSession ? { nativeSessionId: childSessionId } : {}),
+      };
+    };
+
     const retried = await orch.retryChatRun(previous.id);
 
+    expect(calls).toEqual([{
+      nativeSession: { mode: "fork", id: parentSessionId },
+      agentId: originalAgent.id,
+      plan: executionPlan,
+      evidence: skillEvidence,
+    }]);
+    expect(engine.chatRuns.topicNativeSessionForRun(retried.id)).toEqual(topicNativeSession);
     expect(retried).toEqual(expect.objectContaining({
-      id: expect.not.stringMatching(previous.id),
       retryOf: previous.id,
-      trigger: "retry",
-      agentId: agent.id,
-      provider: "claude",
+      agentId: originalAgent.id,
+      provider: "codex",
+      model: "gpt-5.4",
+      timeoutMs: 456_000,
       status: "succeeded",
-      delivery: expect.objectContaining({
-        status: "sent",
-        attempts: 1,
-      }),
     }));
-    expect(engine.chatRuns.get(previous.id)?.status).toBe("failed");
+  });
+
+  test("retrying a native-session Run with a missing local topic plan fails closed", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const executionPlan = {
+      version: 1 as const,
+      instruction: "Frozen topic plan",
+      provider: "codex" as const,
+      model: "gpt-5.4",
+    };
+    const topicNativeSession = {
+      kind: "feishu-topic" as const,
+      chatId: "oc_team",
+      rootMessageId: "om_missing_retry_plan_root",
+      provider: "codex" as const,
+      compatibilityKey: topicNativeSessionCompatibilityKey({ executionPlan }),
+    };
+    const previous = engine.chatRuns.start({
+      space: "team/oc_team",
+      chatId: "oc_team",
+      messageId: "om_missing_retry_plan",
+      author: "ou_me",
+      input: "不能降级成无状态重试",
+      trigger: "message",
+      provider: "codex",
+      model: "gpt-5.4",
+      executionPlan,
+      topicNativeSession,
+    });
+    engine.chatRuns.fail(previous.id, {
+      finishedAt: previous.startedAt,
+      error: { kind: "provider_unavailable", message: "Provider unavailable" },
+    });
+    const topicPlanForRun = engine.chatRuns.topicNativeSessionForRun.bind(engine.chatRuns);
+    engine.chatRuns.topicNativeSessionForRun = (runId) =>
+      runId === previous.id ? undefined : topicPlanForRun(runId);
+
+    await expect(orch.retryChatRun(previous.id)).rejects.toThrow(/native.*plan/i);
+
+    expect(engine.chatRuns.list("team/oc_team")).toHaveLength(1);
+    expect(fake.calls).toHaveLength(0);
   });
 
   test("a queued Chat Run resumes with its immutable execution plan after Agent edits", async () => {
@@ -827,6 +1107,50 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     }));
   });
 
+  test("a queued native-session Run with a missing local topic plan fails closed on recovery", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const executionPlan = {
+      version: 1 as const,
+      instruction: "Frozen queued topic plan",
+      provider: "codex" as const,
+      model: "gpt-5.4",
+    };
+    const queued = engine.chatRuns.start({
+      space: "team/oc_team",
+      chatId: "oc_team",
+      messageId: "om_missing_queued_topic_plan",
+      author: "ou_me",
+      input: "@agent 不能降级成无状态恢复",
+      trigger: "message",
+      provider: "codex",
+      model: "gpt-5.4",
+      executionPlan,
+      topicNativeSession: {
+        kind: "feishu-topic",
+        chatId: "oc_team",
+        rootMessageId: "om_missing_queued_topic_plan",
+        provider: "codex",
+        compatibilityKey: topicNativeSessionCompatibilityKey({ executionPlan }),
+      },
+    });
+    const topicPlanForRun = engine.chatRuns.topicNativeSessionForRun.bind(engine.chatRuns);
+    engine.chatRuns.topicNativeSessionForRun = (runId) =>
+      runId === queued.id ? undefined : topicPlanForRun(runId);
+
+    await orch.start();
+    await orch.stop();
+
+    expect(fake.calls).toHaveLength(0);
+    expect(connector.sent).toHaveLength(0);
+    expect(engine.chatRuns.get(queued.id)).toEqual(expect.objectContaining({
+      status: "failed",
+      error: expect.objectContaining({
+        kind: "interrupted",
+        message: expect.stringMatching(/native.*plan/i),
+      }),
+    }));
+  });
+
   test("different chats run concurrently while the provider/model layer queues overflow", async () => {
     const completions: Array<(text: string) => void> = [];
     const blockingLlm: LlmClient = {
@@ -842,7 +1166,11 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       completeJSON: (options) => fake.completeJSON(options),
     };
     engine.close();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: blockingLlm });
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      llm: blockingLlm,
+      skillCatalog: new SkillCatalog({ roots: [] }),
+    });
     for (const chatId of ["oc_layer_a", "oc_layer_b", "oc_layer_c"]) {
       engine.feishuBindings.connect({
         chatId,
@@ -894,7 +1222,11 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       completeJSON: (options) => fake.completeJSON(options),
     };
     engine.close();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: blockingLlm });
+    engine = new KnowledgeEngine({
+      dataDir: dir,
+      llm: blockingLlm,
+      skillCatalog: new SkillCatalog({ roots: [] }),
+    });
     engine.feishuBindings.connect({
       chatId: "oc_cancel_chat",
       spaceId: "team/oc_cancel_chat",
@@ -926,6 +1258,54 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       status: "cancelled",
       error: expect.objectContaining({ kind: "cancelled" }),
     }));
+  });
+
+  test("cancellation after the provider returns cannot succeed during the cold-start check", async () => {
+    let enteredColdStart!: () => void;
+    const coldStartEntered = new Promise<void>((resolve) => {
+      enteredColdStart = resolve;
+    });
+    let releaseColdStart!: () => void;
+    const coldStartGate = new Promise<void>((resolve) => {
+      releaseColdStart = resolve;
+    });
+    const listPages = engine.listPages.bind(engine);
+    engine.listPages = async (space, type) => {
+      enteredColdStart();
+      await coldStartGate;
+      return listPages(space, type);
+    };
+    engine.askWithExecutionPlan = async () => ({
+      answer: "provider already returned",
+      source: "general",
+      citations: [],
+    });
+    await orch.start();
+
+    const pending = orch.enqueue({
+      kind: "message",
+      eventId: "event_cancel_after_provider",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_me",
+      text: "@agent 请分析",
+      messageId: "message_cancel_after_provider",
+      mentionsBot: true,
+      createdAt: Date.now(),
+    });
+    await coldStartEntered;
+    const running = engine.chatRuns.list().find((run) => run.status === "running");
+
+    expect(running).toBeDefined();
+    expect(orch.cancelChatRun(running!.id)).toBe(true);
+    releaseColdStart();
+    await pending.catch(() => undefined);
+
+    expect(engine.chatRuns.get(running!.id)).toEqual(expect.objectContaining({
+      status: "cancelled",
+      error: expect.objectContaining({ kind: "cancelled" }),
+    }));
+    expect(connector.sent).toHaveLength(0);
   });
 
   test("a retry does not duplicate a reply when delivery succeeded before Run persistence failed", async () => {
@@ -1328,6 +1708,143 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(connector.sent[0]!.markdown).toContain("准备得比较用心");
   });
 
+  test("an explicit reply never falls back to a newer unrelated source when target lookup fails", async () => {
+    const now = Date.now();
+    await engine.remember({
+      space: "team/oc_team",
+      source: "message",
+      author: "ou_alice",
+      chatId: "oc_team",
+      messageId: "om_exact_parent",
+      content: "精确父消息：蓝色方案的预算是 42 万元。",
+      createdAt: now - 2_000,
+    });
+    await engine.remember({
+      space: "team/oc_team",
+      source: "doc",
+      author: "ou_carol",
+      chatId: "oc_team",
+      messageId: "om_unrelated_newer_source",
+      content: "无关新文档：红色方案的预算是 99 万元。",
+      createdAt: now - 1_000,
+    });
+    const transport = connector;
+    const feishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => transport.start(onEvent),
+      stop: () => transport.stop(),
+      reply: (out) => transport.reply(out),
+      notice: (chatId, markdown, opts) => transport.notice(chatId, markdown, opts),
+      resolveReplyTarget: async () => {
+        throw new Error("simulated Feishu target lookup failure");
+      },
+    };
+    orch = new Orchestrator({ engine, connector: feishuConnector, llm: fake });
+    let question = "";
+    engine.askWithExecutionPlan = async (_spaces, input) => {
+      question = input;
+      return {
+        answer: "蓝色方案预算为 42 万元。",
+        source: "general",
+        citations: [],
+      };
+    };
+
+    await orch.start();
+    await transport.inject({
+      kind: "message",
+      eventId: "explicit-parent-fallback-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 这个方案预算是多少？",
+      messageId: "om_explicit_parent_question",
+      rootMessageId: "om_exact_parent",
+      threadId: "omt_exact_parent",
+      parentMessageId: "om_exact_parent",
+      mentionsBot: true,
+      createdAt: now,
+    });
+
+    expect(question).toContain("被回复的消息");
+    expect(question).toContain("蓝色方案的预算是 42 万元");
+    expect(question).not.toContain("红色方案的预算是 99 万元");
+  });
+
+  test("an explicit reply cannot reintroduce a retracted Feishu target into Provider context", async () => {
+    const now = Date.now();
+    await engine.remember({
+      space: "team/oc_team",
+      source: "message",
+      author: "ou_alice",
+      chatId: "oc_team",
+      messageId: "om_retracted_context_target",
+      content: "撤回后的秘密预算是 314159 元。",
+      createdAt: now - 1_000,
+    });
+    expect(await engine.retractMessage("team/oc_team", {
+      chatId: "oc_team",
+      messageId: "om_retracted_context_target",
+      requestedBy: "ou_alice",
+    })).toEqual(expect.objectContaining({ status: "retracted" }));
+    const transport = connector;
+    let downloadCalls = 0;
+    const feishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => transport.start(onEvent),
+      stop: () => transport.stop(),
+      reply: (out) => transport.reply(out),
+      notice: (chatId, markdown, opts) => transport.notice(chatId, markdown, opts),
+      resolveReplyTarget: async () => ({
+        messageId: "om_retracted_context_target",
+        senderId: "ou_alice",
+        text: "撤回后的秘密预算是 314159 元。",
+        messageType: "image",
+      }),
+    };
+    orch = new Orchestrator({
+      engine,
+      connector: feishuConnector,
+      llm: fake,
+      attachmentDownloader: async () => {
+        downloadCalls += 1;
+        return [];
+      },
+    });
+    let question = "";
+    let imageCount = -1;
+    engine.askWithExecutionPlan = async (_spaces, input, _plan, _evidence, opts) => {
+      question = input;
+      imageCount = opts?.images?.length ?? 0;
+      return {
+        answer: "原消息已撤回，无法据此回答。",
+        source: "general",
+        citations: [],
+      };
+    };
+
+    await orch.start();
+    await transport.inject({
+      kind: "message",
+      eventId: "retracted-context-reply-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 这张图里的预算是多少？",
+      messageId: "om_retracted_context_question",
+      rootMessageId: "om_retracted_context_target",
+      threadId: "omt_retracted_context_target",
+      parentMessageId: "om_retracted_context_target",
+      mentionsBot: true,
+      createdAt: now,
+    });
+
+    expect(question).toContain("被回复的消息已撤回");
+    expect(question).not.toContain("314159");
+    expect(imageCount).toBe(0);
+    expect(downloadCalls).toBe(0);
+  });
+
   test("a contextual file request includes extracted attachment text before distillation", async () => {
     const messageId = "om_attachment_probe";
     const chatId = "oc_team";
@@ -1618,6 +2135,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(reminders[0]!.triggerAt).toBeLessThanOrEqual(Date.now() + 3600_000);
     expect(connector.sent.at(-1)?.markdown).toContain("已创建提醒");
     expect(connector.sent.at(-1)?.markdown).toContain("喝水");
+    expect(connector.sent.at(-1)?.idempotencyKey).toBe("source:om_cli-1");
     expect(engine.registry.store("team/oc_team").index().countRaw()).toBe(0);
   });
 
@@ -2278,6 +2796,1335 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(connector.sent.length).toBe(1);
   });
 
+  test("redelivered messages are deduplicated by messageId even when eventId changes", async () => {
+    await orch.start();
+    const message = {
+      kind: "message" as const,
+      chatType: "p2p" as const,
+      chatId: "oc_dm",
+      senderId: "ou_me",
+      text: "在吗",
+      messageId: "om_redelivered",
+      mentionsBot: true,
+      createdAt: Date.now(),
+    };
+
+    await orch.enqueue({ ...message, eventId: "delivery-1" });
+    await orch.enqueue({ ...message, eventId: "delivery-2" });
+
+    expect(connector.sent).toHaveLength(1);
+    expect(engine.chatRuns.list("personal/ou_me")).toHaveLength(1);
+  });
+
+  test("a message can be redelivered after its first in-process attempt fails", async () => {
+    const remember = engine.remember.bind(engine);
+    let rememberAttempts = 0;
+    engine.remember = async (entry) => {
+      rememberAttempts += 1;
+      if (rememberAttempts === 1) throw new Error("temporary capture failure");
+      return remember(entry);
+    };
+    const message = {
+      kind: "message" as const,
+      chatType: "p2p" as const,
+      chatId: "oc_dm",
+      senderId: "ou_me",
+      text: "在吗",
+      messageId: "om_retry_after_failure",
+      mentionsBot: true,
+      createdAt: Date.now(),
+    };
+    await orch.start();
+
+    await expect(orch.enqueue({ ...message, eventId: "failed-delivery" }))
+      .rejects.toThrow("temporary capture failure");
+    await orch.enqueue({ ...message, eventId: "redelivery" });
+
+    expect(rememberAttempts).toBe(2);
+    expect(connector.sent).toHaveLength(1);
+    expect(engine.chatRuns.list("personal/ou_me")).toHaveLength(1);
+  });
+
+  test("a task mutation is not replayed when its reply fails and the message is redelivered", async () => {
+    const deliver = connector.reply.bind(connector);
+    connector.reply = async () => {
+      throw new Error("task reply delivery failed");
+    };
+    const message = {
+      kind: "message" as const,
+      chatType: "p2p" as const,
+      chatId: "oc_dm",
+      senderId: "ou_me",
+      text: "/task new 去重审计",
+      messageId: "om_task_mutation_redelivery",
+      mentionsBot: true,
+      createdAt: Date.now(),
+    };
+    await orch.start();
+
+    await expect(orch.enqueue({ ...message, eventId: "task-mutation-first" }))
+      .rejects.toThrow("task reply delivery failed");
+    expect(engine.tasks.list().filter((task) => task.name === "去重审计")).toHaveLength(1);
+
+    connector.reply = deliver;
+    await orch.enqueue({ ...message, eventId: "task-mutation-redelivery" });
+
+    expect(engine.tasks.list().filter((task) => task.name === "去重审计")).toHaveLength(1);
+    expect(connector.sent).toHaveLength(0);
+  });
+
+  test("a captured-only smart-group message is not reclassified after restart", async () => {
+    const message = {
+      kind: "message" as const,
+      chatType: "group" as const,
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "这是一条只应收录的普通群消息。",
+      messageId: "om_captured_only_restart",
+      mentionsBot: false,
+      createdAt: 100,
+    };
+    await orch.start();
+    await orch.enqueue({ ...message, eventId: "captured-only-first" });
+
+    expect(connector.sent).toHaveLength(0);
+    expect(engine.registry.store("team/oc_team").index().findRawsByMessageId(
+      message.messageId,
+      message.chatId,
+    )).toHaveLength(1);
+    await orch.stop();
+    engine.close();
+
+    let classificationCalls = 0;
+    fake = new FakeLlm().onJSON(() => {
+      classificationCalls += 1;
+      return {
+        participationScore: 100,
+        disruptionRisk: 0,
+        reason: "drifted classifier would now respond",
+      };
+    });
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
+    let providerCalls = 0;
+    engine.askWithExecutionPlan = async () => {
+      providerCalls += 1;
+      return {
+        answer: "must not be sent",
+        source: "general",
+        citations: [],
+      };
+    };
+    orch = new Orchestrator({ engine, connector, llm: fake });
+    await orch.start();
+
+    await orch.enqueue({ ...message, eventId: "captured-only-after-restart" });
+
+    expect(classificationCalls).toBe(0);
+    expect(providerCalls).toBe(0);
+    expect(connector.sent).toHaveLength(0);
+    expect(engine.chatRuns.list("team/oc_team")).toHaveLength(0);
+  });
+
+  test("a persisted positive smart-group decision resumes after restart without reclassification", async () => {
+    const message = {
+      kind: "message" as const,
+      chatType: "group" as const,
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "谁负责后端服务？",
+      messageId: "om_positive_smart_restart",
+      mentionsBot: false,
+      createdAt: 100,
+    };
+    const positive = new FakeLlm().onJSON(() => ({
+      participationScore: 100,
+      disruptionRisk: 0,
+      reason: "应该回答",
+    }));
+    orch = new Orchestrator({ engine, connector, llm: positive });
+    const mutableChatRuns = engine.chatRuns as unknown as {
+      start: typeof engine.chatRuns.start;
+    };
+    const originalStart = engine.chatRuns.start.bind(engine.chatRuns);
+    mutableChatRuns.start = () => {
+      throw new Error("simulated crash before Chat Run persistence");
+    };
+    await orch.start();
+    await expect(orch.enqueue({ ...message, eventId: "positive-smart-before-crash" }))
+      .rejects.toThrow("simulated crash before Chat Run persistence");
+    mutableChatRuns.start = originalStart;
+
+    expect(engine.registry.store("team/oc_team").index().findRawsByMessageId(
+      message.messageId,
+      message.chatId,
+    )).toEqual([
+      expect.objectContaining({ agentHandled: true }),
+    ]);
+    await orch.stop();
+    engine.close();
+
+    let classificationCalls = 0;
+    fake = new FakeLlm().onJSON(() => {
+      classificationCalls += 1;
+      throw new Error("durable response decision must not be reclassified");
+    });
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
+    let providerCalls = 0;
+    engine.askWithExecutionPlan = async () => {
+      providerCalls += 1;
+      return {
+        answer: "后端由 Alice 负责。",
+        source: "general",
+        citations: [],
+      };
+    };
+    orch = new Orchestrator({ engine, connector, llm: fake });
+    await orch.start();
+
+    await orch.enqueue({ ...message, eventId: "positive-smart-after-restart" });
+
+    expect(classificationCalls).toBe(0);
+    expect(providerCalls).toBe(1);
+    expect(connector.sent).toHaveLength(1);
+    expect(engine.chatRuns.list("team/oc_team")).toHaveLength(1);
+  });
+
+  test("a smart-group response does not reach the provider when its durable decision cannot be marked", async () => {
+    const positive = new FakeLlm().onJSON(() => ({
+      participationScore: 100,
+      disruptionRisk: 0,
+      reason: "应该回答",
+    }));
+    orch = new Orchestrator({ engine, connector, llm: positive });
+    engine.markRawAgentHandled = async () => false;
+    let providerCalls = 0;
+    engine.askWithExecutionPlan = async () => {
+      providerCalls += 1;
+      return {
+        answer: "不应发送",
+        source: "general",
+        citations: [],
+      };
+    };
+    const message = {
+      kind: "message" as const,
+      chatType: "group" as const,
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "谁负责后端服务？",
+      messageId: "om_smart_mark_failure",
+      mentionsBot: false,
+      createdAt: 100,
+    };
+    await orch.start();
+
+    await expect(orch.enqueue({ ...message, eventId: "smart-mark-failure" }))
+      .rejects.toThrow("failed to persist smart-group response decision");
+
+    expect(providerCalls).toBe(0);
+    expect(connector.sent).toHaveLength(0);
+    expect(engine.chatRuns.list("team/oc_team")).toHaveLength(0);
+  });
+
+  test("messageId deduplication survives an application restart", async () => {
+    const firstDelivery = {
+      kind: "message" as const,
+      eventId: "before-restart",
+      chatType: "p2p" as const,
+      chatId: "oc_dm",
+      senderId: "ou_me",
+      text: "在吗",
+      messageId: "om_restart_redelivery",
+      mentionsBot: true,
+      createdAt: 100,
+    };
+    await orch.start();
+    await connector.inject(firstDelivery);
+    await orch.stop();
+    engine.close();
+
+    fake = makeFake();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
+    orch = new Orchestrator({ engine, connector, llm: fake });
+    await orch.start();
+    await connector.inject({ ...firstDelivery, eventId: "after-restart" });
+
+    expect(connector.sent).toHaveLength(0);
+    expect(engine.chatRuns.list("personal/ou_me")).toHaveLength(1);
+    expect(engine.registry.store("personal/ou_me").index().findRawsByMessageId(
+      "om_restart_redelivery",
+      "oc_dm",
+    )).toHaveLength(1);
+  });
+
+  test("a retracted message redelivery stays deleted after an application restart", async () => {
+    const original = {
+      kind: "message" as const,
+      eventId: "before-retraction",
+      chatType: "p2p" as const,
+      chatId: "oc_dm",
+      senderId: "ou_me",
+      text: "公司年会是什么时候？",
+      messageId: "om_retracted_redelivery",
+      mentionsBot: true,
+      createdAt: 100,
+    };
+    await orch.start();
+    await connector.inject(original);
+    await orch.stop();
+    expect(await engine.retractMessage("personal/ou_me", {
+      chatId: original.chatId,
+      messageId: original.messageId,
+      requestedBy: original.senderId,
+    })).toEqual(expect.objectContaining({ status: "retracted" }));
+    engine.close();
+
+    fake = makeFake();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
+    orch = new Orchestrator({ engine, connector, llm: fake });
+    await orch.start();
+    await connector.inject({ ...original, eventId: "after-retraction-restart" });
+
+    expect(connector.sent).toHaveLength(0);
+    expect(fake.calls).toHaveLength(0);
+    expect(engine.chatRuns.list("personal/ou_me")).toHaveLength(0);
+    expect(engine.registry.store("personal/ou_me").index().findRawsByMessageId(
+      original.messageId,
+      original.chatId,
+    )).toHaveLength(0);
+  });
+
+  test("one Feishu topic reuses one provider-native session while other topics stay isolated", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Topic Agent",
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      instruction: "Continue the topic naturally.",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const transport = connector;
+    const feishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => transport.start(onEvent),
+      stop: () => transport.stop(),
+      reply: (out) => transport.reply(out),
+      notice: (chatId, markdown, opts) => transport.notice(chatId, markdown, opts),
+      resolveReplyTarget: async (messageId) => messageId === "om_topic_a_reply"
+        ? {
+            messageId: "om_external_reply_target",
+            senderId: "ou_carol",
+            text: "这段内容只存在于当前显式回复目标里。",
+            messageType: "text",
+          }
+        : undefined,
+    };
+    orch = new Orchestrator({ engine, connector: feishuConnector, llm: fake });
+    const firstSessionId = "11111111-2222-4333-8444-555555555555";
+    const secondSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const otherSessionId = "99999999-8888-4777-8666-555555555555";
+    const recoveredSessionId = "12345678-1234-4234-8234-123456789abc";
+    const sessionIds = [firstSessionId, secondSessionId, otherSessionId];
+    const calls: Array<{ spaces: SpaceId[]; nativeSession: unknown }> = [];
+    const questions: string[] = [];
+    engine.askWithExecutionPlan = async (spaces, question, _plan, _evidence, opts) => {
+      calls.push({ spaces: [...spaces], nativeSession: opts?.nativeSession });
+      questions.push(question);
+      if (calls.length === 4) {
+        throw new Error(`no rollout found for thread id ${secondSessionId}`);
+      }
+      return {
+        answer: `answer ${calls.length}`,
+        source: "general",
+        citations: [],
+        ...(opts?.nativeSession
+          ? {
+              nativeSessionId: calls.length === 5
+                ? recoveredSessionId
+                : sessionIds[calls.length - 1]!,
+            }
+          : {}),
+      };
+    };
+    await engine.upsertPage("personal/ou_alice", {
+      slug: "private/alice-note",
+      type: "concept",
+      title: "Alice private note",
+      summary: "Only Alice can read this page.",
+      aliases: [],
+      tags: [],
+      sources: [],
+      links: [],
+      content: "# Alice private note\nThis must not affect a shared topic.\n",
+      updatedAt: Date.now(),
+      contentHash: "private",
+    });
+    await engine.remember({
+      space: "team/oc_team",
+      source: "message",
+      author: "ou_carol",
+      chatId: "oc_team",
+      messageId: "om_other_topic_attachment",
+      content: "另一话题附件里的机密方案：不应注入当前原生话题。",
+      attachments: [{ kind: "file", ref: "file_other_topic", name: "other-topic.txt" }],
+      createdAt: 90,
+    });
+    await orch.start();
+
+    await transport.inject({
+      kind: "message",
+      eventId: "topic-a-root-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 刚才附件里的方案你怎么看？",
+      messageId: "om_topic_a_root",
+      mentionsBot: true,
+      createdAt: 100,
+    });
+    await transport.inject({
+      kind: "message",
+      eventId: "topic-a-reply-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 你怎么看？",
+      messageId: "om_topic_a_reply",
+      rootMessageId: "om_topic_a_root",
+      threadId: "omt_topic_a",
+      parentMessageId: "om_topic_a_root",
+      mentionsBot: true,
+      createdAt: 110,
+    });
+    await transport.inject({
+      kind: "message",
+      eventId: "topic-b-root-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 分析另一个方案",
+      messageId: "om_topic_b_root",
+      mentionsBot: true,
+      createdAt: 120,
+    });
+    await transport.inject({
+      kind: "message",
+      eventId: "topic-a-missing-thread-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 再补充一点",
+      messageId: "om_topic_a_missing_thread",
+      rootMessageId: "om_topic_a_root",
+      threadId: "omt_topic_a",
+      parentMessageId: "om_topic_a_reply",
+      mentionsBot: true,
+      createdAt: 130,
+    });
+    await transport.inject({
+      kind: "message",
+      eventId: "topic-a-recovered-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 从这里重新开始",
+      messageId: "om_topic_a_recovered",
+      rootMessageId: "om_topic_a_root",
+      threadId: "omt_topic_a",
+      parentMessageId: "om_topic_a_missing_thread",
+      mentionsBot: true,
+      createdAt: 140,
+    });
+
+    expect(calls).toEqual([
+      { spaces: ["team/oc_team"], nativeSession: { mode: "start" } },
+      {
+        spaces: ["team/oc_team"],
+        nativeSession: { mode: "fork", id: firstSessionId },
+      },
+      { spaces: ["team/oc_team"], nativeSession: { mode: "start" } },
+      {
+        spaces: ["team/oc_team"],
+        nativeSession: { mode: "fork", id: secondSessionId },
+      },
+      { spaces: ["team/oc_team"], nativeSession: { mode: "start" } },
+    ]);
+    expect(transport.sent.map((reply) => reply.replyToMessageId)).toEqual([
+      "om_topic_a_root",
+      "om_topic_a_reply",
+      "om_topic_b_root",
+      "om_topic_a_missing_thread",
+      "om_topic_a_recovered",
+    ]);
+    expect(transport.sent[0]?.markdown).toContain("知识库还是空的");
+    expect(questions[0]).not.toContain("另一话题附件里的机密方案");
+    expect(questions[0]).not.toContain("最近的附件或文档");
+    expect(questions[1]).toContain("这段内容只存在于当前显式回复目标里。");
+    expect(engine.chatRuns.list("team/oc_team").filter((run) => run.status === "failed"))
+      .toHaveLength(1);
+  });
+
+  test("a native-session capability failure preserves the last committed topic head", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Capability Failure Topic Agent",
+      provider: "codex",
+      model: "gpt-5.4",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const transport = connector;
+    const feishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => transport.start(onEvent),
+      stop: () => transport.stop(),
+      reply: (out) => transport.reply(out),
+      notice: (chatId, markdown, opts) => transport.notice(chatId, markdown, opts),
+    };
+    orch = new Orchestrator({ engine, connector: feishuConnector, llm: fake });
+    const parentSessionId = "11111111-2222-4333-8444-555555555555";
+    const recoveredSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const nativeSessions: unknown[] = [];
+    engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
+      nativeSessions.push(opts?.nativeSession);
+      if (nativeSessions.length === 2) {
+        throw new Error("Provider-native sessions are unavailable for this Codex CLI");
+      }
+      return {
+        answer: `answer ${nativeSessions.length}`,
+        source: "general",
+        citations: [],
+        nativeSessionId: nativeSessions.length === 1 ? parentSessionId : recoveredSessionId,
+      };
+    };
+    await orch.start();
+
+    await transport.inject({
+      kind: "message",
+      eventId: "capability-topic-root-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 给出初始方案",
+      messageId: "om_capability_topic_root",
+      mentionsBot: true,
+      createdAt: 100,
+    });
+    await transport.inject({
+      kind: "message",
+      eventId: "capability-topic-failure-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 继续",
+      messageId: "om_capability_topic_failure",
+      rootMessageId: "om_capability_topic_root",
+      threadId: "omt_capability_topic",
+      parentMessageId: "om_capability_topic_root",
+      mentionsBot: true,
+      createdAt: 110,
+    });
+    await transport.inject({
+      kind: "message",
+      eventId: "capability-topic-retry-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 再试一次",
+      messageId: "om_capability_topic_retry",
+      rootMessageId: "om_capability_topic_root",
+      threadId: "omt_capability_topic",
+      parentMessageId: "om_capability_topic_failure",
+      mentionsBot: true,
+      createdAt: 120,
+    });
+
+    expect(nativeSessions).toEqual([
+      { mode: "start" },
+      { mode: "fork", id: parentSessionId },
+      { mode: "fork", id: parentSessionId },
+    ]);
+    expect(engine.chatRuns.list("team/oc_team").find((run) =>
+      run.messageId === "om_capability_topic_failure"
+    )).toEqual(expect.objectContaining({ status: "failed" }));
+    expect(transport.sent.map((reply) => reply.replyToMessageId)).toEqual([
+      "om_capability_topic_root",
+      "om_capability_topic_failure",
+      "om_capability_topic_retry",
+    ]);
+  });
+
+  test("a transient atomic native-session failure is retried without preserving the missing parent", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Atomic Missing Parent Agent",
+      provider: "codex",
+      model: "gpt-5.4",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const firstTransport = connector;
+    const firstFeishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => firstTransport.start(onEvent),
+      stop: () => firstTransport.stop(),
+      reply: (out) => firstTransport.reply(out),
+      notice: (chatId, markdown, opts) => firstTransport.notice(chatId, markdown, opts),
+    };
+    orch = new Orchestrator({ engine, connector: firstFeishuConnector, llm: fake });
+    const parentSessionId = "11111111-2222-4333-8444-555555555555";
+    const store = engine.chatRuns as unknown as {
+      persist: (...args: unknown[]) => void;
+    };
+    const persist = store.persist.bind(engine.chatRuns);
+    let failNextPersist = false;
+    let injectedPersistFailures = 0;
+    store.persist = (...args) => {
+      if (failNextPersist && injectedPersistFailures === 0) {
+        injectedPersistFailures += 1;
+        throw new Error("simulated first atomic persistence failure");
+      }
+      persist(...args);
+    };
+    let providerCalls = 0;
+    engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
+      providerCalls += 1;
+      if (providerCalls === 1) {
+        return {
+          answer: "initial answer",
+          source: "general",
+          citations: [],
+          nativeSessionId: parentSessionId,
+        };
+      }
+      failNextPersist = true;
+      throw new Error(`no rollout found for thread id ${parentSessionId}`);
+    };
+    await orch.start();
+
+    await firstTransport.inject({
+      kind: "message",
+      eventId: "atomic-parent-root",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 给出初始结论",
+      messageId: "om_atomic_parent_root",
+      mentionsBot: true,
+      createdAt: 100,
+    });
+    await firstTransport.inject({
+      kind: "message",
+      eventId: "atomic-parent-missing",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 继续",
+      messageId: "om_atomic_parent_missing",
+      rootMessageId: "om_atomic_parent_root",
+      threadId: "omt_atomic_parent",
+      parentMessageId: "om_atomic_parent_root",
+      mentionsBot: true,
+      createdAt: 110,
+    });
+
+    expect(injectedPersistFailures).toBe(1);
+    expect(engine.chatRuns.list("team/oc_team").find((run) =>
+      run.messageId === "om_atomic_parent_missing"
+    )).toEqual(expect.objectContaining({
+      status: "failed",
+      error: expect.objectContaining({
+        message: "no rollout found for thread id [redacted-id]",
+      }),
+    }));
+    await orch.stop();
+    engine.close();
+
+    fake = makeFake();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
+    const restartedTransport = connector;
+    const restartedFeishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => restartedTransport.start(onEvent),
+      stop: () => restartedTransport.stop(),
+      reply: (out) => restartedTransport.reply(out),
+      notice: (chatId, markdown, opts) => restartedTransport.notice(chatId, markdown, opts),
+    };
+    orch = new Orchestrator({ engine, connector: restartedFeishuConnector, llm: fake });
+    let restartedNativeSession: unknown;
+    engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
+      restartedNativeSession = opts?.nativeSession;
+      return {
+        answer: "answer after restart",
+        source: "general",
+        citations: [],
+        nativeSessionId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      };
+    };
+    await orch.start();
+    await restartedTransport.inject({
+      kind: "message",
+      eventId: "atomic-parent-after-restart",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 重新开始",
+      messageId: "om_atomic_parent_after_restart",
+      rootMessageId: "om_atomic_parent_root",
+      threadId: "omt_atomic_parent",
+      parentMessageId: "om_atomic_parent_missing",
+      mentionsBot: true,
+      createdAt: 120,
+    });
+
+    expect(restartedNativeSession).toEqual({ mode: "start" });
+  });
+
+  test("a static Feishu topic control reply breaks the native conversation chain", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Static Topic Reply Agent",
+      provider: "codex",
+      model: "gpt-5.4",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const transport = connector;
+    const feishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => transport.start(onEvent),
+      stop: () => transport.stop(),
+      reply: (out) => transport.reply(out),
+      notice: (chatId, markdown, opts) => transport.notice(chatId, markdown, opts),
+      isChatAdministrator: async () => false,
+    };
+    orch = new Orchestrator({ engine, connector: feishuConnector, llm: fake });
+    const firstSessionId = "11111111-2222-4333-8444-555555555555";
+    const restartedSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const nativeSessions: unknown[] = [];
+    engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
+      nativeSessions.push(opts?.nativeSession);
+      return {
+        answer: "topic answer",
+        source: "general",
+        citations: [],
+        ...(opts?.nativeSession
+          ? {
+              nativeSessionId: nativeSessions.length === 1
+                ? firstSessionId
+                : restartedSessionId,
+            }
+          : {}),
+      };
+    };
+    await orch.start();
+
+    await transport.inject({
+      kind: "message",
+      eventId: "static-topic-root-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 给出初始方案",
+      messageId: "om_static_topic_root",
+      mentionsBot: true,
+      createdAt: 100,
+    });
+    await transport.inject({
+      kind: "message",
+      eventId: "static-topic-control-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent /task new 不应创建",
+      messageId: "om_static_topic_control",
+      rootMessageId: "om_static_topic_root",
+      threadId: "omt_static_topic",
+      parentMessageId: "om_static_topic_root",
+      mentionsBot: true,
+      createdAt: 110,
+    });
+    await transport.inject({
+      kind: "message",
+      eventId: "static-topic-next-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 从这里继续分析",
+      messageId: "om_static_topic_next",
+      rootMessageId: "om_static_topic_root",
+      threadId: "omt_static_topic",
+      parentMessageId: "om_static_topic_control",
+      mentionsBot: true,
+      createdAt: 120,
+    });
+
+    expect(nativeSessions).toEqual([{ mode: "start" }, { mode: "start" }]);
+    expect(transport.sent[1]?.markdown).toBe("只有群主或群管理员可以管理本群任务。");
+    expect(engine.chatRuns.list("team/oc_team")).toHaveLength(2);
+  });
+
+  test("a failed Feishu delivery cannot leave an unseen Provider turn as the topic head", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Failed Delivery Topic Agent",
+      provider: "codex",
+      model: "gpt-5.4",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const transport = connector;
+    let failFirstDelivery = true;
+    const feishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => transport.start(onEvent),
+      stop: () => transport.stop(),
+      reply: async (out) => {
+        if (failFirstDelivery && out.replyToMessageId === "om_failed_delivery_root") {
+          failFirstDelivery = false;
+          throw new Error("Feishu delivery unavailable");
+        }
+        await transport.reply(out);
+      },
+      notice: (chatId, markdown, opts) => transport.notice(chatId, markdown, opts),
+    };
+    orch = new Orchestrator({ engine, connector: feishuConnector, llm: fake });
+    const unseenSessionId = "11111111-2222-4333-8444-555555555555";
+    const restartedSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const nativeSessions: unknown[] = [];
+    engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
+      nativeSessions.push(opts?.nativeSession);
+      return {
+        answer: `provider answer ${nativeSessions.length}`,
+        source: "general",
+        citations: [],
+        nativeSessionId: nativeSessions.length === 1
+          ? unseenSessionId
+          : restartedSessionId,
+      };
+    };
+    await orch.start();
+
+    await expect(transport.inject({
+      kind: "message",
+      eventId: "failed-delivery-root-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 给出初始结论",
+      messageId: "om_failed_delivery_root",
+      mentionsBot: true,
+      createdAt: 100,
+    })).rejects.toThrow("Feishu delivery unavailable");
+    expect(engine.chatRuns.list("team/oc_team").find((run) =>
+      run.messageId === "om_failed_delivery_root"
+    )).toEqual(expect.objectContaining({
+      status: "succeeded",
+      delivery: expect.objectContaining({ status: "failed" }),
+    }));
+
+    await transport.inject({
+      kind: "message",
+      eventId: "failed-delivery-next-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 重新开始分析",
+      messageId: "om_failed_delivery_next",
+      rootMessageId: "om_failed_delivery_root",
+      threadId: "omt_failed_delivery",
+      parentMessageId: "om_failed_delivery_root",
+      mentionsBot: true,
+      createdAt: 110,
+    });
+
+    expect(nativeSessions).toEqual([{ mode: "start" }, { mode: "start" }]);
+  });
+
+  test("an unpersisted Feishu delivery success cannot be reused as a Provider topic head", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Ambiguous Delivery Topic Agent",
+      provider: "codex",
+      model: "gpt-5.4",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const transport = connector;
+    const feishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => transport.start(onEvent),
+      stop: () => transport.stop(),
+      reply: (out) => transport.reply(out),
+      notice: (chatId, markdown, opts) => transport.notice(chatId, markdown, opts),
+    };
+    orch = new Orchestrator({ engine, connector: feishuConnector, llm: fake });
+    const firstSessionId = "11111111-2222-4333-8444-555555555555";
+    const restartedSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const nativeSessions: unknown[] = [];
+    engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
+      nativeSessions.push(opts?.nativeSession);
+      return {
+        answer: `provider answer ${nativeSessions.length}`,
+        source: "general",
+        citations: [],
+        nativeSessionId: nativeSessions.length === 1
+          ? firstSessionId
+          : restartedSessionId,
+      };
+    };
+    const persistDeliverySent = engine.chatRuns.deliverySent.bind(engine.chatRuns);
+    let failFirstDeliveryCommit = true;
+    engine.chatRuns.deliverySent = (runId, sentAt) => {
+      if (failFirstDeliveryCommit) {
+        failFirstDeliveryCommit = false;
+        throw new Error("disk unavailable after Feishu delivery");
+      }
+      return persistDeliverySent(runId, sentAt);
+    };
+    await orch.start();
+
+    await transport.inject({
+      kind: "message",
+      eventId: "ambiguous-delivery-root-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 给出初始结论",
+      messageId: "om_ambiguous_delivery_root",
+      mentionsBot: true,
+      createdAt: 100,
+    });
+    expect(engine.chatRuns.list("team/oc_team").find((run) =>
+      run.messageId === "om_ambiguous_delivery_root"
+    )?.delivery.status).toBe("pending");
+
+    await transport.inject({
+      kind: "message",
+      eventId: "ambiguous-delivery-next-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 重新开始分析",
+      messageId: "om_ambiguous_delivery_next",
+      rootMessageId: "om_ambiguous_delivery_root",
+      threadId: "omt_ambiguous_delivery",
+      parentMessageId: "om_ambiguous_delivery_root",
+      mentionsBot: true,
+      createdAt: 110,
+    });
+
+    expect(nativeSessions).toEqual([{ mode: "start" }, { mode: "start" }]);
+    expect(transport.sent).toHaveLength(2);
+  });
+
+  test("retrying an older undelivered Feishu reply clears the newer topic head before sending", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Delayed Static Reply Agent",
+      provider: "codex",
+      model: "gpt-5.4",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const transport = connector;
+    let failInitialReply = true;
+    const feishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => transport.start(onEvent),
+      stop: () => transport.stop(),
+      reply: async (out) => {
+        if (failInitialReply && out.replyToMessageId === "om_delayed_static_h1") {
+          failInitialReply = false;
+          throw new Error("initial H1 delivery failed");
+        }
+        await transport.reply(out);
+      },
+      notice: (chatId, markdown, opts) => transport.notice(chatId, markdown, opts),
+    };
+    orch = new Orchestrator({ engine, connector: feishuConnector, llm: fake });
+    const h2SessionId = "11111111-2222-4333-8444-555555555555";
+    const h3SessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const nativeSessions: unknown[] = [];
+    engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
+      nativeSessions.push(opts?.nativeSession);
+      return {
+        answer: `provider answer ${nativeSessions.length}`,
+        source: "general",
+        citations: [],
+        nativeSessionId: nativeSessions.length === 1 ? h2SessionId : h3SessionId,
+      };
+    };
+    await orch.start();
+
+    await expect(transport.inject({
+      kind: "message",
+      eventId: "delayed-static-h1",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 在吗",
+      messageId: "om_delayed_static_h1",
+      mentionsBot: true,
+      createdAt: 100,
+    })).rejects.toThrow("initial H1 delivery failed");
+    const h1 = engine.chatRuns.list("team/oc_team").find((run) =>
+      run.messageId === "om_delayed_static_h1"
+    )!;
+    expect(h1).toEqual(expect.objectContaining({
+      status: "succeeded",
+      delivery: expect.objectContaining({ status: "failed" }),
+    }));
+
+    await transport.inject({
+      kind: "message",
+      eventId: "delayed-static-h2",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 给出新结论",
+      messageId: "om_delayed_static_h2",
+      rootMessageId: "om_delayed_static_h1",
+      threadId: "omt_delayed_static",
+      parentMessageId: "om_delayed_static_h1",
+      mentionsBot: true,
+      createdAt: 110,
+    });
+    expect(nativeSessions).toEqual([{ mode: "start" }]);
+
+    const invalidate = engine.chatRuns.invalidateTopicNativeSessions.bind(engine.chatRuns);
+    let cleanupAttempts = 0;
+    engine.chatRuns.invalidateTopicNativeSessions = (...args) => {
+      cleanupAttempts += 1;
+      if (cleanupAttempts === 1) throw new Error("topic head persistence failed");
+      return invalidate(...args);
+    };
+    await expect(orch.retryChatRun(h1.id)).rejects.toThrow("topic head persistence failed");
+    expect(transport.sent.map((reply) => reply.replyToMessageId)).toEqual([
+      "om_delayed_static_h2",
+    ]);
+
+    await orch.retryChatRun(h1.id);
+    await transport.inject({
+      kind: "message",
+      eventId: "delayed-static-h3",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 再继续",
+      messageId: "om_delayed_static_h3",
+      rootMessageId: "om_delayed_static_h1",
+      threadId: "omt_delayed_static",
+      parentMessageId: "om_delayed_static_h2",
+      mentionsBot: true,
+      createdAt: 120,
+    });
+
+    expect(nativeSessions).toEqual([{ mode: "start" }, { mode: "start" }]);
+  });
+
+  test("retraction invalidates reply-context history before its static confirmation", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Retraction Topic Agent",
+      provider: "codex",
+      model: "gpt-5.4",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const firstTransport = connector;
+    const sourceText = "A 中的内容只会通过 B 的显式回复上下文进入 Provider。";
+    const firstFeishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => firstTransport.start(onEvent),
+      stop: () => firstTransport.stop(),
+      reply: (out) => firstTransport.reply(out),
+      notice: (chatId, markdown, opts) => firstTransport.notice(chatId, markdown, opts),
+      resolveReplyTarget: async (messageId) =>
+        ["om_retraction_context_answer", "om_retraction_context_command"].includes(messageId)
+          ? {
+              messageId: "om_retraction_context_source",
+              senderId: "ou_alice",
+              text: sourceText,
+              messageType: "text",
+            }
+          : undefined,
+    };
+    orch = new Orchestrator({ engine, connector: firstFeishuConnector, llm: fake });
+    const firstSessionId = "11111111-2222-4333-8444-555555555555";
+    let firstQuestion = "";
+    let firstNativeSession: unknown;
+    engine.askWithExecutionPlan = async (_spaces, question, _plan, _evidence, opts) => {
+      firstQuestion = question;
+      firstNativeSession = opts?.nativeSession;
+      return {
+        answer: "first topic answer",
+        source: "general",
+        citations: [],
+        nativeSessionId: firstSessionId,
+      };
+    };
+    await orch.start();
+
+    await firstTransport.inject({
+      kind: "message",
+      eventId: "retraction-context-source-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: sourceText,
+      messageId: "om_retraction_context_source",
+      mentionsBot: false,
+      createdAt: 100,
+    });
+    await firstTransport.inject({
+      kind: "message",
+      eventId: "retraction-context-answer-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 分析这条",
+      messageId: "om_retraction_context_answer",
+      rootMessageId: "om_retraction_context_other_root",
+      threadId: "omt_retraction_context_other",
+      parentMessageId: "om_retraction_context_source",
+      mentionsBot: true,
+      createdAt: 110,
+    });
+    expect(firstNativeSession).toEqual({ mode: "start" });
+    expect(firstQuestion).toContain(sourceText);
+    expect(engine.chatRuns.list("team/oc_team")).toHaveLength(1);
+
+    const retractMessage = engine.retractMessage.bind(engine);
+    engine.retractMessage = async (space, request) => {
+      await retractMessage(space, request);
+      throw new Error("simulated crash before static retraction confirmation");
+    };
+    await expect(firstTransport.inject({
+      kind: "message",
+      eventId: "retraction-context-command-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 别记这条",
+      messageId: "om_retraction_context_command",
+      rootMessageId: "om_retraction_context_source",
+      threadId: "omt_retraction_context",
+      parentMessageId: "om_retraction_context_answer",
+      mentionsBot: true,
+      createdAt: 120,
+    })).rejects.toThrow("simulated crash before static retraction confirmation");
+    expect(firstTransport.sent).toHaveLength(1);
+    await orch.stop();
+    engine.close();
+
+    fake = makeFake();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
+    const restartedTransport = connector;
+    const restartedFeishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => restartedTransport.start(onEvent),
+      stop: () => restartedTransport.stop(),
+      reply: (out) => restartedTransport.reply(out),
+      notice: (chatId, markdown, opts) => restartedTransport.notice(chatId, markdown, opts),
+    };
+    orch = new Orchestrator({ engine, connector: restartedFeishuConnector, llm: fake });
+    let restartedNativeSession: unknown;
+    engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
+      restartedNativeSession = opts?.nativeSession;
+      return {
+        answer: "answer after restart",
+        source: "general",
+        citations: [],
+        nativeSessionId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      };
+    };
+    await orch.start();
+    await restartedTransport.inject({
+      kind: "message",
+      eventId: "retraction-context-after-restart-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 从已撤回内容之后重新开始",
+      messageId: "om_retraction_context_after_restart",
+      rootMessageId: "om_retraction_context_other_root",
+      threadId: "omt_retraction_context_other",
+      parentMessageId: "om_retraction_context_answer",
+      mentionsBot: true,
+      createdAt: 130,
+    });
+
+    expect(restartedNativeSession).toEqual({ mode: "start" });
+  });
+
+  test("Claude Feishu topic turns remain stateless", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Stateless Claude Topic Agent",
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const transport = connector;
+    const feishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => transport.start(onEvent),
+      stop: () => transport.stop(),
+      reply: (out) => transport.reply(out),
+      notice: (chatId, markdown, opts) => transport.notice(chatId, markdown, opts),
+    };
+    orch = new Orchestrator({ engine, connector: feishuConnector, llm: fake });
+    const nativeSessions: unknown[] = [];
+    const unexpectedSessionIds = [
+      "11111111-2222-4333-8444-555555555555",
+      "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    ];
+    engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
+      nativeSessions.push(opts?.nativeSession);
+      return {
+        answer: "stateless Claude answer",
+        source: "general",
+        citations: [],
+        ...(opts?.nativeSession
+          ? { nativeSessionId: unexpectedSessionIds[nativeSessions.length - 1] }
+          : {}),
+      };
+    };
+    await orch.start();
+
+    await transport.inject({
+      kind: "message",
+      eventId: "claude-topic-root-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 给出方案",
+      messageId: "om_claude_topic_root",
+      mentionsBot: true,
+      createdAt: 100,
+    });
+    await transport.inject({
+      kind: "message",
+      eventId: "claude-topic-reply-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 继续分析",
+      messageId: "om_claude_topic_reply",
+      rootMessageId: "om_claude_topic_root",
+      threadId: "omt_claude_topic",
+      parentMessageId: "om_claude_topic_root",
+      mentionsBot: true,
+      createdAt: 110,
+    });
+
+    expect(nativeSessions).toEqual([undefined, undefined]);
+    expect(engine.chatRuns.list("team/oc_team").every((run) =>
+      engine.chatRuns.topicNativeSessionForRun(run.id) === undefined
+    )).toBeTrue();
+  });
+
+  test("a stateless Provider turn breaks an older Codex topic chain before execution", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const codexAgent = engine.agents.create({
+      name: "Codex Topic Agent",
+      provider: "codex",
+      model: "gpt-5.4",
+      visibility: "Team",
+    });
+    const claudeAgent = engine.agents.create({
+      name: "Claude Topic Agent",
+      provider: "claude",
+      model: "claude-sonnet-4-5",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: codexAgent.id });
+    const transport = connector;
+    const feishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => transport.start(onEvent),
+      stop: () => transport.stop(),
+      reply: (out) => transport.reply(out),
+      notice: (chatId, markdown, opts) => transport.notice(chatId, markdown, opts),
+    };
+    orch = new Orchestrator({ engine, connector: feishuConnector, llm: fake });
+    const firstSessionId = "11111111-2222-4333-8444-555555555555";
+    const restartedSessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const providers: Array<string | undefined> = [];
+    const nativeSessions: unknown[] = [];
+    engine.askWithExecutionPlan = async (_spaces, _question, plan, _evidence, opts) => {
+      providers.push(plan.provider);
+      nativeSessions.push(opts?.nativeSession);
+      return {
+        answer: `answer ${providers.length}`,
+        source: "general",
+        citations: [],
+        ...(opts?.nativeSession
+          ? {
+              nativeSessionId: providers.length === 1
+                ? firstSessionId
+                : restartedSessionId,
+            }
+          : {}),
+      };
+    };
+    await orch.start();
+
+    await transport.inject({
+      kind: "message",
+      eventId: "provider-switch-codex-root",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 给出 Codex 结论",
+      messageId: "om_provider_switch_root",
+      mentionsBot: true,
+      createdAt: 100,
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: claudeAgent.id });
+    await transport.inject({
+      kind: "message",
+      eventId: "provider-switch-claude-middle",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_bob",
+      text: "@agent 用 Claude 补充",
+      messageId: "om_provider_switch_middle",
+      rootMessageId: "om_provider_switch_root",
+      threadId: "omt_provider_switch",
+      parentMessageId: "om_provider_switch_root",
+      mentionsBot: true,
+      createdAt: 110,
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: codexAgent.id });
+    await transport.inject({
+      kind: "message",
+      eventId: "provider-switch-codex-return",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 回到 Codex 继续",
+      messageId: "om_provider_switch_return",
+      rootMessageId: "om_provider_switch_root",
+      threadId: "omt_provider_switch",
+      parentMessageId: "om_provider_switch_middle",
+      mentionsBot: true,
+      createdAt: 120,
+    });
+
+    expect(providers).toEqual(["codex", "claude", "codex"]);
+    expect(nativeSessions).toEqual([{ mode: "start" }, undefined, { mode: "start" }]);
+  });
+
   test("doc links are fetched and remembered as doc entries (Q8)", async () => {
     const fetched: string[] = [];
     const orch2 = new Orchestrator({
@@ -2876,6 +4723,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     await cliConnector.sendP2P("谁负责后端服务");
 
     expect(cliConnector.sent[0]!.markdown).toContain("回答 Agent 暂时不可用");
+    expect(cliConnector.sent[0]!.markdown).toContain("本机 CLI 在控制台可用");
   });
 
   test("CLI-only runtime reports an allowlisted model-capacity error without blaming CLI setup", async () => {

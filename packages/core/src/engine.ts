@@ -22,6 +22,7 @@ import type {
 } from "@homeagent/shared";
 import { realpathSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { isAbsolute, relative, sep } from "node:path";
 import {
   AI_GENERATION_MAX_TOKENS,
   AI_MAX_CONFIGURABLE_TIMEOUT_MINUTES,
@@ -38,10 +39,12 @@ import {
   isCliProvider,
   isCodexReasoningEffortSupported,
   isProviderTimeoutError,
+  preflightProviderNativeSession as preflightLocalProviderNativeSession,
   runProviderDetailed as runLocalProvider,
   type CodexReasoningEffort,
   type ProviderExecution,
   type ProviderId,
+  type ProviderSkillInput,
 } from "@homeagent/llm";
 import type { Knowledge } from "./knowledge.ts";
 import {
@@ -1172,6 +1175,20 @@ export interface EngineOptions {
   llm?: LlmClient;
   /** override the local-CLI runner (tests inject a fake to avoid spawning) */
   runProvider?: RunProviderFn;
+  /**
+   * No-completion Provider capability check for native sessions. Tests using a
+   * fake runner may inject this independently; production defaults to the real
+   * local CLI probe before any routing/synthesis call.
+   */
+  nativeSessionPreflight?: (
+    provider: ProviderId,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+    workdir?: string,
+    execution?: ProviderExecution,
+    skillInputs?: readonly ProviderSkillInput[],
+    protectedDataRoot?: string,
+  ) => Promise<void>;
   /** deterministic web-research seam for tests or custom deployments */
   learningResearch?: LearningResearchProvider;
   /** Mark task runs left active by a previous service process as failed. */
@@ -1265,6 +1282,8 @@ export interface SpaceAgentCallContext {
   client: LlmClient;
   skills: ResolvedAgentSkills;
   execution?: ProviderExecution;
+  /** Canonical, hash-verified Skill directories for this invocation only. */
+  skillInputs?: ProviderSkillInput[];
 }
 
 export interface AgentRunExecutionSnapshot {
@@ -1289,6 +1308,12 @@ function resolvedSkillsFromEvidence(
     skipped,
     warnings: skipped.map((item) => ({ ...item })),
   };
+}
+
+function pathIsWithinOrEqual(path: string, root: string): boolean {
+  const fromRoot = relative(root, path);
+  return fromRoot === ""
+    || (fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot));
 }
 
 function skillsForProviderExecution(
@@ -1413,6 +1438,7 @@ export class KnowledgeEngine implements Knowledge {
   private dataDir: string;
   private llm?: LlmClient;
   private runProvider: RunProviderFn;
+  private nativeSessionPreflight: NonNullable<EngineOptions["nativeSessionPreflight"]>;
   private learningResearch?: LearningResearchProvider;
   private providerRuns = new Map<ProviderId, ProviderRunHealth>();
   private dreamCycles = new Map<SpaceId, DreamCycleHealth>();
@@ -1481,6 +1507,10 @@ export class KnowledgeEngine implements Knowledge {
     this.llm = opts.llm;
     this.learningResearch = opts.learningResearch;
     const providerRunner = opts.runProvider ?? runLocalProvider;
+    this.nativeSessionPreflight = opts.nativeSessionPreflight
+      ?? (opts.llm || opts.runProvider
+        ? async () => {}
+        : preflightLocalProviderNativeSession);
     this.runProvider = async (provider, input, timeoutMs, signal) => {
       const run = this.providerRuns.get(provider) ?? { provider, running: 0 };
       run.running += 1;
@@ -3127,6 +3157,7 @@ export class KnowledgeEngine implements Knowledge {
       options.taskExecution === true,
     );
     const skillNames = skills.resolved.map((skill) => skill.invocationName);
+    const skillInputs = this.skillCatalog.executionInputsAfterValidation(skills.resolved);
     // Chat/Task callers opt into ProviderExecution. Dream and background
     // learning keep it absent; their native Skills are recorded as skipped so
     // the no-tools boundary and trace evidence stay aligned.
@@ -3147,8 +3178,15 @@ export class KnowledgeEngine implements Knowledge {
       execution,
       agent,
       skillNames,
+      skillInputs,
     );
-    return { agent, client, skills, execution };
+    return {
+      agent,
+      client,
+      skills,
+      execution,
+      skillInputs: skillInputs.map((skill) => ({ ...skill })),
+    };
   }
 
   /**
@@ -3232,7 +3270,11 @@ export class KnowledgeEngine implements Knowledge {
     space: SpaceId,
     executionPlan: ResolvedExecutionPlan,
     skillEvidence?: TaskRunSkillEvidence,
-    options: { timeoutMs?: number; signal?: AbortSignal } = {},
+    options: {
+      timeoutMs?: number;
+      signal?: AbortSignal;
+      nativeSessionIsolation?: boolean;
+    } = {},
   ): SpaceAgentCallContext {
     if (!isResolvedExecutionPlan(executionPlan)) {
       throw new Error("Resolved execution plan is invalid");
@@ -3243,6 +3285,7 @@ export class KnowledgeEngine implements Knowledge {
     this.validateFrozenWorkdir(executionPlan.workdir);
     const skills = this.validatedSkillsFromEvidence(executionPlan, skillEvidence);
     const skillNames = skills.resolved.map((skill) => skill.invocationName);
+    const skillInputs = this.skillCatalog.executionInputsAfterValidation(skills.resolved);
     let client = this.llm;
     if (!client) {
       if (!executionPlan.provider || !isCliProvider(executionPlan.provider)) {
@@ -3259,11 +3302,14 @@ export class KnowledgeEngine implements Knowledge {
         executionPlan.execution,
         skillNames,
         executionPlan.workdir,
+        skillInputs,
+        options.nativeSessionIsolation === true,
       );
     }
     return {
       client,
       skills,
+      skillInputs: skillInputs.map((skill) => ({ ...skill })),
       execution: executionPlan.execution
         ? {
             ...executionPlan.execution,
@@ -3290,7 +3336,17 @@ export class KnowledgeEngine implements Knowledge {
     ) {
       throw new Error("Resolved execution plan Skill names do not match its frozen evidence.");
     }
-    if (executionPlan.skillMode === "all") return frozen;
+    if (executionPlan.skillMode === "all") {
+      const provider = executionPlan.provider ?? "gateway";
+      this.skillCatalog.refresh();
+      const current = this.skillCatalog.resolveAll(provider);
+      if (!sameResolvedSkillSnapshots(frozen.resolved, current.resolved)) {
+        throw new Error(
+          "Queued Run Skill snapshot changed after enqueue; refusing to execute mutable Skill content.",
+        );
+      }
+      return frozen;
+    }
     if (frozen.resolved.length === 0) return frozen;
     const provider = executionPlan.provider;
     if (!provider) {
@@ -3322,6 +3378,48 @@ export class KnowledgeEngine implements Knowledge {
       throw new Error(
         "Frozen Workdir is missing, no longer a directory, or resolves to a different location.",
       );
+    }
+  }
+
+  private validateNativeSessionFilesystemContract(
+    execution: ProviderExecution | undefined,
+    workdir?: string,
+  ): string {
+    if (!execution || execution.permission === "full") {
+      throw new Error("provider codex native session isolation is unavailable");
+    }
+    let dataRoot: string;
+    try {
+      dataRoot = realpathSync(this.dataDir);
+      if (!statSync(dataRoot).isDirectory()) throw new Error("not a directory");
+    } catch {
+      throw new Error("provider codex native session isolation is unavailable");
+    }
+    if (workdir) {
+      this.validateFrozenWorkdir(workdir);
+      if (
+        pathIsWithinOrEqual(workdir, dataRoot)
+        || pathIsWithinOrEqual(dataRoot, workdir)
+      ) {
+        throw new Error("provider codex native session isolation is unavailable");
+      }
+    }
+    return dataRoot;
+  }
+
+  private validateNativeSessionSkillRoots(
+    dataRoot: string,
+    skillInputs: readonly ProviderSkillInput[],
+    workdir?: string,
+  ): void {
+    if (skillInputs.some((skill) =>
+      pathIsWithinOrEqual(dataRoot, skill.directory)
+      || Boolean(workdir && (
+        pathIsWithinOrEqual(skill.directory, workdir)
+        || pathIsWithinOrEqual(workdir, skill.directory)
+      ))
+    )) {
+      throw new Error("provider codex native session isolation is unavailable");
     }
   }
 
@@ -3402,6 +3500,7 @@ export class KnowledgeEngine implements Knowledge {
     execution?: ProviderExecution,
     resolvedAgent = this.agentForSpace(space),
     skillNames: string[] = execution?.skills ?? [],
+    skillInputs: ProviderSkillInput[] = [],
   ): LlmClient {
     const agent = resolvedAgent;
     const cfg = config();
@@ -3431,6 +3530,7 @@ export class KnowledgeEngine implements Knowledge {
       execution,
       skillNames,
       resolveAgentWorkdir(agent),
+      skillInputs,
     );
   }
 
@@ -3572,6 +3672,23 @@ export class KnowledgeEngine implements Knowledge {
         return false;
       }
       return this.registry.store(space).index().attributeRawToAgent(rawId, agentId);
+    });
+  }
+
+  /** Persist a smart-group response decision before a Chat Run can be queued. */
+  async markRawAgentHandled(
+    space: SpaceId,
+    rawId: string,
+    agentId?: string,
+  ): Promise<boolean> {
+    return this.serializer.run(space, async () => {
+      if (!this.registry.has(space)) return false;
+      if (agentId) {
+        const agent = this.agents.get(agentId);
+        if (!agent || !agentVisibleInSpace(agent, space)) return false;
+        return this.registry.store(space).index().attributeRawToAgent(rawId, agentId);
+      }
+      return this.registry.store(space).index().markRawAgentHandled(rawId);
     });
   }
 
@@ -4086,10 +4203,34 @@ export class KnowledgeEngine implements Knowledge {
       const matchingRawRecords = index.findRawsByMessageId(request.messageId, request.chatId);
       if (matchingRawRecords.length === 0) {
         const prior = index.getMessageRetraction(request.chatId, request.messageId);
-        if (!prior) return resultFor("not_found");
-        return request.requesterIsAdmin || prior.originalAuthor === request.requestedBy
-          ? resultFor("already_retracted")
-          : resultFor("forbidden");
+        if (prior) {
+          return request.requesterIsAdmin || prior.originalAuthor === request.requestedBy
+            ? resultFor("already_retracted")
+            : resultFor("forbidden");
+        }
+        const targetAuthor = request.targetAuthor?.trim();
+        if (!targetAuthor) return resultFor("not_found");
+        if (
+          targetAuthor.length > 256
+          || /[\u0000-\u001f\u007f]/u.test(targetAuthor)
+        ) {
+          throw new Error("Retraction target author is invalid or exceeds persistence limits");
+        }
+        if (!request.requesterIsAdmin && targetAuthor !== request.requestedBy) {
+          return resultFor("forbidden");
+        }
+        // A connector-resolved message can have entered Provider history as
+        // explicit reply context even when capture policy produced no Raw.
+        // Invalidate all Space heads first, then persist a tombstone so later
+        // replies and delayed delivery cannot reintroduce it.
+        this.chatRuns.invalidateTopicNativeSessionsForSpace(space);
+        index.recordMessageRetraction({
+          chatId: request.chatId,
+          messageId: request.messageId,
+          originalAuthor: targetAuthor,
+          retractedBy: request.requestedBy,
+        });
+        return resultFor("retracted");
       }
       if (
         !request.requesterIsAdmin &&
@@ -4099,6 +4240,12 @@ export class KnowledgeEngine implements Knowledge {
       ) {
         return resultFor("forbidden");
       }
+      // A Provider-owned conversation can contain this Raw indirectly through
+      // retrieval or explicit reply context, so rawId provenance is not enough
+      // to identify every exposed topic. Fail closed for the whole Space before
+      // any retraction mutation: a later persistence failure may lose context,
+      // but it cannot leave withdrawn content available to a future fork.
+      this.chatRuns.invalidateTopicNativeSessionsForSpace(space);
       const removedSourceIds = new Set(matchingRawRecords.map((rawRecord) => rawRecord.id));
       const removedFileDigests = new Set(matchingRawRecords.flatMap((rawRecord) =>
         (rawRecord.attachments ?? []).flatMap((attachment) =>
@@ -4137,12 +4284,6 @@ export class KnowledgeEngine implements Knowledge {
         // Drop it and let any surviving provenance enter a fresh dream cycle.
         removeQuarantineRecord(store, record.id);
       }
-      index.recordMessageRetraction({
-        chatId: request.chatId,
-        messageId: request.messageId,
-        originalAuthor: matchingRawRecords[0]!.author!,
-        retractedBy: request.requestedBy,
-      });
       // A learning plan contains a private snapshot of its source. Remove that
       // graph before deleting the raw provenance so retraction cannot leave a
       // second copy of the book behind.
@@ -4150,6 +4291,15 @@ export class KnowledgeEngine implements Knowledge {
       // Chat Runs retain retryable input and delivered output. Remove the
       // matching operational copy before deleting its raw provenance.
       this.chatRuns.removeByRawIds(removedSourceIds);
+      // Commit the authoritative tombstone only after every local private copy
+      // and Provider continuation head has been removed. If an earlier cleanup
+      // fails, Raw remains eligible for a later retraction retry.
+      index.recordMessageRetraction({
+        chatId: request.chatId,
+        messageId: request.messageId,
+        originalAuthor: matchingRawRecords[0]!.author!,
+        retractedBy: request.requestedBy,
+      });
       for (const rawRecord of matchingRawRecords) index.deleteRaw(rawRecord.id);
       this.removeUnreferencedRawSources(space, removedFileDigests);
       index.markPending([...survivingSourceIds]);
@@ -4744,9 +4894,12 @@ export class KnowledgeEngine implements Knowledge {
       let learningPlansDeleted = 0;
       let workItemsDeleted = 0;
       const learningArchive = this.learning.exportBySpace(space);
+      const chatRunSnapshot = this.chatRuns.snapshotLocalBySpace(space);
+      let chatRunStateRemoved = false;
       try {
         this.taskRuns.removeBySpace(space);
         this.chatRuns.removeBySpace(space);
+        chatRunStateRemoved = true;
         tasksDeleted = this.tasks.removeBySpace(space);
         remindersDeleted = this.reminders.removeBySpace(space);
         learningPlansDeleted = this.learning.removeBySpace(space);
@@ -4756,8 +4909,7 @@ export class KnowledgeEngine implements Knowledge {
       } catch (err) {
         const missingTaskRuns = taskRuns.filter((run) => !this.taskRuns.has(run.id));
         if (missingTaskRuns.length > 0) this.taskRuns.restore(missingTaskRuns);
-        const missingChatRuns = chatRuns.filter((run) => !this.chatRuns.has(run.id));
-        if (missingChatRuns.length > 0) this.chatRuns.restore(missingChatRuns);
+        if (chatRunStateRemoved) this.chatRuns.restoreLocalSnapshot(chatRunSnapshot);
         const missingTasks = tasks.filter((task) => !this.tasks.has(task.id));
         if (missingTasks.length > 0) this.tasks.restore(missingTasks);
         const missingReminders = reminders.filter((reminder) => !this.reminders.has(reminder.id));
@@ -4851,6 +5003,7 @@ export class KnowledgeEngine implements Knowledge {
             )
             .map((raw) => raw.id),
         );
+        if (expiredRawIds.size === 0) return 0;
         const expiredFileDigests = new Set(
           index.listRaw({})
             .filter((raw) => expiredRawIds.has(raw.id))
@@ -4858,16 +5011,22 @@ export class KnowledgeEngine implements Knowledge {
               attachment.sourceDigest ? [attachment.sourceDigest] : []
             )),
         );
-        const removedChatRuns = this.chatRuns.list(meta.id).filter(
-          (run) => run.rawId && expiredRawIds.has(run.rawId),
-        );
+        const chatRunSnapshot = this.chatRuns.snapshotLocalBySpace(meta.id);
+        // Raw content may already have entered any Provider topic in this Space
+        // through retrieval or reply context. Retention therefore invalidates
+        // all heads before authoritative Raw deletion starts.
+        this.chatRuns.invalidateTopicNativeSessionsForSpace(meta.id);
         this.chatRuns.removeByRawIds(expiredRawIds);
         try {
           const deleted = index.deleteExpiredRawMessages(cutoff, protectedRawIds);
           this.removeUnreferencedRawSources(meta.id, expiredFileDigests);
           return deleted;
         } catch (error) {
-          if (removedChatRuns.length > 0) this.chatRuns.restore(removedChatRuns);
+          // Preserve Chat Run audit on rollback, but never revive a Provider
+          // continuation that may contain Raw whose journal deletion began.
+          chatRunSnapshot.topicNativeSessions.clear();
+          chatRunSnapshot.topicNativeSessionLeases.clear();
+          this.chatRuns.restoreLocalSnapshot(chatRunSnapshot);
           throw error;
         }
       });
@@ -6318,12 +6477,48 @@ export class KnowledgeEngine implements Knowledge {
       .map((space) => this.registry.store(space));
     const primary = spaces[0] ?? stores[0]?.space;
     if (!primary) throw new Error("Chat Run requires at least one space");
+    let protectedDataRoot: string | undefined;
+    if (opts.nativeSession) {
+      if (executionPlan.provider !== "codex") {
+        throw new Error("Provider-native Chat sessions require the frozen Codex provider");
+      }
+      if (opts.signal?.aborted) {
+        throw opts.signal.reason ?? new Error("provider native session preflight cancelled");
+      }
+      protectedDataRoot = this.validateNativeSessionFilesystemContract(
+        executionPlan.execution,
+        executionPlan.workdir,
+      );
+    }
     const context = this.executionPlanCallContext(
       primary,
       executionPlan,
       skillEvidence,
-      { signal: opts.signal, timeoutMs: opts.timeoutMs },
+      {
+        signal: opts.signal,
+        timeoutMs: opts.timeoutMs,
+        nativeSessionIsolation: opts.nativeSession !== undefined,
+      },
     );
+    if (opts.nativeSession) {
+      this.validateNativeSessionSkillRoots(
+        protectedDataRoot!,
+        context.skillInputs ?? [],
+        executionPlan.workdir,
+      );
+      await this.nativeSessionPreflight(
+        "codex",
+        opts.timeoutMs,
+        opts.signal,
+        executionPlan.workdir,
+        context.execution,
+        context.skillInputs ?? [],
+        protectedDataRoot,
+      );
+      if (opts.signal?.aborted) {
+        throw opts.signal.reason ?? new Error("provider native session preflight cancelled");
+      }
+    }
     return this.executeAsk(
       stores,
       spaces,

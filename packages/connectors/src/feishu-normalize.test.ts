@@ -33,6 +33,27 @@ describe("normalizeMessage", () => {
     expect(normalizeMessage({ ...base, message_type: "image" })?.messageType).toBe("image");
   });
 
+  test("retains the Feishu topic identity for conversation routing", () => {
+    expect(normalizeMessage({
+      ...base,
+      thread_id: "omt_topic_1",
+      root_id: "om_root_1",
+      parent_id: "om_parent_1",
+    })).toEqual(expect.objectContaining({
+      threadId: "omt_topic_1",
+      rootMessageId: "om_root_1",
+      parentMessageId: "om_parent_1",
+    }));
+  });
+
+  test("uses the lark-cli reply_to field as the topic parent", () => {
+    expect(normalizeMessage({
+      ...base,
+      reply_to: "om_rendered_parent",
+      parent_id: "om_raw_parent",
+    })?.parentMessageId).toBe("om_rendered_parent");
+  });
+
   test("p2p always counts as mentioning the bot", () => {
     const m = normalizeMessage({ ...base, chat_type: "p2p" });
     expect(m!.mentionsBot).toBe(true);
@@ -41,6 +62,17 @@ describe("normalizeMessage", () => {
   test("group without mention -> mentionsBot false", () => {
     const m = normalizeMessage({ ...base, chat_type: "group" }, { botName: "homeagent" });
     expect(m!.mentionsBot).toBe(false);
+  });
+
+  test("treats a Feishu topic_group as a group conversation", () => {
+    const m = normalizeMessage(
+      { ...base, chat_type: "topic_group" },
+      { botName: "homeagent" },
+    );
+    expect(m).toEqual(expect.objectContaining({
+      chatType: "group",
+      mentionsBot: false,
+    }));
   });
 
   test("falls back to id when message_id missing", () => {

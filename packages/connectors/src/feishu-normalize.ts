@@ -204,7 +204,9 @@ export function normalizeMessage(
   const content = asString(obj.content) ?? "";
   if (!chatId || !messageId || !eventId) return null;
 
-  const chatType = chatTypeRaw === "group" ? "group" : "p2p";
+  const chatType = chatTypeRaw === "group" || chatTypeRaw === "topic_group"
+    ? "group"
+    : "p2p";
   const createdAt = Number(asString(obj.create_time) ?? asString(obj.timestamp) ?? Date.now());
 
   return {
@@ -215,6 +217,9 @@ export function normalizeMessage(
     senderId,
     text: content,
     messageId,
+    threadId: asString(obj.thread_id),
+    rootMessageId: asString(obj.root_id),
+    parentMessageId: asString(obj.reply_to) ?? asString(obj.parent_id),
     messageType: asString(obj.message_type),
     mentionsBot: chatType === "p2p" ? true : detectBotMention(obj, content, identity),
     docLinks: extractDocLinks(content),

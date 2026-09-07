@@ -53,6 +53,13 @@ files. Add or extend a public export when a cross-package seam is genuinely need
 - Chat and Task Runs freeze the Agent revision, instruction, provider, model,
   permission, Workdir, execution limits, and Skill evidence used for that run.
   Retry or restart must not silently substitute current configuration.
+- A Feishu topic Chat Run may use only its explicitly routed Provider-native
+  conversation. Bind it by Space, chat, and root message; use Provider fork
+  semantics and stage the returned child session only in the same atomic commit
+  that records Run success. It becomes eligible as the next parent only after
+  `delivery.status=sent` is durably recorded. Never reconstruct topic history in
+  prompts, advance a mapping on failure, or export Provider session ids in Space
+  archives.
 - `write` and `full` Task execution requires a persisted positive human approval
   granting that execution before provider invocation. Immediately before execution,
   the frozen Workdir must still be an existing directory and canonicalize to the
@@ -77,9 +84,11 @@ files. Add or extend a public export when a cross-package seam is genuinely need
   marked live.
 - Data migration must stage and verify before switching, must fail before partial
   mutation on invalid input, and must not delete the old data directory.
-- Preserve provider isolation: ordinary restricted calls must not inherit ambient
-  user rules, hooks, plugins, or conversation history. Tool and Skill access comes
-  only from the frozen HomeAgent execution contract.
+- Preserve provider isolation: restricted calls must not inherit ambient user
+  rules, hooks, plugins, or unrelated conversation history. The sole conversation
+  exception is an explicitly routed Feishu topic Chat turn using its compatible
+  Provider-native parent; shared topic turns may read only their Team Space. Tool
+  and Skill access comes only from the frozen HomeAgent execution contract.
 - Do not perform real Feishu mutations, live provider calls, downloads, signing,
   notarization, or release publication unless the task explicitly requests them
   and the required environment is available.

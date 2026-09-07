@@ -1,11 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
+  symlinkSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,6 +19,8 @@ import {
   applyPendingDataDirectoryMigration,
   DATA_GITIGNORE,
   dataDirectoryWasUninitialized,
+  ensureDataGitIgnore,
+  ensureDataGitIgnoreForRepository,
   readRuntimeDataSettings,
   runtimeDataSettingsPath,
   scheduleDataDirectoryMigration,
@@ -71,6 +77,112 @@ describe("runtime data directory settings", () => {
     mkdirSync(join(runtimeOnly, "config"));
     expect(dataDirectoryWasUninitialized(runtimeOnly)).toBeFalse();
     expect(dataDirectoryWasUninitialized(source)).toBeFalse();
+  });
+
+  test("upgrades an existing managed gitignore to exclude Provider credentials and rollouts", () => {
+    const directory = join(root, "existing-data-repository");
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, ".gitignore"), [
+      "private-notes/",
+      "",
+      "# HomeAgent runtime-only and rebuildable files",
+      "/run/",
+      "/logs/",
+      "/bin/",
+      "**/.index.db",
+      "",
+    ].join("\n"), "utf8");
+
+    ensureDataGitIgnore(directory);
+    ensureDataGitIgnore(directory);
+
+    const gitignore = readFileSync(join(directory, ".gitignore"), "utf8");
+    expect(gitignore).toContain("private-notes/\n");
+    expect(gitignore.match(/\/provider-state\//gu)).toHaveLength(1);
+    expect(gitignore.match(/# HomeAgent runtime-only and rebuildable files/gu)).toHaveLength(1);
+  });
+
+  test("does not create a gitignore for a non-Git data directory", () => {
+    const directory = join(root, "plain-data-directory");
+    mkdirSync(directory);
+
+    ensureDataGitIgnoreForRepository(directory);
+
+    expect(existsSync(join(directory, ".gitignore"))).toBeFalse();
+
+    mkdirSync(join(directory, ".git"));
+    ensureDataGitIgnoreForRepository(directory);
+    expect(readFileSync(join(directory, ".gitignore"), "utf8")).toBe(DATA_GITIGNORE);
+  });
+
+  const symlinkTest = process.platform === "win32" ? test.skip : test;
+  symlinkTest("refuses to follow an existing gitignore symlink", () => {
+    const directory = join(root, "linked-gitignore-data");
+    const target = join(root, "outside-gitignore");
+    mkdirSync(directory);
+    writeFileSync(target, "must remain unchanged\n", "utf8");
+    symlinkSync(target, join(directory, ".gitignore"));
+
+    expect(() => ensureDataGitIgnore(directory)).toThrow("regular file");
+    expect(readFileSync(target, "utf8")).toBe("must remain unchanged\n");
+  });
+
+  test("refuses a linked data-directory root", () => {
+    const target = join(root, "actual-data-root");
+    const linked = join(root, "linked-data-root");
+    mkdirSync(target);
+    symlinkSync(target, linked, process.platform === "win32" ? "junction" : "dir");
+
+    expect(() => ensureDataGitIgnore(linked)).toThrow("canonical directory");
+    expect(existsSync(join(target, ".gitignore"))).toBeFalse();
+  });
+
+  test("preserves the original gitignore and cleans staging after replacement fails", () => {
+    const directory = join(root, "failed-gitignore-replacement");
+    const gitignore = join(directory, ".gitignore");
+    mkdirSync(directory);
+    writeFileSync(gitignore, "private-notes/\n", "utf8");
+
+    expect(() => ensureDataGitIgnore(directory, {
+      beforeReplace: () => {
+        throw new Error("simulated replacement failure");
+      },
+    })).toThrow("simulated replacement failure");
+
+    expect(readFileSync(gitignore, "utf8")).toBe("private-notes/\n");
+    expect(readdirSync(directory).filter((name) => name.startsWith(".gitignore.tmp-")))
+      .toEqual([]);
+  });
+
+  test("does not overwrite a same-content gitignore replaced during staging", () => {
+    const directory = join(root, "raced-gitignore-replacement");
+    const gitignore = join(directory, ".gitignore");
+    mkdirSync(directory);
+    writeFileSync(gitignore, "private-notes/\n", "utf8");
+
+    expect(() => ensureDataGitIgnore(directory, {
+      beforeReplace: () => {
+        rmSync(gitignore);
+        writeFileSync(gitignore, "private-notes/\n", "utf8");
+      },
+    })).toThrow("changed before replacement");
+
+    expect(readFileSync(gitignore, "utf8")).toBe("private-notes/\n");
+    expect(readdirSync(directory).filter((name) => name.startsWith(".gitignore.tmp-")))
+      .toEqual([]);
+  });
+
+  const posixTest = process.platform === "win32" ? test.skip : test;
+  posixTest("preserves an existing gitignore mode across atomic replacement", () => {
+    const directory = join(root, "mode-preserving-gitignore");
+    const gitignore = join(directory, ".gitignore");
+    mkdirSync(directory);
+    writeFileSync(gitignore, "private-notes/\n", "utf8");
+    chmodSync(gitignore, 0o644);
+
+    ensureDataGitIgnore(directory);
+
+    expect(statSync(gitignore).mode & 0o777).toBe(0o644);
   });
 
   test("schedules an absolute empty destination without touching either data tree", () => {

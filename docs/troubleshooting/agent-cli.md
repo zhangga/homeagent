@@ -34,15 +34,54 @@ Windows 和 macOS/Linux 进程都只继承启动时的环境。安装器更新�
 
 **指纹：** Codex 在读取 prompt 前就以参数解析错误退出，常见于 isolation flag 放在错误位置或本机版本过旧。
 
-当前 HomeAgent 适配 Codex 0.147+：`--ephemeral`、`--ignore-user-config` 和 `--ignore-rules` 属于 `exec` 子命令，必须位于 `exec` 之后。先核对：
+当前 HomeAgent 的一次性调用需要 Codex 0.147+；飞书话题的原生会话 fork 及其隔离参数需要 Codex 0.152.1+。
+`--ephemeral`、`--ignore-user-config` 和 `--ignore-rules` 属于 `exec` 子命令，必须位于 `exec` 之后。先核对：
 
 ```bash
 codex --version
 codex --help
 codex exec --help
+codex exec fork --help
+codex mcp list --json
 ```
 
-HomeAgent 通过 stdin 传多行 prompt，并使用 `approval_policy="never"`、ephemeral、忽略用户配置/规则和按权限映射的 sandbox。不要为了绕过解析错误删除隔离参数或改成继承用户规则；这会改变安全契约。版本不匹配时升级受支持 CLI，或在代码和相邻 provider 测试中显式完成兼容改动。
+HomeAgent 通过 stdin 传多行 prompt，并使用 `approval_policy="never"`、ephemeral、忽略用户配置/规则、
+`project_doc_max_bytes=0`、关闭 Codex 自动 Skill 发现和按权限映射的 sandbox。冻结 Skill 由 HomeAgent 在每次调用前
+按已记录摘要捕获，复制到本轮私有临时目录并对副本复验，再以唯一允许的 exact `name → SKILL.md` 映射传入；
+live Skill 目录不会进入 prompt/profile，fork 也会忽略历史 turn 中已清理的旧临时路径。不要为了绕过解析错误删除隔离参数、恢复项目
+`AGENTS.md` 注入或改成继承用户规则；这会改变安全契约。版本不匹配时升级受支持 CLI，或在代码和相邻
+provider 测试中显式完成兼容改动。
+
+HomeAgent 的 Codex setup、能力探测和实际运行共同使用 `<dataDir>/provider-state/codex`。启动时会初始化该独立目录；
+若当前控制台 `CODEX_HOME/auth.json` 是有效的普通文件，HomeAgent 会以有界读取、JSON 校验、同目录临时文件和原子发布
+把登录缓存导入独立目录。源文件不会被修改或链接，控制台的配置、规则、Plugins、Skills、原生会话及其他状态也不会被继承。
+导入后，HomeAgent 优先使用独立目录中的 file credential cache，Codex 可自行刷新该副本；若 file cache 不可用，
+会再用无模型 `login status` 探测 Codex 的系统 keyring，并在验证成功后仅复用这份 OS 凭据。两条路径都继续使用独立
+`CODEX_HOME`，不会继承控制台配置、规则、Plugins、Skills 或会话历史。两种缓存都不可用时，设置页会显示
+“HomeAgent 尚未连接当前 Codex 账号”，需要完成一次官方设备授权；源码模式和打包应用都提供该入口。
+需要自定义隔离位置时设置 `HOMEAGENT_CODEX_HOME`。Codex 专属 Skill 也只从该目录的
+`skills/` 发现；共享 Skill 请放在 `~/.agents/skills`。Provider 已禁用 Plugin/Vendor，不要把 ambient
+`~/.codex/plugins` 或 `~/.codex/vendor_imports` 中的能力写进冻结 Run 证据。
+
+Windows 控制台里的 Codex 能正常执行普通任务，不等于 HomeAgent 飞书话题所需的 exact filesystem profile 已可用：
+Codex 的 `unelevated` fallback 无法满足 restricted read-only root-deny 时，HomeAgent 会继续允许普通调用，但把原生会话标成
+“安全沙箱待设置”。此时在 Agent 详情右侧点击“启用 Windows 安全沙箱”；HomeAgent 通过 Codex App Server 发起官方
+`elevated` 设置，请在弹出的 UAC/管理员窗口中批准。页面会等待完成并自动重新执行同一无模型隔离探测，只有探测通过才显示
+“Codex 已完全可用”。拒绝 UAC、企业策略禁止本地用户/组、防火墙或登录权限变更时，设置会固定失败并允许重试；不要改成
+跳过 root-deny 或把用户的完整 `~/.codex` 配置复制进 HomeAgent。
+
+飞书话题的 Codex 原生会话还要求“有效 MCP 列表为空”且 filesystem root-deny 确实生效。HomeAgent 会用同一受控子进程环境、
+隔离 `CODEX_HOME`、冻结 Workdir、本轮私有 Skill 副本和 exact permission profile 执行
+`codex mcp list --json`（只接受严格的 `[]`）及不调用模型的 sandbox probe。probe 必须同时证明本轮允许目录可读、
+`CODEX_HOME` sentinel 不可读、`<dataDir>/run/` 下仅受 `:root=deny` 保护的 sibling sentinel 也不可读；只证明某条显式 deny 不算通过。
+每次调用都会一边捕获 live Skill bundle 一边核对冻结摘要，复制到私有临时目录后再对副本重算同一摘要；prompt 和 permission profile
+只包含副本路径，成功、失败或取消后都会清理。live 目录在冻结后发生变化时固定拒绝，不会降级为直接授权原路径。
+路由/分类和最终生成都使用这套边界，只有最终生成携带原生会话。`full`、Workdir 与数据目录重叠、无 Workdir 时回退到进程 cwd，
+或任一 probe 失败都会在模型调用前固定拒绝；无 Workdir 的只读话题改用本轮专用空目录。
+System/MDM MCP 无法由本次 CLI 调用全局关闭；只要列表
+非空、非法、探测失败或超时，原生会话都会在模型调用前 fail-closed，且公开错误不显示 server 名称。
+请让机器管理员从 System/MDM 删除这些 MCP，再刷新 Provider 探测；不能清空时改用 Claude
+或保持 Codex 一次性调用，不要绕过该门禁。
 
 ## CLI-004 — 编码由消费方决定
 
@@ -76,7 +115,25 @@ Chat/Task Run 创建时冻结 Agent revision、instruction、provider、model、
 
 `write`/`full` 运行在 provider 调用前必须已有持久化正向人工审批。执行前还要确认冻结 Workdir 仍是目录，重新 canonicalize 后与创建 Run 时的位置相同；缺少审批、owner、来源或执行证据时 fail-closed。应用停止时已经 running 的 provider 进程不得在恢复时重放。
 
-## RUN-002 — WorkAction 结果先 held 再验收
+## RUN-002 — 飞书话题只推进已提交的 Provider 会话
+
+Codex 的飞书群话题使用 Provider 原生会话，而不是由 HomeAgent 重放聊天记录；Claude 当前仍是一次性隔离调用。
+首轮 start，后续每轮从最近成功 head fork；只有 Provider 回答和 Chat Run 成功状态在同一次原子提交中落盘后
+才提升 child。失败、取消、超时或进程中断都保留旧 head。父会话在 Provider 本机不可用，或话题中出现没有进入
+Provider 历史的静态产品回复时，HomeAgent 会废弃旧 head，让下一轮重新 start。
+
+原生链只包含真正进入回答阶段的 Agent 问答，不包含未触发回答的普通群消息、路由或分类调用。当前消息正文以及明确回复目标
+的正文或图片仍可能作为本 turn 的不可信来源上下文传入；未明确回复时不会用同一 chat 的“最近附件”启发式跨话题补上下文。
+若同一话题突然丢失上下文，依次核对 root message、
+冻结配置兼容摘要、Provider 本机历史是否仍存在，以及 `config/chat-runs.json` 是否随同一数据目录重启；不要
+手工填写或从归档导入 session ID。
+
+话题映射不会进入 `homeagent.space` 归档，换机或恢复备份后第一轮重新 start 是预期行为。多人话题只读取 Team
+Space；若发现 Personal Space 内容进入共享话题，应视为隔离故障并停止该版本。撤回消息后相关映射必须与
+Chat Run 删除原子失效，重启后重投同一 `message_id` 也不得重新收录或回答；
+HomeAgent 不负责清除 Provider CLI 账户自己保留的本机会话文件。
+
+## RUN-003 — WorkAction 结果先 held 再验收
 
 WorkAction 产生的 Raw 一开始必须是 `held`：
 

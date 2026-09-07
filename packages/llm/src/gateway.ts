@@ -19,7 +19,7 @@ import {
   type Logger,
 } from "@homeagent/shared";
 import { estimateCost } from "./pricing.ts";
-import type { CompletionUsage } from "./providers.ts";
+import type { CompletionUsage, NativeSessionRequest } from "./providers.ts";
 import {
   recordCall,
   type CallPurpose,
@@ -51,11 +51,15 @@ export interface CompleteOptions {
   space?: string;
   /** number of retryable attempts (network/5xx). default 3 */
   retries?: number;
+  /** Explicit Provider-owned conversation turn; only local CLI adapters consume it. */
+  nativeSession?: NativeSessionRequest;
 }
 
 export interface CompleteResult {
   text: string;
   model: string;
+  /** Provider-owned conversation id for an explicitly stateful call. */
+  nativeSessionId?: string;
   /** @deprecated Prefer usage.inputTokens. Absent means the provider did not report it. */
   inputTokens?: number;
   /** @deprecated Prefer usage.outputTokens. Absent means the provider did not report it. */
@@ -183,6 +187,9 @@ function recordGatewayCall(call: Parameters<typeof recordCall>[0]): void {
 
 /** Free-form text completion. */
 export async function complete(opts: CompleteOptions): Promise<CompleteResult> {
+  if (opts.nativeSession) {
+    throw new Error("legacy gateway does not support native sessions");
+  }
   if (opts.images?.length) {
     throw new Error("legacy gateway does not support image inputs");
   }
@@ -257,6 +264,9 @@ export async function completeJSON<T = unknown>(opts: JSONOptions<T>): Promise<{
   value: T;
   result: CompleteResult;
 }> {
+  if (opts.nativeSession) {
+    throw new Error("legacy gateway does not support native sessions");
+  }
   if (opts.images?.length) {
     throw new Error("legacy gateway does not support image inputs");
   }

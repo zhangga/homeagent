@@ -12,8 +12,8 @@ import { isProviderTimeoutError } from "@homeagent/llm";
  * backend rather than failing silently or exposing arbitrary diagnostics.
  */
 export const NO_PROVIDER_NOTICE = [
-  "⚠️ 回答 Agent 暂时不可用，可能是本机 CLI 未配置、鉴权失败或服务不可达。",
-  "请在管理后台检查当前空间的 Agent，或在设置里更换默认的本机 CLI。",
+  "⚠️ 回答 Agent 暂时不可用。",
+  "即使本机 CLI 在控制台可用，HomeAgent 也可能尚未连接当前账号；请在管理后台检查当前空间的 Agent 和 Provider 连接状态，或更换默认的本机 CLI。",
 ].join("\n");
 
 /** Safe, fixed copy for the canonical capacity error returned by Codex. */
@@ -52,6 +52,31 @@ export const NO_TOOLS_MODE_NOTICE = [
 export const GROUP_REMINDER_AUTOMATION_DENIAL =
   "只有群主或群管理员可以管理本群提醒；私聊提醒仍由本人直接管理。";
 
+/**
+ * Shown when the local CLI login itself expired or was revoked. This is
+ * self-serviceable and must not be reported as a HomeAgent wiring problem: the
+ * operator has to re-run the provider login, not inspect the management backend.
+ */
+export const PROVIDER_LOGIN_EXPIRED_NOTICE = [
+  "⚠️ 本机 Codex 登录已失效，暂时无法回答。",
+  "登录凭据已过期或被吊销（常见于在别处重新登录过）。请在终端执行 `codex login` 重新登录，HomeAgent 会自动采用刷新后的凭据。",
+].join("\n");
+
+/**
+ * Shown when a Feishu group turn needed the Codex native topic session but the
+ * frozen execution contract could not satisfy its isolation gate. This is an
+ * Agent configuration problem, not a missing account connection: `full`
+ * permission, a Workdir overlapping the data directory, a Skill bundle
+ * overlapping the Workdir, a non-empty effective MCP list, or a Codex below
+ * 0.152.1 all fail closed here. The generic notice pointed operators at Agent
+ * and Provider connection status, which cannot fix any of those.
+ */
+export const NATIVE_SESSION_UNAVAILABLE_NOTICE = [
+  "⚠️ 群里的话题回答暂时不可用：当前 Agent 的执行配置无法满足 Codex 原生会话的隔离要求。",
+  "最常见的原因是 Agent 权限为 `full`。群聊话题要求可验证的受限沙箱，因此会在调用模型前固定拒绝；请在管理后台把该 Agent 权限改为 `write` 或 `read`。",
+  "若权限本来就受限，请再依次检查：Workdir 是否与 HomeAgent 数据目录重叠、冻结 Skill 目录是否与 Workdir 重叠、有效 MCP 列表是否为空、本机 Codex 是否为 0.152.1 及以上。",
+].join("\n");
+
 export function providerNotice(error: unknown): string {
   const message = String(error);
   if (/does not support image inputs|不支持图片输入/i.test(message)) {
@@ -62,6 +87,16 @@ export function providerNotice(error: unknown): string {
   }
   if (/selected model is at capacity/i.test(message)) {
     return MODEL_CAPACITY_NOTICE;
+  }
+  if (/provider codex native session isolation is unavailable/i.test(message)) {
+    return NATIVE_SESSION_UNAVAILABLE_NOTICE;
+  }
+  if (
+    /refresh token was revoked|could not be refreshed|please log out and sign in again/i
+      .test(message)
+    || /\b401\b[^\n]*unauthorized|invalid_grant/i.test(message)
+  ) {
+    return PROVIDER_LOGIN_EXPIRED_NOTICE;
   }
   return isProviderTimeoutError(error) ? providerTimeoutNotice(error) : NO_PROVIDER_NOTICE;
 }

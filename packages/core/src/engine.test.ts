@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -17,6 +18,7 @@ import { FakeLlm } from "./testing.ts";
 import { config, type Page, type RawRecord, type SpaceId } from "@homeagent/shared";
 import { BudgetExceededError, localDay, ProviderRunError } from "@homeagent/llm";
 import { SkillCatalog } from "./skill-catalog.ts";
+import type { RunProviderFn } from "./cli-client.ts";
 import type { AggregatedRunUsage } from "./usage.ts";
 import { parseSpaceArchive } from "./governance.ts";
 import { RawJournal } from "./raw-journal.ts";
@@ -5255,7 +5257,292 @@ describe("Knowledge seam contract", () => {
     }));
   });
 
-  test("durable all-Skill Chat keeps its frozen catalog when Skill content changes", async () => {
+  test("native Chat capability is checked before knowledge routing can call a Provider", async () => {
+    const chatDir = join(dir, "native-session-preflight-data");
+    const workdir = join(dir, "native-session-preflight-workspace");
+    mkdirSync(workdir, { recursive: true });
+    let providerCalls = 0;
+    const preflightCalls: Array<{
+      provider: string;
+      timeoutMs?: number;
+      workdir?: string;
+      protectedDataRoot?: string;
+    }> = [];
+    const chatEngine = new KnowledgeEngine({
+      dataDir: chatDir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
+      runProvider: async () => {
+        providerCalls += 1;
+        return JSON.stringify({ slugs: [], relevant: false });
+      },
+      nativeSessionPreflight: async (
+        provider,
+        timeoutMs,
+        _signal,
+        frozenWorkdir,
+        _execution,
+        _skillInputs,
+        protectedDataRoot,
+      ) => {
+        preflightCalls.push({
+          provider,
+          timeoutMs,
+          workdir: frozenWorkdir,
+          protectedDataRoot,
+        });
+        throw new Error("native session capability is unavailable");
+      },
+    });
+    chatEngine.ensureSpace(SPACE);
+    chatEngine.registry.store(SPACE).writePage(
+      page("entities/alice", "Alice", "Alice 负责后端。"),
+    );
+    const agent = chatEngine.agents.create({
+      name: "原生会话助手",
+      provider: "codex",
+      workdir,
+      skills: [],
+    });
+    chatEngine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const snapshot = chatEngine.agentRunExecutionSnapshot(SPACE);
+
+    await expect(chatEngine.askWithExecutionPlan(
+      [SPACE],
+      "谁负责后端？",
+      snapshot.executionPlan,
+      snapshot.skillEvidence,
+      {
+        timeoutMs: 12_345,
+        nativeSession: { mode: "start" },
+      },
+      agent.id,
+    )).rejects.toThrow("native session capability is unavailable");
+    chatEngine.close();
+
+    expect(preflightCalls).toEqual([{
+      provider: "codex",
+      timeoutMs: 12_345,
+      workdir: realpathSync(workdir),
+      protectedDataRoot: realpathSync(chatDir),
+    }]);
+    expect(providerCalls).toBe(0);
+  });
+
+  test("native Chat routing and final calls share one frozen isolation context", async () => {
+    const chatDir = join(dir, "native-session-context-data");
+    const workdir = join(dir, "native-session-context-workspace");
+    const skillRoot = join(dir, "native-session-context-skills");
+    const skillDir = join(skillRoot, "review");
+    mkdirSync(workdir, { recursive: true });
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      ["---", "name: review", "description: Review.", "---", "Review files."].join("\n"),
+      "utf8",
+    );
+    const providerInputs: Array<Parameters<RunProviderFn>[1]> = [];
+    const preflightCalls: Array<{
+      workdir?: string;
+      skillInputs?: readonly { name: string; directory: string; skillFile: string }[];
+      protectedDataRoot?: string;
+    }> = [];
+    const chatEngine = new KnowledgeEngine({
+      dataDir: chatDir,
+      skillCatalog: new SkillCatalog({
+        roots: [{ kind: "codex-user", path: skillRoot, providerIds: ["codex"] }],
+      }),
+      nativeSessionPreflight: async (
+        _provider,
+        _timeoutMs,
+        _signal,
+        frozenWorkdir,
+        _execution,
+        skillInputs,
+        protectedDataRoot,
+      ) => {
+        preflightCalls.push({
+          workdir: frozenWorkdir,
+          skillInputs: skillInputs?.map((skill) => ({ ...skill })),
+          protectedDataRoot,
+        });
+      },
+      runProvider: async (_provider, input) => {
+        providerInputs.push({
+          ...input,
+          skills: input.skills ? [...input.skills] : undefined,
+          skillInputs: input.skillInputs?.map((skill) => ({ ...skill })),
+          execution: input.execution
+            ? { ...input.execution, skills: [...input.execution.skills] }
+            : undefined,
+        });
+        const properties = (input.outputSchema as {
+          properties?: Record<string, unknown>;
+        } | undefined)?.properties ?? {};
+        const text = "relevant" in properties
+          ? JSON.stringify({ slugs: ["entities/alice"], relevant: true })
+          : JSON.stringify({
+              answer: "Alice 负责后端。",
+              grounded: true,
+              usedSlugs: ["entities/alice"],
+              gaps: [],
+            });
+        return {
+          text,
+          usage: { costBasis: "unavailable", source: "legacy-text" },
+          ...(input.nativeSession ? { nativeSessionId: "019-native-child" } : {}),
+        };
+      },
+    });
+    chatEngine.ensureSpace(SPACE);
+    chatEngine.registry.store(SPACE).writePage(
+      page("entities/alice", "Alice", "Alice 负责后端。"),
+    );
+    const agent = chatEngine.agents.create({
+      name: "原生会话隔离助手",
+      provider: "codex",
+      permission: "read-only",
+      workdir,
+      skills: [],
+    });
+    chatEngine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const snapshot = chatEngine.agentRunExecutionSnapshot(SPACE);
+
+    const result = await chatEngine.askWithExecutionPlan(
+      [SPACE],
+      "谁负责后端？",
+      snapshot.executionPlan,
+      snapshot.skillEvidence,
+      { nativeSession: { mode: "start" } },
+      agent.id,
+    );
+    chatEngine.close();
+
+    const expectedSkillInput = {
+      name: "review",
+      directory: realpathSync(skillDir),
+      skillFile: realpathSync(join(skillDir, "SKILL.md")),
+      bundleHash: snapshot.skillEvidence.resolved[0]!.skillFileHash,
+    };
+    expect(result.nativeSessionId).toBe("019-native-child");
+    expect(preflightCalls).toEqual([{
+      workdir: realpathSync(workdir),
+      skillInputs: [expectedSkillInput],
+      protectedDataRoot: realpathSync(chatDir),
+    }]);
+    expect(providerInputs).toHaveLength(2);
+    expect(providerInputs.every((input) => input.nativeSessionIsolation === true)).toBe(true);
+    expect(providerInputs.every((input) => input.protectedDataRoot === realpathSync(chatDir))).toBe(true);
+    expect(providerInputs.every((input) =>
+      JSON.stringify(input.skillInputs) === JSON.stringify([expectedSkillInput])
+    )).toBe(true);
+    expect(providerInputs[0]?.nativeSession).toBeUndefined();
+    expect(providerInputs[1]?.nativeSession).toEqual({ mode: "start" });
+  });
+
+  test("native Chat rejects full access and protected-data Workdirs before custom seams", async () => {
+    for (const scenario of ["full", "workdir-inside-data", "workdir-contains-data"] as const) {
+      const scenarioRoot = join(dir, `native-session-admission-${scenario}`);
+      const chatDir = scenario === "workdir-contains-data"
+        ? join(scenarioRoot, "workspace", "data")
+        : join(scenarioRoot, "data");
+      const workdir = scenario === "workdir-inside-data"
+        ? join(chatDir, "workspace")
+        : scenario === "workdir-contains-data"
+          ? join(scenarioRoot, "workspace")
+          : join(scenarioRoot, "workspace");
+      mkdirSync(chatDir, { recursive: true });
+      mkdirSync(workdir, { recursive: true });
+      let providerCalls = 0;
+      let preflightCalls = 0;
+      const chatEngine = new KnowledgeEngine({
+        dataDir: chatDir,
+        skillCatalog: new SkillCatalog({ roots: [] }),
+        runProvider: async () => {
+          providerCalls += 1;
+          return "unreachable";
+        },
+        nativeSessionPreflight: async () => {
+          preflightCalls += 1;
+        },
+      });
+      chatEngine.ensureSpace(SPACE);
+      const agent = chatEngine.agents.create({
+        name: `native admission ${scenario}`,
+        provider: "codex",
+        permission: scenario === "full" ? "full" : "read-only",
+        workdir,
+        skills: [],
+      });
+      chatEngine.registry.updateMeta(SPACE, { agentId: agent.id });
+      const snapshot = chatEngine.agentRunExecutionSnapshot(SPACE);
+
+      await expect(chatEngine.askWithExecutionPlan(
+        [SPACE],
+        "must fail before provider admission",
+        snapshot.executionPlan,
+        snapshot.skillEvidence,
+        { nativeSession: { mode: "start" } },
+        agent.id,
+      )).rejects.toThrow("provider codex native session isolation is unavailable");
+      expect(preflightCalls).toBe(0);
+      expect(providerCalls).toBe(0);
+      chatEngine.close();
+    }
+  });
+
+  test("native Chat rejects a live Skill bundle exposed through its Workdir", async () => {
+    const scenarioRoot = join(dir, "native-session-skill-workdir-overlap");
+    const chatDir = join(scenarioRoot, "data");
+    const workdir = join(scenarioRoot, "workspace");
+    const skillRoot = join(workdir, "skills");
+    const skillDir = join(skillRoot, "review");
+    mkdirSync(chatDir, { recursive: true });
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      ["---", "name: review", "description: Review.", "---"].join("\n"),
+      "utf8",
+    );
+    let providerCalls = 0;
+    let preflightCalls = 0;
+    const chatEngine = new KnowledgeEngine({
+      dataDir: chatDir,
+      skillCatalog: new SkillCatalog({
+        roots: [{ kind: "codex-user", path: skillRoot, providerIds: ["codex"] }],
+      }),
+      runProvider: async () => {
+        providerCalls += 1;
+        return "unreachable";
+      },
+      nativeSessionPreflight: async () => {
+        preflightCalls += 1;
+      },
+    });
+    chatEngine.ensureSpace(SPACE);
+    const agent = chatEngine.agents.create({
+      name: "native Skill overlap",
+      provider: "codex",
+      permission: "read-only",
+      workdir,
+      skills: [],
+    });
+    chatEngine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const snapshot = chatEngine.agentRunExecutionSnapshot(SPACE);
+
+    await expect(chatEngine.askWithExecutionPlan(
+      [SPACE],
+      "must fail before provider admission",
+      snapshot.executionPlan,
+      snapshot.skillEvidence,
+      { nativeSession: { mode: "start" } },
+      agent.id,
+    )).rejects.toThrow("provider codex native session isolation is unavailable");
+    expect(preflightCalls).toBe(0);
+    expect(providerCalls).toBe(0);
+    chatEngine.close();
+  });
+
+  test("durable all-Skill Chat fails closed when Skill content changes", async () => {
     const chatDir = join(dir, "chat-plan-skill-change");
     const workdir = join(chatDir, "agent-workspace");
     mkdirSync(workdir, { recursive: true });
@@ -5308,29 +5595,113 @@ describe("Knowledge seam contract", () => {
       "utf8",
     );
 
-    const result = await chatEngine.askWithExecutionPlan(
+    await expect(chatEngine.askWithExecutionPlan(
       [SPACE],
       "ordinary durable chat",
       snapshot.executionPlan,
       snapshot.skillEvidence,
-    );
-    expect(result.answer).toBe("base answer");
-    expect(result.context).toBe("agent-workdir");
-    expect(providerCalls).toBe(1);
-    expect(providerInput).toEqual(expect.objectContaining({
-      execution: {
-        permission: "read-only",
-        workdir: realpathSync(workdir),
-        skills: ["review"],
-        skillMode: "all",
-      },
-      skills: ["review"],
-      workdir: realpathSync(workdir),
-    }));
+    )).rejects.toThrow("Skill snapshot changed after enqueue");
+    expect(providerCalls).toBe(0);
+    expect(providerInput).toBeUndefined();
     chatEngine.close();
   });
 
-  test("ask forwards the all-Skill snapshot without a per-call file preflight", async () => {
+  test("durable all-Skill Chat fails closed when its catalog membership changes", async () => {
+    const mutations = [
+      {
+        label: "source added",
+        apply: (lowRoot: string, _highRoot: string) => {
+          const addedDir = join(lowRoot, "summarize");
+          mkdirSync(addedDir, { recursive: true });
+          writeFileSync(
+            join(addedDir, "SKILL.md"),
+            ["---", "name: summarize", "description: Added.", "---", "Added behavior."].join("\n"),
+            "utf8",
+          );
+        },
+      },
+      {
+        label: "source removed",
+        apply: (lowRoot: string, _highRoot: string) => {
+          rmSync(join(lowRoot, "review"), { recursive: true, force: true });
+        },
+      },
+      {
+        label: "higher-precedence conflict added",
+        apply: (_lowRoot: string, highRoot: string) => {
+          const conflictingDir = join(highRoot, "review");
+          mkdirSync(conflictingDir, { recursive: true });
+          writeFileSync(
+            join(conflictingDir, "SKILL.md"),
+            ["---", "name: review", "description: Conflicting.", "---", "Conflicting behavior."].join("\n"),
+            "utf8",
+          );
+        },
+      },
+      {
+        label: "source path moved",
+        apply: (lowRoot: string, _highRoot: string) => {
+          renameSync(join(lowRoot, "review"), join(lowRoot, "moved-review"));
+        },
+      },
+    ];
+
+    for (const [index, mutation] of mutations.entries()) {
+      const chatDir = join(dir, `chat-plan-skill-membership-${index}`);
+      const workdir = join(chatDir, "agent-workspace");
+      const lowRoot = join(chatDir, "vendor-skills");
+      const highRoot = join(chatDir, "user-skills");
+      const skillDir = join(lowRoot, "review");
+      mkdirSync(workdir, { recursive: true });
+      mkdirSync(skillDir, { recursive: true });
+      mkdirSync(highRoot, { recursive: true });
+      writeFileSync(
+        join(skillDir, "SKILL.md"),
+        ["---", "name: review", "description: Original.", "---", "Original behavior."].join("\n"),
+        "utf8",
+      );
+      let providerCalls = 0;
+      const chatEngine = new KnowledgeEngine({
+        dataDir: chatDir,
+        skillCatalog: new SkillCatalog({
+          roots: [
+            { kind: "codex-vendor", path: lowRoot, providerIds: ["codex"] },
+            { kind: "codex-user", path: highRoot, providerIds: ["codex"] },
+          ],
+          cacheTtlMs: 60_000,
+        }),
+        runProvider: async () => {
+          providerCalls += 1;
+          return "provider must not run";
+        },
+      });
+      chatEngine.ensureSpace(SPACE);
+      const agent = chatEngine.agents.create({
+        name: `all-Skill membership ${mutation.label}`,
+        provider: "codex",
+        workdir,
+      });
+      chatEngine.registry.updateMeta(SPACE, { agentId: agent.id });
+      const snapshot = chatEngine.agentRunExecutionSnapshot(SPACE);
+      expect(snapshot.skillEvidence.resolved).toEqual([expect.objectContaining({
+        sourceKey: "codex-vendor:review",
+        name: "review",
+      })]);
+
+      mutation.apply(lowRoot, highRoot);
+
+      await expect(chatEngine.askWithExecutionPlan(
+        [SPACE],
+        `ordinary durable chat after ${mutation.label}`,
+        snapshot.executionPlan,
+        snapshot.skillEvidence,
+      )).rejects.toThrow("Skill snapshot changed after enqueue");
+      expect(providerCalls).toBe(0);
+      chatEngine.close();
+    }
+  });
+
+  test("ask omits an all-Skill source removed before its execution snapshot", async () => {
     const skillRoot = join(dir, "warning-skills");
     const skillDir = join(skillRoot, "review");
     mkdirSync(skillDir, { recursive: true });
@@ -5368,8 +5739,11 @@ describe("Knowledge seam contract", () => {
     taskEngine.close();
 
     expect(result.answer).toBe("base answer");
-    expect(result.skillWarnings).toBeUndefined();
-    expect(providerSkills).toEqual(["review"]);
+    expect(result.skillWarnings).toEqual([expect.objectContaining({
+      name: "review",
+      code: "missing_source",
+    })]);
+    expect(providerSkills).toEqual([]);
   });
 
   test("runTask records the Agent provider and model used for execution", async () => {
@@ -6847,7 +7221,7 @@ describe("Knowledge seam contract", () => {
     });
   });
 
-  test("a queued all-Skill task keeps its frozen catalog when Skill resources change", async () => {
+  test("a queued all-Skill task fails closed when Skill resources change", async () => {
     const recoveryDir = join(dir, "queued-task-skill-recovery");
     const workdir = join(recoveryDir, "workdir");
     const skillRoot = join(recoveryDir, "skills");
@@ -6931,11 +7305,15 @@ describe("Knowledge seam contract", () => {
     const recoveredRun = reopened.getTaskRun(queued.id);
     reopened.close();
 
-    expect(providerCalls).toBe(1);
-    expect(report.ok).toBe(true);
+    expect(providerCalls).toBe(0);
+    expect(report).toEqual(expect.objectContaining({
+      status: "failed",
+      ok: false,
+      error: expect.stringContaining("Skill snapshot changed after enqueue"),
+    }));
     expect(recoveredRun).toEqual(expect.objectContaining({
-      status: "succeeded",
-      output: "executed with the frozen catalog",
+      status: "failed",
+      error: expect.stringContaining("Skill snapshot changed after enqueue"),
     }));
   });
 

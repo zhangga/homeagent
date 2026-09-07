@@ -4,6 +4,29 @@
 
 一个个人或团队知识隔离域。每条 Raw、每个知识页以及相关工作记录只属于一个 Space。
 
+## Provider topic conversation
+
+飞书群里的一个话题由 `chatId + rootMessageId` 唯一定位。冻结 Provider 为 Codex 的普通话题问答会把
+该话题绑定到一条 Provider 原生会话链：首轮新建，后续每轮从最近一次已提交的会话 fork。链中只包含
+真正进入回答阶段的用户 turn 和 Provider 回答；未触发回答的群消息、路由/分类调用以及 HomeAgent 的
+静态回复不会被伪造成 Provider 历史。当前消息显式回复的正文或图片仍可作为本 turn 的不可信来源上下文
+传入，这不属于历史重放。Claude、TRAE、Dream、学习、质量重评、私聊和非话题调用仍是互相隔离的
+一次性 Provider 调用。
+
+HomeAgent 只在本机 `config/chat-runs.json` 保存有界的话题路由、兼容摘要和最近一次成功的 Provider
+会话 ID。新回答产生的 child 与 Chat Run 成功状态必须在同一次原子提交中暂存；只有外发
+`delivery.status=sent` 也持久化后，该 child 才能成为下一轮 parent。外发失败、送达状态不确定、回答失败、
+取消、超时或进程中断都不得推进可复用路由，避免未确认送达或未提交的 Provider turn 污染下一轮。无法恢复 Provider 父会话时废弃旧路由，下一轮
+重新开始；产生未进入 Provider 历史的静态产品回复时也废弃旧路由，避免后续 turn 错认上下文。
+Agent revision、Instruction、Provider、Model、Permission、Workdir 或 Skill 证据变化时兼容摘要变化，
+下一轮必须新建会话。应用使用同一数据目录重启时可以继续；映射不属于 Raw、Knowledge page 或 SQLite
+projection，也不进入 `homeagent.space` 归档，因为 Provider 的本机状态不可移植，归档恢复后的下一轮
+会重新开始。
+
+同一群话题可能由多人参与，因此绑定原生会话的回答只读取对应 Team Space，不能把任一发送者的 Personal
+Space 内容写入共享 Provider 历史。消息撤回、Space 删除或其他会使历史内容失去授权的治理操作必须废弃
+相关路由；这只阻止 HomeAgent 再次引用该会话，Provider 自己在机器账户下保留的数据仍由对应 CLI 管理。
+
 ## Raw
 
 未经提炼的原始输入，包括消息、文档、手动导入、任务结果和学习记录。Raw 保留来源、作者、时间、

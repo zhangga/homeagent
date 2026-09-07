@@ -3,7 +3,9 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Page, SpaceId } from "@homeagent/shared";
+import { topicNativeSessionCompatibilityKey } from "./chat-runs.ts";
 import { KnowledgeEngine } from "./engine.ts";
+import type { ResolvedExecutionPlan } from "./execution-plan.ts";
 import { refreshDigest } from "./digest.ts";
 import { parseSpaceArchive, type SpaceArchive } from "./governance.ts";
 import { knowledgePageRevision } from "./local-agent-knowledge.ts";
@@ -2824,6 +2826,160 @@ describe("space data governance", () => {
     engine.close();
   });
 
+  test("failed raw retention restores Chat Run audit without reviving the topic session", async () => {
+    const dataDir = tempDir("hb-retention-topic-rollback-");
+    let engine = new KnowledgeEngine({ dataDir });
+    const now = 1_800_000_000_000;
+    const day = 86_400_000;
+    await engine.restoreSpace({
+      format: "homeagent.space",
+      version: 1,
+      exportedAt: now,
+      space: { id: SPACE, createdAt: now - 50 * day },
+      purpose: "purpose",
+      schema: "schema",
+      pages: [],
+      raw: [{
+        id: "old-ingested",
+        source: "message",
+        createdAt: now - 40 * day,
+        ingested: true,
+        space: SPACE,
+        content: "old-ingested",
+        attachments: [],
+        admission: "ready",
+      }],
+      retractions: [],
+      tasks: [],
+    });
+    const executionPlan: ResolvedExecutionPlan = {
+      version: 1,
+      instruction: "Topic agent",
+      provider: "codex",
+    };
+    const topicNativeSession = {
+      kind: "feishu-topic" as const,
+      chatId: "oc_governance",
+      rootMessageId: "om_topic_root",
+      provider: "codex" as const,
+      compatibilityKey: topicNativeSessionCompatibilityKey({ executionPlan }),
+    };
+    const head = engine.chatRuns.start({
+      space: SPACE,
+      rawId: "old-ingested",
+      chatId: "oc_governance",
+      messageId: "om_topic_first",
+      input: "first",
+      trigger: "message",
+      executionPlan,
+      topicNativeSession,
+      startedAt: 100,
+    });
+    engine.chatRuns.begin(head.id, 101);
+    engine.chatRuns.prepareTopicNativeSession(head.id);
+    engine.chatRuns.succeed(head.id, {
+      finishedAt: 110,
+      output: "done",
+      nativeSessionId: "11111111-2222-4333-8444-555555555555",
+    });
+    engine.chatRuns.startDeliveryAttempt(head.id, 111);
+    engine.chatRuns.deliverySent(head.id, 112);
+    const index = engine.registry.store(SPACE).index();
+    const mutableIndex = index as unknown as {
+      deleteExpiredRawMessages: typeof index.deleteExpiredRawMessages;
+    };
+    const originalDeleteExpiredRawMessages = index.deleteExpiredRawMessages.bind(index);
+    mutableIndex.deleteExpiredRawMessages = () => {
+      throw new Error("simulated retention failure");
+    };
+    try {
+      await expect(engine.pruneRawMessages(30, now))
+        .rejects.toThrow("simulated retention failure");
+    } finally {
+      mutableIndex.deleteExpiredRawMessages = originalDeleteExpiredRawMessages;
+    }
+
+    expect(engine.chatRuns.get(head.id)?.status).toBe("succeeded");
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir });
+    const followup = engine.chatRuns.start({
+      space: SPACE,
+      chatId: "oc_governance",
+      messageId: "om_topic_followup",
+      input: "followup",
+      trigger: "message",
+      executionPlan,
+      topicNativeSession,
+      startedAt: 120,
+    });
+    engine.chatRuns.begin(followup.id, 121);
+    expect(engine.chatRuns.prepareTopicNativeSession(followup.id)).toEqual({ mode: "start" });
+    engine.close();
+  });
+
+  test("raw retention preserves topic heads when no Raw is expired", async () => {
+    const dataDir = tempDir("hb-retention-topic-noop-");
+    let engine = new KnowledgeEngine({ dataDir });
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "message",
+      author: "ou_owner",
+      chatId: "oc_governance",
+      messageId: "om_recent",
+      content: "recent",
+    });
+    const executionPlan: ResolvedExecutionPlan = {
+      version: 1,
+      instruction: "Topic agent",
+      provider: "codex",
+    };
+    const topicNativeSession = {
+      kind: "feishu-topic" as const,
+      chatId: "oc_governance",
+      rootMessageId: "om_topic_root",
+      provider: "codex" as const,
+      compatibilityKey: topicNativeSessionCompatibilityKey({ executionPlan }),
+    };
+    const head = engine.chatRuns.start({
+      space: SPACE,
+      rawId,
+      chatId: "oc_governance",
+      messageId: "om_recent",
+      input: "recent",
+      trigger: "message",
+      executionPlan,
+      topicNativeSession,
+    });
+    engine.chatRuns.begin(head.id);
+    engine.chatRuns.prepareTopicNativeSession(head.id);
+    engine.chatRuns.succeed(head.id, {
+      finishedAt: Date.now(),
+      output: "done",
+      nativeSessionId: "11111111-2222-4333-8444-555555555555",
+    });
+    engine.chatRuns.startDeliveryAttempt(head.id, Date.now());
+    engine.chatRuns.deliverySent(head.id, Date.now());
+
+    expect((await engine.pruneRawMessages(30, Date.now())).deleted).toBe(0);
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir });
+    const followup = engine.chatRuns.start({
+      space: SPACE,
+      chatId: "oc_governance",
+      messageId: "om_followup",
+      input: "followup",
+      trigger: "message",
+      executionPlan,
+      topicNativeSession,
+    });
+    engine.chatRuns.begin(followup.id);
+    expect(engine.chatRuns.prepareTopicNativeSession(followup.id)).toEqual({
+      mode: "fork",
+      id: "11111111-2222-4333-8444-555555555555",
+    });
+    engine.close();
+  });
+
   test("message retraction removes the matching Chat Run copy", async () => {
     const engine = new KnowledgeEngine({ dataDir: tempDir("hb-chat-retraction-") });
     const rawId = await engine.remember({
@@ -2856,6 +3012,311 @@ describe("space data governance", () => {
 
     expect(result.status).toBe("retracted");
     expect(engine.chatRuns.get(run.id)).toBeUndefined();
+    engine.close();
+  });
+
+  test("connector-authorized retraction without Raw persists a tombstone and clears topic heads", async () => {
+    const dataDir = tempDir("hb-context-only-retraction-");
+    let engine = new KnowledgeEngine({ dataDir });
+    engine.ensureSpace(SPACE, { chatId: "oc_governance" });
+    const executionPlan: ResolvedExecutionPlan = {
+      version: 1,
+      instruction: "Topic agent",
+      provider: "codex",
+    };
+    const topicNativeSession = {
+      kind: "feishu-topic" as const,
+      chatId: "oc_governance",
+      rootMessageId: "om_other_topic_root",
+      provider: "codex" as const,
+      compatibilityKey: topicNativeSessionCompatibilityKey({ executionPlan }),
+    };
+    const head = engine.chatRuns.start({
+      space: SPACE,
+      chatId: "oc_governance",
+      messageId: "om_other_topic_turn",
+      input: "question",
+      trigger: "message",
+      executionPlan,
+      topicNativeSession,
+    });
+    engine.chatRuns.begin(head.id);
+    engine.chatRuns.prepareTopicNativeSession(head.id);
+    engine.chatRuns.succeed(head.id, {
+      finishedAt: Date.now(),
+      output: "answer",
+      nativeSessionId: "11111111-2222-4333-8444-555555555555",
+    });
+    engine.chatRuns.startDeliveryAttempt(head.id, Date.now());
+    engine.chatRuns.deliverySent(head.id, Date.now());
+
+    expect(await engine.retractMessage(SPACE, {
+      chatId: "oc_governance",
+      messageId: "om_context_only_missing_author",
+      requestedBy: "ou_owner",
+    })).toEqual(expect.objectContaining({ status: "not_found" }));
+    expect(await engine.retractMessage(SPACE, {
+      chatId: "oc_governance",
+      messageId: "om_context_only_foreign",
+      requestedBy: "ou_intruder",
+      targetAuthor: "ou_owner",
+    })).toEqual(expect.objectContaining({ status: "forbidden" }));
+    expect(engine.registry.store(SPACE).index().getMessageRetraction(
+      "oc_governance",
+      "om_context_only_foreign",
+    )).toBeNull();
+
+    expect(await engine.retractMessage(SPACE, {
+      chatId: "oc_governance",
+      messageId: "om_context_only_target",
+      requestedBy: "ou_owner",
+      targetAuthor: "ou_owner",
+    })).toEqual(expect.objectContaining({ status: "retracted" }));
+    expect(await engine.retractMessage(SPACE, {
+      chatId: "oc_governance",
+      messageId: "om_context_only_admin_target",
+      requestedBy: "ou_admin",
+      targetAuthor: "ou_other",
+      requesterIsAdmin: true,
+    })).toEqual(expect.objectContaining({ status: "retracted" }));
+    expect(await engine.remember({
+      space: SPACE,
+      source: "message",
+      author: "ou_owner",
+      chatId: "oc_governance",
+      messageId: "om_context_only_target",
+      content: "delayed secret delivery",
+    })).toBe("retracted:om_context_only_target");
+    expect(engine.registry.store(SPACE).index().findRawsByMessageId(
+      "om_context_only_target",
+      "oc_governance",
+    )).toHaveLength(0);
+    engine.close();
+
+    engine = new KnowledgeEngine({ dataDir });
+    expect(engine.registry.store(SPACE).index().getMessageRetraction(
+      "oc_governance",
+      "om_context_only_target",
+    )).toEqual(expect.objectContaining({ originalAuthor: "ou_owner" }));
+    const followup = engine.chatRuns.start({
+      space: SPACE,
+      chatId: "oc_governance",
+      messageId: "om_other_topic_followup",
+      input: "followup",
+      trigger: "message",
+      executionPlan,
+      topicNativeSession,
+    });
+    engine.chatRuns.begin(followup.id);
+    expect(engine.chatRuns.prepareTopicNativeSession(followup.id)).toEqual({ mode: "start" });
+    engine.close();
+  });
+
+  test("a failed context-only retraction journal write keeps the topic head invalidated after reopen", async () => {
+    const dataDir = tempDir("hb-context-only-retraction-head-fail-closed-");
+    let engine = new KnowledgeEngine({ dataDir });
+    engine.ensureSpace(SPACE, { chatId: "oc_governance" });
+    const executionPlan: ResolvedExecutionPlan = {
+      version: 1,
+      instruction: "Topic agent",
+      provider: "codex",
+    };
+    const topicNativeSession = {
+      kind: "feishu-topic" as const,
+      chatId: "oc_governance",
+      rootMessageId: "om_context_only_failure_root",
+      provider: "codex" as const,
+      compatibilityKey: topicNativeSessionCompatibilityKey({ executionPlan }),
+    };
+    const head = engine.chatRuns.start({
+      space: SPACE,
+      chatId: "oc_governance",
+      messageId: "om_context_only_failure_turn",
+      input: "question",
+      trigger: "message",
+      executionPlan,
+      topicNativeSession,
+    });
+    engine.chatRuns.begin(head.id);
+    engine.chatRuns.prepareTopicNativeSession(head.id);
+    engine.chatRuns.succeed(head.id, {
+      finishedAt: head.startedAt,
+      output: "answer",
+      nativeSessionId: "11111111-2222-4333-8444-555555555555",
+    });
+    engine.chatRuns.startDeliveryAttempt(head.id, head.startedAt + 1);
+    engine.chatRuns.deliverySent(head.id, head.startedAt + 2);
+
+    const index = engine.registry.store(SPACE).index();
+    const mutableIndex = index as unknown as {
+      recordMessageRetraction: typeof index.recordMessageRetraction;
+    };
+    const originalRecordMessageRetraction = index.recordMessageRetraction.bind(index);
+    mutableIndex.recordMessageRetraction = () => {
+      throw new Error("simulated context-only retraction journal failure");
+    };
+    try {
+      await expect(engine.retractMessage(SPACE, {
+        chatId: "oc_governance",
+        messageId: "om_context_only_no_raw_target",
+        requestedBy: "ou_owner",
+        targetAuthor: "ou_owner",
+      })).rejects.toThrow("simulated context-only retraction journal failure");
+    } finally {
+      mutableIndex.recordMessageRetraction = originalRecordMessageRetraction;
+    }
+
+    expect(index.findRawsByMessageId(
+      "om_context_only_no_raw_target",
+      "oc_governance",
+    )).toHaveLength(0);
+    expect(index.getMessageRetraction(
+      "oc_governance",
+      "om_context_only_no_raw_target",
+    )).toBeNull();
+    expect(engine.chatRuns.get(head.id)?.status).toBe("succeeded");
+    engine.close();
+
+    engine = new KnowledgeEngine({ dataDir });
+    const followup = engine.chatRuns.start({
+      space: SPACE,
+      chatId: "oc_governance",
+      messageId: "om_context_only_failure_followup",
+      input: "followup",
+      trigger: "message",
+      executionPlan,
+      topicNativeSession,
+    });
+    engine.chatRuns.begin(followup.id);
+    expect(engine.chatRuns.prepareTopicNativeSession(followup.id)).toEqual({ mode: "start" });
+    engine.close();
+  });
+
+  test("message retraction does not commit its tombstone before Chat Run cleanup", async () => {
+    const engine = new KnowledgeEngine({ dataDir: tempDir("hb-chat-retraction-order-") });
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "message",
+      author: "ou_owner",
+      chatId: "oc_governance",
+      messageId: "om_chat_retract_order",
+      content: "撤回顺序",
+    });
+    const mutableChatRuns = engine.chatRuns as unknown as {
+      removeByRawIds: typeof engine.chatRuns.removeByRawIds;
+    };
+    const originalRemoveByRawIds = engine.chatRuns.removeByRawIds.bind(engine.chatRuns);
+    mutableChatRuns.removeByRawIds = () => {
+      throw new Error("simulated Chat Run cleanup failure");
+    };
+    try {
+      await expect(engine.retractMessage(SPACE, {
+        chatId: "oc_governance",
+        messageId: "om_chat_retract_order",
+        requestedBy: "ou_owner",
+      })).rejects.toThrow("simulated Chat Run cleanup failure");
+    } finally {
+      mutableChatRuns.removeByRawIds = originalRemoveByRawIds;
+    }
+
+    const index = engine.registry.store(SPACE).index();
+    expect(index.getMessageRetraction("oc_governance", "om_chat_retract_order")).toBeNull();
+    expect(index.getRaw(rawId)).not.toBeNull();
+    engine.close();
+  });
+
+  test("a failed retraction journal write keeps every Space topic head invalidated after reopen", async () => {
+    const dataDir = tempDir("hb-chat-retraction-head-fail-closed-");
+    let engine = new KnowledgeEngine({ dataDir });
+    const rawId = await engine.remember({
+      space: SPACE,
+      source: "message",
+      author: "ou_owner",
+      chatId: "oc_governance",
+      messageId: "om_chat_retract_head",
+      content: "可能已进入多个原生会话的内容",
+    });
+    const executionPlan: ResolvedExecutionPlan = {
+      version: 1,
+      instruction: "Topic agent",
+      provider: "codex",
+    };
+    const startHead = (rootMessageId: string, messageId: string, sessionId: string) => {
+      const topicNativeSession = {
+        kind: "feishu-topic" as const,
+        chatId: "oc_governance",
+        rootMessageId,
+        provider: "codex" as const,
+        compatibilityKey: topicNativeSessionCompatibilityKey({ executionPlan }),
+      };
+      const run = engine.chatRuns.start({
+        space: SPACE,
+        chatId: "oc_governance",
+        messageId,
+        input: "question",
+        trigger: "message",
+        executionPlan,
+        topicNativeSession,
+      });
+      engine.chatRuns.begin(run.id);
+      engine.chatRuns.prepareTopicNativeSession(run.id);
+      engine.chatRuns.succeed(run.id, {
+        finishedAt: run.startedAt,
+        output: "answer",
+        nativeSessionId: sessionId,
+      });
+      engine.chatRuns.startDeliveryAttempt(run.id, run.startedAt + 1);
+      engine.chatRuns.deliverySent(run.id, run.startedAt + 2);
+      return { run, topicNativeSession };
+    };
+    const first = startHead(
+      "om_topic_root_a",
+      "om_topic_turn_a",
+      "11111111-2222-4333-8444-555555555555",
+    );
+    const second = startHead(
+      "om_topic_root_b",
+      "om_topic_turn_b",
+      "66666666-7777-4888-8999-aaaaaaaaaaaa",
+    );
+    const index = engine.registry.store(SPACE).index();
+    const mutableIndex = index as unknown as {
+      recordMessageRetraction: typeof index.recordMessageRetraction;
+    };
+    const originalRecordMessageRetraction = index.recordMessageRetraction.bind(index);
+    mutableIndex.recordMessageRetraction = () => {
+      throw new Error("simulated retraction journal failure");
+    };
+    try {
+      await expect(engine.retractMessage(SPACE, {
+        chatId: "oc_governance",
+        messageId: "om_chat_retract_head",
+        requestedBy: "ou_owner",
+      })).rejects.toThrow("simulated retraction journal failure");
+    } finally {
+      mutableIndex.recordMessageRetraction = originalRecordMessageRetraction;
+    }
+
+    expect(index.getMessageRetraction("oc_governance", "om_chat_retract_head")).toBeNull();
+    expect(index.getRaw(rawId)).not.toBeNull();
+    expect(engine.chatRuns.get(first.run.id)?.status).toBe("succeeded");
+    expect(engine.chatRuns.get(second.run.id)?.status).toBe("succeeded");
+    engine.close();
+
+    engine = new KnowledgeEngine({ dataDir });
+    for (const [offset, prior] of [first, second].entries()) {
+      const followup = engine.chatRuns.start({
+        space: SPACE,
+        chatId: "oc_governance",
+        messageId: `om_topic_followup_${offset}`,
+        input: "followup",
+        trigger: "message",
+        executionPlan,
+        topicNativeSession: prior.topicNativeSession,
+      });
+      engine.chatRuns.begin(followup.id);
+      expect(engine.chatRuns.prepareTopicNativeSession(followup.id)).toEqual({ mode: "start" });
+    }
     engine.close();
   });
 
@@ -3111,6 +3572,37 @@ describe("space data governance", () => {
       sourceRawIds: ["raw_book"],
       sourceMessageId: "om_book",
     });
+    const executionPlan: ResolvedExecutionPlan = {
+      version: 1,
+      instruction: "Topic agent",
+      provider: "codex",
+    };
+    const topicNativeSession = {
+      kind: "feishu-topic" as const,
+      chatId: "oc_governance",
+      rootMessageId: "om_topic_root",
+      provider: "codex" as const,
+      compatibilityKey: topicNativeSessionCompatibilityKey({ executionPlan }),
+    };
+    const chatRun = engine.chatRuns.start({
+      space: SPACE,
+      chatId: "oc_governance",
+      messageId: "om_topic_first",
+      input: "first",
+      trigger: "message",
+      executionPlan,
+      topicNativeSession,
+      startedAt: 100,
+    });
+    engine.chatRuns.begin(chatRun.id, 101);
+    engine.chatRuns.prepareTopicNativeSession(chatRun.id);
+    engine.chatRuns.succeed(chatRun.id, {
+      finishedAt: 110,
+      output: "done",
+      nativeSessionId: "11111111-2222-4333-8444-555555555555",
+    });
+    engine.chatRuns.startDeliveryAttempt(chatRun.id, 111);
+    engine.chatRuns.deliverySent(chatRun.id, 112);
     engine.registry.remove = () => {
       throw new Error("workspace removal failed");
     };
@@ -3120,6 +3612,22 @@ describe("space data governance", () => {
     expect(engine.registry.has(SPACE)).toBe(true);
     expect(engine.tasks.get(task.id)).toEqual(task);
     expect(engine.learning.get(learningPlan.id)).toEqual(learningPlan);
+    expect(engine.chatRuns.get(chatRun.id)?.status).toBe("succeeded");
+    const followup = engine.chatRuns.start({
+      space: SPACE,
+      chatId: "oc_governance",
+      messageId: "om_topic_followup",
+      input: "followup",
+      trigger: "message",
+      executionPlan,
+      topicNativeSession,
+      startedAt: 120,
+    });
+    engine.chatRuns.begin(followup.id, 121);
+    expect(engine.chatRuns.prepareTopicNativeSession(followup.id)).toEqual({
+      mode: "fork",
+      id: "11111111-2222-4333-8444-555555555555",
+    });
     engine.close();
   });
 

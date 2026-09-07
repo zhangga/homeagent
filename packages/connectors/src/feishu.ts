@@ -14,6 +14,7 @@
  *   - fetches docx links via `docs +fetch --as user` for doc sync (Q8).
  */
 import { config, logger } from "@homeagent/shared";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -40,6 +41,21 @@ const MESSAGE_KEY = "im.message.receive_v1";
 const BOT_ADDED_KEY = "im.chat.member.bot.added_v1";
 const READY_RE = /\[event\]\s+ready\b/;
 const MAX_REPLY_CONTEXT_CHARS = 20_000;
+const MAX_REPLY_IDEMPOTENCY_IDENTITY_CHARS = 512;
+
+function replyIdempotencyKey(out: OutboundReply): string | undefined {
+  const identity = out.idempotencyKey ?? out.replyToMessageId;
+  if (identity === undefined) return undefined;
+  if (
+    typeof identity !== "string"
+    || identity.length === 0
+    || identity.length > MAX_REPLY_IDEMPOTENCY_IDENTITY_CHARS
+  ) {
+    throw new Error("Feishu reply idempotency identity is invalid or exceeds limits");
+  }
+  const digest = createHash("sha256").update(identity).digest("hex").slice(0, 32);
+  return `ha-reply-${digest}`;
+}
 
 export interface CancellableDeadline {
   elapsed: Promise<void>;
@@ -410,6 +426,7 @@ export class FeishuConnector implements Connector {
   // ---- outbound -----------------------------------------------------------
 
   async reply(out: OutboundReply): Promise<void> {
+    const idempotencyKey = replyIdempotencyKey(out);
     const cmd = [
       this.larkBin,
       "im",
@@ -421,12 +438,7 @@ export class FeishuConnector implements Connector {
     ];
     if (out.replyToMessageId) cmd.push("--message-id", out.replyToMessageId);
     if (out.inThread) cmd.push("--reply-in-thread");
-    if (out.replyToMessageId) {
-      cmd.push(
-        "--idempotency-key",
-        `homeagent-${out.replyToMessageId}`.slice(0, 50),
-      );
-    }
+    if (idempotencyKey) cmd.push("--idempotency-key", idempotencyKey);
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         await this.runCommand(cmd);

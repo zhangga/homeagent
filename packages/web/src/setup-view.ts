@@ -236,7 +236,7 @@ function codexLoginSetup(
   const action = html`<form method="post" action="/setup/ai/codex/login">
     <div class="actions"><button class="${primary ? "primary-action" : "secondary-action"}">连接 ChatGPT</button></div>
   </form>`;
-  const content = html`<p class="muted">HomeAgent 使用机器 PATH 中的 Codex 连接 ChatGPT。连接后可用于普通聊天和任务；两者会按 Agent 的 Permission / Workdir 执行，并自动获得全部兼容 Skills。提炼与后台学习仍保持 no-tools。</p>
+  const content = html`<p class="muted">HomeAgent 使用机器 PATH 中的 Codex 连接 ChatGPT，并会自动安全导入控制台 Codex 的登录缓存。连接后可用于普通聊天和任务；两者会按 Agent 的 Permission / Workdir 执行，并自动获得全部兼容 Skills。提炼与后台学习仍保持 no-tools。</p>
     ${error ? html`<div class="flash">${error}</div>` : ""}
     ${action}
   `;
@@ -279,7 +279,7 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
   if (available.length === 0) {
     if (input.codex.enabled && input.codex.installed) {
       return html`<div class="eyebrow">02 · AI</div><h1 class="setup-title">连接机器上的 Codex</h1>
-        <p class="lede">Codex 已安装，尚未连接 ChatGPT。点击下方按钮后在 OpenAI 官方页面完成登录。</p>
+        <p class="lede">Codex 已安装，但 HomeAgent 尚未连接当前 Codex 账号。HomeAgent 会自动安全导入控制台 Codex 的登录缓存；若未检测到有效缓存，请点击下方按钮，在 OpenAI 官方页面完成一次授权。</p>
         ${codexLoginSetup(input, true)}
         ${advancedProviderSetup(taskOnlyAvailable)}`;
     }

@@ -34,6 +34,12 @@ export interface InboundMessage {
   text: string;
   /** message_id, needed to reply in-thread */
   messageId: string;
+  /** Feishu topic/thread id when the platform event belongs to a topic. */
+  threadId?: string;
+  /** Root message id shared by every reply in the same topic. */
+  rootMessageId?: string;
+  /** Immediate parent message id for reply-context resolution. */
+  parentMessageId?: string;
   /** native message type, used to route direct attachments */
   messageType?: string;
   /** true when the bot was @-mentioned (group gating, Q2) */
@@ -59,6 +65,8 @@ export interface OutboundReply {
   chatId: string;
   /** reply target message id (in-thread for groups when supported) */
   replyToMessageId?: string;
+  /** Stable logical delivery identity. Retries of one delivery reuse this value. */
+  idempotencyKey?: string;
   /** markdown body */
   markdown: string;
   /** group replies may thread */

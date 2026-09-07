@@ -22,7 +22,9 @@ import type {
   JSONOptions,
   ProviderRunResult,
   ProviderExecution,
+  ProviderSkillInput,
   ProviderId,
+  NativeSessionRequest,
 } from "@homeagent/llm";
 import { runProviderDetailed as realRunProvider } from "@homeagent/llm";
 import {
@@ -58,10 +60,14 @@ export type RunProviderFn = (
     reasoningEffort?: CodexReasoningEffort;
     images?: CompleteOptions["images"];
     skills?: string[];
+    skillInputs?: ProviderSkillInput[];
     workdir?: string;
+    protectedDataRoot?: string;
     execution?: ProviderExecution;
     outputSchema?: Record<string, unknown>;
     maxTokens?: number;
+    nativeSession?: NativeSessionRequest;
+    nativeSessionIsolation?: boolean;
   },
   timeoutMs?: number,
   signal?: AbortSignal,
@@ -82,6 +88,7 @@ function normalizeProviderResult(
     text: output.text.trim(),
     model: output.model ?? fallbackModel,
     usage: { ...output.usage },
+    nativeSessionId: output.nativeSessionId,
   };
 }
 
@@ -186,6 +193,8 @@ export function makeCliClient(
   execution?: ProviderExecution,
   skills: string[] = execution?.skills ?? [],
   workdir?: string,
+  skillInputs: ProviderSkillInput[] = [],
+  nativeSessionIsolation = false,
 ): LlmClient {
   if (typeof accountingDataDir !== "string" || !accountingDataDir.trim()) {
     throw new Error("accounting data directory is required");
@@ -221,9 +230,15 @@ export function makeCliClient(
             reasoningEffort,
             images: opts.images,
             skills: [...skills],
+            ...(skillInputs.length > 0
+              ? { skillInputs: skillInputs.map((skill) => ({ ...skill })) }
+              : {}),
             workdir,
+            protectedDataRoot: accountingDataDir,
             execution,
             maxTokens: opts.maxTokens,
+            nativeSession: opts.nativeSession,
+            ...(nativeSessionIsolation ? { nativeSessionIsolation: true } : {}),
           },
           timeoutMs,
           signal,
@@ -270,10 +285,16 @@ export function makeCliClient(
             reasoningEffort,
             images: opts.images,
             skills: [...skills],
+            ...(skillInputs.length > 0
+              ? { skillInputs: skillInputs.map((skill) => ({ ...skill })) }
+              : {}),
             workdir,
+            protectedDataRoot: accountingDataDir,
             execution,
             ...(provider === "codex" ? { outputSchema: opts.schema } : {}),
             maxTokens: opts.maxTokens,
+            nativeSession: opts.nativeSession,
+            ...(nativeSessionIsolation ? { nativeSessionIsolation: true } : {}),
           },
           timeoutMs,
           signal,

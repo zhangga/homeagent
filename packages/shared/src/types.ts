@@ -180,6 +180,8 @@ export interface AskResult {
   citations: Citation[];
   /** Durable local quality trace used for explicit answer feedback. */
   traceId?: string;
+  /** Provider-owned conversation head returned by an explicitly stateful Chat turn. */
+  nativeSessionId?: string;
   /** notable gaps the knowledge base did not cover, if any */
   gaps?: string[];
   /** Agent Skills skipped for this call; the base Agent still ran. */

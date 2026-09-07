@@ -206,3 +206,49 @@ test("legacy gateway never silently ignores local image inputs", async () => {
     }),
   ).rejects.toThrow("does not support image inputs");
 });
+
+test("legacy gateway rejects native sessions before accessing the network", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ha-gateway-native-session-"));
+  const previousFetch = globalThis.fetch;
+  const previous = {
+    dataDir: process.env.HOMEAGENT_DATA_DIR,
+    baseUrl: process.env.ANTHROPIC_BASE_URL,
+    token: process.env.ANTHROPIC_AUTH_TOKEN,
+  };
+  let fetchCalls = 0;
+  try {
+    process.env.HOMEAGENT_DATA_DIR = directory;
+    process.env.ANTHROPIC_BASE_URL = "https://gateway.invalid";
+    process.env.ANTHROPIC_AUTH_TOKEN = "test-token";
+    resetConfig();
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return new Response(JSON.stringify({
+        content: [{ type: "text", text: "must not be returned" }],
+      }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await expect(complete({
+      prompt: "start a session",
+      nativeSession: { mode: "start" },
+      retries: 0,
+    })).rejects.toThrow("legacy gateway does not support native sessions");
+    await expect(completeJSON({
+      prompt: "start a session",
+      nativeSession: { mode: "start" },
+      schema: { type: "object" },
+      retries: 0,
+    })).rejects.toThrow("legacy gateway does not support native sessions");
+    expect(fetchCalls).toBe(0);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previous.dataDir === undefined) delete process.env.HOMEAGENT_DATA_DIR;
+    else process.env.HOMEAGENT_DATA_DIR = previous.dataDir;
+    if (previous.baseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = previous.baseUrl;
+    if (previous.token === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;
+    else process.env.ANTHROPIC_AUTH_TOKEN = previous.token;
+    resetConfig();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

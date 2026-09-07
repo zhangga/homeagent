@@ -319,7 +319,7 @@ describe("web backend (read-only)", () => {
         name: "Codex",
         bin: "codex",
         available: false,
-        detail: "ChatGPT 尚未连接",
+        detail: "HomeAgent 尚未连接当前 Codex 账号",
       }],
       providerModels: async () => ({ codex: ["gpt-5.4"] }),
       codexSetup: {
@@ -336,7 +336,7 @@ describe("web backend (read-only)", () => {
     const page = await installed.request("/setup");
     expect(page.status).toBe(200);
     const body = await page.text();
-    expect(body).toContain("Codex 已安装，尚未连接 ChatGPT");
+    expect(body).toContain("Codex 已安装，但 HomeAgent 尚未连接当前 Codex 账号");
     expect(body).toContain('action="/setup/ai/codex/login"');
     expect(body).toContain("连接 ChatGPT");
     expect(body).not.toContain('<option value="codex"');
@@ -349,12 +349,159 @@ describe("web backend (read-only)", () => {
     });
     expect(premature.status).toBe(302);
     expect(decodeURIComponent(premature.headers.get("location") ?? ""))
-      .toContain("ChatGPT 尚未连接");
+      .toContain("HomeAgent 尚未连接当前 Codex 账号");
     expect(readSettings(dir).defaultProvider).toBeUndefined();
 
     const connect = await installed.request("/setup/ai/codex/login", { method: "POST" });
     expect(connect.status).toBe(302);
     expect(loginStarts).toBe(1);
+  });
+
+  test("Agent recovery reuses the console Codex identity before starting login", async () => {
+    const selected = engine.agents.create({ name: "恢复助手", provider: "codex" });
+    let preparations = 0;
+    let loginStarts = 0;
+    const recovering = createWebApp({
+      engine,
+      detectProviders: async () => [{
+        id: "codex",
+        name: "Codex",
+        bin: "codex",
+        available: preparations > 0,
+        detail: preparations > 0 ? "0.152.1" : "HomeAgent 尚未连接当前 Codex 账号",
+      }],
+      providerModels: async () => ({ codex: ["gpt-5.6-sol"] }),
+      codexSetup: {
+        isInstalled: () => true,
+        prepareLocalAuthentication: () => {
+          preparations += 1;
+        },
+        startDeviceLogin: async () => {
+          loginStarts += 1;
+          return { state: "waiting_for_user", message: "等待确认" };
+        },
+        deviceLoginStatus: () => ({ state: "idle", message: "尚未连接" }),
+        cancelDeviceLogin: () => ({ state: "cancelled", message: "已取消" }),
+      },
+    });
+
+    const response = await recovering.request(
+      `/agents/${encodeURIComponent(selected.id)}/provider/recover`,
+      { method: "POST" },
+    );
+
+    expect([302, 303]).toContain(response.status);
+    expect(preparations).toBe(1);
+    expect(loginStarts).toBe(0);
+    expect(decodeURIComponent(response.headers.get("location") ?? "")).toContain(
+      "Provider 已恢复，可以继续使用",
+    );
+  });
+
+  test("Agent recovery falls back to official Codex authorization", async () => {
+    const selected = engine.agents.create({ name: "重新授权助手", provider: "codex" });
+    let loginStarts = 0;
+    const disconnected = createWebApp({
+      engine,
+      detectProviders: async () => [{
+        id: "codex",
+        name: "Codex",
+        bin: "codex",
+        available: false,
+        detail: "HomeAgent 尚未连接当前 Codex 账号",
+      }],
+      providerModels: async () => ({ codex: ["gpt-5.6-sol"] }),
+      codexSetup: {
+        isInstalled: () => true,
+        prepareLocalAuthentication: () => {},
+        startDeviceLogin: async () => {
+          loginStarts += 1;
+          return { state: "waiting_for_user", message: "等待确认" };
+        },
+        deviceLoginStatus: () => ({ state: "idle", message: "尚未连接" }),
+        cancelDeviceLogin: () => ({ state: "cancelled", message: "已取消" }),
+      },
+    });
+
+    const response = await disconnected.request(
+      `/agents/${encodeURIComponent(selected.id)}/provider/recover`,
+      { method: "POST" },
+    );
+
+    expect([302, 303]).toContain(response.status);
+    expect(loginStarts).toBe(1);
+    expect(decodeURIComponent(response.headers.get("location") ?? "")).toBe(
+      "/setup?ok=正在打开 ChatGPT 登录",
+    );
+  });
+
+  test("Agent recovery completes Windows sandbox setup in-page and verifies native sessions", async () => {
+    const selected = engine.agents.create({ name: "原生会话助手", provider: "codex" });
+    let nativeReady = false;
+    let starts = 0;
+    let sandboxSession: import("@homeagent/llm").CodexWindowsSandboxSetupSession = {
+      state: "idle",
+      message: "Windows 安全沙箱尚未设置",
+    };
+    const recovering = createWebApp({
+      engine,
+      detectProviders: async () => [{
+        id: "codex",
+        name: "Codex",
+        bin: "codex",
+        available: true,
+        nativeSessions: nativeReady,
+        ...(nativeReady
+          ? {}
+          : { nativeSessionIssue: "windows-elevated-sandbox-required" as const }),
+        detail: nativeReady
+          ? "codex-cli 0.153.2"
+          : "codex-cli 0.153.2；Codex 原生会话能力不可用",
+      }],
+      providerModels: async () => ({ codex: ["gpt-5.6-sol"] }),
+      codexSetup: {
+        isInstalled: () => true,
+        startDeviceLogin: async () => ({ state: "idle", message: "unused" }),
+        deviceLoginStatus: () => ({ state: "ready", message: "ChatGPT 已连接" }),
+        cancelDeviceLogin: () => ({ state: "cancelled", message: "已取消" }),
+        startWindowsSandboxSetup: async () => {
+          starts += 1;
+          sandboxSession = {
+            state: "waiting_for_user",
+            message: "请在 Windows 系统窗口中批准 Codex 安全沙箱设置",
+          };
+          return sandboxSession;
+        },
+        windowsSandboxSetupStatus: () => sandboxSession,
+        cancelWindowsSandboxSetup: () => ({ state: "cancelled", message: "已取消" }),
+      },
+    });
+
+    const page = await recovering.request(`/agents/${encodeURIComponent(selected.id)}`);
+    expect(await page.text()).toContain(
+      `action="/agents/${encodeURIComponent(selected.id)}/provider/windows-sandbox"`,
+    );
+
+    const start = await recovering.request(
+      `/agents/${encodeURIComponent(selected.id)}/provider/windows-sandbox`,
+      { method: "POST" },
+    );
+    expect([302, 303]).toContain(start.status);
+    expect(starts).toBe(1);
+    expect(decodeURIComponent(start.headers.get("location") ?? "")).toContain(
+      "请在 Windows 系统窗口中批准管理员授权",
+    );
+
+    sandboxSession = { state: "ready", message: "Windows 安全沙箱设置已完成" };
+    nativeReady = true;
+    const verified = await recovering.request(
+      `/agents/${encodeURIComponent(selected.id)}/provider/windows-sandbox/session`,
+    );
+    expect(verified.headers.get("cache-control")).toContain("no-store");
+    expect(await verified.json()).toEqual({
+      state: "ready",
+      message: "Codex 已完全可用",
+    });
   });
 
   test("edits and resets space rules from the knowledge governance page", async () => {
@@ -930,7 +1077,7 @@ describe("web backend (read-only)", () => {
           name: "Codex",
           bin: "codex",
           available: session.state === "ready",
-          detail: session.state === "ready" ? "ready" : "ChatGPT 尚未连接",
+          detail: session.state === "ready" ? "ready" : "HomeAgent 尚未连接当前 Codex 账号",
         },
       ],
       providerModels: async () => ({ codex: ["gpt-5.4"] }),

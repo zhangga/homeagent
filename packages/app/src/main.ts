@@ -18,7 +18,6 @@ import {
 } from "@homeagent/shared";
 import { join } from "node:path";
 import { KnowledgeEngine, type TaskRun } from "@homeagent/core";
-import { CodexProviderSetup } from "@homeagent/llm";
 import {
   ByteTechArticleFetcher,
   FeishuConnector,
@@ -54,6 +53,7 @@ import {
   applyPendingDataDirectoryMigration,
   dataDirectoryWasUninitialized,
   dataDirectoryIsGitRepository,
+  ensureDataGitIgnoreForRepository,
   gitIsAvailable,
   readRuntimeDataSettings,
   runtimeDataSettingsPath,
@@ -67,6 +67,7 @@ import {
 } from "./service.ts";
 import { LocalAgentApiClient, localAgentApiBaseUrl } from "./local-agent-client.ts";
 import { runKnowledgeMcpStdio } from "./mcp.ts";
+import { createCodexSetupPort } from "./codex-setup.ts";
 import { runKnowledgeCli } from "./knowledge-cli.ts";
 import { runFeedbackCli } from "./feedback-cli.ts";
 
@@ -150,6 +151,9 @@ async function run(
     webHost: cfg.webHost,
     webPort: cfg.webPort,
   });
+  // Provider-native rollouts and authentication live below the data root but
+  // must never enter a user-initialized knowledge Git repository.
+  ensureDataGitIgnoreForRepository(cfg.dataDir);
 
   const engine = new KnowledgeEngine({
     recoverInterruptedTaskRuns: true,
@@ -292,9 +296,7 @@ async function run(
 
   // 2. management web backend
   const codexBin = brandedEnv(process.env, "CODEX_BIN")?.trim() || "codex";
-  const codexProviderSetup = runtimePaths.bundled
-    ? new CodexProviderSetup({ codexBin })
-    : undefined;
+  const codexSetup = createCodexSetupPort({ codexBin });
   const feishuIntegration = new FeishuIntegrationService({
     engine,
     larkSetup,
@@ -324,14 +326,7 @@ async function run(
     agentFeedbackToken: cfg.agentFeedbackToken,
     health: reportHealth,
     larkSetup,
-    codexSetup: codexProviderSetup
-      ? {
-          isInstalled: () => Bun.which(codexBin) !== null,
-          startDeviceLogin: () => codexProviderSetup.startDeviceLogin(),
-          deviceLoginStatus: () => codexProviderSetup.deviceLoginStatus(),
-          cancelDeviceLogin: () => codexProviderSetup.cancelDeviceLogin(),
-        }
-      : undefined,
+    codexSetup,
     feishuRuntime: () => connector.health(),
     activeFeishuIdentity: feishuOutboundEnabled && cfg.feishuBotName && cfg.feishuBotOpenId
       ? { botName: cfg.feishuBotName, botOpenId: cfg.feishuBotOpenId }

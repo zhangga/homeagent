@@ -42,6 +42,7 @@ import {
   providerSupportsOrdinaryCompletion,
   providerModels,
   type CodexLoginSession,
+  type CodexWindowsSandboxSetupSession,
   type DetectedProvider,
 } from "@homeagent/llm";
 import {
@@ -119,6 +120,7 @@ import {
 const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 const LOCAL_GOVERNANCE_ACTOR = "local-admin";
 const MAX_LOCAL_AGENT_API_REQUEST_BYTES = 64 * 1024;
+const CODEX_AUTH_UNAVAILABLE_DETAIL = "HomeAgent 尚未连接当前 Codex 账号";
 const log = logger.child("web");
 
 async function readBoundedRequestBody(request: Request, maximumBytes: number): Promise<string | undefined> {
@@ -642,6 +644,17 @@ export function createWebApp(opts: WebOptions): Hono {
     if (!modelCache) modelCache = await listModels();
     return modelCache;
   };
+  const idleCodexWindowsSandbox = (): CodexWindowsSandboxSetupSession => ({
+    state: "idle",
+    message: "Windows 安全沙箱尚未设置",
+  });
+  const getCodexWindowsSandbox = (): CodexWindowsSandboxSetupSession => {
+    try {
+      return opts.codexSetup?.windowsSandboxSetupStatus?.() ?? idleCodexWindowsSandbox();
+    } catch {
+      return { state: "failed", message: "无法读取 Windows 安全沙箱状态，请重试" };
+    }
+  };
   const agentValuesFromBody = (
     body: Record<string, unknown>,
     fallback: AgentEditorValues,
@@ -726,6 +739,9 @@ export function createWebApp(opts: WebOptions): Hono {
       flash: input.flash,
       formError: input.formError,
       catalog,
+      codexWindowsSandboxSetup: selected?.provider === "codex"
+        ? getCodexWindowsSandbox()
+        : undefined,
       revisions: selected ? engine.agents.listRevisions(selected.id) : [],
       draft: selected ? engine.agents.getDraft(selected.id) : undefined,
       expectedHeadRevisionId: input.expectedHeadRevisionId,
@@ -733,7 +749,7 @@ export function createWebApp(opts: WebOptions): Hono {
   };
   const idleCodexLogin = (): CodexLoginSession => ({
     state: "idle",
-    message: "尚未连接 ChatGPT",
+    message: "HomeAgent 尚未连接当前 Codex 账号",
   });
   const getCodexLogin = (): CodexLoginSession => {
     try {
@@ -1221,7 +1237,7 @@ export function createWebApp(opts: WebOptions): Hono {
     if (!selectedProvider?.available) {
       if (provider === "codex" && isCodexInstalled()) {
         return c.redirect(
-          `/setup?ok=${encodeURIComponent("ChatGPT 尚未连接，请先完成登录")}`,
+          `/setup?ok=${encodeURIComponent("HomeAgent 尚未连接当前 Codex 账号，请先完成连接")}`,
         );
       }
       return c.redirect(`/setup?ok=${encodeURIComponent("所选 AI 尚未安装或无法运行")}`);
@@ -2002,6 +2018,132 @@ export function createWebApp(opts: WebOptions): Hono {
         "agents",
       ),
     );
+  });
+
+  app.post("/agents/:id/provider/recover", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    const agent = engine.agents.get(id);
+    if (!agent) return c.notFound();
+    const returnTo = `/agents/${encodeURIComponent(id)}`;
+
+    if (agent.provider === "codex") {
+      try {
+        opts.codexSetup?.prepareLocalAuthentication?.();
+      } catch {
+        // Detection below decides whether the existing HomeAgent identity is usable.
+      }
+    }
+
+    providerCache = null;
+    let provider: DetectedProvider | undefined;
+    try {
+      provider = (await getProviders()).find((item) => item.id === agent.provider);
+    } catch {
+      return c.redirect(
+        `${returnTo}?ok=${encodeURIComponent("Provider 检测暂时失败，请稍后重试")}`,
+      );
+    }
+
+    if (provider?.available) {
+      return c.redirect(
+        `${returnTo}?ok=${encodeURIComponent("Provider 已恢复，可以继续使用")}`,
+      );
+    }
+
+    if (
+      agent.provider === "codex"
+      && provider?.detail === CODEX_AUTH_UNAVAILABLE_DETAIL
+      && opts.codexSetup
+      && isCodexInstalled()
+    ) {
+      startCodexLogin();
+      return c.redirect(
+        `/setup?ok=${encodeURIComponent("正在打开 ChatGPT 登录")}`,
+      );
+    }
+
+    return c.redirect(
+      `${returnTo}?ok=${encodeURIComponent("重新检测完成；CLI 仍不可用，请按提示修复后重试")}`,
+    );
+  });
+
+  app.post("/agents/:id/provider/windows-sandbox", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    const agent = engine.agents.get(id);
+    if (!agent) return c.notFound();
+    const returnTo = `/agents/${encodeURIComponent(id)}`;
+    if (agent.provider !== "codex") return c.notFound();
+
+    providerCache = null;
+    let provider: DetectedProvider | undefined;
+    try {
+      provider = (await getProviders()).find((item) => item.id === "codex");
+    } catch {
+      return c.redirect(
+        `${returnTo}?ok=${encodeURIComponent("Codex 检测暂时失败，请稍后重试")}`,
+      );
+    }
+    if (provider?.available && provider.nativeSessions === true) {
+      return c.redirect(`${returnTo}?ok=${encodeURIComponent("Codex 已完全可用")}`);
+    }
+    if (
+      !provider?.available
+      || provider.nativeSessionIssue !== "windows-elevated-sandbox-required"
+      || !opts.codexSetup?.startWindowsSandboxSetup
+    ) {
+      return c.redirect(
+        `${returnTo}?ok=${encodeURIComponent("当前问题无法通过 Windows 安全沙箱设置修复，请重新检测 Provider")}`,
+      );
+    }
+
+    let session: CodexWindowsSandboxSetupSession;
+    try {
+      session = await opts.codexSetup.startWindowsSandboxSetup();
+    } catch {
+      session = { state: "failed", message: "Windows 安全沙箱设置未完成，请重试" };
+    }
+    if (session.state === "ready") {
+      providerCache = null;
+      return c.redirect(
+        `${returnTo}?ok=${encodeURIComponent("Windows 安全沙箱设置已完成，正在重新检测 Codex")}`,
+      );
+    }
+    if (session.state === "starting" || session.state === "waiting_for_user") {
+      return c.redirect(
+        `${returnTo}?ok=${encodeURIComponent("请在 Windows 系统窗口中批准管理员授权；完成后本页会自动重新检测")}`,
+      );
+    }
+    return c.redirect(
+      `${returnTo}?ok=${encodeURIComponent("Windows 安全沙箱设置未完成，请重试")}`,
+    );
+  });
+
+  app.get("/agents/:id/provider/windows-sandbox/session", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    const agent = engine.agents.get(id);
+    if (!agent || agent.provider !== "codex") return c.notFound();
+
+    const session = getCodexWindowsSandbox();
+    let result = session;
+    if (session.state === "ready") {
+      providerCache = null;
+      try {
+        const provider = (await getProviders()).find((item) => item.id === "codex");
+        result = provider?.available && provider.nativeSessions === true
+          ? { state: "ready", message: "Codex 已完全可用" }
+          : {
+              state: "failed",
+              message: "Windows 安全沙箱已完成，但 Codex 安全验证仍未通过，请重新检测",
+            };
+      } catch {
+        result = {
+          state: "failed",
+          message: "Codex 安全验证暂时失败，请重新检测",
+        };
+      }
+    }
+    c.header("Cache-Control", "no-store");
+    return c.json(result);
   });
 
   app.post("/agents", async (c) => {

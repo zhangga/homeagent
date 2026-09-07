@@ -398,6 +398,81 @@ describe("Agent workbench presenter", () => {
       }),
     );
     expect(view.inspector?.provider.detail).toBe("未找到命令");
+    expect(view.inspector?.provider.recovery).toEqual({
+      kind: "cli",
+      title: "让这个 Agent 恢复工作",
+      description: "请先在运行 HomeAgent 的同一台电脑上检查 CLI，然后重新检测。",
+      actionLabel: "重新检测",
+      command: "claude --version",
+    });
+  });
+
+  test("offers direct recovery when HomeAgent has lost the Codex account connection", () => {
+    const view = buildAgentWorkbench({
+      agents: [agent],
+      mode: "edit",
+      selected: agent,
+      providers: [{
+        id: "codex",
+        name: "Codex",
+        bin: "codex",
+        available: false,
+        detail: "HomeAgent 尚未连接当前 Codex 账号",
+      }],
+      models: {},
+      defaults: { provider: "codex", model: "gpt-5.6-sol" },
+      bindings: [],
+      runs: [],
+    });
+
+    expect(view.list[0]?.readinessLabel).toBe("需要连接");
+    expect(view.inspector?.provider).toEqual(expect.objectContaining({
+      statusLabel: "需要连接",
+      recovery: expect.objectContaining({
+        kind: "codex-auth",
+        actionLabel: "恢复 Codex",
+      }),
+    }));
+  });
+
+  test("explains and offers direct setup when only the elevated Windows sandbox is missing", () => {
+    const view = buildAgentWorkbench({
+      agents: [agent],
+      mode: "edit",
+      selected: agent,
+      providers: [{
+        id: "codex",
+        name: "Codex",
+        bin: "codex",
+        available: true,
+        nativeSessions: false,
+        nativeSessionIssue: "windows-elevated-sandbox-required",
+        detail: "codex-cli 0.153.2；Codex 原生会话能力不可用",
+      }],
+      models: { codex: ["gpt-5.6-sol"] },
+      defaults: { provider: "codex", model: "gpt-5.6-sol" },
+      bindings: [],
+      runs: [],
+      codexWindowsSandboxSetup: {
+        state: "idle",
+        message: "Windows 安全沙箱尚未设置",
+      },
+    });
+
+    expect(view.list[0]?.readinessLabel).toBe("安全沙箱待设置");
+    expect(view.list[0]?.readiness).toBe("unavailable");
+    expect(view.inspector?.provider).toEqual(expect.objectContaining({
+      available: true,
+      statusLabel: "安全沙箱待设置",
+      recovery: {
+        kind: "codex-windows-sandbox",
+        title: "完成 Windows 安全沙箱设置",
+        description:
+          "Codex 已登录并可执行普通任务。完成一次 Windows 系统授权后，HomeAgent 才能安全地连续使用飞书话题会话。",
+        actionLabel: "启用 Windows 安全沙箱",
+        pending: false,
+      },
+    }));
   });
 });
 

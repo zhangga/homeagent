@@ -1,16 +1,23 @@
 import {
   accessSync,
   chmodSync,
+  closeSync,
   constants,
   existsSync,
+  fsyncSync,
+  lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import {
   dirname,
@@ -77,6 +84,7 @@ export const DATA_GITIGNORE = `# HomeAgent runtime-only and rebuildable files
 /run/
 /logs/
 /bin/
+/provider-state/
 **/.index.db
 **/.index.db-shm
 **/.index.db-wal
@@ -240,7 +248,7 @@ export function applyPendingDataDirectoryMigration(input: {
         if (pending.initializeGit) {
           initializeGitRepository(staging, input.gitRunner);
         } else if (destinationAlreadyGit) {
-          ensureGitIgnore(staging);
+          ensureDataGitIgnore(staging);
         }
       },
     });
@@ -333,14 +341,19 @@ export function gitIsAvailable(): boolean {
 }
 
 export function dataDirectoryIsGitRepository(directory: string): boolean {
-  return existsSync(join(directory, ".git"));
+  try {
+    const metadata = lstatSync(join(directory, ".git"));
+    return !metadata.isSymbolicLink() && (metadata.isDirectory() || metadata.isFile());
+  } catch {
+    return false;
+  }
 }
 
 function initializeGitRepository(
   directory: string,
   runner: (directory: string) => { code: number; stderr?: string } = defaultGitRunner,
 ): void {
-  ensureGitIgnore(directory);
+  ensureDataGitIgnore(directory);
   const result = runner(directory);
   if (result.code !== 0) {
     throw new Error(`Git 初始化失败：${result.stderr?.trim() || `exit ${result.code}`}`);
@@ -359,15 +372,176 @@ function defaultGitRunner(directory: string): { code: number; stderr: string } {
   };
 }
 
-function ensureGitIgnore(directory: string): void {
-  const path = join(directory, ".gitignore");
-  if (!existsSync(path)) {
-    writeFileSync(path, DATA_GITIGNORE, "utf8");
-    return;
+export interface EnsureDataGitIgnoreOptions {
+  /** Test seam after the durable temporary file is ready but before replacement. */
+  beforeReplace?: (temporaryPath: string) => void;
+}
+
+function sameFilesystemPath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+function canonicalDataDirectory(directory: string): string {
+  const requested = resolve(directory);
+  mkdirSync(requested, { recursive: true, mode: 0o700 });
+  const metadata = lstatSync(requested);
+  const canonical = realpathSync(requested);
+  if (
+    metadata.isSymbolicLink()
+    || !metadata.isDirectory()
+    || !sameFilesystemPath(requested, canonical)
+  ) {
+    throw new Error("HomeAgent data directory must be a canonical directory");
+  }
+  return canonical;
+}
+
+interface ValidatedGitIgnore {
+  contents: string;
+  identity: {
+    dev: number;
+    ino: number;
+    size: number;
+    mtimeMs: number;
+    ctimeMs: number;
+    mode: number;
+  };
+}
+
+function validatedGitIgnore(path: string, directory: string): ValidatedGitIgnore | undefined {
+  if (!existsSync(path)) return undefined;
+  const before = lstatSync(path);
+  const canonical = realpathSync(path);
+  if (
+    before.isSymbolicLink()
+    || !before.isFile()
+    || !sameFilesystemPath(dirname(canonical), directory)
+    || !sameFilesystemPath(canonical, path)
+  ) {
+    throw new Error("HomeAgent data .gitignore must be a regular file");
   }
   const existing = readFileSync(path, "utf8");
-  if (existing.includes("# HomeAgent runtime-only and rebuildable files")) return;
-  writeFileSync(path, `${existing.trimEnd()}\n\n${DATA_GITIGNORE}`, "utf8");
+  const after = lstatSync(path);
+  if (
+    after.isSymbolicLink()
+    || !after.isFile()
+    || before.dev !== after.dev
+    || before.ino !== after.ino
+    || before.size !== after.size
+    || before.mtimeMs !== after.mtimeMs
+    || before.ctimeMs !== after.ctimeMs
+    || before.mode !== after.mode
+  ) {
+    throw new Error("HomeAgent data .gitignore changed while it was being read");
+  }
+  return {
+    contents: existing,
+    identity: {
+      dev: after.dev,
+      ino: after.ino,
+      size: after.size,
+      mtimeMs: after.mtimeMs,
+      ctimeMs: after.ctimeMs,
+      mode: after.mode,
+    },
+  };
+}
+
+function sameGitIgnoreIdentity(
+  left: ValidatedGitIgnore | undefined,
+  right: ValidatedGitIgnore | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  return left.identity.dev === right.identity.dev
+    && left.identity.ino === right.identity.ino
+    && left.identity.size === right.identity.size
+    && left.identity.mtimeMs === right.identity.mtimeMs
+    && left.identity.ctimeMs === right.identity.ctimeMs
+    && left.identity.mode === right.identity.mode;
+}
+
+function syncDirectory(directory: string): void {
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(directory, "r");
+    fsyncSync(descriptor);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (process.platform !== "win32" || !["EPERM", "EINVAL", "EBADF"].includes(code ?? "")) {
+      throw error;
+    }
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+export function ensureDataGitIgnore(
+  directory: string,
+  options: EnsureDataGitIgnoreOptions = {},
+): void {
+  const canonicalDirectory = canonicalDataDirectory(directory);
+  const path = join(canonicalDirectory, ".gitignore");
+  const initial = validatedGitIgnore(path, canonicalDirectory);
+  const existing = initial?.contents;
+  const requiredLines = DATA_GITIGNORE.trimEnd().split("\n");
+  const existingLines = new Set((existing ?? "").split(/\r?\n/u));
+  const missingLines = requiredLines.filter((line) => !existingLines.has(line));
+  if (existing !== undefined && missingLines.length === 0) return;
+  const hasMarker = existingLines.has(requiredLines[0]!);
+  const addition = existing === undefined
+    ? DATA_GITIGNORE.trimEnd()
+    : hasMarker
+    ? missingLines.filter((line) => line !== requiredLines[0]).join("\n")
+    : DATA_GITIGNORE.trimEnd();
+  if (!addition) return;
+  const contents = existing === undefined
+    ? `${addition}\n`
+    : `${existing.trimEnd()}\n\n${addition}\n`;
+  const temporaryPath = join(
+    canonicalDirectory,
+    `.gitignore.tmp-${process.pid}-${randomUUID()}`,
+  );
+  let temporaryExists = false;
+  try {
+    writeFileSync(temporaryPath, contents, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    temporaryExists = true;
+    chmodSync(temporaryPath, initial ? initial.identity.mode & 0o777 : 0o600);
+    const descriptor = openSync(temporaryPath, "r+");
+    try {
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+    options.beforeReplace?.(temporaryPath);
+    const current = validatedGitIgnore(path, canonicalDirectory);
+    if (!sameGitIgnoreIdentity(initial, current)) {
+      throw new Error("HomeAgent data .gitignore changed before replacement");
+    }
+    renameSync(temporaryPath, path);
+    temporaryExists = false;
+    syncDirectory(canonicalDirectory);
+  } finally {
+    if (temporaryExists) {
+      try {
+        unlinkSync(temporaryPath);
+      } catch {
+        // Preserve the primary write/replace failure during best-effort cleanup.
+      }
+    }
+  }
+}
+
+/** Update runtime exclusions only for an existing, local Git data repository. */
+export function ensureDataGitIgnoreForRepository(directory: string): void {
+  if (dataDirectoryIsGitRepository(directory)) ensureDataGitIgnore(directory);
 }
 
 function writeRuntimeDataSettings(path: string, settings: RuntimeDataSettings): void {

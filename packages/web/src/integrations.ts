@@ -6,7 +6,10 @@ import type {
   LarkSetupInput,
   LarkSetupStatus,
 } from "@homeagent/shared";
-import type { CodexLoginSession } from "@homeagent/llm";
+import type {
+  CodexLoginSession,
+  CodexWindowsSandboxSetupSession,
+} from "@homeagent/llm";
 
 export interface LarkSetupPort {
   status(): Promise<LarkSetupStatus>;
@@ -33,8 +36,14 @@ export interface FeishuRuntimeStatus {
 export interface CodexSetupPort {
   /** Whether `codex` is present on the service PATH. */
   isInstalled(): boolean;
+  /** Retry adopting the console CLI identity before probing Provider readiness. */
+  prepareLocalAuthentication?(): void;
   /** Start the browser/device authorization flow. */
   startDeviceLogin(): Promise<CodexLoginSession>;
   deviceLoginStatus(): CodexLoginSession;
   cancelDeviceLogin(): CodexLoginSession;
+  /** Start Codex's official administrator-approved Windows sandbox setup. */
+  startWindowsSandboxSetup?(): Promise<CodexWindowsSandboxSetupSession>;
+  windowsSandboxSetupStatus?(): CodexWindowsSandboxSetupSession;
+  cancelWindowsSandboxSetup?(): CodexWindowsSandboxSetupSession;
 }

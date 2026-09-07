@@ -2,7 +2,7 @@
  * Orchestrator runtime (plan §III). The single consumer that turns normalized
  * connector events into knowledge operations and replies. Flow per message:
  *
- *   1. Dedup by eventId (feishu can redeliver).
+ *   1. Dedup messages by chatId/messageId and other events by eventId (Feishu can redeliver).
  *   2. Attribution (Q4/Q5): pick write space + read spaces.
  *   3. Reply gateway (Q2): apply static rules, then use an LLM to decide
  *      whether an unmentioned open group question deserves a proactive answer.
@@ -28,7 +28,10 @@ import {
   logger,
   type SerializerSnapshot,
 } from "@homeagent/shared";
-import { isProviderTimeoutError } from "@homeagent/llm";
+import {
+  isProviderNativeSessionParentMissingError,
+  isProviderTimeoutError,
+} from "@homeagent/llm";
 import {
   resolveGroupParticipationLevel,
   isKnowledgeContentRef,
@@ -37,10 +40,12 @@ import {
   type ChatRun,
   type ChatRunError,
   type FeishuGroupBinding,
+  type FinishChatRunFailureInput,
   type KnowledgeEngine,
   type LlmClient,
   RunQueueCancelledError,
   RunQueueTimeoutError,
+  topicNativeSessionCompatibilityKey,
   type RunSchedulerSnapshot,
 } from "@homeagent/core";
 import type {
@@ -113,6 +118,17 @@ class ChatRunTimeoutError extends Error {
   constructor(readonly timeoutMs: number) {
     super(`chat run timed out after ${timeoutMs}ms`);
     this.name = "ChatRunTimeoutError";
+  }
+}
+
+class NativeTopicFailureCommitError extends Error {
+  constructor(
+    readonly result: FinishChatRunFailureInput,
+    readonly notice: string,
+    readonly persistenceError: unknown,
+  ) {
+    super("Failed to atomically record a missing Provider-native parent session.");
+    this.name = "NativeTopicFailureCommitError";
   }
 }
 
@@ -249,7 +265,7 @@ export interface RuntimeOptions {
    */
   activeFeishuAppId?: string;
   llm?: LlmClient;
-  /** max eventIds remembered for dedup */
+  /** max message/event identities remembered for dedup */
   dedupSize?: number;
   /**
    * Optional doc fetcher (Q8). When a message carries docx/wiki links, the
@@ -374,6 +390,7 @@ export class Orchestrator {
         messageId: previous.messageId,
         mentionsBot: true,
         createdAt: previous.startedAt,
+        ...this.topicMessageIdentity(previous.id),
       };
 
       if (
@@ -394,11 +411,37 @@ export class Orchestrator {
             return this.engine.chatRuns.get(previous.id)!;
           }
         }
+        const topic = this.engine.chatRuns.topicNativeSessionForRun(previous.id);
+        if (previous.topicNativeSessionExpected && !topic) {
+          throw new Error(
+            "Chat Run expects a Provider native session but its local topic plan is missing.",
+          );
+        }
+        if (topic) {
+          this.engine.chatRuns.invalidateTopicNativeSessions(
+            previous.space,
+            topic.chatId,
+            topic.rootMessageId,
+          );
+        }
         await this.send(msg, previous.output, previous.id);
         return this.engine.chatRuns.get(previous.id)!;
       }
       if (!["failed", "cancelled", "timed_out"].includes(previous.status)) {
         throw new Error("chat run is not retryable");
+      }
+      if (!previous.executionPlan) {
+        throw new Error(
+          "Chat Run has no immutable execution plan; refusing to retry with live Agent state.",
+        );
+      }
+      if (
+        previous.topicNativeSessionExpected
+        && !this.engine.chatRuns.topicNativeSessionForRun(previous.id)
+      ) {
+        throw new Error(
+          "Chat Run expects a Provider native session but its local topic plan is missing.",
+        );
       }
 
       const { readSpaces, writeSpace } = attribute(msg);
@@ -515,6 +558,12 @@ export class Orchestrator {
     return true;
   }
 
+  private forgetSeen(id: string): void {
+    if (!this.seen.delete(id)) return;
+    const index = this.seenOrder.indexOf(id);
+    if (index >= 0) this.seenOrder.splice(index, 1);
+  }
+
   private pendingReminderKey(msg: InboundMessage, space: SpaceId): string {
     return `${space}\u0000${msg.chatId}\u0000${msg.senderId}`;
   }
@@ -582,18 +631,35 @@ export class Orchestrator {
   }
 
   private async handle(event: InboundEvent): Promise<void> {
-    if (!this.markSeen(event.eventId)) {
-      log.debug("dropping duplicate event", { eventId: event.eventId });
+    const dedupId = event.kind === "message"
+      ? `message:${event.chatId}\u0000${event.messageId}`
+      : `event:${event.eventId}`;
+    if (!this.markSeen(dedupId)) {
+      log.debug("dropping duplicate event", {
+        eventId: event.eventId,
+        ...(event.kind === "message" ? { messageId: event.messageId } : {}),
+      });
       return;
     }
-    if (event.kind === "bot_added") {
-      return this.groupOnboarding.handleBotAdded(event);
+    let durableMutationMayHaveCommitted = false;
+    try {
+      if (event.kind === "bot_added") {
+        return await this.groupOnboarding.handleBotAdded(event);
+      }
+      if (await this.groupOnboarding.handleMessage(event)) return;
+      return await this.handleMessage(event, () => {
+        durableMutationMayHaveCommitted = true;
+      });
+    } catch (error) {
+      if (!durableMutationMayHaveCommitted) this.forgetSeen(dedupId);
+      throw error;
     }
-    if (await this.groupOnboarding.handleMessage(event)) return;
-    return this.handleMessage(event);
   }
 
-  private async handleMessage(msg: InboundMessage): Promise<void> {
+  private async handleMessage(
+    msg: InboundMessage,
+    markDurableMutation: () => void,
+  ): Promise<void> {
     const { writeSpace, readSpaces } = attribute(msg);
     const groupBinding: FeishuGroupBinding | undefined =
       msg.chatType === "group"
@@ -602,6 +668,37 @@ export class Orchestrator {
     if (msg.chatType === "group" && !groupBinding) {
       log.debug("dropping event from an unbound Feishu group", {
         chatId: msg.chatId,
+      });
+      return;
+    }
+    const existingIndex = this.engine.registry.has(writeSpace)
+      ? this.engine.registry.store(writeSpace).index()
+      : undefined;
+    const existingMessageRaws = existingIndex
+      ?.findRawsByMessageId(msg.messageId, msg.chatId) ?? [];
+    const messageWasRetracted = existingIndex
+      ?.getMessageRetraction(msg.chatId, msg.messageId) != null;
+    const existingChatRun = this.engine.chatRuns.list(writeSpace).some((run) =>
+      run.chatId === msg.chatId && run.messageId === msg.messageId
+    );
+    const durableSmartResponseDecision = existingMessageRaws.some((raw) =>
+      raw.source === "message" && raw.agentHandled === true
+    );
+    const capturedOnlySmartGroupRedelivery = existingMessageRaws.length > 0
+      && msg.chatType === "group"
+      && !msg.mentionsBot
+      && groupBinding?.responseMode === "smart"
+      && !durableSmartResponseDecision;
+    if (
+      messageWasRetracted
+      || existingChatRun
+      || existingMessageRaws.some((raw) => raw.agentResponse !== undefined)
+      || capturedOnlySmartGroupRedelivery
+    ) {
+      log.debug("dropping durably captured message redelivery", {
+        space: writeSpace,
+        chatId: msg.chatId,
+        messageId: msg.messageId,
       });
       return;
     }
@@ -619,6 +716,9 @@ export class Orchestrator {
           msg,
           "只有群主或群管理员可以管理本群任务。",
         )) return;
+        if (taskCmd.verb === "new" || taskCmd.verb === "run") {
+          markDurableMutation();
+        }
         this.engine.ensureSpace(writeSpace, { chatId: msg.chatId });
         const reply = await handleTaskCommand(this.engine, writeSpace, taskCmd);
         await this.send(msg, reply);
@@ -647,6 +747,9 @@ export class Orchestrator {
             });
           }
         }
+        if (!["list", "route", "help"].includes(learningCmd.verb)) {
+          markDurableMutation();
+        }
         const reply = await handleLearningCommand(this.engine, learningCmd, {
           space: writeSpace,
           chatId: msg.chatId,
@@ -670,6 +773,7 @@ export class Orchestrator {
           msg,
           GROUP_REMINDER_AUTOMATION_DENIAL,
         )) return;
+        markDurableMutation();
         const reply = this.handlePendingReminderControl(msg, writeSpace, reminderControlNow);
         if (reply) await this.send(msg, reply);
       });
@@ -703,7 +807,10 @@ export class Orchestrator {
       return this.withThinking(msg, () => this.send(msg, "群聊中请回复原消息，并 @我 说「别记这条」。"));
     }
     if (decision.respond && retractionCommand) {
-      return this.withThinking(msg, () => this.handleRetraction(msg, writeSpace));
+      return this.withThinking(
+        msg,
+        () => this.handleRetraction(msg, writeSpace, markDurableMutation),
+      );
     }
 
     const knowledgeControl = parseKnowledgeControl(msg.text);
@@ -721,17 +828,23 @@ export class Orchestrator {
 
       // Always capture (收录 != 应答).
       if (decision.capture && msg.text.trim() !== "") {
-        capturedMessageRawId = await this.engine.remember({
-          space: writeSpace,
-          source: "message",
-          agentId: decision.respond
-            ? this.engine.agentForSpace(writeSpace)?.id
-            : undefined,
-          author: msg.senderId,
-          chatId: msg.chatId,
-          messageId: msg.messageId,
-          content: msg.text,
-        });
+        const captured = existingMessageRaws.find((raw) => raw.source === "message");
+        if (captured) {
+          capturedMessageRawId = captured.id;
+        } else {
+          capturedMessageRawId = await this.engine.remember({
+            space: writeSpace,
+            source: "message",
+            agentId: decision.respond
+              ? this.engine.agentForSpace(writeSpace)?.id
+              : undefined,
+            author: msg.senderId,
+            chatId: msg.chatId,
+            messageId: msg.messageId,
+            content: msg.text,
+          });
+          markDurableMutation();
+        }
       }
 
       if (
@@ -739,7 +852,11 @@ export class Orchestrator {
         && msg.messageType
         && ["image", "file", "audio", "media"].includes(msg.messageType)
         && this.attachmentDownloader
+        && !existingMessageRaws.some((raw) =>
+          raw.attachments?.some((attachment) => attachment.sourceDigest)
+        )
       ) {
+        markDurableMutation();
         await this.syncAttachments(msg, writeSpace);
       }
 
@@ -759,8 +876,9 @@ export class Orchestrator {
               .some((raw) =>
                 raw.messageId === target.messageId
                 && raw.attachments?.some((attachment) => attachment.sourceDigest)
-              );
+            );
             if (!alreadyStored) {
+              markDurableMutation();
               await this.syncAttachments(msg, writeSpace, {
                 messageId: target.messageId,
                 author: target.senderId ?? msg.senderId,
@@ -777,6 +895,7 @@ export class Orchestrator {
 
       // Source sync: pull allowlisted Feishu documents and internal articles.
       if (this.docFetcher && msg.docLinks && msg.docLinks.length > 0) {
+        markDurableMutation();
         sourceSync = await this.syncDocs(msg, writeSpace);
       }
     };
@@ -790,33 +909,51 @@ export class Orchestrator {
       // Persist first: a slow classifier must not put the message's durable
       // capture behind an external model call.
       await captureInputs();
-      const participation = await decideGroupParticipation(
-        () => this.llm ?? this.engine.llmClientForSpace(
-          writeSpace,
-          GROUP_PARTICIPATION_TIMEOUT_MS,
-        ),
-        msg.text,
-        participationLevel,
-      );
-      this.participationMetrics.evaluated += 1;
-      this.participationMetrics[participation.source] += 1;
-      if (participation.respond) this.participationMetrics.responded += 1;
-      else this.participationMetrics.skipped += 1;
-      if (participation.respond) {
+      if (durableSmartResponseDecision) {
         proactiveParticipation = true;
         decision = {
           ...decision,
           respond: true,
-          reason: [
-            `proactive group participation (${participation.source}, ${participationLevel})`,
-            `score=${participation.participationScore}`,
-            `risk=${participation.disruptionRisk}`,
-            participation.reason,
-          ].join(": "),
+          reason: "durably selected for proactive group participation",
         };
+      } else {
+        const participation = await decideGroupParticipation(
+          () => this.llm ?? this.engine.llmClientForSpace(
+            writeSpace,
+            GROUP_PARTICIPATION_TIMEOUT_MS,
+          ),
+          msg.text,
+          participationLevel,
+        );
+        this.participationMetrics.evaluated += 1;
+        this.participationMetrics[participation.source] += 1;
+        if (participation.respond) this.participationMetrics.responded += 1;
+        else this.participationMetrics.skipped += 1;
+        if (participation.respond) {
+          proactiveParticipation = true;
+          decision = {
+            ...decision,
+            respond: true,
+            reason: [
+              `proactive group participation (${participation.source}, ${participationLevel})`,
+              `score=${participation.participationScore}`,
+              `risk=${participation.disruptionRisk}`,
+              participation.reason,
+            ].join(": "),
+          };
+        }
+      }
+      if (decision.respond && !durableSmartResponseDecision) {
         const agentId = this.engine.agentForSpace(writeSpace)?.id;
-        if (agentId && capturedMessageRawId) {
-          await this.engine.attributeRawToAgent(writeSpace, capturedMessageRawId, agentId);
+        if (capturedMessageRawId) {
+          const responseDecisionPersisted = await this.engine.markRawAgentHandled(
+            writeSpace,
+            capturedMessageRawId,
+            agentId,
+          );
+          if (!responseDecisionPersisted) {
+            throw new Error("failed to persist smart-group response decision");
+          }
         }
       }
     }
@@ -828,6 +965,7 @@ export class Orchestrator {
     if (learningAnswer) {
       return this.withThinking(msg, async () => {
         this.engine.ensureSpace(writeSpace, { chatId: msg.chatId });
+        markDurableMutation();
         try {
           const reply = await handleLearningAnswer(this.engine, learningAnswer, {
             space: writeSpace,
@@ -850,6 +988,7 @@ export class Orchestrator {
       const directDraft = parseReminderRequest(msg.text, reminderNow);
       const reminderReply = handleReminderMessage(this.engine, msg, writeSpace, reminderNow);
       if (reminderReply) {
+        markDurableMutation();
         if (directDraft) {
           this.pendingReminderConfirmations.delete(this.pendingReminderKey(msg, writeSpace));
         }
@@ -885,6 +1024,7 @@ export class Orchestrator {
             sourceMessageId: msg.messageId,
             expiresAt: Date.now() + REMINDER_CONFIRMATION_TTL_MS,
           });
+          markDurableMutation();
           await this.send(msg, [
             "请确认以下理解：",
             `提醒内容：${draft.title}`,
@@ -918,6 +1058,7 @@ export class Orchestrator {
         writeSpace,
         capturedMessageRawId,
       );
+      markDurableMutation();
 
       if (sourceSync.attempted > 0 && sourceSync.succeeded === 0) {
         return this.scheduleChatRun(
@@ -982,13 +1123,94 @@ export class Orchestrator {
     rawId?: string,
     retryOf?: string,
   ): ChatRun {
-    const snapshot = this.engine.agentRunExecutionSnapshot(writeSpace);
+    const retrySource = retryOf ? this.engine.chatRuns.get(retryOf) : undefined;
+    if (retryOf && !retrySource) {
+      throw new Error(`unknown chat run: ${retryOf}`);
+    }
+    if (retrySource && !retrySource.executionPlan) {
+      throw new Error(
+        "Chat Run has no immutable execution plan; refusing to retry with live Agent state.",
+      );
+    }
+    const snapshot = retrySource
+      ? {
+          agentId: retrySource.agentId,
+          provider: retrySource.provider,
+          model: retrySource.model,
+          reasoningEffort: retrySource.reasoningEffort,
+          skillEvidence: retrySource.skillEvidence,
+          execution: retrySource.execution,
+          executionPlan: retrySource.executionPlan,
+          timeoutMs: retrySource.timeoutMs,
+        }
+      : (() => {
+          const current = this.engine.agentRunExecutionSnapshot(writeSpace);
+          return {
+            agentId: current.agent?.id,
+            provider: current.provider,
+            model: current.model,
+            reasoningEffort: current.reasoningEffort,
+            skillEvidence: current.skillEvidence,
+            execution: current.execution,
+            executionPlan: current.executionPlan,
+            timeoutMs: this.chatAnswerTimeoutMs ?? config().chatTimeoutMinutes * 60_000,
+          };
+        })();
+    if (!snapshot.executionPlan) {
+      throw new Error("Chat Run requires an immutable execution plan");
+    }
     const rawWorkItemId = rawId && this.engine.registry.has(writeSpace)
       ? this.engine.registry.store(writeSpace).index().getRaw(rawId)?.workItemId
       : undefined;
     const workItemId = rawWorkItemId
-      ?? (retryOf ? this.engine.chatRuns.get(retryOf)?.workItemId : undefined)
+      ?? retrySource?.workItemId
       ?? this.engine.workItems.activeForSpace(writeSpace)?.id;
+    const retryTopic = retrySource
+      ? this.engine.chatRuns.topicNativeSessionForRun(retrySource.id)
+      : undefined;
+    const topicNativeSession = retrySource
+      ? retryTopic?.provider === "codex"
+          && snapshot.executionPlan.provider === "codex"
+        ? {
+            ...retryTopic,
+            compatibilityKey: topicNativeSessionCompatibilityKey({
+              agentId: snapshot.agentId,
+              executionPlan: snapshot.executionPlan,
+              skillEvidence: snapshot.skillEvidence,
+            }),
+          }
+        : undefined
+      : this.connector.name === "feishu"
+          && msg.chatType === "group"
+          && snapshot.executionPlan.provider === "codex"
+        ? {
+            kind: "feishu-topic" as const,
+            chatId: msg.chatId,
+            rootMessageId: msg.rootMessageId ?? msg.messageId,
+            ...(msg.threadId ? { threadId: msg.threadId } : {}),
+            ...(msg.parentMessageId ? { parentMessageId: msg.parentMessageId } : {}),
+            provider: snapshot.executionPlan.provider,
+            compatibilityKey: topicNativeSessionCompatibilityKey({
+              agentId: snapshot.agentId,
+              executionPlan: snapshot.executionPlan,
+              skillEvidence: snapshot.skillEvidence,
+            }),
+          }
+        : undefined;
+    if (
+      !topicNativeSession
+      && this.connector.name === "feishu"
+      && msg.chatType === "group"
+    ) {
+      // A visible stateless Provider turn cannot be inserted into an existing
+      // Codex-native chain. Clear the exact topic before any Provider/static
+      // work so switching away and later back cannot fork past this message.
+      this.engine.chatRuns.invalidateTopicNativeSessions(
+        writeSpace,
+        msg.chatId,
+        msg.rootMessageId ?? msg.messageId,
+      );
+    }
     const run = this.engine.chatRuns.start({
       space: writeSpace,
       workItemId,
@@ -998,18 +1220,31 @@ export class Orchestrator {
       author: msg.senderId,
       input: msg.text,
       trigger: retryOf ? "retry" : "message",
-      agentId: snapshot.agent?.id,
+      agentId: snapshot.agentId,
       provider: snapshot.provider,
       model: snapshot.model,
       reasoningEffort: snapshot.reasoningEffort,
       skillEvidence: snapshot.skillEvidence,
       execution: snapshot.execution,
       executionPlan: snapshot.executionPlan,
-      timeoutMs: this.chatAnswerTimeoutMs ?? config().chatTimeoutMinutes * 60_000,
+      timeoutMs: snapshot.timeoutMs,
       retryOf,
+      ...(topicNativeSession ? { topicNativeSession } : {}),
     });
     if (workItemId) this.engine.workItems.attachChatRun(workItemId, run.id);
     return run;
+  }
+
+  private topicMessageIdentity(
+    runId: string,
+  ): Pick<InboundMessage, "threadId" | "rootMessageId" | "parentMessageId"> {
+    const topic = this.engine.chatRuns.topicNativeSessionForRun(runId);
+    if (!topic) return {};
+    return {
+      ...(topic.threadId ? { threadId: topic.threadId } : {}),
+      rootMessageId: topic.rootMessageId,
+      ...(topic.parentMessageId ? { parentMessageId: topic.parentMessageId } : {}),
+    };
   }
 
   private async scheduleChatRun(
@@ -1048,6 +1283,29 @@ export class Orchestrator {
       });
     } catch (error) {
       const current = this.engine.chatRuns.get(run.id);
+      if (error instanceof NativeTopicFailureCommitError) {
+        if (current?.status !== "running") return;
+        log.warn("atomic native topic failure persistence failed; retrying", {
+          runId: run.id,
+          err: String(error.persistenceError),
+        });
+        let failed: ChatRun | undefined;
+        try {
+          failed = this.engine.chatRuns.failAndInvalidateTopicNativeSession(
+            run.id,
+            error.result,
+          );
+        } catch (retryError) {
+          throw new NativeTopicFailureCommitError(
+            error.result,
+            error.notice,
+            retryError,
+          );
+        }
+        if (!failed) return;
+        await this.send(msg, error.notice, run.id);
+        return;
+      }
       if (error instanceof RunQueueCancelledError && current?.status === "cancelled") {
         return;
       }
@@ -1131,6 +1389,19 @@ export class Orchestrator {
         });
         continue;
       }
+      if (
+        run.topicNativeSessionExpected
+        && !this.engine.chatRuns.topicNativeSessionForRun(run.id)
+      ) {
+        this.engine.chatRuns.fail(run.id, {
+          finishedAt: Date.now(),
+          error: {
+            kind: "interrupted",
+            message: "Queued Chat Run expects a Provider native session but its local topic plan is missing.",
+          },
+        });
+        continue;
+      }
       if (!run.chatId || !run.messageId) {
         this.engine.chatRuns.fail(run.id, {
           finishedAt: Date.now(),
@@ -1154,6 +1425,7 @@ export class Orchestrator {
         messageId: run.messageId,
         mentionsBot: true,
         createdAt: run.startedAt,
+        ...this.topicMessageIdentity(run.id),
       };
       const { readSpaces } = attribute(msg);
       const interpretation = interpretConversation(run.input);
@@ -1220,13 +1492,20 @@ export class Orchestrator {
       if (!run?.executionPlan) {
         throw new Error("Chat Run has no immutable execution plan");
       }
+      const nativeSession = this.engine.chatRuns.prepareTopicNativeSession(runId);
+      const effectiveReadSpaces = nativeSession ? [writeSpace] : readSpaces;
       let context: ConversationContext = { text: userText, images: [] };
       let failureTrace: AskFailureTrace | undefined;
       let res;
       try {
-        context = await this.withReplyContext(msg, userText, writeSpace);
+        context = await this.withReplyContext(
+          msg,
+          userText,
+          writeSpace,
+          nativeSession === undefined,
+        );
         res = await this.engine.askWithExecutionPlan(
-          readSpaces,
+          effectiveReadSpaces,
           context.text,
           run.executionPlan,
           run.skillEvidence,
@@ -1235,50 +1514,58 @@ export class Orchestrator {
             fallbackContext: context.sourceContext ? "message-source" : undefined,
             signal,
             timeoutMs: run.timeoutMs ?? LEGACY_CHAT_PROVIDER_TIMEOUT_MS,
+            nativeSession,
             onFailureTrace: (trace) => {
               failureTrace = trace;
             },
           },
           run.agentId,
         );
+        if (nativeSession && !res.nativeSessionId) {
+          throw new Error("Provider did not return the native topic session id");
+        }
       } catch (err) {
+        const missingNativeParent = nativeSession?.mode === "fork"
+          && isProviderNativeSessionParentMissingError(err);
+        const failure = chatRunError(err);
         // Surface a bounded, classified notice when possible; unclassified
         // provider diagnostics stay behind the fixed safe fallback.
         log.warn("ask failed; sending a bounded provider notice", {
           space: writeSpace,
-          err: String(err),
+          kind: failure.kind,
+          missingNativeParent,
         });
         outcome = isProviderTimeoutError(err) ? "timed_out" : "failed";
-        const failure = chatRunError(err);
+        const failureResult: FinishChatRunFailureInput = {
+          finishedAt: Date.now(),
+          error: failure,
+          traceId: failureTrace?.traceId,
+          usage: failureTrace?.usage,
+        };
+        const notice = failure.kind === "cancelled" ? "本次请求已取消。" : providerNotice(err);
         let finished: ChatRun | undefined;
         if (failure.kind === "cancelled") {
-          finished = this.engine.chatRuns.cancel(runId, {
-            finishedAt: Date.now(),
-            error: failure,
-            traceId: failureTrace?.traceId,
-            usage: failureTrace?.usage,
-          });
+          finished = this.engine.chatRuns.cancel(runId, failureResult);
         } else if (outcome === "timed_out") {
-          finished = this.engine.chatRuns.timeout(runId, {
-            finishedAt: Date.now(),
-            error: failure,
-            traceId: failureTrace?.traceId,
-            usage: failureTrace?.usage,
-          });
+          finished = this.engine.chatRuns.timeout(runId, failureResult);
+        } else if (missingNativeParent) {
+          try {
+            finished = this.engine.chatRuns.failAndInvalidateTopicNativeSession(
+              runId,
+              failureResult,
+            );
+          } catch (persistenceError) {
+            throw new NativeTopicFailureCommitError(
+              failureResult,
+              notice,
+              persistenceError,
+            );
+          }
         } else {
-          finished = this.engine.chatRuns.fail(runId, {
-            finishedAt: Date.now(),
-            error: failure,
-            traceId: failureTrace?.traceId,
-            usage: failureTrace?.usage,
-          });
+          finished = this.engine.chatRuns.fail(runId, failureResult);
         }
         if (!finished) return;
-        await this.send(
-          msg,
-          failure.kind === "cancelled" ? "本次请求已取消。" : providerNotice(err),
-          runId,
-        );
+        await this.send(msg, notice, runId);
         return;
       } finally {
         this.cleanupDownloads(context.images, msg.messageId);
@@ -1289,20 +1576,25 @@ export class Orchestrator {
       if (
         res.source === "general"
         && !res.context
-        && (await this.isColdStart(readSpaces))
+        && (await this.isColdStart(effectiveReadSpaces))
       ) {
         text = `${text}\n\n${coldStartNote()}`;
+      }
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error ? signal.reason : new ChatRunCancelledError();
       }
       const succeeded = this.engine.chatRuns.succeed(runId, {
         finishedAt: Date.now(),
         output: text,
         traceId: res.traceId,
         usage: res.traceId ? this.engine.answerTrace(res.traceId)?.usage : undefined,
+        nativeSessionId: res.nativeSessionId,
       });
       if (!succeeded) return;
       await this.send(msg, text, runId);
       outcome = "succeeded";
     } catch (err) {
+      if (err instanceof NativeTopicFailureCommitError) throw err;
       if (this.engine.chatRuns.get(runId)?.status === "running") {
         const failure = chatRunError(err);
         if (failure.kind === "cancelled") {
@@ -1333,13 +1625,18 @@ export class Orchestrator {
     msg: InboundMessage,
     userText: string,
     writeSpace: SpaceId,
+    allowRecentSourceFallback = true,
   ): Promise<ConversationContext> {
     const currentSourceParts = this.storedReplySourceText(
       writeSpace,
       msg.chatId,
       msg.messageId,
     );
-    if (!mayReferToConversationContext(userText) && currentSourceParts.length === 0) {
+    if (
+      !msg.parentMessageId
+      && !mayReferToConversationContext(userText)
+      && currentSourceParts.length === 0
+    ) {
       return { text: userText, images: [] };
     }
     let target;
@@ -1354,18 +1651,37 @@ export class Orchestrator {
       }
     }
     if (!target) {
-      const sourceParts = currentSourceParts.length > 0
-        ? currentSourceParts
-        : this.storedRecentSourceText(writeSpace, msg);
+      if (
+        msg.parentMessageId
+        && this.messageWasRetracted(writeSpace, msg.chatId, msg.parentMessageId)
+      ) {
+        return this.retractedReplyContext(userText, currentSourceParts);
+      }
+      const explicitReplyParts = msg.parentMessageId
+        ? this.storedMessageContextText(writeSpace, msg.chatId, msg.parentMessageId)
+        : [];
+      const sourceParts = currentSourceParts.length > 0 || explicitReplyParts.length > 0
+        ? [...currentSourceParts, ...explicitReplyParts]
+        : msg.parentMessageId
+          ? []
+          : allowRecentSourceFallback
+            ? this.storedRecentSourceText(writeSpace, msg)
+            : [];
+      const heading = explicitReplyParts.length > 0
+        ? currentSourceParts.length > 0
+          ? "当前消息及被回复的消息"
+          : "被回复的消息"
+        : currentSourceParts.length > 0
+          ? "当前消息的来源正文"
+          : "最近的附件或文档";
       return {
-        text: this.contextualText(
-          userText,
-          currentSourceParts.length > 0 ? "当前消息的来源正文" : "最近的附件或文档",
-          sourceParts,
-        ),
+        text: this.contextualText(userText, heading, sourceParts),
         images: [],
         sourceContext: sourceParts.length > 0,
       };
+    }
+    if (this.messageWasRetracted(writeSpace, msg.chatId, target.messageId)) {
+      return this.retractedReplyContext(userText, currentSourceParts);
     }
     const replySourceParts = this.storedReplySourceText(
       writeSpace,
@@ -1444,6 +1760,30 @@ export class Orchestrator {
     ].join("\n");
   }
 
+  private retractedReplyContext(
+    userText: string,
+    currentSourceParts: string[],
+  ): ConversationContext {
+    const text = currentSourceParts.length > 0
+      ? this.contextualText(userText, "当前消息的来源正文", currentSourceParts)
+      : userText;
+    return {
+      text: [text, "", "【被回复的消息已撤回，不能作为对话上下文。】"].join("\n"),
+      images: [],
+      sourceContext: currentSourceParts.length > 0,
+    };
+  }
+
+  private messageWasRetracted(
+    space: SpaceId,
+    chatId: string,
+    messageId: string,
+  ): boolean {
+    return this.engine.registry.has(space)
+      && this.engine.registry.store(space).index()
+        .getMessageRetraction(chatId, messageId) !== null;
+  }
+
   private storedReplySourceText(
     space: SpaceId,
     chatId: string,
@@ -1458,6 +1798,32 @@ export class Orchestrator {
     )) {
       const isEnrichedSource = raw.source === "doc" || (raw.attachments?.length ?? 0) > 0;
       if (!isEnrichedSource || remaining <= 0) continue;
+      const text = raw.content.trim().slice(0, remaining);
+      if (!text) continue;
+      content.push(text);
+      remaining -= text.length;
+    }
+    return content;
+  }
+
+  /**
+   * Exact local fallback for an explicit reply target. Unlike the heuristic
+   * recent-source lookup, this may include an ordinary text Raw: the native
+   * parent id is authoritative and must never drift to a newer unrelated file.
+   */
+  private storedMessageContextText(
+    space: SpaceId,
+    chatId: string,
+    messageId: string,
+  ): string[] {
+    if (!this.engine.registry.has(space)) return [];
+    let remaining = MAX_REPLY_SOURCE_CHARS;
+    const content: string[] = [];
+    for (const raw of this.engine.registry.store(space).index().findRawsByMessageId(
+      messageId,
+      chatId,
+    )) {
+      if (remaining <= 0) break;
       const text = raw.content.trim().slice(0, remaining);
       if (!text) continue;
       content.push(text);
@@ -1517,7 +1883,11 @@ export class Orchestrator {
     );
   }
 
-  private async handleRetraction(msg: InboundMessage, writeSpace: SpaceId): Promise<void> {
+  private async handleRetraction(
+    msg: InboundMessage,
+    writeSpace: SpaceId,
+    markDurableMutation: () => void,
+  ): Promise<void> {
     let target;
     try {
       target = await this.connector.resolveReplyTarget?.(msg.messageId);
@@ -1533,7 +1903,9 @@ export class Orchestrator {
       chatId: msg.chatId,
       messageId: target.messageId,
       requestedBy: msg.senderId,
+      ...(target.senderId ? { targetAuthor: target.senderId } : {}),
     };
+    markDurableMutation();
     let result = await this.engine.retractMessage(writeSpace, retractionRequest);
     if (result.status === "forbidden" && msg.chatType === "group") {
       const requesterIsAdmin = await this.connector.isChatAdministrator?.(
@@ -1559,11 +1931,10 @@ export class Orchestrator {
       await this.send(msg, "这条消息已经撤回过了，没有重复保留。");
       return;
     }
-
     const pageNote =
       result.affectedPages.length > 0
         ? `，并清理了 ${result.affectedPages.length} 个受影响的知识页`
-        : "，原始记录已删除";
+        : "，已停止保留、引用和后续收录";
     let rebuildNote = "";
     if (result.requeuedSourceIds.length > 0) {
       try {
@@ -1730,6 +2101,14 @@ export class Orchestrator {
       }
       return;
     }
+    const { writeSpace } = attribute(msg);
+    if (!chatRunId && this.connector.name === "feishu" && msg.chatType === "group") {
+      this.engine.chatRuns.invalidateTopicNativeSessions(
+        writeSpace,
+        msg.chatId,
+        msg.rootMessageId ?? msg.messageId,
+      );
+    }
     const inThread = groupBinding?.replyInThread ?? false;
     if (
       chatRunId
@@ -1739,6 +2118,7 @@ export class Orchestrator {
       await this.connector.reply({
         chatId: msg.chatId,
         replyToMessageId: msg.messageId,
+        idempotencyKey: chatRunId ?? `source:${msg.messageId}`,
         markdown,
         inThread,
       });
@@ -1766,7 +2146,6 @@ export class Orchestrator {
         });
       }
     }
-    const { writeSpace } = attribute(msg);
     try {
       await this.engine.recordAgentResponse(writeSpace, {
         chatId: msg.chatId,

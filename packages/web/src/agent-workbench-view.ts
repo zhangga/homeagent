@@ -33,6 +33,19 @@ const REASONING_LABELS: Record<string, string> = {
   max: "最大",
 };
 
+function providerOptionStatus(
+  provider: AgentWorkbenchView["providers"][number],
+): string {
+  if (!provider.available) return `不可用：${provider.detail}`;
+  if (
+    provider.nativeSessions === false
+    && provider.nativeSessionIssue === "windows-elevated-sandbox-required"
+  ) {
+    return "安全沙箱待设置";
+  }
+  return "CLI 就绪";
+}
+
 const AGENT_STYLE = `
   main.agent-page {
     max-width:none;
@@ -434,6 +447,40 @@ const AGENT_STYLE = `
   .agent-provider-state .agent-status-mark { margin-top:6px; }
   .agent-provider-name { font-size:13px; font-weight:650; }
   .agent-provider-detail { margin-top:2px; color:#85857f; font-size:11px; overflow-wrap:anywhere; }
+  .agent-provider-recovery {
+    margin-top:12px;
+    border:1px solid #e6d4b4;
+    border-radius:9px;
+    padding:12px;
+    background:#fbf7ed;
+  }
+  .agent-provider-recovery-title { color:#5e451c; font-size:12px; font-weight:700; }
+  .agent-provider-recovery-copy {
+    margin:5px 0 0;
+    color:#756344;
+    font-size:11px;
+    line-height:1.55;
+  }
+  .agent-provider-command {
+    display:block;
+    margin-top:9px;
+    border:1px solid #e4dac8;
+    border-radius:6px;
+    padding:7px 8px;
+    background:#fffdf8;
+    color:#4a4337;
+    font-size:10.5px;
+    overflow-wrap:anywhere;
+  }
+  .agent-provider-recovery-actions {
+    display:flex;
+    align-items:center;
+    flex-wrap:wrap;
+    gap:9px;
+    margin-top:10px;
+  }
+  .agent-provider-recovery-actions form { margin:0; }
+  .agent-provider-recovery-link { color:#695936; font-size:11px; font-weight:620; }
   .agent-property-field { display:grid; gap:6px; margin:0 0 14px; }
   .agent-property-field:last-child { margin-bottom:0; }
   .agent-property-label {
@@ -1204,7 +1251,7 @@ export function agentWorkbenchView(
                     ${provider.id === values.provider ? "selected" : ""}
                     ${!provider.available && provider.id !== values.provider ? "disabled" : ""}
                   >
-                    ${provider.name} · ${provider.available ? "CLI 就绪" : `不可用：${provider.detail}`}
+                    ${provider.name} · ${providerOptionStatus(provider)}
                   </option>
                 `)}
               </select>
@@ -1523,7 +1570,7 @@ export function agentWorkbenchView(
                   ${provider.id === values.provider ? "selected" : ""}
                   ${!provider.available && provider.id !== values.provider ? "disabled" : ""}
                 >
-                  ${provider.name} · ${provider.available ? "CLI 就绪" : `不可用：${provider.detail}`}
+                  ${provider.name} · ${providerOptionStatus(provider)}
                 </option>
               `)}
             </select>
@@ -1624,12 +1671,44 @@ export function agentWorkbenchView(
       <section class="agent-inspector-section">
         <h3 class="agent-inspector-label">Provider status</h3>
         <div class="agent-provider-state">
-          <span class="agent-status-mark ${view.inspector.provider.available ? "ready" : "unavailable"}" aria-hidden="true"></span>
+          <span class="agent-status-mark ${view.inspector.provider.available && !view.inspector.provider.recovery ? "ready" : "unavailable"}" aria-hidden="true"></span>
           <div>
             <div class="agent-provider-name">${view.inspector.provider.name} · ${view.inspector.provider.statusLabel}</div>
             <div class="agent-provider-detail">${view.inspector.provider.detail}</div>
           </div>
         </div>
+        ${view.inspector.provider.recovery ? html`
+          <div
+            class="agent-provider-recovery"
+            data-provider-recovery="${view.inspector.provider.recovery.kind}"
+            data-windows-sandbox-status="${
+              view.inspector.provider.recovery.kind === "codex-windows-sandbox"
+              && view.inspector.provider.recovery.pending
+                ? `/agents/${encodeURIComponent(view.selected!.id)}/provider/windows-sandbox/session`
+                : ""
+            }"
+          >
+            <div class="agent-provider-recovery-title">${view.inspector.provider.recovery.title}</div>
+            <p class="agent-provider-recovery-copy">${view.inspector.provider.recovery.description}</p>
+            ${view.inspector.provider.recovery.command
+              ? html`<code class="agent-provider-command">${view.inspector.provider.recovery.command}</code>`
+              : ""}
+            <div class="agent-provider-recovery-actions">
+              <form method="post" action="/agents/${encodeURIComponent(view.selected!.id)}/provider/${
+                view.inspector.provider.recovery.kind === "codex-windows-sandbox"
+                  ? "windows-sandbox"
+                  : "recover"
+              }">
+                ${view.inspector.provider.recovery.pending
+                  ? html`<button type="submit" class="agent-primary" disabled>${view.inspector.provider.recovery.actionLabel}</button>`
+                  : html`<button type="submit" class="agent-primary">${view.inspector.provider.recovery.actionLabel}</button>`}
+              </form>
+              ${view.inspector.provider.recovery.kind === "codex-windows-sandbox"
+                ? ""
+                : html`<a class="agent-provider-recovery-link" href="/settings">打开设置</a>`}
+            </div>
+          </div>
+        ` : ""}
       </section>
       <section class="agent-inspector-section">
         <h3 class="agent-inspector-label">
@@ -1742,12 +1821,36 @@ export function agentWorkbenchView(
   var model = document.getElementById('agent-model');
   var reasoning = document.getElementById('agent-reasoning-effort');
   var providerReadiness = document.querySelector('[data-provider-readiness]');
+  var windowsSandboxStatus = document.querySelector(
+    '[data-windows-sandbox-status]:not([data-windows-sandbox-status=""])'
+  );
   var nameIsAutomatic = !!nameInput && nameInput.dataset.nameMode === 'automatic';
   var initial = form ? new FormData(form) : null;
   var initialText = initial ? new URLSearchParams(Array.from(initial.entries()).map(function (entry) {
     return [entry[0], String(entry[1])];
   })).toString() : '';
   var dirty = false;
+  function pollWindowsSandbox() {
+    if (!windowsSandboxStatus) return;
+    fetch(windowsSandboxStatus.dataset.windowsSandboxStatus, {
+      headers: { 'accept': 'application/json' },
+      cache: 'no-store'
+    }).then(function (response) {
+      if (!response.ok) throw new Error('status unavailable');
+      return response.json();
+    }).then(function (session) {
+      if (session.state === 'ready' || session.state === 'failed') {
+        var next = new URL(window.location.href);
+        next.searchParams.set('ok', String(session.message || 'Codex 状态已更新'));
+        window.location.replace(next.toString());
+        return;
+      }
+      window.setTimeout(pollWindowsSandbox, 1000);
+    }).catch(function () {
+      window.setTimeout(pollWindowsSandbox, 1000);
+    });
+  }
+  if (windowsSandboxStatus) window.setTimeout(pollWindowsSandbox, 1000);
   function markDirty() {
     if (!form) return;
     var current = new FormData(form);

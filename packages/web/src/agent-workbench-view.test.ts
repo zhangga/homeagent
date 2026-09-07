@@ -18,6 +18,96 @@ const selected: Agent = {
 };
 
 describe("Agent workbench view", () => {
+  test("renders an actionable Codex recovery card in the Agent inspector", async () => {
+    const view = buildAgentWorkbench({
+      agents: [selected],
+      mode: "edit",
+      selected,
+      providers: [{
+        id: "codex",
+        name: "Codex",
+        bin: "codex",
+        available: false,
+        detail: "HomeAgent 尚未连接当前 Codex 账号",
+      }],
+      models: {},
+      defaults: { provider: "codex", model: "gpt-5.6-sol" },
+      bindings: [],
+      runs: [],
+    });
+
+    const body = String(await agentWorkbenchView(view));
+    expect(body).toContain("Codex · 需要连接");
+    expect(body).toContain("恢复 Codex 连接");
+    expect(body).toContain(
+      `action="/agents/${encodeURIComponent(selected.id)}/provider/recover"`,
+    );
+    expect(body).toContain(">恢复 Codex<");
+    expect(body).toContain('href="/settings"');
+    expect(body).toContain("打开设置");
+  });
+
+  test("renders a safe CLI check and re-detection action for another unavailable Provider", async () => {
+    const claudeAgent = { ...selected, provider: "claude" as const };
+    const view = buildAgentWorkbench({
+      agents: [claudeAgent],
+      mode: "edit",
+      selected: claudeAgent,
+      providers: [{
+        id: "claude",
+        name: "Claude Code",
+        bin: "C:\\private\\claude.exe",
+        available: false,
+        detail: "未找到命令",
+      }],
+      models: {},
+      defaults: { provider: "codex", model: "gpt-5.6-sol" },
+      bindings: [],
+      runs: [],
+    });
+
+    const body = String(await agentWorkbenchView(view));
+    expect(body).toContain("claude --version");
+    expect(body).toContain(">重新检测<");
+    expect(body).not.toContain("C:\\private");
+  });
+
+  test("renders and polls the in-page Windows sandbox setup", async () => {
+    const view = buildAgentWorkbench({
+      agents: [selected],
+      mode: "edit",
+      selected,
+      providers: [{
+        id: "codex",
+        name: "Codex",
+        bin: "codex",
+        available: true,
+        nativeSessions: false,
+        nativeSessionIssue: "windows-elevated-sandbox-required",
+        detail: "codex-cli 0.153.2；Codex 原生会话能力不可用",
+      }],
+      models: { codex: ["gpt-5.6-sol"] },
+      defaults: { provider: "codex", model: "gpt-5.6-sol" },
+      bindings: [],
+      runs: [],
+      codexWindowsSandboxSetup: {
+        state: "waiting_for_user",
+        message: "请在 Windows 系统窗口中批准 Codex 安全沙箱设置",
+      },
+    });
+
+    const body = String(await agentWorkbenchView(view));
+    expect(body).toContain('data-provider-recovery="codex-windows-sandbox"');
+    expect(body).toContain(
+      `action="/agents/${encodeURIComponent(selected.id)}/provider/windows-sandbox"`,
+    );
+    expect(body).toContain("等待系统授权…");
+    expect(body).toContain(
+      `data-windows-sandbox-status="/agents/${encodeURIComponent(selected.id)}/provider/windows-sandbox/session"`,
+    );
+    expect(body).toContain("window.setTimeout(pollWindowsSandbox, 1000)");
+  });
+
   test("renders Chat delivery failure and its Chat retry endpoint", async () => {
     const activityRuns: AgentActivityRun[] = [{
       kind: "chat",

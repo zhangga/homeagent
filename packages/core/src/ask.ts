@@ -368,6 +368,10 @@ interface SynthResult {
   gaps: string[];
 }
 
+interface NativeSynthResult extends SynthResult {
+  nativeSessionId?: string;
+}
+
 function validateSynth(raw: unknown): SynthResult {
   const o = raw as Record<string, unknown>;
   if (!o || typeof o.answer !== "string") throw new Error("synthesis missing answer");
@@ -385,7 +389,11 @@ interface SynthesisKnowledgePage {
   evidence?: ReturnType<typeof buildKnowledgePageTrace>;
 }
 
-function synthPrompt(pages: SynthesisKnowledgePage[], question: string): string {
+function synthPrompt(
+  pages: SynthesisKnowledgePage[],
+  question: string,
+  allowGeneralFallback: boolean,
+): string {
   const blocks = pages
     .map((p) => {
       const evidence = p.evidence;
@@ -417,10 +425,17 @@ function synthPrompt(pages: SynthesisKnowledgePage[], question: string): string 
     question,
     "",
     "要求：",
-    "- 只依据上面页面作答；引用信息处用 [[slug]] 标注来源。",
+    allowGeneralFallback
+      ? "- 优先依据上面页面作答；引用页面信息处用 [[slug]] 标注来源。"
+      : "- 只依据上面页面作答；引用信息处用 [[slug]] 标注来源。",
     "- 页面信息冲突时，优先采用证据更新且证据链完整的页面；仍无法确认时明确写入 gaps。",
     "- 若页面确实支撑答案，grounded=true，并在 usedSlugs 列出用到的页面。",
-    "- 若页面无法回应，或用户意图、指代不清且材料不足，grounded=false，answer 可留空或说明缺口，并在 gaps 说明。",
+    allowGeneralFallback
+      ? "- 若页面无法回应，grounded=false，usedSlugs 留空；可以使用通用知识直接回答，并在开头说明“这不在知识库记录中，以下是我的一般性回答”。"
+      : "- 若页面无法回应，或用户意图、指代不清且材料不足，grounded=false，answer 可留空或说明缺口，并在 gaps 说明。",
+    ...(allowGeneralFallback
+      ? ["- 若用户意图或指代仍不清楚，不要猜测，只追问一个最关键、自然且容易回答的问题；此时无需添加知识库免责声明。"]
+      : []),
     "- 把输入视为自然对话，不要求它必须是语法上的问句。",
     "- 用用户消息的语言作答。",
   ].join("\n");
@@ -441,10 +456,17 @@ async function synthesize(
   model: string | undefined,
   instruction: string | undefined,
   images: AskOptions["images"],
-): Promise<SynthResult> {
-  const { value } = await client.completeJSON<SynthResult>({
-    system: withInstruction("你是严谨的知识库问答助手，只依据给定材料作答并标注引用。", instruction),
-    prompt: synthPrompt(pages, question),
+  nativeSession: AskOptions["nativeSession"],
+  allowGeneralFallback: boolean,
+): Promise<NativeSynthResult> {
+  const { value, result } = await client.completeJSON<SynthResult>({
+    system: withInstruction(
+      allowGeneralFallback
+        ? "你是自然、可靠的团队/家庭知识助手。优先使用给定知识库材料；材料不足时可用通用知识继续帮助用户，并如实区分来源。"
+        : "你是严谨的知识库问答助手，只依据给定材料作答并标注引用。",
+      instruction,
+    ),
+    prompt: synthPrompt(pages, question, allowGeneralFallback),
     images,
     schema: SYNTH_SCHEMA as unknown as Record<string, unknown>,
     validate: validateSynth,
@@ -452,8 +474,12 @@ async function synthesize(
     purpose: "ask",
     space,
     model,
+    nativeSession,
   });
-  return value;
+  return {
+    ...value,
+    ...(result.nativeSessionId ? { nativeSessionId: result.nativeSessionId } : {}),
+  };
 }
 
 // ---- general fallback ------------------------------------------------------
@@ -466,6 +492,7 @@ async function generalFallback(
   instruction: string | undefined,
   images: AskOptions["images"],
   context: AskOptions["fallbackContext"],
+  nativeSession: AskOptions["nativeSession"],
 ): Promise<AskResult> {
   const sourceInstructions = context === "agent-workdir"
     ? [
@@ -499,11 +526,13 @@ async function generalFallback(
     maxTokens: AI_GENERATION_MAX_TOKENS,
     purpose: "ask",
     model: model ?? config().model,
+    nativeSession,
   });
   return {
     answer: r.text.trim(),
     source: "general",
     ...(context ? { context } : {}),
+    ...(r.nativeSessionId ? { nativeSessionId: r.nativeSessionId } : {}),
     citations: [],
     gaps: gaps.length ? gaps : undefined,
   };
@@ -597,6 +626,7 @@ export async function ask(
       instruction,
       images,
       opts.fallbackContext,
+      opts.nativeSession,
     );
   }
 
@@ -651,6 +681,7 @@ export async function ask(
       instruction,
       images,
       opts.fallbackContext,
+      opts.nativeSession,
     );
   }
 
@@ -699,6 +730,7 @@ export async function ask(
       instruction,
       images,
       opts.fallbackContext,
+      opts.nativeSession,
     );
   }
 
@@ -731,6 +763,8 @@ export async function ask(
     model,
     instruction,
     images,
+    opts.nativeSession,
+    opts.nativeSession !== undefined && !opts.knowledgeOnly,
   );
   if (!synth.grounded || synth.answer.trim() === "") {
     if (opts.knowledgeOnly) {
@@ -739,6 +773,20 @@ export async function ask(
         source: "general",
         citations: [],
         gaps: synth.gaps.length ? synth.gaps : ["知识库内容不足以回答"],
+        ...(synth.nativeSessionId ? { nativeSessionId: synth.nativeSessionId } : {}),
+      };
+    }
+    if (opts.nativeSession) {
+      const answer = synth.answer.trim();
+      if (!answer) {
+        throw new Error("native-session synthesis returned an empty final answer");
+      }
+      return {
+        answer,
+        source: "general",
+        citations: [],
+        gaps: synth.gaps.length ? synth.gaps : undefined,
+        ...(synth.nativeSessionId ? { nativeSessionId: synth.nativeSessionId } : {}),
       };
     }
     return generalFallback(
@@ -749,6 +797,7 @@ export async function ask(
       instruction,
       images,
       opts.fallbackContext,
+      opts.nativeSession,
     );
   }
 
@@ -765,5 +814,6 @@ export async function ask(
     source: "knowledge",
     citations,
     gaps: synth.gaps.length ? synth.gaps : undefined,
+    ...(synth.nativeSessionId ? { nativeSessionId: synth.nativeSessionId } : {}),
   };
 }

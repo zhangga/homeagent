@@ -154,6 +154,7 @@ describe("guided setup view", () => {
       },
     });
     expect(login).toContain("Claude Code");
+    expect(login).toContain("自动安全导入控制台 Codex 的登录缓存");
     expect(login).toContain('action="/setup/ai/codex/login"');
     expect(login).toContain("连接 ChatGPT");
 

@@ -22,6 +22,7 @@ import {
   isCliProvider,
   isCodexReasoningEffortSupported,
   normalizeProviderSkills,
+  type CodexWindowsSandboxSetupSession,
   type DetectedProvider,
 } from "@homeagent/llm";
 
@@ -103,6 +104,14 @@ export interface AgentInspectorView {
     available: boolean;
     statusLabel: string;
     detail: string;
+    recovery?: {
+      kind: "codex-auth" | "codex-windows-sandbox" | "cli";
+      title: string;
+      description: string;
+      actionLabel: string;
+      command?: string;
+      pending?: boolean;
+    };
   };
   bindings: AgentBindingView[];
   runs: AgentRunView[];
@@ -204,6 +213,7 @@ export interface BuildAgentWorkbenchInput {
   flash?: string;
   formError?: string;
   catalog?: SkillCatalogSnapshot;
+  codexWindowsSandboxSetup?: CodexWindowsSandboxSetupSession;
   revisions?: AgentRevision[];
   draft?: AgentRevision;
   /** Preserve a stale CAS token on conflict pages until the user explicitly reloads. */
@@ -271,6 +281,71 @@ function detectedProvider(
   providerId: string,
 ): DetectedProvider | undefined {
   return providers.find((provider) => provider.id === providerId);
+}
+
+const CODEX_AUTH_UNAVAILABLE_DETAIL = "HomeAgent 尚未连接当前 Codex 账号";
+
+function providerStatusLabel(provider: DetectedProvider | undefined): string {
+  if (
+    provider?.available
+    && provider.nativeSessions === false
+    && provider.nativeSessionIssue === "windows-elevated-sandbox-required"
+  ) {
+    return "安全沙箱待设置";
+  }
+  if (provider?.available) return "CLI 就绪";
+  if (
+    provider?.id === "codex"
+    && provider.detail === CODEX_AUTH_UNAVAILABLE_DETAIL
+  ) {
+    return "需要连接";
+  }
+  return "CLI 不可用";
+}
+
+function providerRecovery(
+  providerId: string,
+  provider: DetectedProvider | undefined,
+  sandboxSetup?: CodexWindowsSandboxSetupSession,
+): AgentInspectorView["provider"]["recovery"] {
+  if (
+    providerId === "codex"
+    && provider?.available
+    && provider.nativeSessions === false
+    && provider.nativeSessionIssue === "windows-elevated-sandbox-required"
+  ) {
+    const pending = sandboxSetup?.state === "starting"
+      || sandboxSetup?.state === "waiting_for_user";
+    return {
+      kind: "codex-windows-sandbox",
+      title: pending ? "正在启用 Windows 安全沙箱" : "完成 Windows 安全沙箱设置",
+      description: pending
+        ? "请在弹出的 Windows 系统窗口中批准管理员授权；完成后本页会自动重新检测。"
+        : "Codex 已登录并可执行普通任务。完成一次 Windows 系统授权后，HomeAgent 才能安全地连续使用飞书话题会话。",
+      actionLabel: pending ? "等待系统授权…" : "启用 Windows 安全沙箱",
+      pending,
+    };
+  }
+  if (provider?.available) return undefined;
+  if (
+    providerId === "codex"
+    && provider?.detail === CODEX_AUTH_UNAVAILABLE_DETAIL
+  ) {
+    return {
+      kind: "codex-auth",
+      title: "恢复 Codex 连接",
+      description:
+        "HomeAgent 会再次尝试使用本机 Codex 登录并立即检测；若仍不可用，将进入 OpenAI 官方授权。",
+      actionLabel: "恢复 Codex",
+    };
+  }
+  return {
+    kind: "cli",
+    title: "让这个 Agent 恢复工作",
+    description: "请先在运行 HomeAgent 的同一台电脑上检查 CLI，然后重新检测。",
+    actionLabel: "重新检测",
+    ...(isCliProvider(providerId) ? { command: `${providerId} --version` } : {}),
+  };
 }
 
 function effectiveModel(
@@ -663,13 +738,14 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
   const list = input.agents.map((agent) => {
     const provider = detectedProvider(input.providers, agent.provider);
     const available = provider?.available === true;
+    const fullyAvailable = available && provider?.nativeSessions !== false;
     return {
       id: agent.id,
       name: agent.name,
       providerName: provider?.name ?? agent.provider,
       modelLabel: effectiveModel(agent, input.defaults),
-      readiness: available ? "ready" as const : "unavailable" as const,
-      readinessLabel: available ? "CLI 就绪" : "CLI 不可用",
+      readiness: fullyAvailable ? "ready" as const : "unavailable" as const,
+      readinessLabel: providerStatusLabel(provider),
       running: runningAgentIds.has(agent.id),
       selected: input.selected?.id === agent.id,
     };
@@ -790,8 +866,13 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
         id: input.selected.provider,
         name: provider?.name ?? input.selected.provider,
         available: provider?.available === true,
-        statusLabel: provider?.available ? "CLI 就绪" : "CLI 不可用",
+        statusLabel: providerStatusLabel(provider),
         detail: provider?.detail ?? "未检测到此 CLI",
+        recovery: providerRecovery(
+          input.selected.provider,
+          provider,
+          input.codexWindowsSandboxSetup,
+        ),
       },
       bindings: input.bindings.map((binding) => ({
         id: binding.id,

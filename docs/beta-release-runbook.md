@@ -89,9 +89,17 @@ arm64 和 Intel 架构至少各完成一次；测试机不得依赖仓库 checko
 3. 将 `HomeAgent.app` 拖入 `/Applications`，双击启动。
 4. 确认应用自动安装并启动 LaunchAgent，然后自动打开 `/setup`。
 5. 重启 LaunchAgent 后确认后台仍能从服务 `PATH` 解析预装 Provider；删除或保持不存在的
-   `<dataDir>/bin/codex` 不得影响探测。验证普通调用：Claude CLI 必须使用 strict no-tools 模式；Codex 必须记录
-   `ephemeral`、忽略用户配置/规则、`approval_policy=never` 与 `read-only` sandbox 证据。Provider 安装、登录和升级
-   由机器所有者管理，HomeAgent 不得下载或替换该程序。
+   `<dataDir>/bin/codex` 不得影响探测。验证一次性调用：Claude CLI 必须使用 strict no-tools 且不保存会话；
+   Codex 必须记录 `ephemeral`、忽略用户配置/规则、`approval_policy=never` 与 `read-only` sandbox 证据。
+   另验证只有 Codex 飞书话题 Chat 显式启用原生会话，同时屏蔽项目指令并继续忽略环境规则、使用冻结权限；
+   原生能力探测与每轮执行前都必须在同一隔离 `CODEX_HOME` 和冻结 Workdir 下运行
+   `codex mcp list --json`，且只接受空数组；System/MDM 或任何其他层级的 MCP server 必须为空。
+   同时保存本机无模型 `codex sandbox -P <profile> --include-managed-config -C <workdir> ...` 的脱敏证据：
+   允许 sentinel 可读、`CODEX_HOME` 与仅受 `:root=deny` 保护的 sibling sentinel 均不可读，三项缺一不可。
+   Codex 0.152.1 的 macOS/Linux/Windows 都使用统一 `codex sandbox` 入口，但 fake runner 或另一平台的结果不能替代
+   Ubuntu/macOS 支持主机实测；Windows 若无法启用强制 root-deny backend，只能显示 `nativeSessions=false`，不得放宽 profile。
+   Claude 仍必须保持一次性隔离调用。
+   Provider 安装、登录和升级由机器所有者管理，HomeAgent 不得下载或替换该程序。
 6. 创建或连接飞书机器人，确认两个事件消费者就绪。
 7. 加入测试群，确认机器人只登记待确认并发送一次提示；由群主或管理员发送“@HomeAgent 启用群聊”，
    再发送真实消息完成首次知识收录并记下原始记录 ID。
@@ -219,15 +227,33 @@ Maintenance 不得增加调用次数。Wiki Maintenance 必须分别报告无 Ra
    Agent revision、Provider、Model、Permission、Workdir 和完整 Skill 证据。
 3. 从发布历史选择 v1 回滚，确认系统不是原地改写 v1，而是创建并发布一个内容等同 v1 的新版本；回滚前已创建的 Run 仍引用 v2，
    回滚后新建的 Run 引用新的线上版本。
-4. 在飞书发起一次普通 @ 问答。Claude 必须使用 safe mode、空工具集且不保存 Provider 会话；Codex 必须使用临时只读模式、
-   忽略用户配置/规则、禁止审批且不加载 Pinned Skills。Codex 应以冻结的 Agent Workdir（如已配置）作为只读当前目录，Claude 不使用
-   Workdir 工具；绑定的 native Skills 记录为 `no_tools_context` 跳过且未被声明为已执行。普通问答、提炼、学习和质量重新评测都不得加载本机 Skill。
-5. 把 Agent 切换为 Codex 后确认普通 @ 问答正常；切换为 TRAE 后确认系统明确安全拒绝且不产生工具副作用。再运行一条显式研究任务，
-   确认只有该任务按冻结计划使用 Permission / Workdir / Pinned Skills。
-6. 临时修改 Pinned Skill 目录中的一个非 `SKILL.md` 资源文件，再运行先前已排队的显式任务；必须因完整目录树摘要变化而
+4. 把测试群切换为 Codex Team Agent，在飞书群中新建话题并连续 @ 问答两轮。首轮必须新建 Codex 原生会话，
+   第二轮必须从首轮已成功提交的 head fork，Provider 能直接理解上一轮 Agent 问答；路由/分类、未触发回答的
+   群消息和静态产品回复不能伪装成话题历史，同一用户 turn 只能有一次状态化最终生成。回复一条带正文或图片的
+   当前消息时，确认该显式回复目标仍作为本 turn 来源上下文传入；未显式回复时，不得从同一 chat 的最近附件启发式
+   注入另一话题的来源正文。新建另一个话题必须从空会话开始。每轮都必须
+   忽略用户与项目指令/Rules/Hooks/Plugins、关闭 Codex 自动 Skill 发现、禁止交互审批，并按冻结的 Permission、Workdir 与完整 Skill 证据执行。
+   路由/分类与最终生成必须分别从同一冻结摘要生成本轮私有 Skill 副本、复验后仅授权副本，并使用同一规则构造 exact
+   filesystem profile；只有最终生成携带 native session。原 live Skill 路径不得进入 prompt/profile，fork 必须明确忽略历史中已清理的旧副本路径；
+   若 routing 后 live bundle 改变，最终生成应 fail-closed 且不得创建 child session。
+   在同一隔离配置下执行的 `codex mcp list --json` 必须严格为 `[]`；无模型 sandbox probe 还必须证明本轮允许目录可读、
+   隔离 `CODEX_HOME` sentinel 不可读，以及位于 `<dataDir>/run/`、仅受 `:root=deny` 保护的 sibling sentinel 不可读。
+   `full`、Workdir 与数据目录任一方向重叠、冻结 Skill 路径变更或根拒绝无法落实，都必须在任何模型调用前 fail-closed。
+   临时加入一个 System/MDM MCP
+   后应在模型调用前固定失败，管理页同时标记 `nativeSessions=false`，且错误不得泄露 server 名称或配置。
+   用另一名成员续接原话题，确认检索只读取 Team Space，不能读取前一位成员的 Personal Space。提炼、学习和
+   质量重新评测仍不得继承该话题或任何其他 Provider 会话历史。
+5. 重启 HomeAgent 后在原话题继续一轮，确认复用同一条已提交会话链；然后修改并发布 Agent Instruction、Model 或 Skill
+   证据，再次回复必须新建会话。制造一次 Provider 失败，确认失败 turn 不推进 head；恢复后重试仍从最近成功 head fork。
+   用相同 `message_id`、不同 `event_id` 重投一次消息，确认没有第二条 Chat Run、Provider 调用或飞书回复。撤回
+   一条已进入会话的消息后重启，再以不同 `event_id` 重投同一 `message_id`，确认消息、Chat Run 和 Provider
+   会话都不会复活；撤回和任何静态产品回复都应让该话题下一次回答从新会话开始。
+6. 把 Agent 切回 Claude 后确认普通 @ 问答正常且每次仍是隔离的一次性调用；切换为 TRAE 后确认系统明确安全拒绝且不产生工具副作用。
+   再运行一条显式研究任务，确认只有该任务按冻结计划使用 Permission / Workdir / Skills。
+7. 临时修改 Skill 目录中的一个非 `SKILL.md` 资源文件，再运行先前已排队的显式任务；必须因完整目录树摘要变化而
    fail-closed，不能只校验入口文件或静默使用新内容。恢复目录并重新创建 Run 后才允许执行。
-7. 在工作上下文中配置两个下一动作，手动续作第一个并确认 Task Run 成功后先生成“结果 / 检查 / 证据”验收报告；`read-only` 仅在 Raw 已落盘、输出未截断且 Provider 返回严格 JSON 报告（`outcome=completed`、无 blocker、全部检查通过）时自动验收。普通文本或畸形报告必须停在人工验收，结构化 `blocked` 必须形成 blocker 且不得消费动作；`write/full` 即使执行前已审批，执行后仍必须人工接受。接受后才写入 checkpoint、消费当前首个动作；驳回必须填写原因，保留动作和证据并允许从同一边界重试。修改计划后可显式放弃旧的受阻动作，确认系统 blocker 被清除且新的首个动作可继续。待验收时自动续跑暂停，旧 Run 页面不能决定新重试结果。失败应转为阻塞，取消不得消费动作；重启后排队动作按冻结计划恢复，已中断的运行中动作只转为阻塞、不得重放。
-8. 导出并恢复该空间，确认格式为 `homeagent.space v19`，Agent 发布历史、运行所引用的 revision、完整 Skill 证据、跳过原因、工作上下文、WorkAction/checkpoint/验收审计、自动续作策略、Raw 准入状态、分层知识地图、本地 Agent 知识反馈、完整原文件及 Wiki Maintenance 最近完成时间/有界摘要保持不变；待验收动作必须阻止导出与删除。验收前 Raw 必须为 `held` 且不能被 Dream、强制重跑、隔离重试或人工重新提炼读取；接受后才变为 `ready`，驳回、取消或失败后必须为 `excluded`。
+8. 在工作上下文中配置两个下一动作，手动续作第一个并确认 Task Run 成功后先生成“结果 / 检查 / 证据”验收报告；`read-only` 仅在 Raw 已落盘、输出未截断且 Provider 返回严格 JSON 报告（`outcome=completed`、无 blocker、全部检查通过）时自动验收。普通文本或畸形报告必须停在人工验收，结构化 `blocked` 必须形成 blocker 且不得消费动作；`write/full` 即使执行前已审批，执行后仍必须人工接受。接受后才写入 checkpoint、消费当前首个动作；驳回必须填写原因，保留动作和证据并允许从同一边界重试。修改计划后可显式放弃旧的受阻动作，确认系统 blocker 被清除且新的首个动作可继续。待验收时自动续跑暂停，旧 Run 页面不能决定新重试结果。失败应转为阻塞，取消不得消费动作；重启后排队动作按冻结计划恢复，已中断的运行中动作只转为阻塞、不得重放。
+9. 导出并恢复该空间，确认格式为 `homeagent.space v19`，Agent 发布历史、运行所引用的 revision、完整 Skill 证据、跳过原因、工作上下文、WorkAction/checkpoint/验收审计、自动续作策略、Raw 准入状态、分层知识地图、本地 Agent 知识反馈、完整原文件及 Wiki Maintenance 最近完成时间/有界摘要保持不变；待验收动作必须阻止导出与删除。Provider 原生会话 ID/路由不得出现在归档，恢复后同一飞书话题必须新建 Provider 会话。验收前 Raw 必须为 `held` 且不能被 Dream、强制重跑、隔离重试或人工重新提炼读取；接受后才变为 `ready`，驳回、取消或失败后必须为 `excluded`。
 
 这里验收的是当前 native Skill 冻结与执行链。`ManagedSkillStore` 仍是未接入 Provider 运行时的安全基础设施；不得把 Git/URL
 导入、Managed release 执行或 Skill 市场写成已发布能力。
@@ -352,7 +378,7 @@ Claude strict no-tools 或 Codex 临时只读路径。`network_recovery` 不接�
 
 - `group_binding_lifecycle`：入群待确认、管理员启用、断开隐私、原空间重连和状态恢复；
 - `message_capture`：群消息静默收录；
-- `mention_answer`：Claude strict no-tools 或 Codex 临时只读的 @ 问答；绑定的 native Skills 必须显示为跳过；
+- `mention_answer`：Claude strict no-tools 或 Codex 临时只读的 @ 问答；普通/话题 Chat 必须按冻结证据执行有效 Skills，Codex 路由/分类与最终生成都不得看到 ambient Skill；只有提炼、学习等明确的 no-tools 后台路径显示 Skill 跳过；
 - `proactive_participation`：一次主动参与；
 - `image_analysis`：绑定 Codex 时验证临时只读普通会话的原生图片输入；绑定不支持图片的 Provider 时必须明确拒绝，
   不得猜测图片内容。自动驱动的正向识别断言只允许在本轮空间已绑定 Codex 时运行；
@@ -459,7 +485,7 @@ metadata，不得包含消息正文、Instruction、Prompt、凭据或完整模�
 - 自动与真实崩溃恢复均通过；
 - v10、v11、v12、v13、v14、v15、v16、v17、v18 九份真实归档均完成独立迁移、v19 再导出、重启和二次恢复，比对记录已归档；
 - Agent 草稿/发布/回滚、`write/full` 审批与过期、定时只读自动重试三个真实飞书灰度场景全部通过；
-- 普通调用的 Claude strict no-tools 或 Codex 临时只读、native Skill `no_tools_context` 跳过、TRAE 安全拒绝和图片输入边界均有真实消息证据；
+- 普通调用的 Claude strict no-tools 或 Codex 临时只读、普通/话题 Chat 的冻结 Skill 摘要、逐调用私有副本与无 ambient Skill、no-tools 后台路径的 Skill 跳过、TRAE 安全拒绝和图片输入边界均有真实消息证据；
 - 用量页面没有把未知成本显示为 0，质量重新评测没有外发副作用且被标记为 re-evaluation 而非 deterministic replay；
 - 24 小时 soak 达标；公开 Beta 前完成 48 小时 soak；
 - 已记录仍由飞书管理员完成的权限、发布和外部共享步骤。

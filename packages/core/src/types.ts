@@ -2,7 +2,7 @@
  * Core-internal types layered on the shared domain vocabulary. Options bags for
  * the Knowledge seam live here so the interface file stays declarative.
  */
-import type { ImageInput } from "@homeagent/llm";
+import type { ImageInput, NativeSessionRequest } from "@homeagent/llm";
 import type { DreamReport, SpaceId } from "@homeagent/shared";
 import type { AggregatedRunUsage } from "./usage.ts";
 
@@ -41,6 +41,8 @@ export interface AskOptions {
   signal?: AbortSignal;
   /** maximum runtime for each provider call in this answer */
   timeoutMs?: number;
+  /** Provider-owned topic conversation request for the single final answer call. */
+  nativeSession?: NativeSessionRequest;
   /** Observe the durable quality trace recorded before a failed ask is rethrown. */
   onFailureTrace?: (trace: AskFailureTrace) => void;
 }
@@ -53,6 +55,8 @@ export interface RetractionRequest {
   chatId: string;
   messageId: string;
   requestedBy: string;
+  /** Connector-resolved original author; never accept this from message text. */
+  targetAuthor?: string;
   /** trusted role assertion supplied by the chat connector */
   requesterIsAdmin?: boolean;
 }
