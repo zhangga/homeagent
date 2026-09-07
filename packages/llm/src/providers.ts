@@ -2881,6 +2881,14 @@ export function isProviderTimeoutError(error: unknown): boolean {
  * Capability/configuration failures are deliberately excluded: callers must
  * preserve the last committed topic head for transient or repairable failures.
  */
+/**
+ * True when a native topic session was refused because this host cannot prove
+ * the required filesystem isolation. Callers may degrade to a stateless turn;
+ * they must not retry the same native session.
+ */
+export function isProviderNativeSessionIsolationError(error: unknown): boolean {
+  return new RegExp(CODEX_NATIVE_SESSION_PREFLIGHT_ERROR, "iu").test(String(error));
+}
 export function isProviderNativeSessionParentMissingError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /\bno rollout found for thread id\b|\bno conversation found\b|\b(?:session|conversation|thread)(?:\s+id)?\b.{0,80}\b(?:not found|does not exist|unknown)\b/iu

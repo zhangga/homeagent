@@ -77,6 +77,16 @@ export const NATIVE_SESSION_UNAVAILABLE_NOTICE = [
   "若权限本来就受限，请再依次检查：Workdir 是否与 HomeAgent 数据目录重叠、冻结 Skill 目录是否与 Workdir 重叠、有效 MCP 列表是否为空、本机 Codex 是否为 0.152.1 及以上。",
 ].join("\n");
 
+/**
+ * Appended to a group answer that had to run without the Codex native topic
+ * session. The answer itself is valid, but this turn carries no topic memory,
+ * so the note must be visible rather than silently degrading multi-turn.
+ */
+export const NATIVE_SESSION_FALLBACK_SUFFIX = [
+  "",
+  "",
+  "（本轮未使用话题上下文：当前设备无法为群话题提供可验证的隔离沙箱，因此这次回答不包含本话题的上下文记忆。追问时请补齐必要信息。）",
+].join("\n");
 export function providerNotice(error: unknown): string {
   const message = String(error);
   if (/does not support image inputs|不支持图片输入/i.test(message)) {

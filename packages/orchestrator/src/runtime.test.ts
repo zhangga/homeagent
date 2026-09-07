@@ -3486,6 +3486,114 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(restartedNativeSession).toEqual({ mode: "start" });
   });
 
+  test("answers statelessly when native topic isolation is unavailable on this host", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Fallback Topic Agent",
+      provider: "codex",
+      model: "gpt-5.4",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const transport = connector;
+    const feishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => transport.start(onEvent),
+      stop: () => transport.stop(),
+      reply: (out) => transport.reply(out),
+      notice: (chatId, markdown, opts) => transport.notice(chatId, markdown, opts),
+    };
+    orch = new Orchestrator({ engine, connector: feishuConnector, llm: fake });
+    const nativeSessions: unknown[] = [];
+    const spacesSeen: SpaceId[][] = [];
+    engine.askWithExecutionPlan = async (spaces, _question, _plan, _evidence, opts) => {
+      nativeSessions.push(opts?.nativeSession);
+      spacesSeen.push([...spaces]);
+      // This host cannot prove the isolation profile, so every native attempt
+      // fails the preflight exactly like the real provider does.
+      if (opts?.nativeSession) {
+        throw new Error("provider codex native session isolation is unavailable");
+      }
+      return { answer: "stateless answer", source: "general", citations: [] };
+    };
+    await orch.start();
+
+    await transport.inject({
+      kind: "message",
+      eventId: "fallback-topic-root-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 给出方案",
+      messageId: "om_fallback_topic_root",
+      mentionsBot: true,
+      createdAt: 100,
+    });
+
+    // The native attempt happened first, then the same turn was retried without
+    // a native session instead of failing the answer.
+    expect(nativeSessions).toEqual([{ mode: "start" }, undefined]);
+    // A degraded turn must still read only the Team Space.
+    expect(spacesSeen[1]).toEqual(["team/oc_team"]);
+
+    const runs = engine.chatRuns.list("team/oc_team");
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.status).toBe("succeeded");
+    // The frozen topic plan stays on the Run as immutable evidence of what was
+    // requested; what must not survive is a committed session another turn could
+    // fork from.
+    expect(engine.chatRuns.topicNativeSessionForRun(runs[0]!.id)).toBeDefined();
+    // The group must be told this answer carried no topic memory.
+    expect(runs[0]!.output).toContain("本轮未使用话题上下文");
+    // A second turn in the same topic must start fresh rather than fork from a
+    // session this host never established.
+    expect(engine.chatRuns.prepareTopicNativeSession(runs[0]!.id)).toBeUndefined();
+  });
+
+  test("a genuine provider failure is not masked by the stateless fallback", async () => {
+    engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
+    const agent = engine.agents.create({
+      name: "Fallback Guard Agent",
+      provider: "codex",
+      model: "gpt-5.4",
+      visibility: "Team",
+    });
+    engine.updateSpaceMeta("team/oc_team", { agentId: agent.id });
+    const transport = connector;
+    const feishuConnector: Connector = {
+      name: "feishu",
+      start: (onEvent) => transport.start(onEvent),
+      stop: () => transport.stop(),
+      reply: (out) => transport.reply(out),
+      notice: (chatId, markdown, opts) => transport.notice(chatId, markdown, opts),
+    };
+    orch = new Orchestrator({ engine, connector: feishuConnector, llm: fake });
+    let attempts = 0;
+    engine.askWithExecutionPlan = async () => {
+      attempts += 1;
+      // Unrelated to isolation: must fail the run rather than silently retry.
+      throw new Error("provider codex returned turn.failed");
+    };
+    await orch.start();
+
+    await transport.inject({
+      kind: "message",
+      eventId: "fallback-guard-event",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_alice",
+      text: "@agent 给出方案",
+      messageId: "om_fallback_guard",
+      mentionsBot: true,
+      createdAt: 100,
+    });
+
+    expect(attempts).toBe(1);
+    const runs = engine.chatRuns.list("team/oc_team");
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.status).toBe("failed");
+    expect(runs[0]!.output ?? "").not.toContain("本轮未使用话题上下文");
+  });
   test("a static Feishu topic control reply breaks the native conversation chain", async () => {
     engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
     const agent = engine.agents.create({

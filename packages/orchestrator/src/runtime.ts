@@ -29,6 +29,7 @@ import {
   type SerializerSnapshot,
 } from "@homeagent/shared";
 import {
+  isProviderNativeSessionIsolationError,
   isProviderNativeSessionParentMissingError,
   isProviderTimeoutError,
 } from "@homeagent/llm";
@@ -67,6 +68,7 @@ import {
 import { formatAnswer } from "./format.ts";
 import {
   GROUP_REMINDER_AUTOMATION_DENIAL,
+  NATIVE_SESSION_FALLBACK_SUFFIX,
   coldStartNote,
   providerNotice,
 } from "./messages.ts";
@@ -1496,6 +1498,7 @@ export class Orchestrator {
       const effectiveReadSpaces = nativeSession ? [writeSpace] : readSpaces;
       let context: ConversationContext = { text: userText, images: [] };
       let failureTrace: AskFailureTrace | undefined;
+      let nativeSessionFallback = false;
       let res;
       try {
         context = await this.withReplyContext(
@@ -1504,25 +1507,55 @@ export class Orchestrator {
           writeSpace,
           nativeSession === undefined,
         );
-        res = await this.engine.askWithExecutionPlan(
-          effectiveReadSpaces,
-          context.text,
-          run.executionPlan,
-          run.skillEvidence,
-          {
-            images: context.images.map((image) => ({ path: image.localPath })),
-            fallbackContext: context.sourceContext ? "message-source" : undefined,
-            signal,
-            timeoutMs: run.timeoutMs ?? LEGACY_CHAT_PROVIDER_TIMEOUT_MS,
-            nativeSession,
-            onFailureTrace: (trace) => {
-              failureTrace = trace;
+        const executionPlan = run.executionPlan;
+        const askOnce = async (useNativeSession: boolean) =>
+          await this.engine.askWithExecutionPlan(
+            useNativeSession || nativeSession === undefined
+              ? effectiveReadSpaces
+              : [writeSpace],
+            context.text,
+            executionPlan,
+            run.skillEvidence,
+            {
+              images: context.images.map((image) => ({ path: image.localPath })),
+              fallbackContext: context.sourceContext ? "message-source" : undefined,
+              signal,
+              timeoutMs: run.timeoutMs ?? LEGACY_CHAT_PROVIDER_TIMEOUT_MS,
+              ...(useNativeSession ? { nativeSession } : {}),
+              onFailureTrace: (trace) => {
+                failureTrace = trace;
+              },
             },
-          },
-          run.agentId,
-        );
-        if (nativeSession && !res.nativeSessionId) {
-          throw new Error("Provider did not return the native topic session id");
+            run.agentId,
+          );
+        try {
+          res = await askOnce(nativeSession !== undefined);
+          if (nativeSession && !res.nativeSessionId) {
+            throw new Error("Provider did not return the native topic session id");
+          }
+        } catch (nativeError) {
+          // A host whose sandbox cannot enforce the isolation profile can never
+          // run a native topic session. Degrade to a stateless turn rather than
+          // failing every group answer; the turn keeps reading only the Team
+          // Space and never joins the Provider-native chain.
+          if (
+            nativeSession === undefined
+            || signal?.aborted
+            || !isProviderNativeSessionIsolationError(nativeError)
+          ) {
+            throw nativeError;
+          }
+          log.warn("native topic session unavailable; answering statelessly", {
+            space: writeSpace,
+          });
+          nativeSessionFallback = true;
+          this.engine.chatRuns.invalidateTopicNativeSessions(
+            writeSpace,
+            msg.chatId,
+            msg.rootMessageId ?? msg.messageId,
+          );
+          failureTrace = undefined;
+          res = await askOnce(false);
         }
       } catch (err) {
         const missingNativeParent = nativeSession?.mode === "fork"
@@ -1583,12 +1616,15 @@ export class Orchestrator {
       if (signal?.aborted) {
         throw signal.reason instanceof Error ? signal.reason : new ChatRunCancelledError();
       }
+      if (nativeSessionFallback) {
+        text = `${text}${NATIVE_SESSION_FALLBACK_SUFFIX}`;
+      }
       const succeeded = this.engine.chatRuns.succeed(runId, {
         finishedAt: Date.now(),
         output: text,
         traceId: res.traceId,
         usage: res.traceId ? this.engine.answerTrace(res.traceId)?.usage : undefined,
-        nativeSessionId: res.nativeSessionId,
+        ...(nativeSessionFallback ? {} : { nativeSessionId: res.nativeSessionId }),
       });
       if (!succeeded) return;
       await this.send(msg, text, runId);
