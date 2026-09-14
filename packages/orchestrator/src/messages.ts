@@ -3,7 +3,7 @@
  * tweak). The plan calls out coldStartNote (Q3): the honest nudge appended when answering from general
  *     knowledge while the space's knowledge base is still empty.
  */
-import { isProviderTimeoutError } from "@homeagent/llm";
+import { isProviderTimeoutError, providerPreparationFailure, NATIVE_SESSION_ISSUE_LABELS } from "@homeagent/llm";
 
 /**
  * Shown when a message can't be answered because no runnable LLM provider is
@@ -73,22 +73,29 @@ export const PROVIDER_LOGIN_EXPIRED_NOTICE = [
  */
 export const NATIVE_SESSION_UNAVAILABLE_NOTICE = [
   "⚠️ 群里的话题回答暂时不可用：当前 Agent 的执行配置无法满足 Codex 原生会话的隔离要求。",
-  "最常见的原因是 Agent 权限为 `full`。群聊话题要求可验证的受限沙箱，因此会在调用模型前固定拒绝；请在管理后台把该 Agent 权限改为 `write` 或 `read`。",
-  "若权限本来就受限，请再依次检查：Workdir 是否与 HomeAgent 数据目录重叠、冻结 Skill 目录是否与 Workdir 重叠、有效 MCP 列表是否为空、本机 Codex 是否为 0.152.1 及以上。",
+  "本轮不会自动降级，也不能据此判断账号未登录。若权限为 `full`，请按需选择 `read-only` 或 `write` 并发布；受限权限仍须通过沙箱检查。",
+  "请在管理后台检查原生会话状态：Windows 沙箱是否就绪、Workdir 是否与 HomeAgent 数据目录重叠、冻结 Skill 目录是否与 Workdir 重叠、有效 MCP 列表是否为空、本机 Codex 是否为 0.152.1 及以上。",
 ].join("\n");
 
-/**
- * Appended to a group answer that had to run without the Codex native topic
- * session. The answer itself is valid, but this turn carries no topic memory,
- * so the note must be visible rather than silently degrading multi-turn.
- */
-export const NATIVE_SESSION_FALLBACK_SUFFIX = [
-  "",
-  "",
-  "（本轮未使用话题上下文：当前设备无法为群话题提供可验证的隔离沙箱，因此这次回答不包含本话题的上下文记忆。追问时请补齐必要信息。）",
-].join("\n");
 export function providerNotice(error: unknown): string {
   const message = String(error);
+  const preparation = providerPreparationFailure(error);
+  if (preparation?.stage === "skill-staging") {
+    return "⚠️ 冻结 Skill 目录超过本轮准备预算，已停止执行，没有使用删减后的目录。请在管理后台查看执行证据；缩减本机 Skill 资源体积后重新发起请求，重试旧运行不会更换冻结目录。";
+  }
+  if (preparation?.stage === "native-session") {
+    const detail = NATIVE_SESSION_ISSUE_LABELS[preparation.reason];
+    const code = preparation.exitCode === undefined ? "" : `（检查退出码 ${preparation.exitCode}）`;
+    const action = preparation.reason === "windows-elevated-sandbox-required"
+      ? "请在管理后台完成 Windows 安全沙箱设置后重新检测。"
+      : preparation.reason === "protected-root-readable" || preparation.reason === "codex-home-readable"
+        ? "这不是登录失败；切换 write/full 或重复登录不能修复这项读取边界。请查看运行详情，在本机隔离能力修复后重新检测。"
+        : "请查看管理后台的原生会话状态和运行详情，处理该项检查后重新发起请求。";
+    return `⚠️ Codex 群话题隔离检查未通过：${detail}${code}。已阻止继续执行，不会降级。${action}`;
+  }
+  if (/provider codex native session rejects full permission/i.test(message)) {
+    return "⚠️ 当前 Agent 的 full 权限与 Codex 群话题隔离要求冲突，本轮未调用模型，也未降级。请在管理后台将权限改为 read-only；需要写工作目录时选择 write，并发布配置。受限权限仍须通过沙箱检查，这不是登录失败。";
+  }
   if (/does not support image inputs|不支持图片输入/i.test(message)) {
     return UNSUPPORTED_IMAGE_NOTICE;
   }

@@ -8,12 +8,14 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
+import { providerPreparationFailure } from "./provider-preparation.ts";
 import {
   codexReasoningEffortsForModel,
   curatedProviderModels,
@@ -35,6 +37,33 @@ const READ_ONLY_EXECUTION = {
   permission: "read-only" as const,
   skills: [],
 };
+
+test.each([[73, "codex-home-readable"], [74, "allowed-path-unreadable"], [75, "protected-root-readable"]] as const)(
+  "native preflight preserves the precise failed filesystem check (%s)", async (code, reason) => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-native-failure-evidence-")));
+    const previousBin = process.env.HOMEAGENT_CODEX_BIN;
+    const previousHome = process.env.HOMEAGENT_CODEX_HOME;
+    const workdir = join(root, "workdir");
+    const dataRoot = join(root, "data");
+    mkdirSync(workdir); mkdirSync(dataRoot);
+    process.env.HOMEAGENT_CODEX_HOME = join(root, "codex-home");
+    process.env.HOMEAGENT_CODEX_BIN = writeCodexStatusProvider(root, "codex", 0, CODEX_STATUS_ARGS, 0, "codex 0.154.0", "[]", 0, code, "private diagnostic");
+    try {
+      try {
+        await preflightProviderNativeSession("codex", 5000, undefined, workdir, { permission: "write", workdir, skills: [] }, [], dataRoot);
+        throw new Error("expected preflight failure");
+      } catch (error) {
+        expect(providerPreparationFailure(error)).toEqual({ stage: "native-session", reason, exitCode: code });
+        expect(String(error)).not.toContain("private diagnostic");
+      }
+      expect(providerProbeCalls(root, "codex")).toHaveLength(4);
+    } finally {
+      if (previousBin === undefined) delete process.env.HOMEAGENT_CODEX_BIN; else process.env.HOMEAGENT_CODEX_BIN = previousBin;
+      if (previousHome === undefined) delete process.env.HOMEAGENT_CODEX_HOME; else process.env.HOMEAGENT_CODEX_HOME = previousHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 const CODEX_STATUS_ARGS = [
   "-c",
   'cli_auth_credentials_store="file"',
@@ -207,7 +236,7 @@ test("keeps the isolated Codex cache when the ambient copy is unusable", () => {
   }
 });
 
-test("drops Skills that exceed the shared staging budget instead of failing the call", async () => {
+test("stages the complete frozen catalog beyond the single-bundle byte limit", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-codex-skill-budget-")));
   const providerDirectory = join(root, "provider");
   const dataRoot = join(root, "data");
@@ -216,15 +245,14 @@ test("drops Skills that exceed the shared staging budget instead of failing the 
   mkdirSync(dataRoot, { recursive: true });
   mkdirSync(workdir, { recursive: true });
 
-  // Two Skills whose combined payload cannot fit one invocation budget. The
-  // first alone is under the limit, so staging must keep it and drop the rest.
+  // The whole catalog has its own aggregate budget, not one bundle's limit.
   const names = ["fits-first", "over-budget"];
   const skillInputs = names.map((name) => {
     const directory = join(root, "skills", name);
     mkdirSync(directory, { recursive: true });
     const skillFile = join(directory, "SKILL.md");
     writeFileSync(skillFile, `# ${name}\n`, "utf8");
-    // 9 MiB each: one fits inside the 16 MiB budget, two cannot.
+    // 9 MiB each: together they exceed the single-bundle 16 MiB ceiling.
     writeFileSync(join(directory, "payload.bin"), Buffer.alloc(9 * 1024 * 1024, 1));
     return { name, directory, skillFile, bundleHash: hashProviderSkillBundle(skillFile) };
   });
@@ -241,14 +269,72 @@ test("drops Skills that exceed the shared staging budget instead of failing the 
     }, 5000);
 
     const observed = JSON.parse(output.text) as { args: string[]; prompt: string };
-    // The call succeeds and the surviving Skill is still offered to the model.
     expect(observed.prompt).toContain("- fits-first: ");
-    // The dropped Skill must not be advertised, or the model would call a Skill
-    // whose bundle was never staged.
-    expect(observed.prompt).not.toContain("- over-budget: ");
-    expect(observed.args.join("\0")).not.toContain("over-budget");
+    expect(observed.prompt).toContain("- over-budget: ");
   } finally {
     delete process.env.HOMEAGENT_CODEX_BIN;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("over-capacity catalogs fail before invocation and clean every staged copy", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-codex-catalog-capacity-")));
+  const previous = process.env.HOMEAGENT_CODEX_BIN;
+  const workdir = join(root, "workdir");
+  mkdirSync(workdir);
+  const skillInputs = Array.from({ length: 9 }, (_, index) => {
+    const directory = join(root, `skill-${index}`);
+    mkdirSync(directory);
+    const skillFile = join(directory, "SKILL.md");
+    writeFileSync(skillFile, `# Skill ${index}\n`);
+    writeFileSync(join(directory, "payload.bin"), Buffer.alloc(15 * 1024 * 1024));
+    return { name: `skill-${index}`, directory, skillFile, bundleHash: hashProviderSkillBundle(skillFile) };
+  });
+  const stagedBefore = stagedCodexSkillDirectories();
+  try {
+    process.env.HOMEAGENT_CODEX_BIN = writeArgAndStdinReportingCodexProvider(root);
+    try {
+      await runProviderDetailed("codex", { prompt: "must not run a partial catalog", skillInputs,
+        execution: { permission: "read-only", workdir, skills: skillInputs.map(skill => skill.name), skillMode: "all" },
+      }, 5000);
+      throw new Error("expected capacity error");
+    } catch (error) {
+      expect(providerPreparationFailure(error)).toEqual({ stage: "skill-staging", reason: "capacity-exceeded", requestedSkills: 9, stagedSkills: 8 });
+    }
+    expect(existsSync(join(root, "provider.calls.jsonl"))).toBe(false);
+    expect(stagedCodexSkillDirectories()).toEqual(stagedBefore);
+  } finally {
+    if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN; else process.env.HOMEAGENT_CODEX_BIN = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30000);
+
+test("the shared staged read root rejects substituted or extra bundles before sandboxing", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-codex-staged-root-contract-")));
+  const previous = process.env.HOMEAGENT_CODEX_BIN;
+  const workdir = join(root, "workdir");
+  const dataRoot = join(root, "data");
+  const source = join(root, "source");
+  for (const directory of [workdir, dataRoot, source]) mkdirSync(directory);
+  const skillFile = join(source, "SKILL.md");
+  writeFileSync(skillFile, "# Frozen\n");
+  const stagedBefore = stagedCodexSkillDirectories();
+  try {
+    process.env.HOMEAGENT_CODEX_BIN = writeArgAndStdinReportingCodexProvider(root);
+    const pending = preflightProviderNativeSession("codex", 5000, undefined, workdir,
+      { permission: "write", workdir, skills: ["frozen"] },
+      [{ name: "frozen", directory: source, skillFile, bundleHash: hashProviderSkillBundle(skillFile) }], dataRoot);
+    // Staging is synchronous before the first fake CLI probe. Substitute its
+    // child while that probe is pending, keeping the directory count unchanged.
+    const created = stagedCodexSkillDirectories().filter(name => !stagedBefore.includes(name));
+    expect(created).toHaveLength(1);
+    const stagedRoot = join(realpathSync(tmpdir()), created[0]!);
+    renameSync(join(stagedRoot, "skill-0000"), join(stagedRoot, "unlisted-bundle"));
+    await expect(pending).rejects.toThrow("native session isolation is unavailable");
+    expect(providerProbeCalls(root, "provider").some(args => args.includes("sandbox"))).toBe(false);
+    expect(stagedCodexSkillDirectories()).toEqual(stagedBefore);
+  } finally {
+    if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN; else process.env.HOMEAGENT_CODEX_BIN = previous;
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -874,6 +960,9 @@ function codexMcpListArgs(workdir?: string): string[] {
 
 describe("Codex model capabilities", () => {
   test("reasoning effort choices follow the selected model", () => {
+    expect(codexReasoningEffortsForModel("gpt-6-astra")).toEqual([
+      "low", "medium", "high", "xhigh", "max", "ultra",
+    ]);
     expect(codexReasoningEffortsForModel("gpt-5.6-sol")).toEqual([
       "none",
       "low",
@@ -1199,6 +1288,31 @@ describe("provider detection", () => {
     }
   });
 
+  test.each([false, true])("Codex reports redacted execution evidence before final parsing (failure=%s)", async (fail) => {
+    const previous = process.env.HOMEAGENT_CODEX_BIN;
+    const directory = mkdtempSync(join(tmpdir(), "ha-codex-audit-"));
+    const evidence: unknown[] = [];
+    try {
+      process.env.HOMEAGENT_CODEX_BIN = writeStaticProvider(directory, [
+        JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: 'lark-cli im +chat-list --as bot --json', exit_code: 0, aggregated_output: '{"ok":true,"identity":"bot","data":{"chats":[]}}' } }),
+        JSON.stringify(fail ? { type: "turn.failed", error: { message: "test failure" } } : { type: "item.completed", item: { type: "agent_message", text: "done" } }),
+      ].join("\n"));
+      const result = runProviderDetailed("codex", {
+        prompt: "audit", execution: READ_ONLY_EXECUTION, onExecutionEvidence: value => evidence.push(value),
+      }, 500);
+      if (fail) await expect(result).rejects.toThrow();
+      else expect((await result).text).toBe("done");
+      expect(evidence).toEqual([{ source: "codex-jsonl", truncated: false, events: [{
+        kind: "command", status: "completed", exitCode: 0,
+        lark: { operation: "chat-list", requestedIdentity: "bot", reportedIdentity: "bot", ok: true, count: 0 },
+      }] }]);
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+      else process.env.HOMEAGENT_CODEX_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("Claude rejects native sessions when OAuth, frozen Skills, and isolation cannot coexist", async () => {
     for (const nativeSession of [
       { mode: "start" as const },
@@ -1381,6 +1495,11 @@ describe("provider detection", () => {
         realpathSync(workdir),
       ]));
       const sandboxProbe = calls[3]!;
+      const profile = sandboxProbe.find(arg => arg.startsWith("permissions="))!;
+      expect(profile).toContain("homeagent-codex-skills-");
+      expect(profile).not.toContain("skill-0000");
+      const finalProfile = observed.args.find(arg => arg.startsWith("permissions="))!;
+      expect(finalProfile).toBe(profile);
       const encodedIndex = sandboxProbe.indexOf("-EncodedCommand");
       const probeCommand = process.platform === "win32"
         ? Buffer.from(sandboxProbe[encodedIndex + 1]!, "base64").toString("utf16le")
@@ -1566,7 +1685,7 @@ describe("provider detection", () => {
     }
   });
 
-  test("Codex bounds aggregate staged Skill bytes for one invocation", async () => {
+  test("Codex does not silently narrow a frozen all-Skill invocation", async () => {
     const previousBin = process.env.HOMEAGENT_CODEX_BIN;
     const root = mkdtempSync(join(tmpdir(), "ha-codex-staged-aggregate-"));
     const providerDirectory = join(root, "provider");
@@ -1605,15 +1724,9 @@ describe("provider detection", () => {
         skillInputs,
       }, 500);
 
-      // The aggregate byte cap is still enforced: two 8 MiB bundles cannot both
-      // be staged for one invocation. Exceeding it is a capacity limit, so the
-      // call proceeds with the Skills that fit instead of failing outright.
       const observed = JSON.parse(output.text) as { prompt: string; args: string[] };
       expect(observed.prompt).toContain("- first: ");
-      expect(observed.prompt).not.toContain("- second: ");
-      // A dropped Skill must not remain in the invocation contract, or the model
-      // could call a bundle that was never staged.
-      expect(observed.args.join("\0")).not.toContain("second");
+      expect(observed.prompt).toContain("- second: ");
       // Staged copies are still cleaned up once the call finishes.
       expect(stagedCodexSkillDirectories()).toEqual(stagedBefore);
     } finally {
@@ -2745,21 +2858,21 @@ describe("provider detection", () => {
         "exec --ephemeral --strict-config --ignore-user-config --ignore-rules --json --sandbox read-only --skip-git-repo-check -- -",
       );
 
-      const configuredRun = await runProvider(
-        "codex",
-        {
-          prompt: "hello",
-          model: "gpt-5.6-sol",
-          reasoningEffort: "high",
-          execution: READ_ONLY_EXECUTION,
-        },
-        500,
-      );
-      expect(configuredRun).toContain("model_reasoning_effort");
-      expect(configuredRun).toContain("high");
-      expect(configuredRun).toContain(
-        "exec --ephemeral --strict-config --ignore-user-config --ignore-rules --json --sandbox read-only --skip-git-repo-check -m gpt-5.6-sol -- -",
-      );
+      for (const [model, reasoningEffort] of [
+        ["gpt-5.6-sol", "high"],
+        ["gpt-6-astra", "ultra"],
+      ] as const) {
+        const configuredRun = await runProvider(
+          "codex",
+          { prompt: "hello", model, reasoningEffort, execution: READ_ONLY_EXECUTION },
+          500,
+        );
+        expect(configuredRun).toContain("model_reasoning_effort");
+        expect(configuredRun).toContain(reasoningEffort);
+        expect(configuredRun).toContain(
+          `exec --ephemeral --strict-config --ignore-user-config --ignore-rules --json --sandbox read-only --skip-git-repo-check -m ${model} -- -`,
+        );
+      }
     } finally {
       for (const key of keys) {
         const value = previous[key];
@@ -3285,7 +3398,7 @@ describe("provider detection", () => {
         }
 
         expect(failure).toBe(
-          "Error: provider codex native session isolation is unavailable",
+          "ProviderPreparationError: provider codex native session isolation is unavailable (mcp-not-isolated)",
         );
         expect(failure).not.toContain(privateServerName);
         expect(providerProbeCalls(directory, name)).toEqual([
@@ -3832,8 +3945,8 @@ describe("provider detection", () => {
     // no "gateway" key — providers are CLIs only
     expect(m.gateway).toBeUndefined();
     expect(m["trae-cli"]).toContain("openrouter-3o");
-    // codex list mirrors mew's menu
-    expect(m.codex?.slice(0, 3)).toEqual([
+    expect(m.codex?.slice(0, 4)).toEqual([
+      "gpt-6-astra",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",

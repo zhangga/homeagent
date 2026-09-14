@@ -634,6 +634,19 @@ describe("AgentStore", () => {
     expect(changed?.reasoningEffort).toBe("");
   });
 
+  test("GPT-6 Astra preserves its model and reasoning on reload and rejects none", () => {
+    const store = new AgentStore(dir);
+    const agent = store.create({
+      name: "Astra 助手", provider: "codex", model: "gpt-6-astra", reasoningEffort: "ultra",
+    });
+    expect(new AgentStore(dir).get(agent.id)).toEqual(expect.objectContaining({
+      model: "gpt-6-astra", reasoningEffort: "ultra",
+    }));
+    expect(store.update(agent.id, { reasoningEffort: "none" })?.reasoningEffort).toBe("");
+    expect(store.update(agent.id, { reasoningEffort: "ultra" })?.reasoningEffort).toBe("ultra");
+    expect(store.update(agent.id, { model: "gpt-5.6-sol" })?.reasoningEffort).toBe("");
+  });
+
   test("task-execution fields: defaults, safe parsing, and update", () => {
     const store = new AgentStore(dir);
     const a = store.create({

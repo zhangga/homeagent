@@ -25,6 +25,7 @@ export interface DreamOptions {
 }
 
 export interface AskOptions {
+  onExecutionEvidence?: import("@homeagent/llm").RunInput["onExecutionEvidence"];
   /** model override for synthesis */
   model?: string;
   /** agent persona / extra system instruction injected into synthesis + fallback */

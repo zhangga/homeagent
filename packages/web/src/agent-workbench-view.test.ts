@@ -18,6 +18,19 @@ const selected: Agent = {
 };
 
 describe("Agent workbench view", () => {
+  test("a readable protected root is not presented as a login or UAC setup problem", async () => {
+    const view = buildAgentWorkbench({ agents: [selected], mode: "edit", selected,
+      providers: [{ id: "codex", name: "Codex", bin: "codex", available: true, nativeSessions: false,
+        nativeSessionIssue: "protected-root-readable", detail: "受保护数据目录仍可读取" }],
+      models: {}, defaults: { provider: "codex", model: "gpt-5.6-sol" }, bindings: [], runs: [],
+    });
+    const body = String(await agentWorkbenchView(view));
+    expect(body).toContain("原生话题隔离未通过");
+    expect(body).toContain("受保护数据目录仍可读取");
+    expect(body).toContain("重新检测");
+    expect(body).not.toContain("启用 Windows 安全沙箱");
+    expect(body).not.toContain("恢复 Codex 连接");
+  });
   test("renders an actionable Codex recovery card in the Agent inspector", async () => {
     const view = buildAgentWorkbench({
       agents: [selected],
@@ -45,6 +58,9 @@ describe("Agent workbench view", () => {
     expect(body).toContain(">恢复 Codex<");
     expect(body).toContain('href="/settings"');
     expect(body).toContain("打开设置");
+    expect(body).toContain("Codex 群话题不支持 full，也不会自动降级");
+    expect(body).toContain("需要写工作目录选 write");
+    expect(body).toContain("修改后需发布");
   });
 
   test("renders a safe CLI check and re-detection action for another unavailable Provider", async () => {

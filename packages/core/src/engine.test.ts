@@ -100,6 +100,16 @@ afterEach(() => {
 });
 
 describe("Knowledge seam contract", () => {
+  test("local execution evidence is excluded from Space archives", async () => {
+    engine.ensureSpace(SPACE);
+    const run = engine.chatRuns.start({ space: SPACE, input: "audit", trigger: "message", startedAt: 100 });
+    engine.chatRuns.succeed(run.id, { finishedAt: 110, output: "done", executionEvidence: { calls: [], truncated: false } });
+    engine.chatRuns.deliverySent(run.id, 111);
+    const archive = await engine.exportSpace(SPACE);
+    expect(archive.chatRuns[0]?.id).toBe(run.id);
+    expect(JSON.stringify(archive.chatRuns)).not.toContain("executionEvidence");
+    expect(engine.chatRuns.get(run.id)?.executionEvidence).toEqual({ calls: [], truncated: false });
+  });
   test("engine satisfies the Knowledge interface shape", () => {
     // Structural assertion: assigning to the interface type is the contract.
     const k: Knowledge = engine;
@@ -5483,7 +5493,9 @@ describe("Knowledge seam contract", () => {
         snapshot.skillEvidence,
         { nativeSession: { mode: "start" } },
         agent.id,
-      )).rejects.toThrow("provider codex native session isolation is unavailable");
+      )).rejects.toThrow(scenario === "full"
+        ? "provider codex native session rejects full permission"
+        : "provider codex native session isolation is unavailable");
       expect(preflightCalls).toBe(0);
       expect(providerCalls).toBe(0);
       chatEngine.close();

@@ -20,6 +20,7 @@ import {
 } from "@homeagent/shared";
 import { estimateCost } from "./pricing.ts";
 import type { CompletionUsage, NativeSessionRequest } from "./providers.ts";
+import type { ProviderExecutionEvidence } from "./execution-evidence.ts";
 import {
   recordCall,
   type CallPurpose,
@@ -38,6 +39,7 @@ export interface ImageInput {
 }
 
 export interface CompleteOptions {
+  onExecutionEvidence?: (evidence: ProviderExecutionEvidence) => void;
   model?: string;
   system?: string;
   messages?: Message[];

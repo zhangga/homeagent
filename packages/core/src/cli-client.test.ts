@@ -43,6 +43,18 @@ describe("extractJson", () => {
 });
 
 describe("makeCliClient", () => {
+  test("forwards private evidence observers for text and JSON calls without adding them to prompts", async () => {
+    let observed = 0;
+    const client = makeCliClient("codex", undefined, testAccountingDataDir, async (_id, input) => {
+      expect(input.prompt).not.toContain("onExecutionEvidence");
+      input.onExecutionEvidence?.({ source: "codex-jsonl", events: [], truncated: false });
+      return '{"ok":true}';
+    });
+    const onExecutionEvidence = () => { observed++; };
+    await client.complete({ prompt: "text", onExecutionEvidence });
+    await client.completeJSON({ prompt: "json", schema: { type: "object" }, onExecutionEvidence });
+    expect(observed).toBe(2);
+  });
   test("requires an explicit accounting directory", () => {
     expect(() => (makeCliClient as unknown as (...args: unknown[]) => unknown)(
       "codex",

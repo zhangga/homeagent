@@ -31,6 +31,7 @@ const REASONING_LABELS: Record<string, string> = {
   high: "高",
   xhigh: "超高",
   max: "最大",
+  ultra: "极致（Ultra）",
 };
 
 function providerOptionStatus(
@@ -43,6 +44,7 @@ function providerOptionStatus(
   ) {
     return "安全沙箱待设置";
   }
+  if (provider.nativeSessions === false) return "原生话题隔离未通过";
   return "CLI 就绪";
 }
 
@@ -1342,6 +1344,7 @@ export function agentWorkbenchView(
                   `)}
                 </select>
                 ${errorFor(view.errors, "permission")}
+                <p class="agent-field-hint">Codex 群话题不支持 full，也不会自动降级。只读选 read-only，需要写工作目录选 write；两者仍须通过隔离检查。</p>
               </div>
             </div>
             <div class="agent-field agent-create-field">
@@ -1628,6 +1631,7 @@ export function agentWorkbenchView(
               `)}
             </select>
             ${errorFor(view.errors, "permission")}
+            <p class="agent-field-hint">Codex 群话题不支持 full，也不会自动降级。只读选 read-only，需要写工作目录选 write；修改后需发布。</p>
           </div>
         </div>
       </section>

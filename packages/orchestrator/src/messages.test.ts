@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ProviderRunError } from "@homeagent/llm";
+import { ProviderRunError, ProviderPreparationError } from "@homeagent/llm";
 import {
   MODEL_CAPACITY_NOTICE,
   NATIVE_SESSION_UNAVAILABLE_NOTICE,
@@ -9,6 +9,24 @@ import {
   UNSUPPORTED_IMAGE_NOTICE,
   providerNotice,
 } from "./messages.ts";
+
+test("full permission rejection is distinct from a failed host sandbox probe", () => {
+  const notice = providerNotice(new Error("provider codex native session rejects full permission"));
+  expect(notice).toContain("full 权限");
+  expect(notice).toContain("未调用模型，也未降级");
+  expect(notice).toContain("发布配置");
+  expect(notice).not.toContain("当前设备无法");
+});
+
+test("a failed root-deny proof has a precise notice, not login or setup advice", () => {
+  const notice = providerNotice(new ProviderPreparationError({ stage: "native-session", reason: "protected-root-readable", exitCode: 75 }));
+  expect(notice).toContain("受保护数据目录仍可读取");
+  expect(notice).toContain("检查退出码 75");
+  expect(notice).toContain("不是登录失败");
+  expect(notice).not.toContain("完成 Windows 安全沙箱设置");
+  const capacity = providerNotice(new ProviderPreparationError({ stage: "skill-staging", reason: "capacity-exceeded", requestedSkills: 112, stagedSkills: 55 }));
+  expect(capacity).toContain("没有使用删减后的目录");
+});
 
 test("provider notices explain fail-closed no-tools and visual boundaries", () => {
   expect(providerNotice(
@@ -92,6 +110,8 @@ test("a failed native-session gate is reported as a config fix, not a connection
   // verify Agent/Provider connection status, which cannot fix this.
   expect(NATIVE_SESSION_UNAVAILABLE_NOTICE).toContain("full");
   expect(NATIVE_SESSION_UNAVAILABLE_NOTICE).toContain("write");
+  expect(NATIVE_SESSION_UNAVAILABLE_NOTICE).toContain("Windows 沙箱是否就绪");
+  expect(NATIVE_SESSION_UNAVAILABLE_NOTICE).toContain("不能据此判断账号未登录");
   expect(NATIVE_SESSION_UNAVAILABLE_NOTICE).not.toContain("Provider 连接状态");
   expect(NATIVE_SESSION_UNAVAILABLE_NOTICE).not.toContain("codex login");
 });

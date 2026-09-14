@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ProviderRunError, type JSONOptions } from "@homeagent/llm";
+import { ProviderRunError, ProviderPreparationError, type JSONOptions } from "@homeagent/llm";
 import {
   AI_OPERATION_TIMEOUT_MS,
   resetConfig,
@@ -3486,7 +3486,26 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(restartedNativeSession).toEqual({ mode: "start" });
   });
 
-  test("answers statelessly when native topic isolation is unavailable on this host", async () => {
+  test.each([false, true])("Chat persists observed execution evidence with its outcome (failure=%s)", async (fail) => {
+    const observed = { source: "codex-jsonl" as const, events: [], truncated: false };
+    fake.onText(opts => {
+      opts.onExecutionEvidence?.(observed);
+      if (fail) throw new Error("provider failed");
+      return "分析完成";
+    });
+    await orch.start();
+    await connector.inject({
+      kind: "message", eventId: "audit-event", chatType: "group", chatId: "oc_team",
+      senderId: "ou_alice", text: "@agent 分析本周的发布问题", messageId: "om_audit",
+      mentionsBot: true, createdAt: 100,
+    });
+    const run = engine.chatRuns.list("team/oc_team")[0]!;
+    expect(run.status).toBe(fail ? "failed" : "succeeded");
+    expect(run.executionEvidence).toEqual({ calls: [observed], truncated: false });
+    expect(run.executionPlan?.skillMode).toBe("all");
+  });
+
+  test("fails closed without a stateless retry when native topic isolation is unavailable", async () => {
     engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
     const agent = engine.agents.create({
       name: "Fallback Topic Agent",
@@ -3512,7 +3531,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       // This host cannot prove the isolation profile, so every native attempt
       // fails the preflight exactly like the real provider does.
       if (opts?.nativeSession) {
-        throw new Error("provider codex native session isolation is unavailable");
+        throw new ProviderPreparationError({ stage: "native-session", reason: "protected-root-readable", exitCode: 75 });
       }
       return { answer: "stateless answer", source: "general", citations: [] };
     };
@@ -3530,21 +3549,20 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       createdAt: 100,
     });
 
-    // The native attempt happened first, then the same turn was retried without
-    // a native session instead of failing the answer.
-    expect(nativeSessions).toEqual([{ mode: "start" }, undefined]);
-    // A degraded turn must still read only the Team Space.
-    expect(spacesSeen[1]).toEqual(["team/oc_team"]);
+    // No second invocation is allowed after the native preflight fails.
+    expect(nativeSessions).toEqual([{ mode: "start" }]);
+    expect(spacesSeen).toEqual([["team/oc_team"]]);
 
     const runs = engine.chatRuns.list("team/oc_team");
     expect(runs).toHaveLength(1);
-    expect(runs[0]!.status).toBe("succeeded");
+    expect(runs[0]!.status).toBe("failed");
+    expect(runs[0]!.executionPlan?.skillMode).toBe("all");
+    expect(runs[0]!.executionEvidence?.preparationFailure).toEqual({ stage: "native-session", reason: "protected-root-readable", exitCode: 75 });
     // The frozen topic plan stays on the Run as immutable evidence of what was
     // requested; what must not survive is a committed session another turn could
     // fork from.
     expect(engine.chatRuns.topicNativeSessionForRun(runs[0]!.id)).toBeDefined();
-    // The group must be told this answer carried no topic memory.
-    expect(runs[0]!.output).toContain("本轮未使用话题上下文");
+    expect(runs[0]!.output).toBeUndefined();
     // A second turn in the same topic must start fresh rather than fork from a
     // session this host never established.
     expect(engine.chatRuns.prepareTopicNativeSession(runs[0]!.id)).toBeUndefined();

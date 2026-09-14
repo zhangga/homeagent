@@ -178,11 +178,12 @@ function usageFromError(error: unknown): CompletionUsage | undefined {
 export function observeLlmUsage(
   client: LlmClient,
   record: (usage?: CompletionUsage) => void,
+  onExecutionEvidence?: import("@homeagent/llm").RunInput["onExecutionEvidence"],
 ): LlmClient {
   return {
     async complete(options) {
       try {
-        const result = await client.complete(options);
+        const result = await client.complete(onExecutionEvidence ? { ...options, onExecutionEvidence } : options);
         record(result.usage);
         return result;
       } catch (error) {
@@ -194,7 +195,7 @@ export function observeLlmUsage(
     },
     async completeJSON<T>(options: JSONOptions<T>) {
       try {
-        const output = await client.completeJSON<T>(options);
+        const output = await client.completeJSON<T>(onExecutionEvidence ? { ...options, onExecutionEvidence } : options);
         record(output.result.usage);
         return output;
       } catch (error) {

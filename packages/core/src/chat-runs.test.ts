@@ -24,6 +24,26 @@ afterEach(() => {
 });
 
 describe("ChatRunStore", () => {
+  test("execution evidence survives reopen and cannot be mutated or polluted", () => {
+    const store = new ChatRunStore(dir);
+    const run = store.start({ space: SPACE, input: "audit", trigger: "message", startedAt: 100 });
+    const evidence = { calls: [{ source: "codex-jsonl" as const, events: [], truncated: false }], truncated: false,
+      preparationFailure: { stage: "native-session" as const, reason: "protected-root-readable" as const, exitCode: 75 },
+    };
+    store.fail(run.id, { finishedAt: 110, error: { kind: "provider_unavailable", message: "native isolation preflight failed" }, executionEvidence: evidence });
+    evidence.calls.length = 0;
+    const reopened = new ChatRunStore(dir);
+    expect(reopened.get(run.id)?.executionEvidence?.calls).toHaveLength(1);
+    expect(reopened.get(run.id)?.executionEvidence?.preparationFailure).toEqual({ stage: "native-session", reason: "protected-root-readable", exitCode: 75 });
+    reopened.get(run.id)!.executionEvidence!.calls.length = 0;
+    expect(reopened.get(run.id)?.executionEvidence?.calls).toHaveLength(1);
+    const next = store.start({ space: SPACE, input: "audit", trigger: "message", startedAt: 120 });
+    const polluted = { calls: [], truncated: false, secret: "forbidden" };
+    expect(() => store.succeed(next.id, {
+      finishedAt: 130, output: "done", executionEvidence: polluted,
+    })).toThrow();
+    expect(new ChatRunStore(dir).get(next.id)?.status).toBe("queued");
+  });
   test("persists queued work and only marks it running when admitted", () => {
     const store = new ChatRunStore(dir);
     const queued = store.start({
@@ -1039,10 +1059,13 @@ describe("ChatRunStore", () => {
         finishedAt: 130,
         output: "second",
         nativeSessionId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        executionEvidence: { calls: [{ source: "codex-jsonl", events: [], truncated: false }], truncated: false },
       })).toThrow("simulated persistence failure");
     } finally {
       prototype.persist = originalPersist;
     }
+    expect(store.get(second.id)?.executionEvidence).toBeUndefined();
+    expect(new ChatRunStore(dir).get(second.id)?.executionEvidence).toBeUndefined();
 
     expect(store.get(second.id)?.status).toBe("running");
     expect(store.prepareTopicNativeSession(second.id)).toEqual({

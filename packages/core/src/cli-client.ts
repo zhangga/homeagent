@@ -68,6 +68,7 @@ export type RunProviderFn = (
     maxTokens?: number;
     nativeSession?: NativeSessionRequest;
     nativeSessionIsolation?: boolean;
+    onExecutionEvidence?: import("@homeagent/llm").RunInput["onExecutionEvidence"];
   },
   timeoutMs?: number,
   signal?: AbortSignal,
@@ -238,6 +239,7 @@ export function makeCliClient(
             execution,
             maxTokens: opts.maxTokens,
             nativeSession: opts.nativeSession,
+            ...(opts.onExecutionEvidence ? { onExecutionEvidence: opts.onExecutionEvidence } : {}),
             ...(nativeSessionIsolation ? { nativeSessionIsolation: true } : {}),
           },
           timeoutMs,
@@ -292,6 +294,7 @@ export function makeCliClient(
             protectedDataRoot: accountingDataDir,
             execution,
             ...(provider === "codex" ? { outputSchema: opts.schema } : {}),
+            ...(opts.onExecutionEvidence ? { onExecutionEvidence: opts.onExecutionEvidence } : {}),
             maxTokens: opts.maxTokens,
             nativeSession: opts.nativeSession,
             ...(nativeSessionIsolation ? { nativeSessionIsolation: true } : {}),

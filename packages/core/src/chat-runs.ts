@@ -11,6 +11,9 @@ import {
 import { dirname, join } from "node:path";
 import {
   CODEX_REASONING_EFFORTS,
+  cloneExecutionEvidence,
+  isExecutionEvidence,
+  type ExecutionEvidence,
   type CodexReasoningEffort,
   type NativeSessionRequest,
   type ProviderExecution,
@@ -67,6 +70,8 @@ export interface ChatRunDelivery {
 }
 
 export interface ChatRun {
+  /** Redacted tool metadata, kept only in the local run history. */
+  executionEvidence?: ExecutionEvidence;
   id: string;
   space: SpaceId;
   workItemId?: string;
@@ -141,6 +146,7 @@ export interface ChatRunStoreOptions {
 }
 
 export interface FinishChatRunSuccessInput {
+  executionEvidence?: ExecutionEvidence;
   finishedAt: number;
   output: string;
   traceId?: string;
@@ -150,6 +156,7 @@ export interface FinishChatRunSuccessInput {
 }
 
 export interface FinishChatRunFailureInput {
+  executionEvidence?: ExecutionEvidence;
   finishedAt: number;
   error: ChatRunError;
   traceId?: string;
@@ -254,6 +261,7 @@ export function topicNativeSessionCompatibilityKey(
 function clone(run: ChatRun): ChatRun {
   return {
     ...run,
+    executionEvidence: run.executionEvidence ? cloneExecutionEvidence(run.executionEvidence) : undefined,
     skillEvidence: run.skillEvidence
       ? {
           requested: run.skillEvidence.requested.map((item) => ({ ...item })),
@@ -570,6 +578,7 @@ export function isChatRun(value: unknown): value is ChatRun {
       Number.isInteger(run.timeoutMs)
       && run.timeoutMs > 0
     ))
+    && (run.executionEvidence === undefined || isExecutionEvidence(run.executionEvidence))
     && (run.usage === undefined || isAggregatedRunUsage(run.usage))
     && (run.error === undefined || (
       typeof run.error === "object"
@@ -1150,6 +1159,7 @@ export class ChatRunStore {
       run.outputTruncated =
         result.output.length > MAX_CHAT_RUN_OUTPUT_CHARACTERS || undefined;
       run.traceId = result.traceId;
+      run.executionEvidence = result.executionEvidence ? cloneExecutionEvidence(result.executionEvidence) : undefined;
       run.usage = result.usage ? cloneAggregatedRunUsage(result.usage) : undefined;
       run.error = undefined;
       return clone(run);
@@ -1202,6 +1212,7 @@ export class ChatRunStore {
         message: sanitizeChatRunDiagnostic(result.error.message),
       };
       run.traceId = result.traceId;
+      run.executionEvidence = result.executionEvidence ? cloneExecutionEvidence(result.executionEvidence) : undefined;
       run.usage = result.usage ? cloneAggregatedRunUsage(result.usage) : undefined;
       return clone(run);
     });

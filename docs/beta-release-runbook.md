@@ -98,6 +98,8 @@ arm64 和 Intel 架构至少各完成一次；测试机不得依赖仓库 checko
    允许 sentinel 可读、`CODEX_HOME` 与仅受 `:root=deny` 保护的 sibling sentinel 均不可读，三项缺一不可。
    Codex 0.152.1 的 macOS/Linux/Windows 都使用统一 `codex sandbox` 入口，但 fake runner 或另一平台的结果不能替代
    Ubuntu/macOS 支持主机实测；Windows 若无法启用强制 root-deny backend，只能显示 `nativeSessions=false`，不得放宽 profile。
+   检查退出码 73/74/75 必须分别展示状态目录可读、授权目录不可读、受保护数据目录可读的固定原因，且不得显示“完全可用”或自动无状态重试。
+   完整 Skill 目录累计超过 16 MiB、但未超过 128 MiB / 200,000 条目时，实际副本数量必须与冻结目录一致；超过总预算应整轮失败、清理副本、保留有界准备失败证据，不得静默删减。原生权限中的共同 Skill 读取根必须只覆盖本轮已验证副本，不得覆盖 live Skill 根或整个临时目录。
    Claude 仍必须保持一次性隔离调用。
    Provider 安装、登录和升级由机器所有者管理，HomeAgent 不得下载或替换该程序。
 6. 创建或连接飞书机器人，确认两个事件消费者就绪。

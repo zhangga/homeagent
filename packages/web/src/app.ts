@@ -2044,6 +2044,9 @@ export function createWebApp(opts: WebOptions): Hono {
       );
     }
 
+    if (provider?.available && provider.id === "codex" && provider.nativeSessions === false) {
+      return c.redirect(`${returnTo}?ok=${encodeURIComponent("CLI 连接可用，但原生话题隔离仍未通过；请查看具体检查原因")}`);
+    }
     if (provider?.available) {
       return c.redirect(
         `${returnTo}?ok=${encodeURIComponent("Provider 已恢复，可以继续使用")}`,

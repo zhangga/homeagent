@@ -3197,6 +3197,9 @@ export class KnowledgeEngine implements Knowledge {
     space: SpaceId,
     taskExecution = true,
     research = false,
+    // Ordinary Chat and Task runs use the full catalog; explicit background
+    // no-tools snapshots may still resolve legacy bindings as skipped evidence.
+    skillScope: "all" | "bound" = taskExecution ? "all" : "bound",
   ): AgentRunExecutionSnapshot {
     const agent = this.agentForSpace(space);
     const cfg = config();
@@ -3217,7 +3220,7 @@ export class KnowledgeEngine implements Knowledge {
         ? agent.reasoningEffort
         : undefined;
     const skills = skillsForProviderExecution(
-      taskExecution
+      skillScope === "all"
         ? this.skillCatalog.resolveAll(resolutionProvider)
         : this.skillCatalog.resolveAgentBindings(agent?.skills ?? [], resolutionProvider),
       taskExecution,
@@ -3232,14 +3235,12 @@ export class KnowledgeEngine implements Knowledge {
     let resolutionError: string | undefined;
     try {
       workdir = resolveAgentWorkdir(agent);
-      if (taskExecution) {
-        execution = {
-          ...resolveAgentExecution(agent),
-          skills: skills.resolved.map((skill) => skill.invocationName),
-          skillMode: "all",
-          ...(research ? { research: true } : {}),
-        };
-      }
+      execution = {
+        ...resolveAgentExecution(agent),
+        skills: skills.resolved.map((skill) => skill.invocationName),
+        ...(skillScope === "all" ? { skillMode: "all" as const } : {}),
+        ...(research ? { research: true } : {}),
+      };
     } catch (error) {
       resolutionError = executionResolutionError(error);
     }
@@ -3251,7 +3252,7 @@ export class KnowledgeEngine implements Knowledge {
       model,
       reasoningEffort,
       workdir,
-      skillMode: taskExecution ? "all" : undefined,
+      skillMode: skillScope === "all" ? "all" : undefined,
       execution,
       resolutionError,
     };
@@ -3385,7 +3386,10 @@ export class KnowledgeEngine implements Knowledge {
     execution: ProviderExecution | undefined,
     workdir?: string,
   ): string {
-    if (!execution || execution.permission === "full") {
+    if (execution?.permission === "full") {
+      throw new Error("provider codex native session rejects full permission");
+    }
+    if (!execution) {
       throw new Error("provider codex native session isolation is unavailable");
     }
     let dataRoot: string;
@@ -4638,7 +4642,8 @@ export class KnowledgeEngine implements Knowledge {
           taskIds.has(run.taskId)
           || (run.workActionId !== undefined && workActionIds.has(run.workActionId))
         ),
-        chatRuns,
+        // Local execution audits are deliberately not portable Space content.
+        chatRuns: chatRuns.map(({ executionEvidence: _audit, ...run }) => run),
         workItems,
         workActions: workContinuation.actions,
         workContinuationPolicies: workContinuation.policies,
@@ -6546,7 +6551,7 @@ export class KnowledgeEngine implements Knowledge {
     traceExecution?: AnswerTraceExecution,
   ): Promise<AskResult> {
     const usage = new RunUsageAccumulator();
-    const client = observeLlmUsage(context.client, (item) => usage.record(item));
+    const client = observeLlmUsage(context.client, (item) => usage.record(item), opts.onExecutionEvidence);
     const skillWarnings = skillWarningViews(context.skills);
     const startedAt = Date.now();
     let retrievalPages: AnswerTraceRetrievalPage[] = [];

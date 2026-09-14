@@ -83,7 +83,7 @@ beforeEach(async () => {
     ],
     providerModels: async () => ({
       claude: ["sonnet", "opus"],
-      codex: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"],
+      codex: ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"],
       "trae-cli": ["openrouter-3o"],
     }),
   });
@@ -396,6 +396,18 @@ describe("web backend (read-only)", () => {
     expect(decodeURIComponent(response.headers.get("location") ?? "")).toContain(
       "Provider 已恢复，可以继续使用",
     );
+  });
+
+  test("Agent re-detection never calls a failed native boundary fully recovered", async () => {
+    const selected = engine.agents.create({ name: "隔离助手", provider: "codex" });
+    const recovering = createWebApp({ engine, detectProviders: async () => [{
+      id: "codex", name: "Codex", bin: "codex", available: true, nativeSessions: false,
+      nativeSessionIssue: "protected-root-readable", detail: "受保护数据目录仍可读取",
+    }] });
+    const response = await recovering.request(`/agents/${selected.id}/provider/recover`, { method: "POST" });
+    const location = decodeURIComponent(response.headers.get("location") ?? "");
+    expect(location).toContain("原生话题隔离仍未通过");
+    expect(location).not.toContain("Provider 已恢复");
   });
 
   test("Agent recovery falls back to official Codex authorization", async () => {
@@ -2458,29 +2470,36 @@ describe("management backend (read-write)", () => {
     expect(view).toContain("简洁作答");
   });
 
-  test("creating a Codex agent persists its exact model and reasoning effort", async () => {
-    const form = new URLSearchParams({
-      name: "深度助手",
-      provider: "codex",
-      model: "gpt-5.6-sol",
-      reasoningEffort: "high",
-    });
-    const response = await app.request("/agents", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: form.toString(),
-    });
+  test.each([
+    ["gpt-5.6-sol", "high"],
+    ["gpt-6-astra", "ultra"],
+  ] as const)(
+    "creating a Codex agent persists model %s and reasoning %s",
+    async (model, reasoningEffort) => {
+      const form = new URLSearchParams({
+        name: "深度助手",
+        provider: "codex",
+        model,
+        reasoningEffort,
+      });
+      const response = await app.request("/agents", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      });
 
-    expect([302, 303]).toContain(response.status);
-    const agent = engine.agents.list().find((item) => item.name === "深度助手");
-    expect(agent?.model).toBe("gpt-5.6-sol");
-    expect(agent?.reasoningEffort).toBe("high");
+      expect([302, 303]).toContain(response.status);
+      const agent = engine.agents.list().find((item) => item.name === "深度助手");
+      expect(agent?.model).toBe(model);
+      expect(agent?.reasoningEffort).toBe(reasoningEffort);
 
-    const view = await (await app.request(`/agents/${encodeURIComponent(agent!.id)}`)).text();
-    expect(view).toContain('name="reasoningEffort"');
-    expect(view).toContain('value="high" selected');
-    expect(view).toContain("仅 Codex");
-  });
+      const view = await (await app.request(`/agents/${encodeURIComponent(agent!.id)}`)).text();
+      expect(view).toContain('name="reasoningEffort"');
+      expect(view).toContain(`value="${model}" selected`);
+      expect(view).toContain(`value="${reasoningEffort}" selected`);
+      expect(view).toContain("仅 Codex");
+    },
+  );
 
   test("Agent editor saves drafts, publishes explicitly, and rolls back as a new revision", async () => {
     const created = engine.agents.create({

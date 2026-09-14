@@ -44,6 +44,8 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ImageInput } from "./gateway.ts";
+import { collectCodexExecutionEvidence, type ProviderExecutionEvidence } from "./execution-evidence.ts";
+import { ProviderPreparationError, SkillStagingBudget, NATIVE_SESSION_ISSUE_LABELS, type NativeSessionIssue } from "./provider-preparation.ts";
 
 const log = logger.child("providers");
 
@@ -89,9 +91,16 @@ export class ProviderRunError extends Error {
   }
 }
 
-/** Reasoning levels currently exposed by the GPT-5.6 family in Codex. */
-export const CODEX_REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
+/** Union of reasoning levels exposed by the supported Codex models. */
+export const CODEX_REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type CodexReasoningEffort = (typeof CODEX_REASONING_EFFORTS)[number];
+
+const ASTRA_REASONING_EFFORTS: readonly CodexReasoningEffort[] = [
+  "low", "medium", "high", "xhigh", "max", "ultra",
+];
+const GPT_56_REASONING_EFFORTS: readonly CodexReasoningEffort[] = [
+  "none", "low", "medium", "high", "xhigh", "max",
+];
 
 const STANDARD_REASONING_EFFORTS: readonly CodexReasoningEffort[] = [
   "none",
@@ -111,8 +120,9 @@ const LEGACY_CODEX_REASONING_EFFORTS: readonly CodexReasoningEffort[] = [
 export function codexReasoningEffortsForModel(
   model?: string,
 ): readonly CodexReasoningEffort[] {
+  if (model === "gpt-6-astra") return ASTRA_REASONING_EFFORTS;
   if (model === "gpt-5.6-sol" || model === "gpt-5.6-terra" || model === "gpt-5.6-luna") {
-    return CODEX_REASONING_EFFORTS;
+    return GPT_56_REASONING_EFFORTS;
   }
   if (model === "gpt-5.5" || model === "gpt-5.4" || model === "gpt-5.4-mini") {
     return STANDARD_REASONING_EFFORTS;
@@ -156,6 +166,8 @@ interface CliSpec {
 }
 
 export interface RunInput {
+  /** Private, redacted metadata only; never part of the model prompt or argv. */
+  onExecutionEvidence?: (evidence: ProviderExecutionEvidence) => void;
   prompt: string;
   system?: string;
   model?: string;
@@ -199,6 +211,8 @@ interface PreparedRunInput extends RunInput {
   outputLastMessagePath?: string;
   /** Harmless, invocation-owned read root used by the no-model sandbox proof. */
   nativeIsolationReadRoot?: string;
+  /** Invocation-owned root containing only verified frozen Skill copies. */
+  nativeSkillReadRoot?: string;
   /** Authentication cache selected by a no-completion status probe. */
   codexCredentialStore?: "file" | "keyring";
 }
@@ -270,8 +284,6 @@ function sandboxForPermission(
 const MAX_PROVIDER_SKILL_INPUTS = 2_000;
 const MAX_PROVIDER_SKILL_BUNDLE_ENTRIES = 50_000;
 const MAX_PROVIDER_SKILL_BUNDLE_BYTES = 16 * 1024 * 1024;
-const MAX_PROVIDER_SKILL_INVOCATION_ENTRIES = 50_000;
-const MAX_PROVIDER_SKILL_INVOCATION_BYTES = 16 * 1024 * 1024;
 const MAX_CODEX_NATIVE_PERMISSION_CONFIG_CHARS = process.platform === "win32"
   ? 20_000
   : 128_000;
@@ -280,18 +292,6 @@ interface ProviderSkillBundleFile {
   path: string;
   mode: number;
   content: Buffer;
-}
-
-/**
- * Distinguish "this invocation ran out of shared staging budget" from every
- * other bundle rejection. Only the two capacity limits qualify; integrity
- * failures (symlinks, escapes, mid-capture mutation, missing SKILL.md) must keep
- * failing the whole call so a tampered bundle can never be silently dropped.
- */
-function isProviderSkillBudgetExhausted(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : "";
-  return message === "Skill bundle is too large"
-    || message === "Skill bundle has too many entries";
 }
 
 interface ProviderSkillBundleSnapshot {
@@ -423,6 +423,7 @@ export function hashProviderSkillBundle(
 
 interface StagedProviderSkillInputs {
   inputs: ProviderSkillInput[];
+  readRoot?: string;
   cleanup: () => void;
 }
 
@@ -446,43 +447,17 @@ function stageProviderSkillInputs(
     }
   };
   try {
-    let stagedEntries = 0;
-    let stagedBytes = 0;
-    const overBudget: string[] = [];
+    const budget = new SkillStagingBudget(inputs.length);
     const staged: ProviderSkillInput[] = [];
     inputs.forEach((input, index) => {
       if (signal?.aborted) {
         throw signal.reason ?? new Error("provider Skill staging cancelled");
       }
-      let captured: ProviderSkillBundleSnapshot;
-      try {
-        captured = snapshotProviderSkillBundle(
-          input.skillFile,
-          Math.min(
-            MAX_PROVIDER_SKILL_BUNDLE_ENTRIES,
-            MAX_PROVIDER_SKILL_INVOCATION_ENTRIES - stagedEntries,
-          ),
-          Math.min(
-            MAX_PROVIDER_SKILL_BUNDLE_BYTES,
-            MAX_PROVIDER_SKILL_INVOCATION_BYTES - stagedBytes,
-          ),
-        );
-      } catch (error) {
-        // Exhausting the shared per-invocation budget is a capacity limit, not
-        // evidence that the frozen bundle was tampered with. Drop the Skill from
-        // this invocation instead of failing the whole call; a bundle that
-        // actually changed still fails the hash comparison below.
-        if (isProviderSkillBudgetExhausted(error)) {
-          overBudget.push(input.name);
-          return;
-        }
-        throw error;
-      }
-      stagedEntries += captured.entries;
-      stagedBytes += captured.totalBytes;
+      const captured = snapshotProviderSkillBundle(input.skillFile);
       if (captured.hash !== input.bundleHash) {
         throw new Error("frozen Skill bundle changed before staging");
       }
+      budget.reserve(captured.totalBytes, captured.entries);
       const directory = join(stageRoot, `skill-${String(index).padStart(4, "0")}`);
       mkdirSync(directory, { recursive: false, mode: 0o700 });
       for (const file of captured.files) {
@@ -508,16 +483,11 @@ function stageProviderSkillInputs(
         bundleHash: input.bundleHash,
       });
     });
-    if (overBudget.length > 0) {
-      log.warn("Codex Skill staging exceeded the per-invocation budget", {
-        droppedCount: overBudget.length,
-        stagedCount: staged.length,
-      });
-    }
-    return { inputs: staged, cleanup };
+    return { inputs: staged, readRoot: stageRoot, cleanup };
   } catch (error) {
     cleanup();
     if (signal?.aborted) throw signal.reason ?? error;
+    if (error instanceof ProviderPreparationError) throw error;
     throw new Error("provider Skill input changed after frozen validation");
   }
 }
@@ -635,6 +605,7 @@ function codexNativeIsolationOverrides(
   skillInputs: readonly ProviderSkillInput[],
   probeReadRoot?: string,
   protectedDataRoot?: string,
+  staging: { readRoot?: string; validateOnly?: boolean } = {},
 ): string[] {
   if (!execution || execution.permission === "full") {
     throw new Error("provider codex native session isolation is unavailable");
@@ -698,7 +669,29 @@ function codexNativeIsolationOverrides(
       // beside its frozen staged copy, so every native turn rejects overlap.
       throw new Error("provider codex native session isolation is unavailable");
     }
-    filesystem.set(skill.directory, "read");
+    if (!staging.readRoot) filesystem.set(skill.directory, "read");
+  }
+  if (staging.readRoot) {
+    // One invocation-owned root contains exactly the verified bundles. Granting
+    // it keeps Windows argv bounded without granting a live Skill directory.
+    const root = staging.readRoot;
+    const metadata = lstatSync(root);
+    const expectedDirectories = new Set(skillInputs.map(skill => basename(skill.directory)));
+    const children = readdirSync(root, { withFileTypes: true });
+    if (metadata.isSymbolicLink() || !metadata.isDirectory() || !samePath(realpathSync(root), root)
+      || !samePath(dirname(root), realpathSync(tmpdir()))
+      || !basename(root).startsWith("homeagent-codex-skills-")
+      || skillInputs.some(skill => !samePath(dirname(skill.directory), root))
+      || expectedDirectories.size !== skillInputs.length || children.length !== skillInputs.length
+      || children.some(child => !child.isDirectory() || child.isSymbolicLink()
+        || !expectedDirectories.has(child.name)
+        || !samePath(realpathSync(join(root, child.name)), join(root, child.name)))
+      || pathIsWithinOrEqual(root, codexHome) || pathIsWithinOrEqual(codexHome, root)
+      || pathIsWithinOrEqual(root, dataRoot) || pathIsWithinOrEqual(dataRoot, root)
+      || pathIsWithinOrEqual(root, frozenWorkdir) || pathIsWithinOrEqual(frozenWorkdir, root)) {
+      throw new Error(CODEX_NATIVE_SESSION_PREFLIGHT_ERROR);
+    }
+    filesystem.set(root, "read");
   }
   if (probeReadRoot) {
     let canonicalProbeRoot: string;
@@ -727,7 +720,7 @@ function codexNativeIsolationOverrides(
     .join(",");
   const permissionOverride =
     `permissions={${CODEX_NATIVE_PERMISSION_PROFILE}={filesystem={${filesystemToml}},network={enabled=false}}}`;
-  if (permissionOverride.length > MAX_CODEX_NATIVE_PERMISSION_CONFIG_CHARS) {
+  if (!staging.validateOnly && permissionOverride.length > MAX_CODEX_NATIVE_PERMISSION_CONFIG_CHARS) {
     throw new Error("provider codex native session isolation is unavailable");
   }
   return [
@@ -1111,7 +1104,7 @@ export interface DetectedProvider {
   /** Whether this installed CLI can safely continue Provider-owned conversations. */
   nativeSessions?: boolean;
   /** Safe, bounded reason native conversations are unavailable when recovery is known. */
-  nativeSessionIssue?: "windows-elevated-sandbox-required";
+  nativeSessionIssue?: NativeSessionIssue;
   /** version string when available; else a short reason it is not */
   detail: string;
 }
@@ -1192,6 +1185,7 @@ const KNOWN: CliSpec[] = [
     versionArgs: ["--version"],
     // Curated from OpenAI's current model catalog (CLIs expose no list command).
     models: [
+      "gpt-6-astra",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
@@ -1211,6 +1205,7 @@ const KNOWN: CliSpec[] = [
       nativeSession,
       nativeSessionIsolation,
       nativeIsolationReadRoot,
+      nativeSkillReadRoot,
       codexCredentialStore,
       outputSchemaPath,
       outputLastMessagePath,
@@ -1271,6 +1266,7 @@ const KNOWN: CliSpec[] = [
           skillInputs ?? [],
           nativeIsolationReadRoot,
           protectedDataRoot,
+          { readRoot: nativeSkillReadRoot },
         ));
       }
       for (const feature of CODEX_DISABLED_AMBIENT_FEATURES) {
@@ -1668,6 +1664,7 @@ function codexSentinelReadCommand(
 interface CodexNativeSessionCapability {
   available: boolean;
   issue?: DetectedProvider["nativeSessionIssue"];
+  exitCode?: number;
 }
 
 async function codexNativeFilesystemIsolationCapability(
@@ -1678,6 +1675,7 @@ async function codexNativeFilesystemIsolationCapability(
   execution: ProviderExecution,
   skillInputs: readonly ProviderSkillInput[],
   protectedDataRoot?: string,
+  stagedSkillReadRoot?: string,
 ): Promise<CodexNativeSessionCapability> {
   let codexHomeSentinel: ReturnType<typeof stageCodexIsolationSentinel> | undefined;
   let rootSentinel: ReturnType<typeof stageCodexRootDenySentinel> | undefined;
@@ -1689,6 +1687,7 @@ async function codexNativeFilesystemIsolationCapability(
       skillInputs,
       context.probeReadRoot,
       protectedDataRoot,
+      { readRoot: stagedSkillReadRoot },
     );
     codexHomeSentinel = stageCodexIsolationSentinel();
     rootSentinel = stageCodexRootDenySentinel(protectedDataRoot);
@@ -1732,13 +1731,17 @@ async function codexNativeFilesystemIsolationCapability(
     if (available) return { available: true };
     return {
       available: false,
-      ...(probe.stderr.includes(CODEX_WINDOWS_ELEVATED_SANDBOX_REQUIRED)
-        ? { issue: "windows-elevated-sandbox-required" as const }
-        : {}),
+      issue: probe.timedOut ? "filesystem-probe-timeout"
+        : probe.code === 75 ? "protected-root-readable"
+        : probe.code === 73 ? "codex-home-readable"
+        : probe.code === 74 ? "allowed-path-unreadable"
+        : probe.stderr.includes(CODEX_WINDOWS_ELEVATED_SANDBOX_REQUIRED) ? "windows-elevated-sandbox-required"
+        : "filesystem-probe-failed",
+      ...(probe.code !== null ? { exitCode: probe.code } : {}),
     };
   } catch (error) {
     if (signal?.aborted) throw error;
-    return { available: false };
+    return { available: false, issue: "invalid-execution-contract" };
   } finally {
     rootSentinel?.cleanup();
     codexHomeSentinel?.cleanup();
@@ -1756,13 +1759,14 @@ function codexVersionSupportsNativeSessions(version: string): boolean {
   return true;
 }
 
-async function codexNativeSessionsAvailable(
+async function codexNativeSessionsCapability(
   bin: string,
   timeoutMs: number,
   signal?: AbortSignal,
   knownVersion?: string,
   workdir?: string,
-): Promise<boolean> {
+): Promise<CodexNativeSessionCapability> {
+  let stage: NativeSessionIssue = "native-cli-unavailable";
   try {
     let version = knownVersion;
     if (!version) {
@@ -1772,13 +1776,13 @@ async function codexNativeSessionsAvailable(
         Math.min(timeoutMs, 6_000),
         signal,
       );
-    if (versionProbe.aborted) {
-      throw signal?.reason ?? new Error("provider capability probe cancelled");
-    }
-      if (versionProbe.timedOut || versionProbe.code !== 0) return false;
+      if (versionProbe.aborted) {
+        throw signal?.reason ?? new Error("provider capability probe cancelled");
+      }
+      if (versionProbe.timedOut || versionProbe.code !== 0) return { available: false, issue: stage };
       version = `${versionProbe.stdout}\n${versionProbe.stderr}`;
     }
-    if (!codexVersionSupportsNativeSessions(version)) return false;
+    if (!codexVersionSupportsNativeSessions(version)) return { available: false, issue: stage };
     const probe = await runCmd(
       bin,
       ["exec", "fork", "--help"],
@@ -1786,12 +1790,13 @@ async function codexNativeSessionsAvailable(
       signal,
     );
     if (probe.aborted) throw signal?.reason ?? new Error("provider capability probe cancelled");
-    if (probe.timedOut || probe.code !== 0) return false;
+    if (probe.timedOut || probe.code !== 0) return { available: false, issue: stage };
 
     // Codex has no global switch that can suppress System/MDM-managed MCP
     // servers. A Provider-native topic would let those tools persist across
     // turns, so prove the effective list is empty in the exact execution root
     // before allowing any model call. Never expose list contents in errors.
+    stage = "mcp-not-isolated";
     const mcpProbe = await runCmd(
       bin,
       [
@@ -1814,21 +1819,22 @@ async function codexNativeSessionsAvailable(
       || !codexMcpProbeStderrIsSafe(mcpProbe.stderr)
       || Buffer.byteLength(mcpProbe.stdout, "utf8") > MAX_CODEX_MCP_LIST_BYTES
     ) {
-      return false;
+      return { available: false, issue: stage };
     }
     try {
       const configured: unknown = JSON.parse(mcpProbe.stdout);
-      return Array.isArray(configured) && configured.length === 0;
+      return Array.isArray(configured) && configured.length === 0
+        ? { available: true } : { available: false, issue: stage };
     } catch {
-      return false;
+      return { available: false, issue: stage };
     }
   } catch (error) {
     if (signal?.aborted) throw error;
-    return false;
+    return { available: false, issue: stage };
   }
 }
 
-async function codexNativeIsolationContextAvailable(
+async function assertCodexNativeIsolationContext(
   bin: string,
   timeoutMs: number,
   signal: AbortSignal | undefined,
@@ -1837,8 +1843,9 @@ async function codexNativeIsolationContextAvailable(
   skillInputs: readonly ProviderSkillInput[],
   knownVersion?: string,
   protectedDataRoot?: string,
-): Promise<boolean> {
-  return (await codexNativeIsolationContextCapability(
+  stagedSkillReadRoot?: string,
+): Promise<void> {
+  const capability = await codexNativeIsolationContextCapability(
     bin,
     timeoutMs,
     signal,
@@ -1847,7 +1854,12 @@ async function codexNativeIsolationContextAvailable(
     skillInputs,
     knownVersion,
     protectedDataRoot,
-  )).available;
+    stagedSkillReadRoot,
+  );
+  if (!capability.available) throw new ProviderPreparationError({
+    stage: "native-session", reason: capability.issue ?? "invalid-execution-contract",
+    ...(capability.exitCode !== undefined ? { exitCode: capability.exitCode } : {}),
+  });
 }
 
 async function codexNativeIsolationContextCapability(
@@ -1859,15 +1871,16 @@ async function codexNativeIsolationContextCapability(
   skillInputs: readonly ProviderSkillInput[],
   knownVersion?: string,
   protectedDataRoot?: string,
+  stagedSkillReadRoot?: string,
 ): Promise<CodexNativeSessionCapability> {
-  const sessionsAvailable = await codexNativeSessionsAvailable(
+  const sessionsAvailable = await codexNativeSessionsCapability(
     bin,
     timeoutMs,
     signal,
     knownVersion,
     context.workdir,
   );
-  if (!sessionsAvailable) return { available: false };
+  if (!sessionsAvailable.available) return sessionsAvailable;
   return await codexNativeFilesystemIsolationCapability(
     bin,
     timeoutMs,
@@ -1876,6 +1889,7 @@ async function codexNativeIsolationContextCapability(
     execution,
     skillInputs,
     protectedDataRoot,
+    stagedSkillReadRoot,
   );
 }
 
@@ -1907,6 +1921,7 @@ export async function preflightProviderNativeSession(
       normalizedSkillInputs,
       context.probeReadRoot,
       protectedDataRoot,
+      { validateOnly: true },
     );
     stagedSkillInputs = stageProviderSkillInputs(normalizedSkillInputs, signal);
     // Validate the exact profile before any subprocess and reject native full:
@@ -1917,8 +1932,9 @@ export async function preflightProviderNativeSession(
       stagedSkillInputs.inputs,
       context.probeReadRoot,
       protectedDataRoot,
+      { readRoot: stagedSkillInputs.readRoot },
     );
-    if (!await codexNativeIsolationContextAvailable(
+    await assertCodexNativeIsolationContext(
       providerBin(spec),
       timeoutMs,
       signal,
@@ -1927,14 +1943,14 @@ export async function preflightProviderNativeSession(
       stagedSkillInputs.inputs,
       undefined,
       protectedDataRoot,
-    )) {
-      throw new Error(CODEX_NATIVE_SESSION_PREFLIGHT_ERROR);
-    }
+      stagedSkillInputs.readRoot,
+    );
   } catch (error) {
     if (signal?.aborted) {
       throw signal.reason ?? error;
     }
-    throw new Error(CODEX_NATIVE_SESSION_PREFLIGHT_ERROR);
+    if (error instanceof ProviderPreparationError) throw error;
+    throw new ProviderPreparationError({ stage: "native-session", reason: "invalid-execution-contract" });
   } finally {
     context?.cleanup();
     stagedSkillInputs?.cleanup();
@@ -2106,7 +2122,7 @@ export async function detectProviders(timeoutMs = 6000): Promise<DetectedProvide
               available: true,
               nativeSessions: false,
               ...(nativeCapability.issue ? { nativeSessionIssue: nativeCapability.issue } : {}),
-              detail: `${version}；${CODEX_NATIVE_SESSION_UNAVAILABLE_DETAIL}`,
+              detail: `${version}；${CODEX_NATIVE_SESSION_UNAVAILABLE_DETAIL}${nativeCapability.issue ? `：${NATIVE_SESSION_ISSUE_LABELS[nativeCapability.issue]}` : ""}`,
             });
             continue;
           }
@@ -2253,34 +2269,6 @@ export function curatedProviderModels(): Record<string, string[]> {
   const map: Record<string, string[]> = {};
   for (const spec of KNOWN) map[spec.id] = spec.models;
   return map;
-}
-
-/**
- * Restrict the requested Skill names to the bundles that survived staging.
- * Returns nothing when every Skill was staged, so the ordinary path is
- * untouched and the invocation list still mirrors the frozen evidence.
- */
-function providerSkillInvocationNarrowing(
-  input: RunInput,
-  requestedInputs: readonly ProviderSkillInput[],
-  staged: readonly ProviderSkillInput[],
-): Partial<RunInput> {
-  // Only staging can drop bundles. Providers that never stage, and calls that
-  // carry a name-only Skill contract with no bundles, keep their execution
-  // contract verbatim so it is never silently emptied.
-  if (requestedInputs.length === 0) return {};
-  if (requestedInputs.length === staged.length) return {};
-  const kept = new Set(staged.map((skill) => skill.name));
-  const requested = Array.isArray(input.execution?.skills)
-    ? input.execution.skills
-    : Array.isArray(input.skills)
-      ? input.skills
-      : [];
-  const skills = requested.filter((name) => kept.has(name));
-  return {
-    skills,
-    ...(input.execution ? { execution: { ...input.execution, skills } } : {}),
-  };
 }
 
 function injectProviderSkills(id: ProviderId, input: RunInput): RunInput {
@@ -2549,6 +2537,7 @@ export async function runProviderDetailed(
         normalizedSkillInputs,
         isolationContext.probeReadRoot,
         input.protectedDataRoot,
+        { validateOnly: true },
       );
     }
     stagedSkillInputs = id === "codex"
@@ -2557,19 +2546,11 @@ export async function runProviderDetailed(
     effectiveInput = {
       ...effectiveInput,
       skillInputs: stagedSkillInputs.inputs,
-      // Staging may drop Skills that no longer fit the shared per-invocation
-      // budget. Narrow the invocation list to exactly what was staged so the
-      // frozen-evidence check keeps comparing argv against real staged bundles.
-      ...providerSkillInvocationNarrowing(
-        effectiveInput,
-        normalizedSkillInputs,
-        stagedSkillInputs.inputs,
-      ),
     };
     const prepared = injectProviderSkills(id, effectiveInput);
     const bin = providerBin(spec);
     if (nativeIsolation) {
-      if (!await codexNativeIsolationContextAvailable(
+      await assertCodexNativeIsolationContext(
         bin,
         timeoutMs,
         signal,
@@ -2578,9 +2559,8 @@ export async function runProviderDetailed(
         prepared.skillInputs ?? [],
         undefined,
         prepared.protectedDataRoot,
-      )) {
-        throw new Error(CODEX_NATIVE_SESSION_PREFLIGHT_ERROR);
-      }
+        stagedSkillInputs.readRoot,
+      );
     }
     if (!prepared.execution && id === "trae-cli") {
       throw new Error(`provider ${id} cannot provide a no-tools execution mode`);
@@ -2601,6 +2581,7 @@ export async function runProviderDetailed(
       : undefined;
     const providerInput: PreparedRunInput = {
       ...prepared,
+      nativeSkillReadRoot: stagedSkillInputs.readRoot,
       ...(id === "codex"
         ? {
             codexCredentialStore:
@@ -2627,6 +2608,7 @@ export async function runProviderDetailed(
       prepared.execution?.workdir ?? prepared.workdir,
       id === "claude" || id === "codex" ? prepared.prompt : undefined,
     );
+    if (id === "codex") input.onExecutionEvidence?.(collectCodexExecutionEvidence(stdout));
     if (aborted) throw signal?.reason ?? new Error(`provider ${id} cancelled`);
     if (timedOut) throw new Error(`provider ${id} timed out after ${timeoutMs}ms`);
     if (code !== 0) {
@@ -2877,14 +2859,8 @@ export function isProviderTimeoutError(error: unknown): boolean {
 }
 
 /**
- * True only when a requested Provider-native parent no longer exists.
- * Capability/configuration failures are deliberately excluded: callers must
- * preserve the last committed topic head for transient or repairable failures.
- */
-/**
- * True when a native topic session was refused because this host cannot prove
- * the required filesystem isolation. Callers may degrade to a stateless turn;
- * they must not retry the same native session.
+ * A native preflight rejected the configuration or could not prove isolation.
+ * Callers must fail closed, not substitute a stateless or broader-permission call.
  */
 export function isProviderNativeSessionIsolationError(error: unknown): boolean {
   return new RegExp(CODEX_NATIVE_SESSION_PREFLIGHT_ERROR, "iu").test(String(error));

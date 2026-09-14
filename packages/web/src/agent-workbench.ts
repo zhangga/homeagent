@@ -22,6 +22,7 @@ import {
   isCliProvider,
   isCodexReasoningEffortSupported,
   normalizeProviderSkills,
+  NATIVE_SESSION_ISSUE_LABELS,
   type CodexWindowsSandboxSetupSession,
   type DetectedProvider,
 } from "@homeagent/llm";
@@ -293,6 +294,7 @@ function providerStatusLabel(provider: DetectedProvider | undefined): string {
   ) {
     return "安全沙箱待设置";
   }
+  if (provider?.available && provider.nativeSessions === false) return "原生话题隔离未通过";
   if (provider?.available) return "CLI 就绪";
   if (
     provider?.id === "codex"
@@ -324,6 +326,13 @@ function providerRecovery(
         : "Codex 已登录并可执行普通任务。完成一次 Windows 系统授权后，HomeAgent 才能安全地连续使用飞书话题会话。",
       actionLabel: pending ? "等待系统授权…" : "启用 Windows 安全沙箱",
       pending,
+    };
+  }
+  if (providerId === "codex" && provider?.available && provider.nativeSessions === false) {
+    return {
+      kind: "cli", title: "原生话题隔离未通过",
+      description: `${provider.nativeSessionIssue ? NATIVE_SESSION_ISSUE_LABELS[provider.nativeSessionIssue] : "当前隔离检查未通过"}。CLI 连接可用不代表话题隔离可用；不能通过 full 或重复登录绕过。修复本机隔离能力后可重新检测。`,
+      actionLabel: "重新检测",
     };
   }
   if (provider?.available) return undefined;
