@@ -77,14 +77,14 @@ function boolean(value: unknown): boolean { if (typeof value !== "boolean") inva
 /** Explicit preservation intent only; never inspect fetched source text for authorization. */
 function requestsRawPreservation(text: string): boolean {
   const preservation = /保存|收录|入库|留存/u.test(text)
-    || /(?:^|[，,。；;\s]|并|请|再|同时|以及)记录(?:下|一下)?[^。！？\n]{0,40}(?:原始|原文|聊天记录|群聊记录)/u.test(text);
-  return preservation
-    && /原始|原文|聊天记录|群聊记录/u.test(text)
-    && !declinesRawPreservation(text);
+    // Match the action “记录相关信息” / “把消息记录下来”, not the noun “聊天记录”.
+    || /(?:^|[，,。；;\s]|并|请|再|同时|以及)记录|记录(?:下来|一下|到|进)/u.test(text);
+  return preservation && !declinesRawPreservation(text);
 }
 
 function declinesRawPreservation(text: string): boolean {
-  return /(?:不要|无需|不必|不用|别|不想|不需要|不再|不|取消|停止)\s*(?:自动)?\s*(?:保存|记录|收录|入库|留存)/u.test(text);
+  return /(?:不要|无需|不必|不用|别|不想|不需要|不再|不|取消|停止)\s*(?:自动)?\s*(?:保存|记录|收录|入库|留存)/u.test(text)
+    || /(?:只|仅)(?:要|需|需要)?\s*(?:保存|记录|收录|入库|留存)\s*(?:总结|摘要|周报|报告|结论|提炼结果)/u.test(text);
 }
 
 export function requestsChatRawImport(text: string): boolean {

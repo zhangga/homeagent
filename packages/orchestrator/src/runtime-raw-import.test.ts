@@ -64,11 +64,15 @@ test.each(["valid", "external", "invalid", "missing"] as const)("Feishu Chat app
   } finally { await runtime.stop(); engine.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test("same-topic follow-up after restart imports to data with a fresh handoff and retained source", async () => {
+test.each([
+  "@agent 飞书群：PST 提炼最近一周，并保存原始数据。首轮专用标记",
+  "@HomeAgent 飞书群：PST高峰期拉扯卡顿专项\n提炼下最近两周的主要内容，记录相关信息",
+])("same-topic follow-up after restart imports to data with a fresh handoff and retained source: %s", async (firstRequest) => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-topic-raw-followup-")));
   const workdir = join(root, "work"); mkdirSync(workdir);
   const dataDir = join(root, "data");
   const space = "team/oc_capture" as const;
+  const sourceName = firstRequest.includes("PST高峰期") ? "PST高峰期拉扯卡顿专项" : "PST";
   const files: string[] = [];
   let finalCalls = 0;
   const sessions = ["11111111-2222-4333-8444-555555555551", "11111111-2222-4333-8444-555555555552", "11111111-2222-4333-8444-555555555553"] as const;
@@ -78,7 +82,7 @@ test("same-topic follow-up after restart imports to data with a fresh handoff an
       const turn = finalCalls++;
       if (turn < 2) {
         expect(input.nativeSession).toEqual(turn === 0 ? { mode: "start" } : { mode: "fork", id: sessions[0] });
-        expect(input.prompt).toContain('"requestedName":"PST"');
+        expect(input.prompt).toContain(JSON.stringify({ requestedName: sourceName }));
         expect(input.prompt).toContain("无需寻找或调用其他 HomeAgent 入库接口");
         expect(input.prompt).toContain("不把本次查询截止时间直接称作下次增量起点");
         if (turn === 1) {
@@ -87,7 +91,7 @@ test("same-topic follow-up after restart imports to data with a fresh handoff an
         }
         const file = JSON.parse(input.prompt.match(/写入 ("[^\n]+?")；/u)![1]!) as string;
         files.push(file);
-        writeFileSync(file, JSON.stringify({ version: 1, chatId: "oc_pst", chatName: "PST", startAt: 100, endAt: 200,
+        writeFileSync(file, JSON.stringify({ version: 1, chatId: "oc_pst", chatName: sourceName, startAt: 100, endAt: 200,
           mainComplete: true, threadsComplete: false, olderThreadsScanned: true, failedMessageIds: ["om_retracted"],
           messages: [{ messageId: `om_source_${turn}`, createdAt: 150, text: `真实查询正文 ${turn}` }] }));
       } else {
@@ -112,7 +116,7 @@ test("same-topic follow-up after restart imports to data with a fresh handoff an
       expectedScopeFingerprint: engine.localExecution.preview(agent.id, draft.id).fingerprint });
     await runtime.start();
     await transport.inject({ kind: "message", eventId: "evt_first", chatType: "group", chatId: "oc_capture", senderId: "ou_fixture",
-      text: "@agent 飞书群：PST 提炼最近一周，并保存原始数据。首轮专用标记", messageId: "om_first", mentionsBot: true, createdAt: 200 });
+      text: firstRequest, messageId: "om_first", mentionsBot: true, createdAt: 200 });
     await runtime.stop(); engine.close();
     engine = createEngine();
     runtime = new Orchestrator({ engine, connector, llm: classifier });

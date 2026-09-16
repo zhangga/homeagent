@@ -78,6 +78,27 @@ test("topic follow-ups retain preservation and source intent while current chang
   expect(resolveChatRawImportRequest(["飞书群：PST 查询最近两周", "把原始记录入库"])).toEqual({ requestedName: "PST" });
 });
 
+test.each([
+  "@HomeAgent 飞书群：PST高峰期拉扯卡顿专项\n提炼下最近两周的主要内容，记录相关信息",
+  "飞书群：PST高峰期拉扯卡顿专项 提炼最近两周，并保存相关数据",
+  "飞书群：PST高峰期拉扯卡顿专项 整理最近两周，保存下来",
+  "飞书群：PST高峰期拉扯卡顿专项 查询最近两周，把这些消息记录下来",
+])("preservation does not require the user to name Raw: %s", request => {
+  expect(requestsChatRawImport(request)).toBe(true);
+  expect(resolveChatRawImportRequest([request, "重新提炼最近两周"]))
+    .toEqual({ requestedName: "PST高峰期拉扯卡顿专项" });
+});
+
+test("ordinary message queries and explicit summary-only requests do not request source capture", () => {
+  for (const request of ["飞书群：PST 查询聊天记录", "飞书群：PST 提炼最近两周，不用记录相关信息",
+    "飞书群：PST 提炼最近两周，只保存总结"]) {
+    expect(requestsChatRawImport(request)).toBe(false);
+    expect(resolveChatRawImportRequest([request, "继续提炼"])).toBeUndefined();
+  }
+  expect(resolveChatRawImportRequest(["飞书群：PST 提炼并保存相关信息", "这次只保存总结"]))
+    .toBeUndefined();
+});
+
 test("named external source is saved only in the requesting Space with actual provenance", async () => {
   const { engine, capture, file, run } = fixture("飞书群：PST线上应急处理小组 提炼最近一周，并保存原始记录");
   expect(capture.instruction).toContain("不得用当前群替换目标群");
