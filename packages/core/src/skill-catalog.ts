@@ -374,6 +374,9 @@ export class SkillCatalog {
   private readonly cacheTtlMs: number;
   private readonly now: () => number;
   private snapshot?: SkillCatalogSnapshot;
+  private snapshotVersion = 0;
+  /** In-memory invalidation only; never scans disk or resolves Skills. */
+  cachedSnapshotVersion(): number { return this.snapshotVersion; }
   /** Bundle hashes produced by the immediately preceding synchronous resolve. */
   private lastResolvedBundleHashes = new Map<string, string>();
   /**
@@ -528,6 +531,7 @@ export class SkillCatalog {
       refreshedAt: this.now(),
     };
     this.snapshot = snapshot;
+    this.snapshotVersion++;
     return snapshot;
   }
 

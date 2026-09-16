@@ -64,6 +64,7 @@ import {
   codexReasoningEffortsForModel,
   providerSupportsOrdinaryCompletion,
   NATIVE_SESSION_ISSUE_LABELS,
+  EXECUTION_POLICY_ISSUE_LABELS,
   type DetectedProvider,
 } from "@homeagent/llm";
 import type { FeishuRuntimeStatus } from "./integrations.ts";
@@ -965,7 +966,7 @@ export function governanceView(
     </div>
     <div class="card">
       <h2 style="margin-top:0">恢复空间</h2>
-      <p class="muted">接受 homeagent.space v1–v19 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录，v19 包含按 SHA-256 校验的完整原文件；已有同名空间不会被覆盖。</p>
+      <p class="muted">接受 homeagent.space v1–v20 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录，v19 包含按 SHA-256 校验的完整原文件，v20 保留 Agent 执行模式意图但不包含本机完全访问确认；已有同名空间不会被覆盖。</p>
       <form method="post" action="/governance/restore" enctype="multipart/form-data" class="actions">
         <input type="file" name="archive" accept="application/json,.json" required />
         <button type="submit">上传并恢复</button>
@@ -1700,6 +1701,7 @@ export function taskRunView(
   flashMsg?: string,
   queue?: RunQueueInfo,
   workContext?: { action: WorkAction; item: WorkItem },
+  localAuthorization?: string,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const workAcceptance = workContext?.action.acceptances?.find(
     (acceptance) => acceptance.taskRunId === run.id,
@@ -1784,6 +1786,7 @@ export function taskRunView(
       : ""}
     <div class="card stack">
       <div><strong>状态：</strong>${taskRunStatus(run.status)}</div>
+      ${localAuthorization ? html`<div class="contentbox"><strong>当前本机授权：</strong>${localAuthorization}</div>` : ""}
       ${approval
         ? html`<div class="contentbox">
             <strong>高权限执行审批</strong>
@@ -1883,16 +1886,22 @@ const CHAT_RUN_ERROR_LABELS: Record<NonNullable<ChatRun["error"]>["kind"], strin
 function executionEvidenceView(run: ChatRun): HtmlEscapedString | Promise<HtmlEscapedString> {
   const evidence = run.executionEvidence;
   if (!evidence) return html`<div><strong>执行证据：</strong>未记录执行证据（旧运行或非采集路径），不能据此推断没有调用工具。</div>`;
-  return html`<details><summary>执行证据 · ${evidence.calls.length} 次 Provider 输出</summary>
+  return html`<details><summary>执行证据 · ${evidence.calls.length} 次 Provider 调用记录</summary>
     ${evidence.preparationFailure ? html`<p><strong>运行准备失败：</strong>
       ${evidence.preparationFailure.stage === "native-session" ? html`${NATIVE_SESSION_ISSUE_LABELS[evidence.preparationFailure.reason]}
         · ${evidence.preparationFailure.reason}${evidence.preparationFailure.exitCode === undefined ? "" : ` · 退出码 ${evidence.preparationFailure.exitCode}`}`
+        : evidence.preparationFailure.stage === "execution-policy" ? html`${EXECUTION_POLICY_ISSUE_LABELS[evidence.preparationFailure.reason]}`
         : html`冻结 Skill 目录超过准备预算 · 请求 ${evidence.preparationFailure.requestedSkills} 个，已准备 ${evidence.preparationFailure.stagedSkills} 个；已停止并清理副本，没有使用删减目录。`}
     </p>` : ""}
-    <p class="muted">仅记录 Codex 已完成工具事件的脱敏元数据，不保存命令、输出正文或凭据；退出成功不证明业务任务已完成。未识别的命令或缺失身份保持未知。</p>
+    <p class="muted">记录运行模式、进程状态和 Codex 已完成工具事件的脱敏元数据，不保存命令、输出正文或凭据；退出成功不证明业务任务已完成。未识别的命令或缺失身份保持未知。</p>
     ${evidence.calls.length === 0 ? html`<p>未收到可采集的工具输出。可能在预检阶段被拒绝、调用被中断，或 Provider 不支持；这不是“没有权限”的证据。</p>` : ""}
     ${evidence.truncated || evidence.calls.some(call => call.truncated) ? html`<p>已截断：证据达到记录上限，不能视为完整执行历史。</p>` : ""}
     ${evidence.calls.map((call, index) => html`<div><strong>调用 ${index + 1} · ${call.source}</strong>
+      ${call.execution ? html`<p>${call.execution.executionMode === "local-full-access" ? "本机完全访问 · 未隔离" : "隔离模式"}
+        · 沙箱检查：${({ passed: "隔离已通过", failed: "隔离失败", "not-applicable": "不适用（未启用沙箱）", "not-checked": "未检查" })[call.execution.sandboxCheck]}
+        · ${call.execution.effectiveSandbox}
+        · ${call.execution.process === "started" ? "进程已启动" : "进程未启动"}
+        · ${call.execution.model === "verified" ? "模型调用已验证" : "模型调用未验证"}</p>` : html`<p>未记录模式及进程证据（历史记录），不补造隔离或调用结论。</p>`}
       ${call.events.length === 0 ? html`<p>没有可识别的已完成工具事件。</p>` : html`<ul>${call.events.map(event => html`<li>
         ${event.kind} · ${event.status}${event.exitCode !== undefined ? ` · 退出码 ${event.exitCode}` : ""}
         ${event.lark ? html`<div>飞书操作：${event.lark.operation} · 显式身份：${event.lark.requestedIdentity}
@@ -1909,6 +1918,7 @@ export function chatRunView(
   flashMsg?: string,
   queue?: RunQueueInfo,
   reruns: QualityRerun[] = [],
+  localAuthorization?: string,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const retryable =
     ["failed", "cancelled", "timed_out"].includes(run.status)
@@ -1958,6 +1968,7 @@ export function chatRunView(
       <div><strong>执行快照：</strong>${run.provider ?? "未记录"} / ${run.model || "CLI 默认模型"}
         ${run.reasoningEffort ? ` · reasoning ${run.reasoningEffort}` : ""}</div>
       <div><strong>冻结权限：</strong>${run.executionPlan?.execution?.permission ?? run.execution?.permission ?? "未记录"}</div>
+      ${localAuthorization ? html`<div><strong>当前本机授权：</strong>${localAuthorization}</div>` : ""}
       ${executionEvidenceView(run)}
       <div><strong>空间：</strong>${run.space}</div>
       <div><strong>投递：</strong>${deliveryLabel} · 已尝试 ${run.delivery.attempts} 次</div>

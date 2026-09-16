@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import {
   FakeLlm,
   KnowledgeEngine,
+  SkillCatalog,
   normalizeTopicLearningRoute,
   type GroupParticipationLevel,
 } from "@homeagent/core";
@@ -163,6 +164,8 @@ async function evaluateRetrievalCases(
     const engine = new KnowledgeEngine({
       dataDir: join(root, `retrieval-${index}`),
       llm: fake,
+      // The fixed quality dataset exercises retrieval, not the operator's local tools.
+      skillCatalog: new SkillCatalog({ roots: [] }),
     });
     const space = `team/evaluation_${index}` as SpaceId;
     for (const candidate of item.pages) await engine.upsertPage(space, page(candidate));

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -15,7 +15,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
-import { providerPreparationFailure } from "./provider-preparation.ts";
+import { providerPreparationFailure, ProviderPreparationError } from "./provider-preparation.ts";
+import type { ProviderExecutionEvidence } from "./execution-evidence.ts";
 import {
   codexReasoningEffortsForModel,
   curatedProviderModels,
@@ -544,6 +545,8 @@ function writeArgReportingCodexProvider(
   sessionId: string,
   name = "provider",
   answer?: string,
+  sandboxExitCode = 0,
+  keyringOnly = false,
 ): string {
   const script = join(directory, `${name}.js`);
   const calls = join(directory, `${name}.calls.jsonl`);
@@ -555,9 +558,10 @@ function writeArgReportingCodexProvider(
       "const args = process.argv.slice(2);",
       `appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");`,
       "if (args.length === 1 && args[0] === '--version') process.stdout.write('codex-cli 0.152.1\\n');",
+      `else if (args.includes('login') && args.includes('status')) { process.exitCode = ${keyringOnly} && args.includes('cli_auth_credentials_store="file"') ? 1 : 0; }`,
       "else if (JSON.stringify(args) === JSON.stringify(['exec', 'fork', '--help'])) process.stdout.write('Usage: codex exec fork [OPTIONS] [SESSION_ID] [PROMPT]\\n');",
       "else if (args.length === 5 && args[0] === '-c' && args[2] === 'mcp' && args[3] === 'list' && args[4] === '--json') process.stdout.write('[]');",
-      "else if (args.includes('sandbox') && args.includes('-P') && args.includes('homeagent_topic')) process.exitCode = 0;",
+      `else if (args.includes('sandbox') && args.includes('-P') && args.includes('homeagent_topic')) process.exitCode = ${sandboxExitCode};`,
       "else {",
       `  process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: ${JSON.stringify(sessionId)} }) + "\\n");`,
       `  process.stdout.write(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: ${answer === undefined ? "args.join(' ')" : JSON.stringify(answer)} } }) + '\\n');`,
@@ -576,6 +580,211 @@ function writeArgReportingCodexProvider(
   if (process.platform !== "win32") chmodSync(bin, 0o755);
   return bin;
 }
+
+test("explicit full topic start, fork and routing do not invoke a failing Windows proof", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-dual-mode-")));
+  const previousBin = process.env.HOMEAGENT_CODEX_BIN;
+  const previousHome = process.env.HOMEAGENT_CODEX_HOME;
+  const workdir = join(root, "workdir");
+  const dataRoot = join(root, "data");
+  mkdirSync(workdir); mkdirSync(dataRoot);
+  process.env.HOMEAGENT_CODEX_HOME = join(root, "codex-home");
+  const sessionId = "11111111-2222-4333-8444-555555555555";
+  process.env.HOMEAGENT_CODEX_BIN = writeArgReportingCodexProvider(root, sessionId, "full", undefined, 75, true);
+  const execution = { permission: "full" as const, executionMode: "local-full-access" as const, workdir, skills: [] };
+  try {
+    await preflightProviderNativeSession("codex", 5000, undefined, workdir, execution, [], dataRoot);
+    for (const nativeSession of [undefined, { mode: "start" as const }, { mode: "fork" as const, id: "22222222-2222-4333-8444-555555555555" }]) {
+      const result = await runProviderDetailed("codex", {
+        prompt: "private topic body", execution, protectedDataRoot: dataRoot,
+        nativeTopic: true, nativeSession,
+        acquireExecutionPermit: () => ({ register: () => () => {}, release: () => {} }),
+      }, 5000);
+      expect(result.text).toContain("--sandbox danger-full-access");
+      expect(result.text).toContain('cli_auth_credentials_store="keyring"');
+      expect(result.text).not.toContain("permissions=");
+      expect(result.text).toContain("--strict-config --ignore-user-config --ignore-rules --json");
+      expect(result.text.includes("--ephemeral")).toBe(nativeSession === undefined);
+      expect(result.nativeSessionId).toBe(nativeSession ? sessionId : undefined);
+    }
+    const calls = providerProbeCalls(root, "full");
+    expect(calls.some(args => args.includes("sandbox"))).toBe(false);
+    expect(calls.some(args => args.includes("private topic body"))).toBe(false);
+    await expect(runProviderDetailed("codex", { prompt: "denied", execution, protectedDataRoot: dataRoot }, 5000))
+      .rejects.toThrow("local-execution-consent-required");
+    expect(providerProbeCalls(root, "full")).toHaveLength(calls.length);
+  } finally {
+    if (previousBin === undefined) delete process.env.HOMEAGENT_CODEX_BIN; else process.env.HOMEAGENT_CODEX_BIN = previousBin;
+    if (previousHome === undefined) delete process.env.HOMEAGENT_CODEX_HOME; else process.env.HOMEAGENT_CODEX_HOME = previousHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  ["old-version", "codex 0.152.0", 0, "[]", 0, 0, "native-cli-unavailable"],
+  ["missing-fork", "codex 0.154.0", 1, "[]", 0, 0, "native-cli-unavailable"],
+  ["managed-mcp", "codex 0.154.0", 0, '[{"name":"private-server"}]', 0, 0, "mcp-not-isolated"],
+  ["malformed-mcp", "codex 0.154.0", 0, "{}", 0, 0, "mcp-not-isolated"],
+  ["signed-out", "codex 0.154.0", 0, "[]", 1, 1, "authentication is unavailable"],
+] as const)("full access still rejects %s for non-topic runs", async (_name, version, forkCode, mcp, fileCode, keyringCode, expected) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-full-capability-")));
+  const previousBin = process.env.HOMEAGENT_CODEX_BIN;
+  const previousHome = process.env.HOMEAGENT_CODEX_HOME;
+  const workdir = join(root, "workdir"); const dataRoot = join(root, "data");
+  mkdirSync(workdir); mkdirSync(dataRoot);
+  process.env.HOMEAGENT_CODEX_HOME = join(root, "codex-home");
+  process.env.HOMEAGENT_CODEX_BIN = writeCodexStatusProvider(root, "provider", fileCode, CODEX_STATUS_ARGS, forkCode, version, mcp, 0, 75, "private diagnostic", keyringCode);
+  let authorized = false;
+  try {
+    await expect(preflightProviderNativeSession("codex", 5000, undefined, workdir,
+      { permission: "full", executionMode: "local-full-access", workdir, skills: [] }, [], dataRoot))
+      .rejects.toThrow(expected);
+    await expect(runProviderDetailed("codex", {
+      prompt: "private body", protectedDataRoot: dataRoot,
+      execution: { permission: "full", executionMode: "local-full-access", workdir, skills: [] },
+      acquireExecutionPermit: () => { authorized = true; return { register: () => () => {}, release: () => {} }; },
+    }, 5000)).rejects.toThrow(expected);
+    expect(authorized).toBe(false);
+    const calls = providerProbeCalls(root, "provider");
+    expect(calls.some(args => args.includes("--json") && args.includes("exec"))).toBe(false);
+    expect(calls.some(args => args.includes("sandbox"))).toBe(false);
+  } finally {
+    if (previousBin === undefined) delete process.env.HOMEAGENT_CODEX_BIN; else process.env.HOMEAGENT_CODEX_BIN = previousBin;
+    if (previousHome === undefined) delete process.env.HOMEAGENT_CODEX_HOME; else process.env.HOMEAGENT_CODEX_HOME = previousHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("full access checks the launch permit after preparation and releases it before waiting for completion", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-full-permit-")));
+  const previousBin = process.env.HOMEAGENT_CODEX_BIN;
+  const previousHome = process.env.HOMEAGENT_CODEX_HOME;
+  const workdir = join(root, "workdir"); const dataRoot = join(root, "data");
+  mkdirSync(workdir); mkdirSync(dataRoot);
+  process.env.HOMEAGENT_CODEX_HOME = join(root, "codex-home");
+  process.env.HOMEAGENT_CODEX_BIN = writeArgReportingCodexProvider(root, "11111111-2222-4333-8444-555555555555");
+  const execution = { permission: "full" as const, executionMode: "local-full-access" as const, workdir, skills: [] };
+  const evidence: ProviderExecutionEvidence[] = [];
+  try {
+    await expect(runProviderDetailed("codex", {
+      prompt: "never start", execution, protectedDataRoot: dataRoot, onExecutionEvidence: value => evidence.push(value),
+      acquireExecutionPermit: () => { throw new ProviderPreparationError({ stage: "execution-policy", reason: "local-execution-consent-revoked" }); },
+    }, 5000)).rejects.toThrow("local-execution-consent-revoked");
+    expect(providerProbeCalls(root, "provider").some(args => args.includes("--strict-config"))).toBe(false);
+    expect(evidence[0]?.execution).toEqual({ executionMode: "local-full-access", effectiveSandbox: "danger-full-access", sandboxCheck: "not-applicable", process: "not-started", model: "unknown" });
+    await expect(runProviderDetailed("codex", {
+      prompt: "a callback is not itself a permit", execution, protectedDataRoot: dataRoot,
+      acquireExecutionPermit: () => undefined!,
+    }, 5000)).rejects.toThrow("local-execution-consent-required");
+    expect(providerProbeCalls(root, "provider").some(args => args.includes("--strict-config"))).toBe(false);
+    const events: string[] = [];
+    let yieldedAfterPermit = false;
+    await expect(runProviderDetailed("codex", {
+      prompt: "cancel immediately", execution, protectedDataRoot: dataRoot,
+      acquireExecutionPermit: () => {
+        queueMicrotask(() => { yieldedAfterPermit = true; });
+        return {
+          register: cancel => {
+            expect(yieldedAfterPermit).toBe(false);
+            events.push("registered"); cancel(); return () => { events.push("unregistered"); };
+          },
+          release: () => { events.push("released"); },
+        };
+      },
+    }, 5000)).rejects.toThrow("cancelled");
+    expect(events).toEqual(["registered", "released", "unregistered"]);
+    let releasedAfterPathChange = false;
+    await expect(runProviderDetailed("codex", {
+      prompt: "do not use a replacement directory", execution, protectedDataRoot: dataRoot,
+      acquireExecutionPermit: () => {
+        renameSync(workdir, join(root, "old-workdir"));
+        mkdirSync(workdir);
+        return { register: () => { throw new Error("must not start"); }, release: () => { releasedAfterPathChange = true; } };
+      },
+    }, 5000)).rejects.toThrow("execution-mode-invalid");
+    expect(releasedAfterPathChange).toBe(true);
+  } finally {
+    if (previousBin === undefined) delete process.env.HOMEAGENT_CODEX_BIN; else process.env.HOMEAGENT_CODEX_BIN = previousBin;
+    if (previousHome === undefined) delete process.env.HOMEAGENT_CODEX_HOME; else process.env.HOMEAGENT_CODEX_HOME = previousHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each(["change-content", "extra-bundle", "replace-bundle"] as const)("full access rechecks frozen Skills inside the launch permit: %s", async (mutation) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-full-skill-proof-")));
+  const previousBin = process.env.HOMEAGENT_CODEX_BIN;
+  const previousHome = process.env.HOMEAGENT_CODEX_HOME;
+  const workdir = join(root, "workdir");
+  const dataRoot = join(root, "data");
+  const skillDirectory = join(root, "skill");
+  for (const directory of [workdir, dataRoot, skillDirectory]) mkdirSync(directory);
+  const skillFile = join(skillDirectory, "SKILL.md");
+  writeFileSync(skillFile, "# Frozen Skill\n");
+  const bundleHash = hashProviderSkillBundle(skillFile);
+  const stagedBefore = stagedCodexSkillDirectories();
+  process.env.HOMEAGENT_CODEX_HOME = join(root, "codex-home");
+  process.env.HOMEAGENT_CODEX_BIN = writeArgReportingCodexProvider(root, "11111111-2222-4333-8444-555555555555");
+  let released = false;
+  let registered = false;
+  try {
+    await expect(runProviderDetailed("codex", {
+      prompt: "must preserve every frozen Skill", protectedDataRoot: dataRoot,
+      execution: { permission: "full", executionMode: "local-full-access", workdir, skills: ["frozen"], skillMode: "all" },
+      skillInputs: [{ name: "frozen", directory: skillDirectory, skillFile, bundleHash }],
+      acquireExecutionPermit: () => {
+        const created = stagedCodexSkillDirectories().filter(name => !stagedBefore.includes(name));
+        expect(created).toHaveLength(1);
+        const stagedRoot = join(realpathSync(tmpdir()), created[0]!);
+        if (mutation === "change-content") writeFileSync(join(stagedRoot, "skill-0000", "SKILL.md"), "# Replaced\n");
+        if (mutation === "extra-bundle") mkdirSync(join(stagedRoot, "extra"));
+        if (mutation === "replace-bundle") renameSync(join(stagedRoot, "skill-0000"), join(stagedRoot, "replacement"));
+        return { register: () => { registered = true; return () => {}; }, release: () => { released = true; } };
+      },
+    }, 5000)).rejects.toThrow("staged Skill bundle failed verification");
+    expect(released).toBe(true);
+    expect(registered).toBe(false);
+    expect(providerProbeCalls(root, "provider").some(args => args.includes("--strict-config") || args.includes("sandbox"))).toBe(false);
+    expect(stagedCodexSkillDirectories()).toEqual(stagedBefore);
+  } finally {
+    if (previousBin === undefined) delete process.env.HOMEAGENT_CODEX_BIN; else process.env.HOMEAGENT_CODEX_BIN = previousBin;
+    if (previousHome === undefined) delete process.env.HOMEAGENT_CODEX_HOME; else process.env.HOMEAGENT_CODEX_HOME = previousHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed provider stdin write force-stops the child before clearing termination timers", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-provider-stdin-failure-")));
+  const previousBin = process.env.HOMEAGENT_CODEX_BIN;
+  process.env.HOMEAGENT_CODEX_BIN = writeArgReportingCodexProvider(root, "11111111-2222-4333-8444-555555555555");
+  const originalSpawn = Bun.spawn;
+  const killedWith: Array<number | NodeJS.Signals | undefined> = [];
+  const exits: Array<Promise<number>> = [];
+  const restore: Array<() => void> = [];
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation((...args) => {
+    // The real process boundary is retained; only its pipe failure is injected.
+    const proc: Bun.Subprocess<"pipe", "pipe", "pipe"> = Reflect.apply(originalSpawn, Bun, args);
+    exits.push(proc.exited);
+    const write = spyOn(proc.stdin, "write").mockImplementation(() => { throw new Error("injected stdin failure"); });
+    const kill = proc.kill.bind(proc);
+    const killed = spyOn(proc, "kill").mockImplementation(signal => {
+      killedWith.push(signal);
+      kill(9); // Also clean up the real test child while exercising the red case.
+    });
+    restore.push(() => { write.mockRestore(); killed.mockRestore(); });
+    return proc;
+  });
+  try {
+    await expect(runProviderDetailed("codex", { prompt: "pipe failure", execution: READ_ONLY_EXECUTION }, 5000))
+      .rejects.toThrow("injected stdin failure");
+    expect(killedWith).toEqual([9]);
+  } finally {
+    spawnSpy.mockRestore();
+    await Promise.all(exits);
+    for (const reset of restore) reset();
+    if (previousBin === undefined) delete process.env.HOMEAGENT_CODEX_BIN; else process.env.HOMEAGENT_CODEX_BIN = previousBin;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function writeArgAndStdinReportingCodexProvider(
   directory: string,
@@ -947,6 +1156,23 @@ function providerProbeCalls(directory: string, name: string): string[][] {
     .map((line) => JSON.parse(line) as string[]);
 }
 
+test("default CLI detection checks native commands without starting an unrequested isolation probe", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ha-detect-on-demand-"));
+  const previous = process.env.HOMEAGENT_CODEX_BIN;
+  try {
+    process.env.HOMEAGENT_CODEX_BIN = writeCodexStatusProvider(directory, "codex-on-demand", 0, CODEX_STATUS_ARGS, 0, "codex-cli 0.154.0", "[]", 0, 75);
+    const codex = (await detectProviders(501)).find(provider => provider.id === "codex")!;
+    expect(codex.available).toBe(true);
+    expect(codex.nativeSessions).toBeUndefined();
+    expect(codex.nativeSessionCommands).toBe(true);
+    expect(providerProbeCalls(directory, "codex-on-demand").some(args => args.includes("sandbox"))).toBe(false);
+    expect(providerProbeCalls(directory, "codex-on-demand").some(args => args.includes("mcp"))).toBe(false);
+  } finally {
+    if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN; else process.env.HOMEAGENT_CODEX_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 function codexMcpListArgs(workdir?: string): string[] {
   const absoluteWorkdir = resolve(workdir ?? process.cwd());
   return [
@@ -1302,7 +1528,8 @@ describe("provider detection", () => {
       }, 500);
       if (fail) await expect(result).rejects.toThrow();
       else expect((await result).text).toBe("done");
-      expect(evidence).toEqual([{ source: "codex-jsonl", truncated: false, events: [{
+      expect(evidence).toEqual([{ source: "codex-jsonl", truncated: false,
+        execution: { executionMode: "isolated", sandboxCheck: "not-checked", effectiveSandbox: "read-only", process: "started", model: fail ? "unknown" : "verified" }, events: [{
         kind: "command", status: "completed", exitCode: 0,
         lark: { operation: "chat-list", requestedIdentity: "bot", reportedIdentity: "bot", ok: true, count: 0 },
       }] }]);
@@ -1566,6 +1793,8 @@ describe("provider detection", () => {
       for (const observed of observations) {
         expect(observed.prompt).toContain("本轮唯一有效的技能映射");
         expect(observed.prompt).toContain("忽略会话历史中的旧技能路径");
+        expect(observed.prompt).toContain("按该名称在本轮映射中解析");
+        expect(observed.prompt).toContain("依赖未列入映射时报告缺失");
         expect(observed.prompt).toContain("homeagent-codex-skills-");
         expect(observed.prompt).not.toContain(realpathSync(liveSkillDirectory));
         expect(observed.args.join("\0")).not.toContain(realpathSync(liveSkillDirectory));
@@ -1814,7 +2043,8 @@ describe("provider detection", () => {
           protectedDataRoot: dataRoot,
           execution,
           nativeSessionIsolation: true,
-        }, 500)).rejects.toThrow("native session isolation is unavailable");
+        }, 500)).rejects.toThrow(execution.permission === "full"
+          ? "local-execution-consent-required" : "native session isolation is unavailable");
       }
       await expect(runProviderDetailed("codex", {
         prompt: "must not expose the live Skill through Workdir",
@@ -1862,7 +2092,7 @@ describe("provider detection", () => {
         0,
         42,
       );
-      expect((await detectProviders(500)).find((provider) => provider.id === "codex"))
+      expect((await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "codex"))
         .toEqual(expect.objectContaining({ available: true, nativeSessions: false }));
 
       await expect(runProviderDetailed("codex", {
@@ -2842,7 +3072,7 @@ describe("provider detection", () => {
       const bin = writeArgEchoProvider(directory);
       for (const key of keys) process.env[key] = bin;
 
-      const detected = await detectProviders(500);
+      const detected = await detectProviders(500, { codexNativeIsolation: true });
       expect(detected.map(({ id, bin }) => ({ id, bin }))).toEqual([
         { id: "claude", bin },
         { id: "codex", bin },
@@ -2908,7 +3138,7 @@ describe("provider detection", () => {
         "trae-capability",
       );
 
-      const detected = await detectProviders(500);
+      const detected = await detectProviders(500, { codexNativeIsolation: true });
       expect(detected.find((provider) => provider.id === "claude")).toEqual(
         expect.objectContaining({
           available: false,
@@ -2939,7 +3169,7 @@ describe("provider detection", () => {
         "claude-native-session-capability",
       );
 
-      expect((await detectProviders(500)).find((provider) => provider.id === "claude"))
+      expect((await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "claude"))
         .toEqual(expect.objectContaining({
           available: true,
           detail: "claude-native-session-capability 1.0",
@@ -2962,7 +3192,7 @@ describe("provider detection", () => {
         name,
       );
 
-      expect((await detectProviders(500)).find((provider) => provider.id === "claude"))
+      expect((await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "claude"))
         .toEqual(expect.objectContaining({
           available: true,
           detail: "claude-capability-ready 1.0",
@@ -2995,7 +3225,7 @@ describe("provider detection", () => {
         }),
       );
 
-      const claude = (await detectProviders(500)).find((provider) => provider.id === "claude");
+      const claude = (await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "claude");
       expect(claude).toEqual(expect.objectContaining({
         available: false,
         detail: "Claude 认证不可用",
@@ -3021,7 +3251,7 @@ describe("provider detection", () => {
     try {
       process.env.HOMEAGENT_CODEX_BIN = writeCodexStatusProvider(directory, name, 1);
 
-      const codex = (await detectProviders(500)).find((provider) => provider.id === "codex");
+      const codex = (await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "codex");
       expect(codex).toEqual(expect.objectContaining({
         available: false,
         detail: "HomeAgent 尚未连接当前 Codex 账号",
@@ -3075,7 +3305,7 @@ describe("provider detection", () => {
       process.env.HOMEAGENT_CODEX_HOME = codexHome;
       expect(existsSync(codexHome)).toBe(false);
 
-      const codex = (await detectProviders(500)).find((provider) => provider.id === "codex");
+      const codex = (await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "codex");
 
       expect(codex).toEqual(expect.objectContaining({
         available: true,
@@ -3120,7 +3350,7 @@ describe("provider detection", () => {
 
       expect(existsSync(codexHome)).toBe(false);
       ensureProviderCodexHome();
-      const codex = (await detectProviders(500)).find((provider) => provider.id === "codex");
+      const codex = (await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "codex");
 
       expect(existsSync(codexHome)).toBe(true);
       expect(codex).toEqual(expect.objectContaining({
@@ -3153,7 +3383,7 @@ describe("provider detection", () => {
         42,
       );
 
-      const codex = (await detectProviders(500)).find((provider) => provider.id === "codex");
+      const codex = (await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "codex");
       expect(codex).toEqual(expect.objectContaining({
         available: true,
         nativeSessions: false,
@@ -3190,7 +3420,7 @@ describe("provider detection", () => {
         `windows sandbox failed: Restricted read-only access requires the elevated Windows sandbox backend\n${privateDiagnostic}`,
       );
 
-      const codex = (await detectProviders(500)).find((provider) => provider.id === "codex");
+      const codex = (await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "codex");
       expect(codex).toEqual(expect.objectContaining({
         available: true,
         nativeSessions: false,
@@ -3228,7 +3458,7 @@ describe("provider detection", () => {
         warnings,
       );
 
-      const codex = (await detectProviders(500)).find((provider) => provider.id === "codex");
+      const codex = (await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "codex");
       expect(codex).toEqual(expect.objectContaining({
         available: true,
         nativeSessions: true,
@@ -3261,7 +3491,7 @@ describe("provider detection", () => {
         0,
       );
 
-      const codex = (await detectProviders(500)).find((provider) => provider.id === "codex");
+      const codex = (await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "codex");
       expect(codex).toEqual(expect.objectContaining({ available: true }));
       await expect(runProviderDetailed("codex", {
         prompt: "must reach only the fake provider",
@@ -3301,7 +3531,7 @@ describe("provider detection", () => {
         "codex-cli 0.151.9",
       );
 
-      const codex = (await detectProviders(500)).find((provider) => provider.id === "codex");
+      const codex = (await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "codex");
       expect(codex).toEqual(expect.objectContaining({
         available: true,
         nativeSessions: false,
@@ -3334,7 +3564,7 @@ describe("provider detection", () => {
         JSON.stringify([{ name: privateServerName }]),
       );
 
-      const codex = (await detectProviders(500)).find((provider) => provider.id === "codex");
+      const codex = (await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "codex");
       expect(codex).toEqual(expect.objectContaining({
         available: true,
         nativeSessions: false,
@@ -3492,7 +3722,7 @@ describe("provider detection", () => {
       const proc = Bun.spawn([
         process.execPath,
         "-e",
-        "import { detectProviders } from './packages/llm/src/providers.ts'; console.log(JSON.stringify((await detectProviders(500)).find((provider) => provider.id === 'codex')));",
+        "import { detectProviders } from './packages/llm/src/providers.ts'; console.log(JSON.stringify((await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === 'codex')));",
       ], {
         cwd: process.cwd(),
         env,
@@ -3544,7 +3774,7 @@ describe("provider detection", () => {
         7,
       );
 
-      const claude = (await detectProviders(500)).find((provider) => provider.id === "claude");
+      const claude = (await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "claude");
       expect(claude).toEqual(expect.objectContaining({
         available: false,
         detail: "Claude 认证不可用",
@@ -3574,7 +3804,7 @@ describe("provider detection", () => {
           name,
           output,
         );
-        const claude = (await detectProviders(500)).find(
+        const claude = (await detectProviders(500, { codexNativeIsolation: true })).find(
           (provider) => provider.id === "claude",
         );
         expect(claude).toEqual(expect.objectContaining({
@@ -3604,7 +3834,7 @@ describe("provider detection", () => {
         1_000,
       );
 
-      expect((await detectProviders(500)).find((provider) => provider.id === "claude"))
+      expect((await detectProviders(500, { codexNativeIsolation: true })).find((provider) => provider.id === "claude"))
         .toEqual(expect.objectContaining({
           available: false,
           detail: "Claude 认证不可用",
@@ -3624,7 +3854,7 @@ describe("provider detection", () => {
       delete process.env.HOMEAGENT_CODEX_BIN;
       process.env.HOMEBRAIN_CODEX_BIN = writeArgEchoProvider(directory);
 
-      const detected = await detectProviders(500);
+      const detected = await detectProviders(500, { codexNativeIsolation: true });
       expect(detected.find((provider) => provider.id === "codex")?.bin)
         .toBe(process.env.HOMEBRAIN_CODEX_BIN);
       expect(await runProvider(

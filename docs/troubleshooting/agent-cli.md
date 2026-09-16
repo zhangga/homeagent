@@ -63,14 +63,14 @@ HomeAgent 的 Codex setup、能力探测和实际运行共同使用 `<dataDir>/p
 `skills/` 发现；共享 Skill 请放在 `~/.agents/skills`。Provider 已禁用 Plugin/Vendor，不要把 ambient
 `~/.codex/plugins` 或 `~/.codex/vendor_imports` 中的能力写进冻结 Run 证据。
 
-Windows 控制台里的 Codex 能正常执行普通任务，不等于 HomeAgent 飞书话题所需的 exact filesystem profile 已可用：
+Windows 控制台里的 Codex 能正常执行普通任务，不等于 HomeAgent 隔离模式飞书话题所需的 exact filesystem profile 已可用：
 Codex 的 `unelevated` fallback 无法满足 restricted read-only root-deny 时，HomeAgent 会继续允许普通调用，但把原生会话标成
 “安全沙箱待设置”。此时在 Agent 详情右侧点击“启用 Windows 安全沙箱”；HomeAgent 通过 Codex App Server 发起官方
 `elevated` 设置，请在弹出的 UAC/管理员窗口中批准。页面会等待完成并自动重新执行同一无模型隔离探测，只有探测通过才显示
-“Codex 已完全可用”。拒绝 UAC、企业策略禁止本地用户/组、防火墙或登录权限变更时，设置会固定失败并允许重试；不要改成
-跳过 root-deny 或把用户的完整 `~/.codex` 配置复制进 HomeAgent。
+“机器隔离探测已通过”；实际 Agent 的 Workdir、Skill 和模型调用仍单独核验。拒绝 UAC、企业策略禁止本地用户/组、防火墙或登录权限变更时，设置会固定失败并允许重试；不要伪造隔离通过或把用户的完整 `~/.codex` 配置复制进 HomeAgent。
+默认启动和页面检测只检查 CLI、身份与原生命令支持；隔离模式需显式点击“检测隔离能力”才执行机器探针，未检测不算通过。完全访问的连接检测和旧沙箱轮询不会再触发隔离探针或设置。
 
-飞书话题的 Codex 原生会话还要求“有效 MCP 列表为空”且 filesystem root-deny 确实生效。HomeAgent 会用同一受控子进程环境、
+两种模式的飞书话题都要求“有效 MCP 列表为空”；隔离模式另要求 filesystem root-deny 确实生效。隔离模式会用同一受控子进程环境、
 隔离 `CODEX_HOME`、冻结 Workdir、本轮私有 Skill 副本和 exact permission profile 执行
 `codex mcp list --json`（只接受严格的 `[]`）及不调用模型的 sandbox probe。probe 必须同时证明本轮允许目录可读、
 `CODEX_HOME` sentinel 不可读、`<dataDir>/run/` 下仅受 `:root=deny` 保护的 sibling sentinel 也不可读；只证明某条显式 deny 不算通过。
@@ -85,12 +85,29 @@ System/MDM MCP 无法由本次 CLI 调用全局关闭；只要列表
 
 ### 群话题权限与执行证据
 
+双模式仍在实施中：已接通显式 `local-full-access` 的持久化确认、逐进程检查、页面选择/确认发布/撤销和逐 Agent 准备检查（P4）。Windows / Codex 0.154.0 已通过一次性实例的完全访问回答、原生 fork、文件编辑和撤销阻断；完整 Skill、真实飞书与重启衔接仍未验证，不能推断既有服务已恢复。
+开发者可经授权运行 [最小真实验收入口](../codex-dual-execution-mode.md#133a-不接飞书的最小真实验收入口)。不要把真实测试的 Codex 状态目录放在系统 Temp：CLI 可能拒绝创建辅助程序，产生警告并使严格 MCP 检查失败；这不等于账号未登录。入口使用仓库内 Git 忽略的一次性目录，正常结束或受控取消后清理；不要放宽 MCP 检查或复制完整控制台配置。
+离线 Edge 页面验收已修复确认发布误返回 403（确认页引用来源策略导致同站 POST 的 Origin 为 null）、模式切换按钮文案和手机详情抽屉滚动问题。若更新后仍显示旧行为，先刷新页面重新取得当前实例/版本的表单；不要放宽 Origin 校验或手工改数据授权。离线页面通过仍不证明本机 Codex 已可调用。
+从 Agent 执行配置选择“本机完全访问（无沙箱）”，使用 `full` 和有效 Workdir，再进入独立确认页；核对模型、指令、完整 Chat 范围，手动勾选风险确认后发布新版本。
+Task 默认不启用，勾选后仍须逐次人工审批。新增绑定/修改回复策略需再次确认；右侧可撤销全部完全访问授权。切回隔离必须明确选择 `read-only` 或 `write` 并发布。
+发布后在右侧点击“检测当前发布配置”，不要把机器连接诊断当作本 Agent 的结果。检测只做无模型准备，完全访问不执行受限沙箱探针。
+“准备通过”最多缓存 60 秒；配置/身份/Workdir/Skill 变化后重新检测。OS keyring、管理员 MCP 和实际模型/网络状态仍以执行时检查为准；恢复 CLI 会作废旧诊断。
+健康页的待检测/过期为 degraded，不代表失败或已通过；已知的所需配置失败才阻断对应就绪门禁，后台故障另计。Run 详情的“当前本机授权”只说明冻结确认仍否有效，不是补造过去的执行证据，也不替代 Task 审批。
+旧 `full` 不是授权；`local-execution-consent-required`／`local-execution-consent-revoked` 表示执行许可不足，
+不是账号未登录。不要手工编辑 live data 或向调用参数注入许可回调。发布成功也不代表模型、网络或飞书权限已经验证。
+旧 full 排队/待审批项和确认失效队列会明确停止；正常重启保留有效确认，Agent 备份恢复则使确认失效。
+重试保留旧计划和执行时限，要采用新模式/新配置应新建运行；完全访问历史暂不支持质量重评，Task 后提炼不会继承完全访问。
+详细进度见 [双模式实施文档](../codex-dual-execution-mode.md#12-分阶段实施与完成条件)。
+
+运行详情的“不适用（未启用沙箱）”不代表隔离通过；“进程已启动”也不代表模型调用已验证。
+这些状态来自 HomeAgent 选定参数、子进程状态及结构化结果，不从回答文字猜测；旧记录不补造新结论。
+
 排查“只看得到几个群”时，从 Agent 的 Recent runs 打开本轮 Chat Run，先看冻结的 Skill 目录和权限，
 再看执行证据中的飞书操作、显式身份和 CLI 报告身份。普通 Chat 默认冻结全部兼容 Skill；这不会自动
 授予飞书用户身份或跨 Space 读取权限。没有执行证据的旧回答不能当作权限检查结果。
-`full` 的群话题会明确报配置冲突，不会降级成普通完全访问调用；修改为 `read-only` 或 `write` 后须发布
+旧或未确认 `full` 的群话题会明确报配置/授权问题，不会自动降级；修改为 `read-only` 或 `write` 后须发布
 并发送新请求，旧运行重试不会采用新配置。受限权限下平台沙箱检查仍失败时，应继续排查隔离后端，不能改回
-`full` 绕过。详情页只显示脱敏元数据，不显示完整命令或原始工具输出；未知身份和截断证据必须保留不确定性。
+`full` 假装隔离通过。显式完全访问使用另一执行契约，须经页面确认，并接受工具无文件/网络隔离的风险。详情页只显示脱敏元数据，不显示完整命令或原始工具输出；未知身份和截断证据必须保留不确定性。
 
 对于新运行，先看准备失败的固定原因码，而不是再次尝试登录：
 

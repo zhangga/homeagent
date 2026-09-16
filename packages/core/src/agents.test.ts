@@ -384,7 +384,7 @@ describe("AgentStore", () => {
     const restarted = new AgentStore(dir);
     expect(restarted.get("agent_v3")).toEqual(migrated);
     expect(restarted.listRevisions("agent_v3")).toEqual([revision]);
-    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(4);
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(5);
   });
 
   test("restored Agents are normalized into a readable current record", () => {
@@ -489,7 +489,7 @@ describe("AgentStore", () => {
       { kind: "source", sourceKey: "codex-user:ship", name: "ship" },
     ]);
     const raw = JSON.parse(readFileSync(join(dir, "config", "agents.json"), "utf8"));
-    expect(raw.version).toBe(4);
+    expect(raw.version).toBe(5);
     expect(raw.agents[agent.id].skills).toEqual(agent.skills);
   });
 
@@ -826,7 +826,7 @@ describe("AgentStore", () => {
       name: "review",
     }]);
     const onDisk = JSON.parse(readFileSync(path, "utf8"));
-    expect(onDisk.version).toBe(4);
+    expect(onDisk.version).toBe(5);
     expect(onDisk.agents.agent_old.skills).toEqual(store.get("agent_old")?.skills);
   });
 
@@ -890,7 +890,7 @@ describe("AgentStore", () => {
     ]);
     expect(store.get("agent_skills")?.permission).toBe("read-only");
     const migrated = JSON.parse(readFileSync(path, "utf8"));
-    expect(migrated.version).toBe(4);
+    expect(migrated.version).toBe(5);
     expect(migrated.agents.agent_skills.skills).toEqual([
       { kind: "legacy-name", name: "code-review" },
       { kind: "legacy-name", name: "github:yeet" },

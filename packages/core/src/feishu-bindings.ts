@@ -6,20 +6,18 @@
  * space, tasks, reminders, or learned content associated with it.
  */
 import {
-  closeSync,
   existsSync,
-  mkdirSync,
-  openSync,
+  lstatSync,
   readFileSync,
-  unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import type { SpaceId } from "@homeagent/shared";
 import { isSpaceId } from "@homeagent/shared";
 import type { GroupParticipationLevel, SpaceMeta } from "./types.ts";
-import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
+import { assertLocalStatePath, writeAtomicStateFile } from "./durable-file.ts";
+import { CommittedStateChanges } from "./committed-state-changes.ts";
+import { isExecutionScopeEpoch } from "./execution-identities.ts";
 
 export type FeishuGroupBindingState =
   | "pending_confirmation"
@@ -45,6 +43,8 @@ export interface FeishuConfirmationPrompt {
 }
 
 export interface FeishuGroupBinding {
+  /** Local policy incarnation, assigned by the store, never by callers. */
+  executionScopeEpoch?: string;
   chatId: string;
   spaceId: SpaceId;
   boundAppId?: string;
@@ -99,15 +99,24 @@ interface FeishuGroupBindingsFileV2 {
   bindings: FeishuGroupBinding[];
 }
 
+interface FeishuGroupBindingsFileV3 {
+  version: 3;
+  bindings: FeishuGroupBinding[];
+}
+
 type FeishuGroupBindingsFile =
   | FeishuGroupBindingsFileV1
-  | FeishuGroupBindingsFileV2;
+  | FeishuGroupBindingsFileV2
+  | FeishuGroupBindingsFileV3;
 
 export class FeishuGroupBindingStore {
+  private readonly changes = new CommittedStateChanges();
+
+  onCommittedChange(listener: () => void): () => void { return this.changes.subscribe(listener); }
   private readonly configPath: string;
   private bindings: Map<string, FeishuGroupBinding>;
 
-  constructor(dataDir: string) {
+  constructor(private readonly dataDir: string) {
     this.configPath = join(dataDir, "config", "feishu-group-bindings.json");
     const existed = existsSync(this.configPath);
     const loaded = this.load();
@@ -172,9 +181,8 @@ export class FeishuGroupBindingStore {
     };
     const candidate = new Map(this.bindings);
     candidate.set(binding.chatId, binding);
-    this.persist(candidate);
-    this.bindings = candidate;
-    return cloneBinding(binding);
+    this.commit(candidate);
+    return this.getByChatId(binding.chatId)!;
   }
 
   connect(input: ConnectFeishuGroupInput): FeishuGroupBinding {
@@ -208,9 +216,8 @@ export class FeishuGroupBindingStore {
     };
     const candidate = new Map(this.bindings);
     candidate.set(binding.chatId, binding);
-    this.persist(candidate);
-    this.bindings = candidate;
-    return cloneBinding(binding);
+    this.commit(candidate);
+    return this.getByChatId(binding.chatId)!;
   }
 
   updatePolicy(
@@ -223,14 +230,15 @@ export class FeishuGroupBindingStore {
     if (!previous) return undefined;
     const binding: FeishuGroupBinding = {
       ...previous,
-      ...patch,
+      responseMode: patch.responseMode ?? previous.responseMode,
+      participationLevel: Object.hasOwn(patch, "participationLevel") ? patch.participationLevel : previous.participationLevel,
+      replyInThread: patch.replyInThread ?? previous.replyInThread,
       updatedAt: Date.now(),
     };
     const candidate = new Map(this.bindings);
     candidate.set(binding.chatId, binding);
-    this.persist(candidate);
-    this.bindings = candidate;
-    return cloneBinding(binding);
+    this.commit(candidate);
+    return this.getByChatId(binding.chatId)!;
   }
 
   disconnect(spaceId: SpaceId): FeishuGroupBinding | undefined {
@@ -246,17 +254,15 @@ export class FeishuGroupBindingStore {
     };
     const candidate = new Map(this.bindings);
     candidate.set(binding.chatId, binding);
-    this.persist(candidate);
-    this.bindings = candidate;
-    return cloneBinding(binding);
+    this.commit(candidate);
+    return this.getByChatId(binding.chatId)!;
   }
 
   removeByChatId(chatId: string): boolean {
     if (!this.bindings.has(chatId)) return false;
     const candidate = new Map(this.bindings);
     candidate.delete(chatId);
-    this.persist(candidate);
-    this.bindings = candidate;
+    this.commit(candidate);
     return true;
   }
 
@@ -280,8 +286,7 @@ export class FeishuGroupBindingStore {
       changed += 1;
     }
     if (changed > 0) {
-      this.persist(candidate);
-      this.bindings = candidate;
+      this.commit(candidate);
     }
     return changed;
   }
@@ -306,8 +311,7 @@ export class FeishuGroupBindingStore {
       changed += 1;
     }
     if (changed > 0) {
-      this.persist(candidate);
-      this.bindings = candidate;
+      this.commit(candidate);
     }
     return changed;
   }
@@ -335,9 +339,8 @@ export class FeishuGroupBindingStore {
     };
     const candidate = new Map(this.bindings);
     candidate.set(binding.chatId, binding);
-    this.persist(candidate);
-    this.bindings = candidate;
-    return cloneBinding(binding);
+    this.commit(candidate);
+    return this.getByChatId(binding.chatId)!;
   }
 
   migrateLegacy(spaces: SpaceMeta[], currentAppId?: string): number {
@@ -380,8 +383,7 @@ export class FeishuGroupBindingStore {
       migrated += 1;
     }
     if (migrated > 0) {
-      this.persist(candidate);
-      this.bindings = candidate;
+      this.commit(candidate);
     }
     return migrated;
   }
@@ -430,31 +432,34 @@ export class FeishuGroupBindingStore {
     };
     const candidate = new Map(this.bindings);
     candidate.set(binding.chatId, binding);
-    this.persist(candidate);
-    this.bindings = candidate;
-    return cloneBinding(binding);
+    this.commit(candidate);
+    return this.getByChatId(binding.chatId)!;
   }
 
   private load(): {
     bindings: Map<string, FeishuGroupBinding>;
     needsMigration: boolean;
   } {
+    assertLocalStatePath(this.dataDir, this.configPath);
     if (!existsSync(this.configPath)) {
       return { bindings: new Map(), needsMigration: false };
     }
+    if (lstatSync(this.configPath).isSymbolicLink()) throw new Error("Invalid Feishu group binding path");
     const parsed = JSON.parse(
       readFileSync(this.configPath, "utf8"),
     ) as FeishuGroupBindingsFile;
     if (
-      (parsed.version !== 1 && parsed.version !== 2)
+      (parsed.version !== 1 && parsed.version !== 2 && parsed.version !== 3)
       || !Array.isArray(parsed.bindings)
+      || parsed.bindings.length > 10_000
+      || Buffer.byteLength(JSON.stringify(parsed.bindings)) > 16 * 1024 * 1024
     ) {
       throw new Error("Unsupported Feishu group binding registry");
     }
     const map = new Map<string, FeishuGroupBinding>();
     const spaces = new Set<string>();
     for (const candidate of parsed.bindings) {
-      const binding = parseBinding(candidate);
+      const binding = parseBinding(parsed.version === 3 ? candidate : { ...candidate, executionScopeEpoch: randomUUID() });
       if (map.has(binding.chatId) || spaces.has(binding.spaceId)) {
         throw new Error("Duplicate Feishu group binding");
       }
@@ -463,50 +468,44 @@ export class FeishuGroupBindingStore {
     }
     return {
       bindings: map,
-      needsMigration: parsed.version === 1,
+      needsMigration: parsed.version !== 3,
     };
   }
 
   private persist(bindings: Map<string, FeishuGroupBinding>): void {
-    const configDir = dirname(this.configPath);
-    mkdirSync(configDir, { recursive: true, mode: 0o700 });
-    const temporaryPath =
-      `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
-    const file: FeishuGroupBindingsFileV2 = {
-      version: 2,
+    assertLocalStatePath(this.dataDir, this.configPath);
+    const file: FeishuGroupBindingsFileV3 = {
+      version: 3,
       bindings: [...bindings.values()].sort((a, b) =>
         a.chatId.localeCompare(b.chatId)
       ),
     };
-    try {
-      writeFileSync(temporaryPath, JSON.stringify(file, null, 2), {
-        encoding: "utf8",
-        mode: 0o600,
-      });
-      const fileDescriptor = openSync(temporaryPath, "r+");
-      try {
-        durableFsyncSync(fileDescriptor);
-      } finally {
-        closeSync(fileDescriptor);
-      }
-      durableRenameSync(temporaryPath, this.configPath);
-      const directoryDescriptor = openSync(configDir, "r");
-      try {
-        durableFsyncSync(directoryDescriptor, {
-          allowUnsupportedDirectoryOnWindows: true,
-        });
-      } finally {
-        closeSync(directoryDescriptor);
-      }
-    } catch (error) {
-      try {
-        unlinkSync(temporaryPath);
-      } catch {
-        // A successful rename consumes the temporary path.
-      }
-      throw error;
-    }
+    if (bindings.size > 10_000 || Buffer.byteLength(JSON.stringify(file.bindings)) > 16 * 1024 * 1024) throw new Error("Feishu group binding registry exceeds capacity");
+    for (const binding of bindings.values()) parseBinding(binding);
+    writeAtomicStateFile(this.configPath, JSON.stringify(file, null, 2));
   }
+
+  private commit(bindings: Map<string, FeishuGroupBinding>): void {
+    const candidate = new Map<string, FeishuGroupBinding>();
+    const spaces = new Set<string>();
+    for (const [chatId, binding] of bindings) {
+      const previous = this.bindings.get(chatId);
+      const epoch = previous && executionPolicyIdentity(previous) === executionPolicyIdentity(binding)
+        ? previous.executionScopeEpoch : randomUUID();
+      const next = parseBinding({ ...binding, executionScopeEpoch: epoch });
+      if (chatId !== next.chatId || spaces.has(next.spaceId)) throw new Error("Duplicate Feishu group binding");
+      spaces.add(next.spaceId);
+      candidate.set(chatId, next);
+    }
+    this.persist(candidate);
+    this.bindings = candidate;
+    this.changes.notify();
+  }
+}
+
+function executionPolicyIdentity(binding: FeishuGroupBinding): string {
+  return JSON.stringify([binding.chatId, binding.spaceId, binding.boundAppId, binding.state,
+    binding.responseMode, binding.participationLevel, binding.replyInThread]);
 }
 
 const MAX_STORED_ERROR_LENGTH = 500;
@@ -583,8 +582,11 @@ function parseBinding(candidate: unknown): FeishuGroupBinding {
   if (
     typeof binding.chatId !== "string"
     || !binding.chatId.trim()
+    || binding.chatId.length > 256
+    || !isExecutionScopeEpoch(binding.executionScopeEpoch)
     || typeof binding.spaceId !== "string"
     || !isSpaceId(binding.spaceId)
+    || binding.spaceId.length > 256
     || !binding.spaceId.startsWith("team/")
     || typeof binding.state !== "string"
     || !BINDING_STATES.includes(binding.state as FeishuGroupBindingState)
@@ -596,7 +598,7 @@ function parseBinding(candidate: unknown): FeishuGroupBinding {
     || !Number.isFinite(binding.createdAt)
     || !Number.isFinite(binding.updatedAt)
     || (binding.boundAppId !== undefined
-      && typeof binding.boundAppId !== "string")
+      && (typeof binding.boundAppId !== "string" || !binding.boundAppId.trim() || binding.boundAppId.length > 256))
     || (binding.lastVerifiedAt !== undefined
       && !Number.isFinite(binding.lastVerifiedAt))
     || (

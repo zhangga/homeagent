@@ -519,7 +519,7 @@ describe("TaskRunStore", () => {
       }),
       approvalNotification: { status: "pending", attempts: 0 },
     }));
-    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(12);
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(13);
   });
 
   test("rejects pending approval as a durable cancelled run", () => {
@@ -630,7 +630,7 @@ describe("TaskRunStore", () => {
       finishedAt: expect.any(Number),
       error: expect.stringMatching(/approval/i),
     }));
-    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(12);
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(13);
   });
 
   test("preserves an unapproved legacy running write run as a durable failure", () => {
@@ -672,7 +672,7 @@ describe("TaskRunStore", () => {
         error: expect.stringMatching(/approval/i),
       }));
       expect(new TaskRunStore(dir).get(run.id)?.finishedAt).toBe(460);
-      expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(12);
+      expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(13);
     } finally {
       clock.mockRestore();
     }
@@ -715,12 +715,12 @@ describe("TaskRunStore", () => {
       decidedBy: "homeagent.archive-v10",
       reason: expect.stringMatching(/not recorded/i),
     });
-    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(12);
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(13);
 
     const dishonest = JSON.parse(readFileSync(path, "utf8"));
     dishonest.runs[run.id].approval.decidedAt = 551;
     writeFileSync(path, JSON.stringify(dishonest), "utf8");
-    expect(new TaskRunStore(dir).get(run.id)).toBeUndefined();
+    expect(() => new TaskRunStore(dir)).toThrow("refusing to overwrite");
   });
 
   test("rejects a current v8 risky run whose approval audit was removed", () => {
@@ -750,9 +750,7 @@ describe("TaskRunStore", () => {
     delete corrupted.runs[run.id].approval;
     writeFileSync(path, JSON.stringify(corrupted), "utf8");
 
-    const reopened = new TaskRunStore(dir);
-    expect(reopened.get(run.id)).toBeUndefined();
-    expect(reopened.list()).toEqual([]);
+    expect(() => new TaskRunStore(dir)).toThrow("refusing to overwrite");
   });
 
   test("terminal transitions clamp rollback timestamps and survive restart", () => {
@@ -921,7 +919,7 @@ describe("TaskRunStore", () => {
     corrupted.runs[pending.id].runStartedAt = 6_050;
     writeFileSync(path, JSON.stringify(corrupted), "utf8");
 
-    expect(new TaskRunStore(dir).get(pending.id)).toBeUndefined();
+    expect(() => new TaskRunStore(dir)).toThrow("refusing to overwrite");
   });
 
   test("terminal runs cannot be rewritten by another terminal transition", () => {
@@ -1286,7 +1284,7 @@ describe("TaskRunStore", () => {
       },
     });
     expect(JSON.parse(readFileSync(join(dir, "config", "task-runs.json"), "utf8")).version)
-      .toBe(12);
+      .toBe(13);
   });
 
   test("rejects an invalid resolved execution plan before persisting a run", () => {
@@ -1364,7 +1362,7 @@ describe("TaskRunStore", () => {
       }],
       skipped: [],
     });
-    expect(JSON.parse(readFileSync(join(dir, "config", "task-runs.json"), "utf8")).version).toBe(12);
+    expect(JSON.parse(readFileSync(join(dir, "config", "task-runs.json"), "utf8")).version).toBe(13);
   });
 
   test("rejects unbounded Skill evidence before persisting a run", () => {
@@ -1451,6 +1449,6 @@ describe("TaskRunStore", () => {
     legacy.version = 99;
     delete legacy.runs[run.id]!.provider;
     writeFileSync(path, JSON.stringify(legacy), "utf8");
-    expect(new TaskRunStore(dir).list()).toEqual([]);
+    expect(() => new TaskRunStore(dir)).toThrow("unsupported");
   });
 });

@@ -4,6 +4,7 @@ import type {
   AgentChatRecord,
   AgentInput,
   AgentRevision,
+  AgentReadinessSnapshot,
   AgentSkillBinding,
   SkillCatalogSnapshot,
   SkillRootKind,
@@ -37,6 +38,7 @@ export interface AgentEditorValues {
   reasoningEffort: string;
   visibility: string;
   permission: string;
+  executionMode?: string;
   workdir: string;
   skills: string;
   /** Exact source keys submitted by the catalog selector. */
@@ -104,6 +106,7 @@ export interface AgentInspectorView {
     name: string;
     available: boolean;
     statusLabel: string;
+    nativeCommandsLabel?: string;
     detail: string;
     recovery?: {
       kind: "codex-auth" | "codex-windows-sandbox" | "cli";
@@ -130,6 +133,7 @@ export interface AgentRevisionView {
   provider: string;
   model: string;
   permission: string;
+  executionMode?: string;
   published: boolean;
   draft: boolean;
 }
@@ -155,6 +159,18 @@ export interface AgentWorkbenchView {
   skillCatalog: AgentSkillCatalogView;
   flash?: string;
   formError?: string;
+  localExecution?: AgentLocalExecutionView;
+  readiness?: { csrfToken: string; snapshot: AgentReadinessSnapshot };
+}
+
+export interface AgentLocalExecutionView {
+  csrfToken: string;
+  confirmationUrl?: string;
+  confirmed: boolean;
+  confirmedScopes: number;
+  pendingScopes: number;
+  taskExecutionEnabled: boolean;
+  activeGrants: number;
 }
 
 export type AgentSkillCatalogStatus =
@@ -219,6 +235,8 @@ export interface BuildAgentWorkbenchInput {
   draft?: AgentRevision;
   /** Preserve a stale CAS token on conflict pages until the user explicitly reloads. */
   expectedHeadRevisionId?: string;
+  localExecution?: AgentLocalExecutionView;
+  readiness?: { csrfToken: string; snapshot: AgentReadinessSnapshot };
 }
 
 export interface AgentValidationContext {
@@ -286,7 +304,8 @@ function detectedProvider(
 
 const CODEX_AUTH_UNAVAILABLE_DETAIL = "HomeAgent 尚未连接当前 Codex 账号";
 
-function providerStatusLabel(provider: DetectedProvider | undefined): string {
+function providerStatusLabel(provider: DetectedProvider | undefined, full = false): string {
+  if (provider?.available && full) return "CLI 已连接 · 本机完全访问（未隔离）";
   if (
     provider?.available
     && provider.nativeSessions === false
@@ -309,7 +328,9 @@ function providerRecovery(
   providerId: string,
   provider: DetectedProvider | undefined,
   sandboxSetup?: CodexWindowsSandboxSetupSession,
+  full = false,
 ): AgentInspectorView["provider"]["recovery"] {
+  if (provider?.available && full) return undefined;
   if (
     providerId === "codex"
     && provider?.available
@@ -331,7 +352,7 @@ function providerRecovery(
   if (providerId === "codex" && provider?.available && provider.nativeSessions === false) {
     return {
       kind: "cli", title: "原生话题隔离未通过",
-      description: `${provider.nativeSessionIssue ? NATIVE_SESSION_ISSUE_LABELS[provider.nativeSessionIssue] : "当前隔离检查未通过"}。CLI 连接可用不代表话题隔离可用；不能通过 full 或重复登录绕过。修复本机隔离能力后可重新检测。`,
+      description: `${provider.nativeSessionIssue ? NATIVE_SESSION_ISSUE_LABELS[provider.nativeSessionIssue] : "当前隔离检查未通过"}。CLI 连接可用不代表话题隔离可用；请修复隔离后复检，或在执行模式中可明确选择本机完全访问并确认风险。仅修改 full 不会授权；完全访问不是隔离通过，也不会自动切换。`,
       actionLabel: "重新检测",
     };
   }
@@ -382,6 +403,9 @@ export function editorValuesFor(
     reasoningEffort: agent?.reasoningEffort ?? "",
     visibility: agent?.visibility ?? "Team",
     permission: agent?.permission ?? "read-only",
+    executionMode: initialProvider === "codex"
+      ? agent?.executionMode ?? (agent?.permission === "full" ? "" : "isolated")
+      : "",
     workdir: agent?.workdir ?? "",
     skills: (agent?.skills ?? []).map((binding) => binding.name).join(", "),
     skillSourceKeys: (agent?.skills ?? [])
@@ -581,6 +605,11 @@ export function validateAgentEditor(
   if (!AGENT_PERMISSIONS.includes(permission as Agent["permission"])) {
     errors.permission = "请选择有效的任务权限";
   }
+  if (provider === "codex") {
+    const mode = values.executionMode || (permission === "full" ? "" : "isolated");
+    if (mode !== "isolated" && mode !== "local-full-access") errors.executionMode = "请选择 Codex 执行模式；旧 full 配置必须重新确认";
+    else if ((mode === "local-full-access") !== (permission === "full")) errors.executionMode = "隔离模式使用 read-only/write；本机完全访问必须使用 full 并确认发布";
+  } else if (values.executionMode) errors.executionMode = "只有 Codex 支持此执行模式";
   if (values.workdir.length > MAX_WORKDIR_LENGTH) {
     errors.workdir = `Workdir 不能超过 ${MAX_WORKDIR_LENGTH} 个字符`;
   } else if ((permission === "write" || permission === "full") && !values.workdir.trim()) {
@@ -676,8 +705,11 @@ export function agentInputForEditor(
   catalog: SkillCatalogSnapshot | undefined,
   current?: Agent | null,
 ): AgentInput {
+  const executionMode = values.provider === "codex"
+    ? values.executionMode || (values.permission === "full" ? undefined : "isolated")
+    : undefined;
   if (values.skillSourceKeys === undefined) {
-    return { ...values, skills: values.skills };
+    return { ...values, executionMode, skills: values.skills };
   }
   const catalogByKey = new Map(
     catalog?.sources.map((source) => [source.sourceKey, source]) ?? [],
@@ -708,6 +740,7 @@ export function agentInputForEditor(
     reasoningEffort: values.reasoningEffort,
     visibility: values.visibility,
     permission: values.permission,
+    executionMode,
     workdir: values.workdir,
     skills,
   };
@@ -747,14 +780,15 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
   const list = input.agents.map((agent) => {
     const provider = detectedProvider(input.providers, agent.provider);
     const available = provider?.available === true;
-    const fullyAvailable = available && provider?.nativeSessions !== false;
+    const full = agent.executionMode === "local-full-access";
+    const fullyAvailable = available && !full && provider?.nativeSessions !== false;
     return {
       id: agent.id,
       name: agent.name,
       providerName: provider?.name ?? agent.provider,
       modelLabel: effectiveModel(agent, input.defaults),
       readiness: fullyAvailable ? "ready" as const : "unavailable" as const,
-      readinessLabel: providerStatusLabel(provider),
+      readinessLabel: providerStatusLabel(provider, full),
       running: runningAgentIds.has(agent.id),
       selected: input.selected?.id === agent.id,
     };
@@ -875,12 +909,14 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
         id: input.selected.provider,
         name: provider?.name ?? input.selected.provider,
         available: provider?.available === true,
-        statusLabel: providerStatusLabel(provider),
+        statusLabel: providerStatusLabel(provider, input.selected.executionMode === "local-full-access"),
+        nativeCommandsLabel: provider?.id === "codex" ? provider.nativeSessionCommands === true ? "支持" : provider.nativeSessionCommands === false ? "不支持或检查失败" : "未单独检测" : undefined,
         detail: provider?.detail ?? "未检测到此 CLI",
         recovery: providerRecovery(
           input.selected.provider,
           provider,
           input.codexWindowsSandboxSetup,
+          input.selected.executionMode === "local-full-access",
         ),
       },
       bindings: input.bindings.map((binding) => ({
@@ -926,6 +962,7 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
             provider: revision.snapshot.provider,
             model: revision.snapshot.model || "CLI 默认模型",
             permission: revision.snapshot.permission,
+            executionMode: revision.snapshot.provider === "codex" ? revision.snapshot.executionMode ?? (revision.snapshot.permission === "full" ? "legacy-full" : "isolated") : undefined,
             published: revision.id === input.selected?.publishedRevisionId,
             draft: revision.source === "draft" && revision.id === input.draft?.id,
           })),
@@ -939,6 +976,8 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
     ),
     flash: input.flash,
     formError: input.formError,
+    localExecution: input.localExecution,
+    readiness: input.readiness,
   };
 }
 

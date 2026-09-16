@@ -11,6 +11,8 @@ import type {
 import type { DetectedProvider } from "@homeagent/llm";
 import {
   buildAgentWorkbench,
+  agentInputForEditor,
+  editorValuesFor,
   generatedAgentName,
   validateAgentEditor,
   type AgentEditorValues,
@@ -46,6 +48,24 @@ const providers: DetectedProvider[] = [
     detail: "未找到命令",
   },
 ];
+
+test("the editor preserves explicit Codex execution mode and refuses legacy full or conflicting permissions", () => {
+  const workdir = mkdtempSync(join(tmpdir(), "ha-editor-mode-"));
+  try {
+    const current = { ...agent, executionMode: "local-full-access" as const, permission: "full" as const, workdir };
+    const defaults = { provider: "codex", model: "gpt-5.6-sol" };
+    const values = editorValuesFor(current, providers, defaults);
+    expect(values.executionMode).toBe("local-full-access");
+    expect(agentInputForEditor(values, undefined, current).executionMode).toBe("local-full-access");
+    const context = { providers, defaults, current };
+    expect(validateAgentEditor(values, context).ok).toBe(true);
+    for (const executionMode of [undefined, "", "isolated", "invalid"]) {
+      expect(validateAgentEditor({ ...values, executionMode }, context).errors.executionMode).toBeDefined();
+    }
+    expect(validateAgentEditor({ ...values, permission: "write" }, context).errors.executionMode).toBeDefined();
+    expect(validateAgentEditor({ ...values, provider: "claude", reasoningEffort: "" }, context).errors.executionMode).toBeDefined();
+  } finally { rmSync(workdir, { recursive: true, force: true }); }
+});
 
 const bindings: SpaceMeta[] = [
   {

@@ -618,6 +618,20 @@ describe("FeishuConnector outbound", () => {
     expect(cmd).toContain("bot");
   });
 
+  test("reply and notice send local file paths as text while preserving web evidence links", async () => {
+    const commands: string[][] = [];
+    connector = new FeishuConnector({ spawner: new FakeSpawner(), runCommand: async cmd => { commands.push(cmd); return "{}"; } });
+    const markdown = "[交接文件](D:/Client/homeagent-chat-raw.json)\n[原始消息](https://example.com/message)";
+    await connector.reply({ chatId: "oc_one", replyToMessageId: "om_one", markdown });
+    await connector.notice("oc_one", markdown);
+    for (const cmd of commands) {
+      const sent = cmd[cmd.indexOf("--markdown") + 1]!;
+      expect(sent).toContain("本机文件：` D:/Client/homeagent-chat-raw.json `");
+      expect(sent).not.toContain("](D:");
+      expect(sent).toContain("[原始消息](https://example.com/message)");
+    }
+  });
+
   test("reply retries one logical delivery with a bounded opaque idempotency key", async () => {
     const commands: string[][] = [];
     connector = new FeishuConnector({

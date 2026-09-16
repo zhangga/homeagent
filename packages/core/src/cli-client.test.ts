@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetConfig } from "@homeagent/shared";
 import { localDay, ProviderRunError, spentToday } from "@homeagent/llm";
-import { CliCompletionError, extractJson, makeCliClient } from "./cli-client.ts";
+import { CliCompletionError, extractJson, makeCliClient, type RunProviderFn } from "./cli-client.ts";
 import { observeLlmUsage, RunUsageAccumulator } from "./usage.ts";
 
 const testAccountingDataDir = mkdtempSync(join(tmpdir(), "ha-cli-client-suite-"));
@@ -43,6 +43,24 @@ describe("extractJson", () => {
 });
 
 describe("makeCliClient", () => {
+  test("forwards the frozen full mode and per-process permit for routing and final calls", async () => {
+    const seen: Parameters<RunProviderFn>[1][] = [];
+    const permit = () => ({ register: () => () => {}, release: () => {} });
+    const cli = makeCliClient("codex", undefined, testAccountingDataDir, async (_id, input) => {
+      seen.push(input); return '{"ok":true}';
+    }, undefined, undefined, undefined,
+    { permission: "full", executionMode: "local-full-access", workdir: testAccountingDataDir, skills: [] },
+    [], testAccountingDataDir, [], true, permit);
+    await cli.completeJSON({ prompt: "route", schema: { type: "object" } });
+    await cli.complete({ prompt: "final" });
+    expect(seen).toHaveLength(2);
+    for (const input of seen) {
+      expect(input.execution?.executionMode).toBe("local-full-access");
+      expect(input.acquireExecutionPermit).toBe(permit);
+      expect(input.nativeTopic).toBe(true);
+      expect(input.prompt).not.toContain("acquireExecutionPermit");
+    }
+  });
   test("forwards private evidence observers for text and JSON calls without adding them to prompts", async () => {
     let observed = 0;
     const client = makeCliClient("codex", undefined, testAccountingDataDir, async (_id, input) => {
@@ -313,13 +331,13 @@ describe("makeCliClient", () => {
     expect(seen).toHaveLength(2);
     expect(seen[0]).toEqual(expect.objectContaining({
       nativeSession: undefined,
-      nativeSessionIsolation: true,
+      nativeTopic: true,
       protectedDataRoot: testAccountingDataDir,
       skillInputs: [skillInput],
     }));
     expect(seen[1]).toEqual(expect.objectContaining({
       nativeSession: { mode: "start" },
-      nativeSessionIsolation: true,
+      nativeTopic: true,
       protectedDataRoot: testAccountingDataDir,
       skillInputs: [skillInput],
     }));

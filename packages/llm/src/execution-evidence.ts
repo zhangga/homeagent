@@ -1,5 +1,6 @@
 /** Private local audit metadata. Never persist commands, output, paths or resource names. */
 import { isProviderPreparationFailure, type ProviderPreparationFailure } from "./provider-preparation.ts";
+import { isCodexExecutionMode, type CodexExecutionMode } from "./codex-execution-policy.ts";
 const OPERATIONS = ["chat-list", "chat-search", "chat-messages-list", "messages-search", "messages-mget", "threads-messages-list", "auth-status"] as const;
 type Operation = typeof OPERATIONS[number];
 type Identity = "user" | "bot";
@@ -20,6 +21,14 @@ export interface ProviderExecutionEvidence {
   source: "codex-jsonl";
   events: ToolExecutionEvidence[];
   truncated: boolean;
+  execution?: ProviderExecutionMetadata;
+}
+export interface ProviderExecutionMetadata {
+  executionMode: CodexExecutionMode;
+  sandboxCheck: "passed" | "failed" | "not-applicable" | "not-checked";
+  effectiveSandbox: "permission-profile" | "read-only" | "workspace-write" | "danger-full-access";
+  process: "not-started" | "started";
+  model: "unknown" | "verified";
 }
 export interface ExecutionEvidence {
   calls: ProviderExecutionEvidence[];
@@ -34,12 +43,29 @@ const identity = (value: unknown): value is Identity => value === "user" || valu
 const count = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 1_000_000;
 const keys = (value: Record<string, unknown>, allowed: string[]) => Object.keys(value).every(key => allowed.includes(key));
 
+function isExecutionMetadata(value: unknown): value is ProviderExecutionMetadata {
+  if (!record(value) || !keys(value, ["executionMode", "sandboxCheck", "effectiveSandbox", "process", "model"])
+    || !isCodexExecutionMode(value.executionMode)
+    || !["passed", "failed", "not-applicable", "not-checked"].some(item => item === value.sandboxCheck)
+    || !["permission-profile", "read-only", "workspace-write", "danger-full-access"].some(item => item === value.effectiveSandbox)
+    || !["not-started", "started"].some(item => item === value.process)
+    || !["unknown", "verified"].some(item => item === value.model)
+    || (value.process === "not-started" && value.model === "verified")) return false;
+  if (value.executionMode === "local-full-access") {
+    return value.sandboxCheck === "not-applicable" && value.effectiveSandbox === "danger-full-access";
+  }
+  if (value.effectiveSandbox === "danger-full-access" || value.sandboxCheck === "not-applicable") return false;
+  if (value.effectiveSandbox !== "permission-profile") return value.sandboxCheck === "not-checked";
+  return value.process !== "started" || value.sandboxCheck === "passed";
+}
+
 export function isExecutionEvidence(value: unknown): value is ExecutionEvidence {
   if (!record(value) || !keys(value, ["calls", "truncated", "preparationFailure"]) || typeof value.truncated !== "boolean"
     || (value.preparationFailure !== undefined && !isProviderPreparationFailure(value.preparationFailure))
     || !Array.isArray(value.calls) || value.calls.length > MAX_CALLS) return false;
-  return value.calls.every(call => record(call) && keys(call, ["source", "events", "truncated"])
+  return value.calls.every(call => record(call) && keys(call, ["source", "events", "truncated", "execution"])
     && call.source === "codex-jsonl" && typeof call.truncated === "boolean"
+    && (call.execution === undefined || isExecutionMetadata(call.execution))
     && Array.isArray(call.events) && call.events.length <= MAX_EVENTS && call.events.every(event => {
       if (!record(event) || !keys(event, ["kind", "status", "exitCode", "lark"])
         || typeof event.kind !== "string" || !["command", "file-change", "mcp", "web-search"].includes(event.kind)

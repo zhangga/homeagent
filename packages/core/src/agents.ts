@@ -29,6 +29,7 @@ import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type {
   CodexReasoningEffort,
+  CodexExecutionMode,
   ProviderExecution,
   ProviderExecutionPermission,
   ProviderId,
@@ -39,9 +40,18 @@ import {
   isCliProvider,
   isCodexReasoningEffortSupported,
   normalizeProviderSkills,
+  isCodexExecutionMode,
+  validateCodexFullAccessWorkdir,
 } from "@homeagent/llm";
 import { canonicalModelId, logger, type SpaceId } from "@homeagent/shared";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
+import { CommittedStateChanges } from "./committed-state-changes.ts";
+import { pruneLocalExecutionGrants } from "./local-execution-retention.ts";
+import {
+  cloneLocalExecutionGrant, isLocalExecutionGrant, normalizeLocalExecutionConfirmation,
+  MAX_LOCAL_EXECUTION_GRANTS, MAX_LOCAL_EXECUTION_GRANTS_PER_AGENT, MAX_LOCAL_EXECUTION_GRANT_BYTES,
+  type LocalExecutionConfirmation, type LocalExecutionGrant,
+} from "./local-execution-grants.ts";
 import {
   isAgentRevisionId,
   MAX_EXECUTION_PLAN_INSTRUCTION_CHARACTERS,
@@ -90,6 +100,7 @@ export interface Agent {
   workdir?: string;
   /** Task execution permission tier. */
   permission: AgentPermission;
+  executionMode?: CodexExecutionMode;
   /** Exact local Skill sources selected for this Agent, plus unresolved legacy names. */
   skills: AgentSkillBinding[];
   /** Immutable revision currently used by get()/list() and runtime calls. */
@@ -107,6 +118,7 @@ export interface AgentRevisionSnapshot {
   visibility: AgentVisibility;
   workdir?: string;
   permission: AgentPermission;
+  executionMode?: CodexExecutionMode;
   skills: AgentSkillBinding[];
 }
 
@@ -140,22 +152,27 @@ export interface AgentInput {
   visibility?: string;
   workdir?: string;
   permission?: string;
+  executionMode?: string;
   /** Source-bound Skills. String values are accepted only for legacy callers. */
   skills?: AgentSkillBinding[] | string | string[];
 }
 
-interface AgentsFileV4 {
-  version: 4;
+interface AgentsFileV5 {
+  version: 5;
   agents: Record<string, Agent>;
   revisions: Record<string, AgentRevision[]>;
+  localExecutionGrants: Record<string, LocalExecutionGrant>;
 }
 
 interface AgentStoreState {
   agents: Map<string, Agent>;
   revisions: Map<string, AgentRevision[]>;
+  localExecutionGrants: Map<string, LocalExecutionGrant>;
 }
 
 export interface AgentStoreOptions {
+  /** Trusted synchronous Core reader; absent/unknown means no authorization records may be evicted. */
+  referencedLocalExecutionGrantIds?: () => ReadonlySet<string> | undefined;
   resolveLegacySkill?: (
     name: string,
     provider: ProviderId,
@@ -315,6 +332,7 @@ function isCurrentAgentRecord(value: unknown, id: string): value is Agent {
     ))
     && typeof candidate.permission === "string"
     && AGENT_PERMISSIONS.includes(candidate.permission as AgentPermission)
+    && validExecutionMode(candidate)
     && isPersistedSkillBindings(candidate.skills)
     && (candidate.publishedRevisionId === undefined
       || isAgentRevisionId(candidate.publishedRevisionId))
@@ -323,6 +341,11 @@ function isCurrentAgentRecord(value: unknown, id: string): value is Agent {
     && typeof candidate.updatedAt === "number"
     && Number.isFinite(candidate.updatedAt)
     && candidate.updatedAt >= candidate.createdAt;
+}
+
+function validExecutionMode(value: Pick<Partial<Agent>, "executionMode" | "provider" | "permission">): boolean {
+  return value.executionMode === undefined || (value.provider === "codex" && isCodexExecutionMode(value.executionMode)
+    && (value.executionMode === "local-full-access" ? value.permission === "full" : value.permission !== "full"));
 }
 
 function assertAgentInputFitsExecutionPlan(input: AgentInput): void {
@@ -392,8 +415,11 @@ function normalizeAgentForPersistence(agent: Agent): Agent {
 
 function cloneAgent(agent: Agent): Agent {
   return {
-    ...agent,
-    skills: agent.skills.map((binding) => ({ ...binding })),
+    id: agent.id,
+    ...snapshotFromAgent(agent),
+    publishedRevisionId: agent.publishedRevisionId,
+    createdAt: agent.createdAt,
+    updatedAt: agent.updatedAt,
   };
 }
 
@@ -406,7 +432,12 @@ function cloneRevisionSnapshot(snapshot: AgentRevisionSnapshot): AgentRevisionSn
 
 function cloneRevision(revision: AgentRevision): AgentRevision {
   return {
-    ...revision,
+    id: revision.id,
+    agentId: revision.agentId,
+    number: revision.number,
+    source: revision.source,
+    ...(revision.basedOnRevisionId === undefined ? {} : { basedOnRevisionId: revision.basedOnRevisionId }),
+    createdAt: revision.createdAt,
     snapshot: cloneRevisionSnapshot(revision.snapshot),
   };
 }
@@ -421,6 +452,7 @@ function snapshotFromAgent(agent: Agent): AgentRevisionSnapshot {
     visibility: agent.visibility,
     workdir: agent.workdir,
     permission: agent.permission,
+    ...(agent.executionMode === undefined ? {} : { executionMode: agent.executionMode }),
     skills: agent.skills.map((binding) => ({ ...binding })),
   };
 }
@@ -610,27 +642,35 @@ export function resolveAgentExecution(agent?: Agent): AgentExecution {
   }
   return {
     permission,
+    ...(agent?.executionMode === undefined ? {} : { executionMode: agent.executionMode }),
     workdir,
     skills: [],
   };
 }
 
 export class AgentStore {
+  private readonly changes = new CommittedStateChanges();
+
+  onCommittedChange(listener: () => void): () => void { return this.changes.subscribe(listener); }
   private configPath: string;
   private backupPath: string;
   private agents: Map<string, Agent>;
   private revisions: Map<string, AgentRevision[]>;
+  private localExecutionGrants = new Map<string, LocalExecutionGrant>();
   private readonly resolveLegacySkill?: AgentStoreOptions["resolveLegacySkill"];
   private readonly validateSourceSkill?: AgentStoreOptions["validateSourceSkill"];
+  private readonly referencedLocalExecutionGrantIds?: AgentStoreOptions["referencedLocalExecutionGrantIds"];
 
   constructor(dataDir: string, options: AgentStoreOptions = {}) {
     this.configPath = join(dataDir, "config", "agents.json");
     this.backupPath = `${this.configPath}.bak`;
     this.resolveLegacySkill = options.resolveLegacySkill;
     this.validateSourceSkill = options.validateSourceSkill;
+    this.referencedLocalExecutionGrantIds = options.referencedLocalExecutionGrantIds;
     const loaded = this.load();
     this.agents = loaded.agents;
     this.revisions = loaded.revisions;
+    this.localExecutionGrants = loaded.localExecutionGrants;
   }
 
   private normalizeInputSkills(
@@ -684,6 +724,7 @@ export class AgentStore {
   private read(path: string): AgentStoreState & { migrated: boolean } {
     const agents = new Map<string, Agent>();
     const revisions = new Map<string, AgentRevision[]>();
+    const localExecutionGrants = new Map<string, LocalExecutionGrant>();
     const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
     if (
       !parsed
@@ -696,7 +737,7 @@ export class AgentStore {
     if (
       typeof rawVersion === "number"
       && Number.isInteger(rawVersion)
-      && rawVersion > 4
+      && rawVersion > 5
     ) {
       throw new UnsupportedAgentConfigVersionError(rawVersion);
     }
@@ -706,6 +747,7 @@ export class AgentStore {
       && rawVersion !== 2
       && rawVersion !== 3
       && rawVersion !== 4
+      && rawVersion !== 5
     ) {
       throw new Error(`Invalid Agent config schema: ${path}`);
     }
@@ -717,7 +759,7 @@ export class AgentStore {
     ) {
       throw new Error(`Invalid Agent config schema: ${path}`);
     }
-    if (rawVersion === 4) {
+    if (rawVersion === 4 || rawVersion === 5) {
       if (
         !("revisions" in parsed)
         || !parsed.revisions
@@ -732,6 +774,7 @@ export class AgentStore {
           throw new Error(`Invalid Agent config entry: ${path}#${id}`);
         }
         const agent = cloneAgent(value);
+        if (rawVersion === 4 && agent.executionMode !== undefined) throw new Error("旧 Agent 格式不能携带执行模式");
         const rawRevisions = revisionTable[id];
         if (
           !Array.isArray(rawRevisions)
@@ -744,6 +787,7 @@ export class AgentStore {
           if (!isAgentRevision(revision, agent)) {
             throw new Error(`Invalid Agent revision: ${path}#${id}`);
           }
+          if (rawVersion === 4 && revision.snapshot.executionMode !== undefined) throw new Error("旧 Agent 格式不能携带执行模式");
           return cloneRevision(revision);
         });
         assertAgentRevisionHistory(agent, history, `Invalid Agent revisions: ${path}#${id}`);
@@ -753,7 +797,19 @@ export class AgentStore {
       for (const id of Object.keys(revisionTable)) {
         if (!agents.has(id)) throw new Error(`Orphan Agent revisions: ${path}#${id}`);
       }
-      return { agents, revisions, migrated: false };
+      if (rawVersion === 5) {
+        if (!("localExecutionGrants" in parsed) || !parsed.localExecutionGrants
+          || typeof parsed.localExecutionGrants !== "object" || Array.isArray(parsed.localExecutionGrants)) {
+          throw new Error("本机完全访问确认集合无效");
+        }
+        this.assertGrantTableBounds(parsed.localExecutionGrants);
+        for (const [id, grant] of Object.entries(parsed.localExecutionGrants)) {
+          if (!isLocalExecutionGrant(grant) || grant.id !== id) throw new Error("本机完全访问确认无效");
+          localExecutionGrants.set(id, cloneLocalExecutionGrant(grant));
+        }
+        this.assertGrantState(agents, revisions, localExecutionGrants);
+      }
+      return { agents, revisions, localExecutionGrants, migrated: rawVersion !== 5 };
     }
 
     const legacyAgentSchema = rawVersion !== 3;
@@ -787,6 +843,7 @@ export class AgentStore {
         throw new Error(`Invalid Agent config entry: ${path}#${id}`);
       }
       const a = { ...candidate } as Agent;
+      if (a.executionMode !== undefined) throw new Error("旧 Agent 格式不能携带执行模式");
       // Migrate older files: unknown/legacy providers (e.g. "gateway",
       // which is no longer selectable) normalize to the default CLI.
       const normalized = normalizeProvider(a.provider as string | undefined);
@@ -833,12 +890,12 @@ export class AgentStore {
       agents.set(id, published);
       revisions.set(id, [revision]);
     }
-    return { agents, revisions, migrated };
+    return { agents, revisions, localExecutionGrants, migrated };
   }
 
   private load(): AgentStoreState {
     if (!existsSync(this.configPath) && !existsSync(this.backupPath)) {
-      return { agents: new Map(), revisions: new Map() };
+      return { agents: new Map(), revisions: new Map(), localExecutionGrants: new Map() };
     }
     let loaded: AgentStoreState & { migrated: boolean };
     let recovered = false;
@@ -867,11 +924,19 @@ export class AgentStore {
     }
     // Rewrite once so the on-disk file reflects a migration or recovery.
     if (loaded.migrated || recovered) {
-      this.persist(loaded.agents, loaded.revisions);
+      if (recovered) {
+        for (const grant of loaded.localExecutionGrants.values()) {
+          if (grant.revokedAt === undefined) {
+            grant.revokedAt = Math.max(Date.now(), grant.confirmedAt);
+            grant.revocationReason = "backup-recovery";
+          }
+        }
+      }
+      this.persist(loaded.agents, loaded.revisions, loaded.localExecutionGrants);
     } else {
-      this.ensureRecoveryCopy(loaded.agents, loaded.revisions);
+      this.ensureRecoveryCopy(loaded.agents, loaded.revisions, loaded.localExecutionGrants);
     }
-    return { agents: loaded.agents, revisions: loaded.revisions };
+    return { agents: loaded.agents, revisions: loaded.revisions, localExecutionGrants: loaded.localExecutionGrants };
   }
 
   private writeAtomic(path: string, contents: string): void {
@@ -927,11 +992,14 @@ export class AgentStore {
   private serialize(
     agents: Map<string, Agent>,
     revisions: Map<string, AgentRevision[]>,
+    localExecutionGrants: Map<string, LocalExecutionGrant>,
   ): string {
-    const file: AgentsFileV4 = {
-      version: 4,
+    this.assertGrantState(agents, revisions, localExecutionGrants);
+    const file: AgentsFileV5 = {
+      version: 5,
       agents: Object.fromEntries(agents),
       revisions: Object.fromEntries(revisions),
+      localExecutionGrants: Object.fromEntries(localExecutionGrants),
     };
     return JSON.stringify(file, null, 2);
   }
@@ -939,8 +1007,9 @@ export class AgentStore {
   private ensureRecoveryCopy(
     agents: Map<string, Agent>,
     revisions: Map<string, AgentRevision[]>,
+    localExecutionGrants: Map<string, LocalExecutionGrant>,
   ): void {
-    const contents = this.serialize(agents, revisions);
+    const contents = this.serialize(agents, revisions, localExecutionGrants);
     let current = false;
     if (existsSync(this.backupPath)) {
       try {
@@ -965,9 +1034,10 @@ export class AgentStore {
   private persist(
     agents = this.agents,
     revisions = this.revisions,
+    localExecutionGrants = this.localExecutionGrants,
   ): void {
     mkdirSync(dirname(this.configPath), { recursive: true, mode: 0o700 });
-    const contents = this.serialize(agents, revisions);
+    const contents = this.serialize(agents, revisions, localExecutionGrants);
     this.writeAtomic(this.configPath, contents);
     try {
       // The primary rename is the commit point. Refresh recovery only after it
@@ -988,6 +1058,7 @@ export class AgentStore {
     change: (
       candidateAgents: Map<string, Agent>,
       candidateRevisions: Map<string, AgentRevision[]>,
+      candidateGrants: Map<string, LocalExecutionGrant>,
     ) => T,
   ): T {
     const candidateAgents = new Map(
@@ -999,13 +1070,37 @@ export class AgentStore {
         history.map(cloneRevision),
       ]),
     );
-    const result = change(candidateAgents, candidateRevisions);
+    const candidateGrants = new Map([...this.localExecutionGrants].map(([id, grant]) => [id, cloneLocalExecutionGrant(grant)]));
+    const result = change(candidateAgents, candidateRevisions, candidateGrants);
     for (const [id, agent] of candidateAgents) {
       candidateAgents.set(id, normalizeAgentForPersistence(agent));
     }
-    this.persist(candidateAgents, candidateRevisions);
+    for (const [id, grant] of candidateGrants) {
+      const agent = candidateAgents.get(grant.agentId);
+      if (!agent) candidateGrants.delete(id);
+      else if (agent.executionMode !== "local-full-access" && grant.revokedAt === undefined) {
+        grant.revokedAt = Math.max(Date.now(), grant.confirmedAt);
+        grant.revocationReason = "mode-changed";
+      }
+    }
+    if ([...candidateGrants.keys()].some(id => !this.localExecutionGrants.has(id))) {
+      pruneLocalExecutionGrants(candidateGrants, () => {
+        const referenced = this.referencedLocalExecutionGrantIds?.();
+        if (!(referenced instanceof Set)) return undefined;
+        const protectedIds = new Set(referenced);
+        for (const grant of candidateGrants.values()) {
+          if (!this.localExecutionGrants.has(grant.id)
+            || this.agents.get(grant.agentId)?.publishedRevisionId === grant.agentRevisionId
+            || candidateAgents.get(grant.agentId)?.publishedRevisionId === grant.agentRevisionId) protectedIds.add(grant.id);
+        }
+        return protectedIds;
+      });
+    }
+    this.persist(candidateAgents, candidateRevisions, candidateGrants);
     this.agents = candidateAgents;
     this.revisions = candidateRevisions;
+    this.localExecutionGrants = candidateGrants;
+    this.changes.notify();
     return result;
   }
 
@@ -1026,6 +1121,57 @@ export class AgentStore {
 
   listRevisions(id: string): AgentRevision[] {
     return (this.revisions.get(id) ?? []).map(cloneRevision);
+  }
+
+  listLocalExecutionGrants(agentId: string): LocalExecutionGrant[] {
+    return [...this.localExecutionGrants.values()].filter(grant => grant.agentId === agentId).map(cloneLocalExecutionGrant);
+  }
+
+  /** Revoke all revisions, including queued runs bound to older publications. */
+  revokeLocalExecutionGrants(agentId: string, expectedHeadRevisionId: string): number {
+    if (!this.agents.has(agentId)) return 0;
+    if (!isAgentRevisionId(expectedHeadRevisionId)) throw new Error("本机完全访问确认必须指定当前版本");
+    this.assertExpectedHead(this.revisions.get(agentId) ?? [], expectedHeadRevisionId);
+    if (!this.listLocalExecutionGrants(agentId).some(grant => grant.revokedAt === undefined)) return 0;
+    return this.commit((_agents, _revisions, grants) => {
+      let count = 0;
+      for (const grant of grants.values()) {
+        if (grant.agentId !== agentId || grant.revokedAt !== undefined) continue;
+        grant.revokedAt = Math.max(Date.now(), grant.confirmedAt);
+        grant.revocationReason = "operator";
+        count++;
+      }
+      return count;
+    });
+  }
+
+  private assertGrantState(agents: Map<string, Agent>, revisions: Map<string, AgentRevision[]>, grants: Map<string, LocalExecutionGrant>): void {
+    this.assertGrantTableBounds(Object.fromEntries(grants));
+    const counts = new Map<string, number>();
+    const confirmedRevisions = new Set<string>();
+    for (const [id, grant] of grants) {
+      const agent = agents.get(grant.agentId);
+      const revision = revisions.get(grant.agentId)?.find(value => value.id === grant.agentRevisionId);
+      if (!isLocalExecutionGrant(grant) || grant.id !== id || !agent || !revision
+        || !["release", "rollback"].includes(revision.source) || revision.snapshot.executionMode !== "local-full-access"
+        || revision.snapshot.provider !== "codex" || revision.snapshot.permission !== "full"
+        || grant.confirmedAt < revision.createdAt || confirmedRevisions.has(revision.id)
+        || grant.chatScopes.some(scope => !agentVisibleInSpace({ ...agent, visibility: revision.snapshot.visibility }, scope.spaceId))) {
+        throw new Error("本机完全访问确认与发布版本不匹配");
+      }
+      confirmedRevisions.add(revision.id);
+      const count = (counts.get(grant.agentId) ?? 0) + 1;
+      if (count > MAX_LOCAL_EXECUTION_GRANTS_PER_AGENT) throw new Error("该 Agent 的本机完全访问确认超过上限");
+      counts.set(grant.agentId, count);
+    }
+  }
+
+  private assertGrantTableBounds(table: object): void {
+    // Use the same compact UTF-8 representation on read and before candidate persistence.
+    if (Object.keys(table).length > MAX_LOCAL_EXECUTION_GRANTS
+      || Buffer.byteLength(JSON.stringify(table), "utf8") > MAX_LOCAL_EXECUTION_GRANT_BYTES) {
+      throw new Error("本机完全访问确认集合超过上限");
+    }
   }
 
   /** Return only an unpublished draft; published heads are not drafts. */
@@ -1052,6 +1198,14 @@ export class AgentStore {
     if (input.visibility !== undefined) agent.visibility = normalizeVisibility(input.visibility);
     if (input.workdir !== undefined) agent.workdir = input.workdir.trim() || undefined;
     if (input.permission !== undefined) agent.permission = normalizePermission(input.permission);
+    if (input.executionMode !== undefined) {
+      if (!isCodexExecutionMode(input.executionMode)) throw new Error("Agent 执行模式无效");
+      agent.executionMode = input.executionMode;
+    }
+    if (input.provider !== undefined && agent.provider !== "codex" && input.executionMode === undefined) delete agent.executionMode;
+    if (!validExecutionMode(agent) || (agent.provider === "codex" && agent.permission === "full" && agent.executionMode === undefined)) {
+      throw new Error("Agent 执行模式与权限不匹配");
+    }
     if (input.skills !== undefined) {
       agent.skills = this.normalizeInputSkills(input.skills, agent.provider);
     }
@@ -1097,6 +1251,7 @@ export class AgentStore {
     const now = Date.now();
     const model = normalizeModel(input.model);
     const provider = normalizeProvider(input.provider);
+    if (input.executionMode !== undefined && !isCodexExecutionMode(input.executionMode)) throw new Error("Agent 执行模式无效");
     const identity: Agent = {
       id: `agent_${randomUUID()}`,
       name: input.name?.trim() || DEFAULT_AGENT_NAME,
@@ -1107,10 +1262,14 @@ export class AgentStore {
       visibility: normalizeVisibility(input.visibility),
       workdir: input.workdir?.trim() || undefined,
       permission: normalizePermission(input.permission),
+      ...(isCodexExecutionMode(input.executionMode) ? { executionMode: input.executionMode } : {}),
       skills: this.normalizeInputSkills(input.skills, provider),
       createdAt: now,
       updatedAt: now,
     };
+    if (!validExecutionMode(identity) || (provider === "codex" && identity.permission === "full" && identity.executionMode === undefined)) {
+      throw new Error("Agent 执行模式与权限不匹配");
+    }
     const revision = this.nextRevision(
       identity,
       [],
@@ -1179,6 +1338,7 @@ export class AgentStore {
     id: string,
     draftRevisionId?: string,
     expectedHeadRevisionId?: string,
+    confirmation?: LocalExecutionConfirmation,
   ): Agent | undefined {
     const current = this.agents.get(id);
     if (!current) return undefined;
@@ -1190,6 +1350,14 @@ export class AgentStore {
         ? history[0]
         : undefined;
     if (!draft) return undefined;
+    const consent = draft.snapshot.executionMode === "local-full-access"
+      ? normalizeLocalExecutionConfirmation(confirmation) : undefined;
+    if (consent && !expectedHeadRevisionId) throw new Error("本机完全访问确认必须指定当前版本");
+    if (!consent && confirmation !== undefined) throw new Error("隔离模式不能创建本机完全访问确认");
+    if (consent) validateCodexFullAccessWorkdir({
+      execution: { permission: "full", executionMode: "local-full-access", workdir: draft.snapshot.workdir, skills: [] },
+      protectedDataRoot: dirname(dirname(this.configPath)),
+    });
     const revision = this.nextRevision(
       current,
       history,
@@ -1198,9 +1366,14 @@ export class AgentStore {
       draft.id,
     );
     const agent = materializeRevision(current, revision);
-    this.commit((candidateAgents, candidateRevisions) => {
+    this.commit((candidateAgents, candidateRevisions, candidateGrants) => {
       candidateAgents.set(id, agent);
       candidateRevisions.set(id, [revision, ...history]);
+      if (consent) {
+        const grant: LocalExecutionGrant = { ...consent, version: 1, id: `local_execution_grant_${randomUUID()}`,
+          agentId: id, agentRevisionId: revision.id, confirmedAt: revision.createdAt };
+        candidateGrants.set(grant.id, grant);
+      }
     });
     return cloneAgent(agent);
   }
@@ -1210,6 +1383,7 @@ export class AgentStore {
     id: string,
     revisionId: string,
     expectedHeadRevisionId?: string,
+    confirmation?: LocalExecutionConfirmation,
   ): Agent | undefined {
     const current = this.agents.get(id);
     if (!current) return undefined;
@@ -1217,6 +1391,14 @@ export class AgentStore {
     this.assertExpectedHead(history, expectedHeadRevisionId);
     const target = history.find((revision) => revision.id === revisionId);
     if (!target || target.source === "draft") return undefined;
+    const consent = target.snapshot.executionMode === "local-full-access"
+      ? normalizeLocalExecutionConfirmation(confirmation) : undefined;
+    if (consent && !expectedHeadRevisionId) throw new Error("本机完全访问确认必须指定当前版本");
+    if (!consent && confirmation !== undefined) throw new Error("隔离模式不能创建本机完全访问确认");
+    if (consent) validateCodexFullAccessWorkdir({
+      execution: { permission: "full", executionMode: "local-full-access", workdir: target.snapshot.workdir, skills: [] },
+      protectedDataRoot: dirname(dirname(this.configPath)),
+    });
     const revision = this.nextRevision(
       current,
       history,
@@ -1225,9 +1407,14 @@ export class AgentStore {
       target.id,
     );
     const agent = materializeRevision(current, revision);
-    this.commit((candidateAgents, candidateRevisions) => {
+    this.commit((candidateAgents, candidateRevisions, candidateGrants) => {
       candidateAgents.set(id, agent);
       candidateRevisions.set(id, [revision, ...history]);
+      if (consent) {
+        const grant: LocalExecutionGrant = { ...consent, version: 1, id: `local_execution_grant_${randomUUID()}`,
+          agentId: id, agentRevisionId: revision.id, confirmedAt: revision.createdAt };
+        candidateGrants.set(grant.id, grant);
+      }
     });
     return cloneAgent(agent);
   }

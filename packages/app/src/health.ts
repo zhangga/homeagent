@@ -457,8 +457,38 @@ export function createSystemHealthReporter(
       }
     }
 
+    // Native diagnostics are operator-initiated. Health never starts an Agent probe.
+    let agentExecutionReady = true;
+    try {
+      const required = new Set<string>();
+      const missingTaskGrants = new Set<string>();
+      for (const meta of sources.engine.registry.list()) {
+        const agent = meta.agentId ? sources.engine.agents.get(meta.agentId) : undefined;
+        if (agent?.provider === "codex" && ((meta.id.startsWith("personal/") && agent.executionMode === "local-full-access")
+          || (meta.id.startsWith("team/") && sources.engine.feishuBindings.getBySpace(meta.id)?.state === "active"))) required.add(agent.id);
+      }
+      for (const task of sources.engine.tasks.list()) {
+        if (!task.enabled) continue;
+        const agent = sources.engine.agentForSpace(task.space);
+        if (agent?.provider !== "codex" || agent.executionMode !== "local-full-access") continue;
+        required.add(agent.id);
+        if (!agent.publishedRevisionId || !sources.engine.localExecution.referenceFor(task.space, agent.id, agent.publishedRevisionId, "task")) missingTaskGrants.add(agent.id);
+      }
+      const counts = { ready: 0, unavailable: 0, unknown: 0, checking: 0 };
+      for (const id of required) counts[missingTaskGrants.has(id) ? "unavailable" : sources.engine.agentReadiness.status(id)?.state ?? "unknown"]++;
+      agentExecutionReady = counts.unavailable === 0;
+      components.agentExecution = {
+        status: !agentExecutionReady ? "down" : counts.unknown + counts.checking > 0 ? "degraded" : "ok",
+        summary: !agentExecutionReady ? "所需 Agent 当前执行配置不可用" : counts.unknown + counts.checking > 0 ? "部分 Agent 执行配置待检测；CLI 连接不代表准备通过" : "所需 Agent 准备检查通过或无此类工作流；实际调用另行验证",
+        details: counts,
+      };
+    } catch {
+      agentExecutionReady = false;
+      components.agentExecution = { status: "down", summary: "Agent 执行配置状态读取失败" };
+    }
     const ready =
       core.ok &&
+      agentExecutionReady &&
       connector.ready &&
       providerReady &&
       dreamHealth?.started === true &&

@@ -313,7 +313,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       throw new Error("provider failed");
     });
     engine.close();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: failing });
+    engine = new KnowledgeEngine({ dataDir: dir, llm: failing, skillCatalog: new SkillCatalog({ roots: [] }) });
     await engine.upsertPage("team/oc_team", {
       slug: "entities/alice",
       type: "entity",
@@ -403,7 +403,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     failing.onJSON(providerFailure);
     failing.onText(providerFailure);
     engine.close();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: failing });
+    engine = new KnowledgeEngine({ dataDir: dir, llm: failing, skillCatalog: new SkillCatalog({ roots: [] }) });
     engine.ensureSpace("team/oc_team", { chatId: "oc_team" });
     const agent = engine.agents.create({
       name: "Failure usage Agent",
@@ -1035,6 +1035,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     } | undefined;
     engine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async (provider, input) => {
         providerCall = {
           provider,
@@ -1088,6 +1089,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     let providerCalls = 0;
     engine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => {
         providerCalls += 1;
         return "must not execute";
@@ -2904,7 +2906,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
         reason: "drifted classifier would now respond",
       };
     });
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
     connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
     let providerCalls = 0;
     engine.askWithExecutionPlan = async () => {
@@ -2969,7 +2971,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       classificationCalls += 1;
       throw new Error("durable response decision must not be reclassified");
     });
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
     connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
     let providerCalls = 0;
     engine.askWithExecutionPlan = async () => {
@@ -3046,7 +3048,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     engine.close();
 
     fake = makeFake();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
     connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
     orch = new Orchestrator({ engine, connector, llm: fake });
     await orch.start();
@@ -3083,7 +3085,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     engine.close();
 
     fake = makeFake();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
     connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
     orch = new Orchestrator({ engine, connector, llm: fake });
     await orch.start();
@@ -3446,7 +3448,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     engine.close();
 
     fake = makeFake();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
     connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
     const restartedTransport = connector;
     const restartedFeishuConnector: Connector = {
@@ -4051,7 +4053,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     engine.close();
 
     fake = makeFake();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
     connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
     const restartedTransport = connector;
     const restartedFeishuConnector: Connector = {
@@ -4693,6 +4695,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     let participationTimeout: number | undefined;
     const cliEngine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async (_id, input, timeoutMs) => {
         if (/群消息是否值得机器人主动回答/.test(input.prompt)) {
           participationTimeout = timeoutMs;
@@ -4725,6 +4728,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     let sawLegacyIntentPrompt = false;
     const cliEngine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async (id, input) => {
         const outputSchema = JSON.stringify(input.outputSchema ?? {});
         if (/像海盗一样说话/.test(input.prompt)) sawInstruction = true;
@@ -4784,6 +4788,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     let sawLegacyIntentPrompt = false;
     const cliEngine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async (id, input) => {
         if (/JSON Schema/.test(input.prompt) && /intent/.test(input.prompt)) {
           sawLegacyIntentPrompt = id === "codex";
@@ -4813,6 +4818,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     let sawConversation = false;
     const cliEngine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async (id, input) => {
         if (/JSON Schema/.test(input.prompt) && /intent/.test(input.prompt)) {
           sawLegacyIntentPrompt = id === "codex";
@@ -4839,7 +4845,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   test("CLI-only runtime gives configuration guidance when no local provider can be resolved", async () => {
     saveSettings({ defaultProvider: "gateway" }, dir);
     resetConfig();
-    const cliEngine = new KnowledgeEngine({ dataDir: dir });
+    const cliEngine = new KnowledgeEngine({ dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }) });
     const { connector: cliConnector, orchestrator: cliOrch } = makeCliOnlyRuntime(
       cliEngine,
       "personal/ou_me",
@@ -4855,6 +4861,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   test("CLI-only runtime reports an allowlisted model-capacity error without blaming CLI setup", async () => {
     const cliEngine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => {
         throw new ProviderRunError(
           "codex",
@@ -4884,6 +4891,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     resetConfig();
     const cliEngine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async (_id, _input, timeoutMs) => {
         throw new Error(`provider codex timed out after ${timeoutMs}ms`);
       },
@@ -4910,6 +4918,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     const providerTimeouts: Array<number | undefined> = [];
     const cliEngine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async (_id, _input, timeoutMs) => {
         providerTimeouts.push(timeoutMs);
         return "这是一个需要模型回答的问题。";
@@ -4931,6 +4940,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   test("CLI-only runtime enforces the frozen timeout across the whole answer", async () => {
     const cliEngine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async (_id, _input, timeoutMs, signal) => {
         expect(timeoutMs).toBe(25);
         return await new Promise<string>((_resolve, reject) => {
@@ -4958,7 +4968,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
   test("CLI-only runtime answers a prefiltered greeting without resolving a provider", async () => {
     saveSettings({ defaultProvider: "gateway" }, dir);
     resetConfig();
-    const cliEngine = new KnowledgeEngine({ dataDir: dir });
+    const cliEngine = new KnowledgeEngine({ dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }) });
     const { connector: cliConnector, orchestrator: cliOrch } = makeCliOnlyRuntime(
       cliEngine,
       "personal/ou_me",

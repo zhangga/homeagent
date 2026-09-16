@@ -19,7 +19,7 @@ afterEach(() => {
 });
 
 describe("FeishuGroupBindingStore", () => {
-  test("creates an empty version 2 registry", () => {
+  test("creates an empty version 3 registry", () => {
     dataDir = mkdtempSync(join(tmpdir(), "homeagent-feishu-bindings-"));
 
     const store = new FeishuGroupBindingStore(dataDir);
@@ -28,7 +28,7 @@ describe("FeishuGroupBindingStore", () => {
     expect(JSON.parse(readFileSync(
       join(dataDir, "config", "feishu-group-bindings.json"),
       "utf8",
-    ))).toEqual({ version: 2, bindings: [] });
+    ))).toEqual({ version: 3, bindings: [] });
   });
 
   test("migrates a version 1 registry without changing existing bindings", () => {
@@ -53,10 +53,11 @@ describe("FeishuGroupBindingStore", () => {
 
     const store = new FeishuGroupBindingStore(dataDir);
 
-    expect(store.list()).toEqual([existing]);
+    expect(store.list()).toEqual([expect.objectContaining(existing)]);
+    expect(store.list()[0]!.executionScopeEpoch).toMatch(/^[0-9a-f-]{36}$/);
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
-      version: 2,
-      bindings: [existing],
+      version: 3,
+      bindings: [expect.objectContaining({ ...existing, executionScopeEpoch: store.list()[0]!.executionScopeEpoch })],
     });
   });
 
@@ -389,7 +390,7 @@ describe("FeishuGroupBindingStore", () => {
     dataDir = mkdtempSync(join(tmpdir(), "homeagent-feishu-bindings-"));
     const path = join(dataDir, "config", "feishu-group-bindings.json");
     mkdirSync(join(dataDir, "config"), { recursive: true });
-    writeFileSync(path, JSON.stringify({ version: 3, bindings: [] }));
+    writeFileSync(path, JSON.stringify({ version: 4, bindings: [] }));
     expect(() => new FeishuGroupBindingStore(dataDir!)).toThrow("Unsupported");
 
     const valid = {

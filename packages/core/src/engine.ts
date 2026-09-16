@@ -20,9 +20,9 @@ import type {
   SkillWarningView,
   SpaceId,
 } from "@homeagent/shared";
-import { realpathSync, statSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { isAbsolute, relative, sep } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import {
   AI_GENERATION_MAX_TOKENS,
   AI_MAX_CONFIGURABLE_TIMEOUT_MINUTES,
@@ -36,6 +36,8 @@ import {
 } from "@homeagent/shared";
 import {
   BudgetExceededError,
+  ProviderPreparationError,
+  validateCodexFullAccessWorkdir,
   isCliProvider,
   isCodexReasoningEffortSupported,
   isProviderTimeoutError,
@@ -45,6 +47,7 @@ import {
   type ProviderExecution,
   type ProviderId,
   type ProviderSkillInput,
+  type RunInput,
 } from "@homeagent/llm";
 import type { Knowledge } from "./knowledge.ts";
 import {
@@ -75,6 +78,9 @@ import {
 import { SpaceRegistry } from "./registry.ts";
 import { normalizeSearchLimit } from "./sqlite.ts";
 import type { RawSourceCapture, RawSourceDownload } from "./raw-source-files.ts";
+import { chatRawEntryUpdatedAt, chatRawImportId, createChatRawCapture, formatChatRawImportReceipt, isChatRawScopeSkip, parseChatRawImport, readChatRawCapture, resolveChatRawImportRequest, type ChatRawImportReceipt } from "./chat-raw-import.ts";
+import { ChatSourceProgressStore, chatSourceProgressInstruction } from "./chat-source-progress.ts";
+import { assertLocalStatePath } from "./durable-file.ts";
 import { FeishuGroupBindingStore } from "./feishu-bindings.ts";
 import {
   AgentStore,
@@ -94,9 +100,17 @@ import {
   type ResolvedAgentSkills,
 } from "./skill-catalog.ts";
 import {
+  archiveExecutionPlan,
+  cloneResolvedExecutionPlan,
   isResolvedExecutionPlan,
+  LEGACY_CODEX_FULL_RECONFIRMATION,
+  LOCAL_EXECUTION_NOT_CONFIRMED,
+  type LocalExecutionReference,
   type ResolvedExecutionPlan,
+  type StoredExecutionPlan,
 } from "./execution-plan.ts";
+import { LocalExecutionAuthorizations, type ConfirmLocalExecutionScopes } from "./local-execution-scopes.ts";
+import { AgentReadiness, type AgentReadinessOptions } from "./agent-readiness.ts";
 import {
   DEFAULT_TASK_TIMEOUT_MINUTES,
   TaskStore,
@@ -256,8 +270,8 @@ export class TaskAlreadyRunningError extends Error {
 }
 
 class TaskRunCancelledError extends Error {
-  constructor() {
-    super("任务已由用户取消");
+  constructor(reason: "operator" | "local-authorization" = "operator") {
+    super(reason === "operator" ? "任务已由用户取消" : "本机完全访问确认已失效或执行已关闭，任务已取消");
     this.name = "TaskRunCancelledError";
   }
 }
@@ -1197,6 +1211,8 @@ export interface EngineOptions {
   recoverInterruptedChatRuns?: boolean;
   /** Local Skill catalog override for deterministic tests or custom embedding. */
   skillCatalog?: SkillCatalog;
+  /** Diagnostic clock and machine identity seam; never changes execution authority. */
+  readiness?: Pick<AgentReadinessOptions, "now" | "providerIdentity">;
 }
 
 function classifyTaskRunFailure(
@@ -1425,6 +1441,7 @@ export class KnowledgeEngine implements Knowledge {
   readonly feishuBindings: FeishuGroupBindingStore;
   readonly skillCatalog: SkillCatalog;
   readonly agents: AgentStore;
+  readonly localExecution: LocalExecutionAuthorizations;
   readonly tasks: TaskStore;
   readonly taskRuns: TaskRunStore;
   readonly chatRuns: ChatRunStore;
@@ -1439,6 +1456,7 @@ export class KnowledgeEngine implements Knowledge {
   private llm?: LlmClient;
   private runProvider: RunProviderFn;
   private nativeSessionPreflight: NonNullable<EngineOptions["nativeSessionPreflight"]>;
+  readonly agentReadiness: AgentReadiness;
   private learningResearch?: LearningResearchProvider;
   private providerRuns = new Map<ProviderId, ProviderRunHealth>();
   private dreamCycles = new Map<SpaceId, DreamCycleHealth>();
@@ -1451,6 +1469,7 @@ export class KnowledgeEngine implements Knowledge {
   private deliveringLearningCounts = new Map<string, number>();
   private backgroundRunCounts = new Map<SpaceId, number>();
   private readonly runConcurrency: RunConcurrencyConfig;
+  private readonly executionSubscriptions: (() => void)[] = [];
 
   constructor(opts: EngineOptions = {}) {
     this.dataDir = opts.dataDir ?? config().dataDir;
@@ -1463,6 +1482,11 @@ export class KnowledgeEngine implements Knowledge {
       roots: defaultSkillRoots(),
     });
     this.agents = new AgentStore(this.dataDir, {
+      referencedLocalExecutionGrantIds: () => {
+        const active = this.localExecution?.referencedGrantIds();
+        if (!active || !this.chatRuns || !this.taskRuns) return undefined;
+        return new Set([...active, ...this.chatRuns.referencedLocalExecutionGrantIds(), ...this.taskRuns.referencedLocalExecutionGrantIds()]);
+      },
       resolveLegacySkill: (name, provider) => {
         const binding = this.skillCatalog.resolveLegacyName(name, provider);
         return binding ? { kind: "source", ...binding } : undefined;
@@ -1470,6 +1494,7 @@ export class KnowledgeEngine implements Knowledge {
       validateSourceSkill: (binding) =>
         this.skillCatalog.hasCatalogSourceBinding(binding),
     });
+    this.localExecution = new LocalExecutionAuthorizations(this.agents, this.registry, this.feishuBindings);
     this.tasks = new TaskStore(this.dataDir);
     this.taskRuns = new TaskRunStore(this.dataDir, {
       recoverInterrupted: opts.recoverInterruptedTaskRuns,
@@ -1511,6 +1536,8 @@ export class KnowledgeEngine implements Knowledge {
       ?? (opts.llm || opts.runProvider
         ? async () => {}
         : preflightLocalProviderNativeSession);
+    this.agentReadiness = new AgentReadiness({ agents: this.agents, skills: this.skillCatalog,
+      localExecution: this.localExecution, dataDir: this.dataDir, preflight: this.nativeSessionPreflight, ...opts.readiness });
     this.runProvider = async (provider, input, timeoutMs, signal) => {
       const run = this.providerRuns.get(provider) ?? { provider, running: 0 };
       run.running += 1;
@@ -1534,6 +1561,41 @@ export class KnowledgeEngine implements Knowledge {
         run.running -= 1;
       }
     };
+    this.reconcileLocalExecutionRuns();
+    for (const store of [this.agents, this.registry, this.feishuBindings]) {
+      this.executionSubscriptions.push(store.onCommittedChange(() => this.reconcileLocalExecutionRuns()));
+    }
+  }
+
+  private localExecutionPlanError(
+    space: SpaceId, agentId: string | undefined, plan: StoredExecutionPlan | undefined, kind: "chat" | "task",
+  ): string | undefined {
+    if (plan?.provider !== "codex" || plan.execution?.permission !== "full") return undefined;
+    if (plan.execution.executionMode !== "local-full-access") return LEGACY_CODEX_FULL_RECONFIRMATION;
+    if (!isResolvedExecutionPlan(plan) || plan.resolutionError || !agentId || !plan.agentRevisionId
+      || !this.localExecution.validateReference(space, agentId, plan.agentRevisionId, kind, plan.localExecution)) {
+      return "本次运行的完全访问确认已失效或绑定范围已变化，请按当前配置新建运行";
+    }
+    return undefined;
+  }
+
+  /** No process replay: only queued/approval work is terminalized here. Active calls own cancellation. */
+  private reconcileLocalExecutionRuns(): void {
+    for (const run of this.taskRuns.list()) {
+      if (run.status !== "queued" && run.status !== "awaiting_approval") continue;
+      const error = this.localExecutionPlanError(run.space, run.agentId, run.executionPlan, "task");
+      if (!error) continue;
+      this.finishQueuedTaskRun(run, error, run.status === "awaiting_approval" ? "cancelled" : "failed");
+      this.runScheduler.cancel(run.id);
+      this.settleWorkActionFromTaskRun(run.id);
+    }
+    for (const run of this.chatRuns.list()) {
+      if (run.status !== "queued") continue;
+      const message = this.localExecutionPlanError(run.space, run.agentId, run.executionPlan, "chat");
+      if (!message) continue;
+      this.chatRuns.fail(run.id, { finishedAt: Math.max(Date.now(), run.startedAt), error: { kind: "provider_unavailable", message } });
+      this.runScheduler.cancel(run.id);
+    }
   }
 
   private reconcileTaskRunHealth(): void {
@@ -2940,6 +3002,7 @@ export class KnowledgeEngine implements Knowledge {
     id: string,
     draftRevisionId?: string,
     expectedHeadRevisionId?: string,
+    confirmation?: ConfirmLocalExecutionScopes,
   ): Agent | undefined {
     const current = this.agents.get(id);
     if (!current) return undefined;
@@ -2953,13 +3016,16 @@ export class KnowledgeEngine implements Knowledge {
       ...draft.snapshot,
       skills: draft.snapshot.skills.map((binding) => ({ ...binding })),
     });
-    return this.agents.release(id, draft.id, expectedHeadRevisionId);
+    return confirmation
+      ? this.localExecution.release(id, draft.id, expectedHeadRevisionId ?? "", confirmation)
+      : this.agents.release(id, draft.id, expectedHeadRevisionId);
   }
 
   rollbackAgent(
     id: string,
     revisionId: string,
     expectedHeadRevisionId?: string,
+    confirmation?: ConfirmLocalExecutionScopes,
   ): Agent | undefined {
     const current = this.agents.get(id);
     if (!current) return undefined;
@@ -2972,7 +3038,9 @@ export class KnowledgeEngine implements Knowledge {
       ...target.snapshot,
       skills: target.snapshot.skills.map((binding) => ({ ...binding })),
     });
-    return this.agents.rollback(id, revisionId, expectedHeadRevisionId);
+    return confirmation
+      ? this.localExecution.rollback(id, revisionId, expectedHeadRevisionId ?? "", confirmation)
+      : this.agents.rollback(id, revisionId, expectedHeadRevisionId);
   }
 
   private assertAgentLifecycleHead(
@@ -3150,6 +3218,14 @@ export class KnowledgeEngine implements Knowledge {
     const provider: ProviderId = isCliProvider(selectedProvider)
       ? selectedProvider
       : "gateway";
+    if (options.taskExecution && provider === "codex" && agent?.permission === "full") {
+      const snapshot = this.agentRunExecutionSnapshot(space, true, false, "all");
+      if (snapshot.agent?.id !== agent.id || snapshot.agent.publishedRevisionId !== agent.publishedRevisionId) {
+        throw new Error(LOCAL_EXECUTION_NOT_CONFIRMED);
+      }
+      return this.executionPlanCallContext(space, snapshot.executionPlan, snapshot.skillEvidence,
+        { timeoutMs: options.timeoutMs, signal: options.signal, agentId: agent.id });
+    }
     const skills = skillsForProviderExecution(
       options.resolvedSkills ?? (options.taskExecution
         ? this.skillCatalog.resolveAll(provider)
@@ -3200,6 +3276,7 @@ export class KnowledgeEngine implements Knowledge {
     // Ordinary Chat and Task runs use the full catalog; explicit background
     // no-tools snapshots may still resolve legacy bindings as skipped evidence.
     skillScope: "all" | "bound" = taskExecution ? "all" : "bound",
+    invocationKind: "chat" | "task" = "chat",
   ): AgentRunExecutionSnapshot {
     const agent = this.agentForSpace(space);
     const cfg = config();
@@ -3233,6 +3310,7 @@ export class KnowledgeEngine implements Knowledge {
     let execution: ProviderExecution | undefined;
     let workdir: string | undefined;
     let resolutionError: string | undefined;
+    let localExecution: LocalExecutionReference | undefined;
     try {
       workdir = resolveAgentWorkdir(agent);
       execution = {
@@ -3241,11 +3319,22 @@ export class KnowledgeEngine implements Knowledge {
         ...(skillScope === "all" ? { skillMode: "all" as const } : {}),
         ...(research ? { research: true } : {}),
       };
+      if (provider === "codex") {
+        if (execution.permission === "full" && execution.executionMode === undefined) {
+          resolutionError = LEGACY_CODEX_FULL_RECONFIRMATION;
+        } else if (execution.executionMode === "local-full-access") {
+          localExecution = taskExecution && agent?.publishedRevisionId
+            ? this.localExecution.referenceFor(space, agent.id, agent.publishedRevisionId, invocationKind) : undefined;
+          if (!localExecution) resolutionError = LOCAL_EXECUTION_NOT_CONFIRMED;
+        } else {
+          execution.executionMode = "isolated";
+        }
+      }
     } catch (error) {
       resolutionError = executionResolutionError(error);
     }
     const executionPlan: ResolvedExecutionPlan = {
-      version: 1,
+      version: 2,
       agentRevisionId: agent?.publishedRevisionId,
       instruction: agent?.instruction ?? "",
       provider,
@@ -3255,6 +3344,7 @@ export class KnowledgeEngine implements Knowledge {
       skillMode: skillScope === "all" ? "all" : undefined,
       execution,
       resolutionError,
+      ...(localExecution ? { localExecution } : {}),
     };
     return {
       agent,
@@ -3274,39 +3364,113 @@ export class KnowledgeEngine implements Knowledge {
     options: {
       timeoutMs?: number;
       signal?: AbortSignal;
-      nativeSessionIsolation?: boolean;
+      nativeTopic?: boolean;
+      agentId?: string;
+      taskRunId?: string;
     } = {},
   ): SpaceAgentCallContext {
     if (!isResolvedExecutionPlan(executionPlan)) {
       throw new Error("Resolved execution plan is invalid");
     }
+    executionPlan = cloneResolvedExecutionPlan(executionPlan);
+    skillEvidence = skillEvidence ? structuredClone(skillEvidence) : undefined;
     if (executionPlan.resolutionError !== undefined) {
       throw new Error(executionPlan.resolutionError);
+    }
+    if (executionPlan.provider === "codex" && executionPlan.execution?.permission === "full"
+      && executionPlan.execution.executionMode !== "local-full-access") {
+      throw new Error(LEGACY_CODEX_FULL_RECONFIRMATION);
     }
     this.validateFrozenWorkdir(executionPlan.workdir);
     const skills = this.validatedSkillsFromEvidence(executionPlan, skillEvidence);
     const skillNames = skills.resolved.map((skill) => skill.invocationName);
     const skillInputs = this.skillCatalog.executionInputsAfterValidation(skills.resolved);
-    let client = this.llm;
-    if (!client) {
+    const full = executionPlan.execution?.executionMode === "local-full-access";
+    const directoryIdentity = full && executionPlan.workdir ? lstatSync(executionPlan.workdir) : undefined;
+    const revoked = () => new ProviderPreparationError({ stage: "execution-policy", reason: "local-execution-consent-revoked" });
+    const validateAuthority = () => {
+      const reference = executionPlan.localExecution;
+      const kind = options.taskRunId ? "task" : "chat";
+      if (!options.agentId || !executionPlan.agentRevisionId || !reference
+        || !this.localExecution.validateReference(space, options.agentId, executionPlan.agentRevisionId, kind, reference)) throw revoked();
+      if (options.taskRunId) {
+        const run = this.taskRuns.get(options.taskRunId);
+        const approval = run?.approval;
+        if (!run || run.space !== space || run.agentId !== options.agentId || run.status !== "running"
+          || !isTaskRunLaunchAdmitted(run) || JSON.stringify(run.executionPlan) !== JSON.stringify(executionPlan)
+          || approval?.status !== "approved" || !approval.decidedBy || approval.decidedAt === undefined
+          || (approval.expiresAt !== undefined && approval.decidedAt >= approval.expiresAt)
+          || !this.taskForRun(run.id) || this.workActionExecutionBoundaryError(run)) throw revoked();
+      }
+    };
+    const validateLaunch = () => {
+      validateAuthority();
+      try {
+        validateCodexFullAccessWorkdir({ execution: executionPlan.execution, workdir: executionPlan.workdir, protectedDataRoot: this.dataDir });
+        const currentDirectory = lstatSync(executionPlan.workdir!);
+        if (!directoryIdentity || directoryIdentity.dev !== currentDirectory.dev || directoryIdentity.ino !== currentDirectory.ino) {
+          throw new Error("Directory identity changed");
+        }
+        this.validateFrozenWorkdir(executionPlan.workdir);
+        this.validatedSkillsFromEvidence(executionPlan, skillEvidence);
+      } catch {
+        // Preparation failures are terminal, not retrieval failures eligible for FTS fallback.
+        throw new ProviderPreparationError({ stage: "execution-policy", reason: "execution-mode-invalid" });
+      }
+    };
+    const makeClient = (signal = options.signal, acquireExecutionPermit?: RunInput["acquireExecutionPermit"]): LlmClient => {
+      if (this.llm) return this.llm;
       if (!executionPlan.provider || !isCliProvider(executionPlan.provider)) {
         throw new NoProviderError(space);
       }
-      client = makeCliClient(
+      return makeCliClient(
         executionPlan.provider,
         executionPlan.model,
         this.dataDir,
         this.runProvider,
         options.timeoutMs,
         executionPlan.reasoningEffort,
-        options.signal,
+        signal,
         executionPlan.execution,
         skillNames,
         executionPlan.workdir,
         skillInputs,
-        options.nativeSessionIsolation === true,
+        options.nativeTopic === true,
+        acquireExecutionPermit,
       );
-    }
+    };
+    const invoke = async <T>(call: (client: LlmClient) => Promise<T>): Promise<T> => {
+      validateLaunch();
+      const controller = new AbortController();
+      const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+      const stop = this.localExecution.watch(validateAuthority, () => controller.abort(revoked()));
+      const releaseReference = this.localExecution.retain(executionPlan.localExecution);
+      const acquire: NonNullable<RunInput["acquireExecutionPermit"]> = () => {
+        if (signal.aborted) throw signal.reason;
+        validateLaunch();
+        let released = false;
+        return {
+          register: cancel => {
+            if (released) throw revoked();
+            return this.localExecution.watch(validateAuthority, cancel);
+          },
+          release: () => { released = true; },
+        };
+      };
+      try {
+        if (signal.aborted) throw signal.reason;
+        const result = await call(makeClient(signal, acquire));
+        if (signal.aborted) throw signal.reason;
+        validateAuthority();
+        return result;
+      } catch (error) {
+        throw signal.aborted ? signal.reason : error;
+      } finally { stop(); releaseReference(); }
+    };
+    const client: LlmClient = full ? {
+      complete: opts => invoke(client => client.complete(opts)),
+      completeJSON: opts => invoke(client => client.completeJSON(opts)),
+    } : makeClient();
     return {
       client,
       skills,
@@ -3386,11 +3550,14 @@ export class KnowledgeEngine implements Knowledge {
     execution: ProviderExecution | undefined,
     workdir?: string,
   ): string {
-    if (execution?.permission === "full") {
+    if (execution?.permission === "full" && execution.executionMode !== "local-full-access") {
       throw new Error("provider codex native session rejects full permission");
     }
     if (!execution) {
       throw new Error("provider codex native session isolation is unavailable");
+    }
+    if (execution.executionMode === "local-full-access") {
+      validateCodexFullAccessWorkdir({ execution, workdir, protectedDataRoot: this.dataDir });
     }
     let dataRoot: string;
     try {
@@ -4619,11 +4786,12 @@ export class KnowledgeEngine implements Knowledge {
           contentBase64: Buffer.from(bytes).toString("base64"),
         };
       });
+      const { agentBindingEpoch: _localEpoch, ...portableMeta } = meta;
       return {
         format: SPACE_ARCHIVE_FORMAT,
         version: SPACE_ARCHIVE_VERSION,
         exportedAt: Date.now(),
-        space: { ...meta },
+        space: portableMeta,
         agent: agent
           ? {
               ...agent,
@@ -4641,9 +4809,11 @@ export class KnowledgeEngine implements Knowledge {
         taskRuns: taskRuns.filter((run) =>
           taskIds.has(run.taskId)
           || (run.workActionId !== undefined && workActionIds.has(run.workActionId))
-        ),
+        ).map(run => ({ ...run, executionPlan: run.executionPlan ? archiveExecutionPlan(run.executionPlan) : undefined })),
         // Local execution audits are deliberately not portable Space content.
-        chatRuns: chatRuns.map(({ executionEvidence: _audit, ...run }) => run),
+        chatRuns: chatRuns.map(({ executionEvidence: _audit, ...run }) => ({
+          ...run, executionPlan: run.executionPlan ? archiveExecutionPlan(run.executionPlan) : undefined,
+        })),
         workItems,
         workActions: workContinuation.actions,
         workContinuationPolicies: workContinuation.policies,
@@ -5530,6 +5700,11 @@ export class KnowledgeEngine implements Knowledge {
     if (!pending.executionPlan) {
       throw new Error(`task run has no immutable execution plan: ${runId}`);
     }
+    const localError = this.localExecutionPlanError(pending.space, pending.agentId, pending.executionPlan, "task");
+    if (localError) {
+      this.reconcileLocalExecutionRuns();
+      throw new Error(localError);
+    }
     const boundaryError = this.workActionExecutionBoundaryError(pending);
     if (boundaryError) {
       const decidedAt = Math.max(
@@ -5825,19 +6000,37 @@ export class KnowledgeEngine implements Knowledge {
     if (activeRunId) {
       throw new TaskAlreadyRunningError(taskId, activeRunId);
     }
+    const previous = retryOf ? this.taskRuns.get(retryOf) : undefined;
+    if (retryOf && (!previous || !isResolvedExecutionPlan(previous.executionPlan))) {
+      throw new Error("历史运行没有可执行的冻结计划，请按当前配置新建运行");
+    }
+    if (previous) {
+      const localError = this.localExecutionPlanError(previous.space, previous.agentId, previous.executionPlan, "task");
+      if (localError) throw new Error(localError);
+      timeoutMs = previous.timeoutMs ?? timeoutMs;
+    }
     let snapshot: AgentRunExecutionSnapshot;
     try {
-      snapshot = this.agentRunExecutionSnapshot(
+      snapshot = previous && isResolvedExecutionPlan(previous.executionPlan) ? {
+        executionPlan: cloneResolvedExecutionPlan(previous.executionPlan),
+        provider: previous.executionPlan.provider,
+        model: previous.executionPlan.model,
+        reasoningEffort: previous.executionPlan.reasoningEffort,
+        execution: previous.executionPlan.execution,
+        skillEvidence: previous.skillEvidence ? structuredClone(previous.skillEvidence) : { requested: [], resolved: [], skipped: [] },
+      } : this.agentRunExecutionSnapshot(
         task.space,
         true,
         workActionId === undefined,
+        "all",
+        "task",
       );
     } catch (error) {
       const resolutionError = executionResolutionError(error);
       snapshot = {
         skillEvidence: { requested: [], resolved: [], skipped: [] },
         executionPlan: {
-          version: 1,
+          version: 2,
           instruction: "",
           resolutionError,
         },
@@ -5855,7 +6048,7 @@ export class KnowledgeEngine implements Knowledge {
       trigger,
       workItemId,
       workActionId,
-      agentId: snapshot.agent?.id,
+      agentId: previous ? previous.agentId : snapshot.agent?.id,
       provider: snapshot.provider,
       model: snapshot.model,
       executionPlan: snapshot.executionPlan,
@@ -5982,7 +6175,7 @@ export class KnowledgeEngine implements Knowledge {
     if (!isTaskRunLaunchAdmitted(run)) {
       throw new Error(`task run launch is not admitted: ${run.id}`);
     }
-    if (!run.executionPlan) {
+    if (!isResolvedExecutionPlan(run.executionPlan)) {
       throw new Error(`task run has no immutable execution plan: ${run.id}`);
     }
     const timeoutMs = run.timeoutMs ?? task.timeoutMinutes * 60_000;
@@ -5997,6 +6190,8 @@ export class KnowledgeEngine implements Knowledge {
         {
           timeoutMs,
           signal: controller.signal,
+          agentId: run.agentId,
+          taskRunId: run.id,
         },
       );
     } catch (error) {
@@ -6158,6 +6353,7 @@ export class KnowledgeEngine implements Knowledge {
 
   /** Re-enqueue durable Task Runs that had not started when the service stopped. */
   resumeQueuedTaskRuns(): StartedTaskRun[] {
+    this.reconcileLocalExecutionRuns();
     this.reconcileExecutionBoundaries();
     const resumed: StartedTaskRun[] = [];
     const queued = this.taskRuns.list()
@@ -6170,7 +6366,7 @@ export class KnowledgeEngine implements Knowledge {
         this.finishQueuedTaskRun(run, boundaryError, "cancelled");
         continue;
       }
-      if (!run.executionPlan) {
+      if (!isResolvedExecutionPlan(run.executionPlan)) {
         this.finishQueuedTaskRun(
           run,
           "Queued Task Run has no immutable execution plan; refusing to use live Agent state.",
@@ -6216,7 +6412,7 @@ export class KnowledgeEngine implements Knowledge {
           task.space,
           run.executionPlan,
           run.skillEvidence,
-          { timeoutMs, signal: controller.signal },
+          { timeoutMs, signal: controller.signal, agentId: run.agentId, taskRunId: run.id },
         );
       } catch (error) {
         setupError = error;
@@ -6269,8 +6465,15 @@ export class KnowledgeEngine implements Knowledge {
     let output: string | undefined;
     let rawId: string | undefined;
     let failurePhase: TaskRunFailure["phase"] = "admission";
+    let stopLocalExecution: (() => void) | undefined;
     try {
       if (setupError) throw setupError;
+      if (executionPlan.execution?.executionMode === "local-full-access") {
+        stopLocalExecution = this.localExecution.watch(() => {
+          const error = this.localExecutionPlanError(run.space, run.agentId, executionPlan, "task");
+          if (error) throw new Error(error);
+        }, () => controller.abort(new TaskRunCancelledError("local-authorization")));
+      }
       this.registry.ensure(task.space);
       // The LLM call runs OUTSIDE the per-space serializer — research is
       // long-running and must not block captures/distillation. Only the write
@@ -6314,12 +6517,22 @@ export class KnowledgeEngine implements Knowledge {
       let pagesWritten: number | undefined;
       if (distill) {
         try {
+          // Dream is a separate no-tools workflow, even after an approved Task.
+          // Keep the frozen Provider/model, but never pass the Task's capability.
+          const dreamClient = this.llm ?? makeCliClient(
+            executionPlan.provider!, executionPlan.model, this.dataDir, this.runProvider,
+            run.timeoutMs, executionPlan.reasoningEffort, controller.signal,
+          );
+          const dreamContext: SpaceAgentCallContext = {
+            client: observeLlmUsage(dreamClient, item => usage.record(item)),
+            skills: skillsForProviderExecution(observedCallContext.skills, false),
+          };
           const report = await this.serializer.run(
             task.space,
             async () => this.executeDreamCycle(
               task.space,
               { signal: controller.signal },
-              observedCallContext,
+              dreamContext,
             ),
           );
           throwIfTaskRunAborted(controller.signal);
@@ -6423,6 +6636,7 @@ export class KnowledgeEngine implements Knowledge {
         finishedAt,
       };
     } finally {
+      stopLocalExecution?.();
       if (this.activeTaskRuns.get(task.id) === run.id) {
         this.activeTaskRuns.delete(task.id);
       }
@@ -6447,26 +6661,114 @@ export class KnowledgeEngine implements Knowledge {
           taskExecution: true,
         });
     const snapshot = primary ? this.agentRunExecutionSnapshot(primary) : undefined;
-    return this.executeAsk(
-      stores,
-      spaces,
-      question,
-      {
-        ...opts,
-        fallbackContext: snapshot?.executionPlan.provider === "codex"
-            && snapshot.executionPlan.workdir
-          ? "agent-workdir"
+    const releaseReference = this.localExecution.retain(snapshot?.executionPlan.localExecution);
+    try {
+      return await this.executeAsk(
+        stores,
+        spaces,
+        question,
+        {
+          ...opts,
+          fallbackContext: snapshot?.executionPlan.provider === "codex"
+              && snapshot.executionPlan.workdir
+            ? "agent-workdir"
+            : undefined,
+        },
+        context,
+        snapshot
+          ? answerTraceExecution(
+              snapshot.executionPlan,
+              snapshot.skillEvidence,
+              snapshot.agent?.id,
+            )
           : undefined,
+      );
+    } finally { releaseReference(); }
+  }
+
+  /** A host-owned handoff scoped to one active Run. No generic filesystem import endpoint. */
+  prepareChatRawImport(runId: string): { instruction: string; finish(signal?: AbortSignal): Promise<string> } | undefined {
+    const run = this.chatRuns.get(runId);
+    if (!run || run.inputTruncated) return undefined;
+    const sourceScope = resolveChatRawImportRequest(this.chatRuns.topicInputsThroughRun(runId));
+    if (!sourceScope) return undefined;
+    const denied = {
+      instruction: "本轮没有可用的聊天原文自动入库交接。只能报告实际查询/文件保存结果，不能声称已入库；不得自行调用管理接口或手工修改数据目录。",
+      finish: async () => "原始记录未自动入库：需要在来源群对应的已启用团队 Space 中，由具有有效写入权限和 Workdir 的 Chat Run 提交。",
+    };
+    const plan = run.executionPlan;
+    if (!isResolvedExecutionPlan(plan) || plan.resolutionError || !plan.workdir
+      || !["write", "full"].includes(plan.execution?.permission ?? "")
+      || !run.chatId || run.space !== `team/${run.chatId}` || !this.registry.has(run.space)) return denied;
+    const initialBinding = this.feishuBindings.getBySpace(run.space);
+    const initialMeta = this.registry.get(run.space);
+    const validate = (signal?: AbortSignal) => {
+      const current = this.chatRuns.get(runId);
+      const binding = this.feishuBindings.getBySpace(run.space);
+      const meta = this.registry.get(run.space);
+      if (signal?.aborted || current?.status !== "running" || binding?.state !== "active"
+        || binding.chatId !== run.chatId || !binding.boundAppId
+        || binding.executionScopeEpoch !== initialBinding?.executionScopeEpoch
+        || meta?.agentBindingEpoch !== initialMeta?.agentBindingEpoch
+        || this.localExecutionPlanError(run.space, run.agentId, plan, "chat")) throw new Error("Chat Raw import authorization expired");
+      this.validateNativeSessionFilesystemContract(plan.execution, plan.workdir);
+    };
+    try { validate(); } catch { return denied; }
+    const sourceSelector = sourceScope.requestedName ? `name:${sourceScope.requestedName}`
+      : sourceScope.requestedChatId && sourceScope.requestedChatId !== run.chatId ? `id:${sourceScope.requestedChatId}` : undefined;
+    const capture = createChatRawCapture(plan.workdir, run.chatId, sourceScope);
+    const progress = new ChatSourceProgressStore(this.dataDir, this.registry.store(run.space).root, run.space,
+      JSON.stringify([initialBinding?.executionScopeEpoch, initialMeta?.agentBindingEpoch]), sourceSelector);
+    let progressInstruction: string;
+    try { progressInstruction = chatSourceProgressInstruction(progress.read()); }
+    catch { return { instruction: "本群查询进度文件无法校验。本轮不能自动入库或推进增量；报告状态待修复，不自行覆盖运行数据。", finish: async () => "原始记录未自动入库：本群查询进度文件无法校验，需检查本机状态文件。" }; }
+    return {
+      instruction: `${capture.instruction}\n以下进度按本轮声明的来源目标隔离；如 sourceChatId 存在，只有本次解析的实际目标 ID 相同时才能使用，目标变化须重新建立基线，不能沿用旧群的增量起点或补读 ID。\n${progressInstruction}`,
+      finish: async (signal) => {
+        const receipt: ChatRawImportReceipt = { imported: 0, duplicates: 0, excluded: 0, incomplete: true };
+        try {
+          return await this.serializer.run(run.space, async () => {
+            validate(signal);
+            const contents = readChatRawCapture(capture);
+            if (isChatRawScopeSkip(contents, run.chatId!)) {
+              return "原始记录未自动入库：目标群未匹配本轮请求确定的来源范围。本次未写入 Raw，也未更新增量基线；查询及本地文件保存情况见正文。";
+            }
+            const parsed = parseChatRawImport(contents, run.space, run.chatId!, sourceScope);
+            if (parsed.endAt > Date.now()) throw new Error("Chat capture window is in the future");
+            receipt.excluded = parsed.excluded;
+            receipt.incomplete = parsed.incomplete;
+            const store = this.registry.store(run.space);
+            assertLocalStatePath(this.dataDir, join(store.root, ".index.db"));
+            for (const entry of parsed.entries) {
+              const day = new Date(entry.createdAt!).toISOString().slice(0, 10).split("-");
+              assertLocalStatePath(this.dataDir, join(store.root, "raw", "records", day[0]!, day[1]!, `${day[2]}.jsonl`));
+            }
+            const index = store.index();
+            // Persist the pending interval before Raw writes: a crash or partial write must not lose this gap.
+            progress.commit({ ...parsed, sourceChatId: parsed.chatId, incomplete: true });
+            for (const entry of parsed.entries) {
+              if (index.getMessageRetraction(parsed.chatId, entry.messageId!)) { receipt.excluded++; receipt.incomplete = true; continue; }
+              const existing = index.findRawsByMessageId(entry.messageId!, parsed.chatId);
+              const updatedAt = chatRawEntryUpdatedAt(entry);
+              if (updatedAt === undefined && existing.some(raw => raw.source === "message" || chatRawEntryUpdatedAt(raw) !== undefined)) { receipt.duplicates++; continue; }
+              if (updatedAt !== undefined && existing.some(raw => (chatRawEntryUpdatedAt(raw) ?? -1) > updatedAt)) { receipt.duplicates++; continue; }
+              const id = chatRawImportId(run.space, parsed.chatId, entry.messageId!, updatedAt);
+              if (index.captureImportedRaw(id, { ...entry, ...(run.agentId ? { agentId: run.agentId } : {}) })) {
+                receipt.imported++;
+                if (updatedAt !== undefined && existing.length) receipt.updated = (receipt.updated ?? 0) + 1;
+              }
+              else receipt.duplicates++;
+            }
+            const committed = progress.commit({ ...parsed, sourceChatId: parsed.chatId, incomplete: receipt.incomplete });
+            receipt.progress = committed;
+            if (committed.retryStartAt < committed.pendingThrough) receipt.incomplete = true;
+            return formatChatRawImportReceipt(receipt);
+          });
+        } catch {
+          return `原始记录入库未完成：已确认新增 ${receipt.imported} 条；其余未确认。请检查交接文件、来源群范围、大小/格式和当前授权后重新请求。已落盘记录保留，重试按消息去重；未下载附件，未推进增量起点。`;
+        }
       },
-      context,
-      snapshot
-        ? answerTraceExecution(
-            snapshot.executionPlan,
-            snapshot.skillEvidence,
-            snapshot.agent?.id,
-          )
-        : undefined,
-    );
+    };
   }
 
   /** Execute a durable Chat Run using only the configuration captured at enqueue time. */
@@ -6478,68 +6780,78 @@ export class KnowledgeEngine implements Knowledge {
     opts: AskOptions = {},
     traceAgentId?: string,
   ): Promise<AskResult> {
+    if (!isResolvedExecutionPlan(executionPlan)) throw new Error("Resolved execution plan is invalid");
+    executionPlan = cloneResolvedExecutionPlan(executionPlan);
+    skillEvidence = skillEvidence ? structuredClone(skillEvidence) : undefined;
+    spaces = [...spaces];
     const stores = spaces.filter((space) => this.registry.has(space))
       .map((space) => this.registry.store(space));
     const primary = spaces[0] ?? stores[0]?.space;
     if (!primary) throw new Error("Chat Run requires at least one space");
-    let protectedDataRoot: string | undefined;
-    if (opts.nativeSession) {
-      if (executionPlan.provider !== "codex") {
-        throw new Error("Provider-native Chat sessions require the frozen Codex provider");
+    const releaseReference = this.localExecution.retain(executionPlan.localExecution);
+    try {
+      let protectedDataRoot: string | undefined;
+      if (opts.nativeSession) {
+        if (executionPlan.provider !== "codex") {
+          throw new Error("Provider-native Chat sessions require the frozen Codex provider");
+        }
+        if (opts.signal?.aborted) {
+          throw opts.signal.reason ?? new Error("provider native session preflight cancelled");
+        }
+        protectedDataRoot = this.validateNativeSessionFilesystemContract(
+          executionPlan.execution,
+          executionPlan.workdir,
+        );
       }
-      if (opts.signal?.aborted) {
-        throw opts.signal.reason ?? new Error("provider native session preflight cancelled");
+      const context = this.executionPlanCallContext(
+        primary,
+        executionPlan,
+        skillEvidence,
+        {
+          signal: opts.signal,
+          timeoutMs: opts.timeoutMs,
+          nativeTopic: opts.nativeSession !== undefined,
+          agentId: traceAgentId,
+        },
+      );
+      if (opts.nativeSession) {
+        if (executionPlan.execution?.executionMode !== "local-full-access") {
+          this.validateNativeSessionSkillRoots(
+            protectedDataRoot!,
+            context.skillInputs ?? [],
+            executionPlan.workdir,
+          );
+        }
+        await this.nativeSessionPreflight(
+          "codex",
+          opts.timeoutMs,
+          opts.signal,
+          executionPlan.workdir,
+          context.execution,
+          context.skillInputs ?? [],
+          protectedDataRoot,
+        );
+        if (opts.signal?.aborted) {
+          throw opts.signal.reason ?? new Error("provider native session preflight cancelled");
+        }
       }
-      protectedDataRoot = this.validateNativeSessionFilesystemContract(
-        executionPlan.execution,
-        executionPlan.workdir,
+      return await this.executeAsk(
+        stores,
+        spaces,
+        question,
+        {
+          ...opts,
+          model: executionPlan.model,
+          instruction: executionPlan.instruction || undefined,
+          fallbackContext: opts.fallbackContext
+            ?? (executionPlan.provider === "codex" && executionPlan.workdir
+              ? "agent-workdir"
+              : undefined),
+        },
+        context,
+        answerTraceExecution(executionPlan, skillEvidence, traceAgentId),
       );
-    }
-    const context = this.executionPlanCallContext(
-      primary,
-      executionPlan,
-      skillEvidence,
-      {
-        signal: opts.signal,
-        timeoutMs: opts.timeoutMs,
-        nativeSessionIsolation: opts.nativeSession !== undefined,
-      },
-    );
-    if (opts.nativeSession) {
-      this.validateNativeSessionSkillRoots(
-        protectedDataRoot!,
-        context.skillInputs ?? [],
-        executionPlan.workdir,
-      );
-      await this.nativeSessionPreflight(
-        "codex",
-        opts.timeoutMs,
-        opts.signal,
-        executionPlan.workdir,
-        context.execution,
-        context.skillInputs ?? [],
-        protectedDataRoot,
-      );
-      if (opts.signal?.aborted) {
-        throw opts.signal.reason ?? new Error("provider native session preflight cancelled");
-      }
-    }
-    return this.executeAsk(
-      stores,
-      spaces,
-      question,
-      {
-        ...opts,
-        model: executionPlan.model,
-        instruction: executionPlan.instruction || undefined,
-        fallbackContext: opts.fallbackContext
-          ?? (executionPlan.provider === "codex" && executionPlan.workdir
-            ? "agent-workdir"
-            : undefined),
-      },
-      context,
-      answerTraceExecution(executionPlan, skillEvidence, traceAgentId),
-    );
+    } finally { releaseReference(); }
   }
 
   private async executeAsk(
@@ -6558,6 +6870,7 @@ export class KnowledgeEngine implements Knowledge {
     try {
       const asking = askImpl(stores, question, opts, {
         client,
+        toolExecution: context.execution !== undefined,
         onRetrieval: (evidence) => {
           retrievalPages = evidence.pages.map((page) => ({ ...page }));
         },
@@ -6669,7 +6982,7 @@ export class KnowledgeEngine implements Knowledge {
     if (
       sourceRun.status !== "succeeded"
       || !sourceRun.traceId
-      || !sourceRun.executionPlan
+      || !isResolvedExecutionPlan(sourceRun.executionPlan)
     ) {
       throw new Error(`chat run is not eligible for evaluation rerun: ${chatRunId}`);
     }
@@ -6683,6 +6996,9 @@ export class KnowledgeEngine implements Knowledge {
     });
     if (!audit) throw new Error(`could not start evaluation rerun: ${chatRunId}`);
     try {
+      if (sourceRun.executionPlan.provider === "codex" && sourceRun.executionPlan.execution?.permission === "full") {
+        throw new Error("本机完全访问运行暂不支持质量重评，请按当前配置新建运行");
+      }
       const missingSourceSpaces = sourceTrace.spaces.filter(
         (space) => !this.registry.has(space),
       );
@@ -6937,6 +7253,9 @@ export class KnowledgeEngine implements Knowledge {
   }
 
   close(): void {
+    this.agentReadiness.close();
+    for (const unsubscribe of this.executionSubscriptions.splice(0)) unsubscribe();
+    this.localExecution.close();
     this.registry.closeAll();
   }
 }

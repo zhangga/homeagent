@@ -84,6 +84,7 @@ beforeEach(() => {
   // No real CLI spawns in the contract test: a fake runner returns empty
   // structured results (dream analyze => no operations) and empty text.
   engine = new KnowledgeEngine({
+    skillCatalog: new SkillCatalog({ roots: [] }),
     dataDir: dir,
     runProvider: async (_id, input) => {
       if (/JSON Schema/.test(input.prompt) && /operations/.test(input.prompt)) {
@@ -215,6 +216,7 @@ describe("Knowledge seam contract", () => {
     });
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         markProviderStarted();
@@ -239,6 +241,7 @@ describe("Knowledge seam contract", () => {
   test("continuing a work item executes its first action and records an action-boundary checkpoint", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, input) => {
         expect(input.prompt).toContain("执行只读发布前检查");
@@ -287,6 +290,7 @@ describe("Knowledge seam contract", () => {
   test("a Task Run persistence failure fails a newly claimed work action closed without restart", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("恢复后检查通过"),
     });
@@ -337,6 +341,7 @@ describe("Knowledge seam contract", () => {
     for (const failedAssociation of ["work item", "work action"] as const) {
       engine.close();
       engine = new KnowledgeEngine({
+        skillCatalog: new SkillCatalog({ roots: [] }),
         dataDir: join(dir, failedAssociation.replace(" ", "-")),
         runProvider: async () => completedWorkActionOutput("恢复关联存储后检查通过"),
       });
@@ -403,6 +408,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -472,6 +478,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -528,6 +535,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -608,6 +616,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -673,6 +682,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -721,6 +731,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -779,6 +790,7 @@ describe("Knowledge seam contract", () => {
     expect(engine.workItems.get(item.id)?.taskRunIds).toContain(orphan.id);
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -800,6 +812,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -861,6 +874,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -937,6 +951,7 @@ describe("Knowledge seam contract", () => {
   test("export refuses an unsettled WorkAction without accepting or advancing it", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("captured before settlement"),
     });
@@ -1000,6 +1015,7 @@ describe("Knowledge seam contract", () => {
   test("export replays an already accepted terminal projection without creating acceptance", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("durably accepted result"),
     });
@@ -1040,6 +1056,7 @@ describe("Knowledge seam contract", () => {
   test("restart preserves authoritative WorkAction attempt order when Run creation times are inverted", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("audited writable result"),
     });
@@ -1100,6 +1117,7 @@ describe("Knowledge seam contract", () => {
     writeFileSync(continuationPath, JSON.stringify(continuationFile, null, 2), "utf8");
 
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         throw new Error("startup must not replay an accepted attempt");
@@ -1119,6 +1137,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -1155,6 +1174,7 @@ describe("Knowledge seam contract", () => {
     engine.workItems.attachTaskRun(foreignItem.id, runs[1]!.id);
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -1183,6 +1203,7 @@ describe("Knowledge seam contract", () => {
   test("plain read-only output that reports a blocker is never auto-accepted", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () =>
         "无法安全完成：缺少访问发布检查服务的权限，当前动作仍被阻塞",
@@ -1222,6 +1243,7 @@ describe("Knowledge seam contract", () => {
   test("a structured blocked result becomes a blocker without consuming the action", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => blockedWorkActionOutput(
         "发布检查无法执行",
@@ -1271,6 +1293,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -1329,6 +1352,7 @@ describe("Knowledge seam contract", () => {
   test("a WorkAction Raw stays out of Dream while its result awaits acceptance", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, input) => {
         if (/JSON Schema/.test(input.prompt) && /operations/.test(input.prompt)) {
@@ -1372,6 +1396,7 @@ describe("Knowledge seam contract", () => {
   test("an explicit forced Dream cannot bypass a held WorkAction Raw", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, input) => {
         if (/JSON Schema/.test(input.prompt) && /operations/.test(input.prompt)) {
@@ -1409,6 +1434,7 @@ describe("Knowledge seam contract", () => {
   test("a global forced Dream still excludes held WorkAction Raw", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("全局重跑前仍待验收"),
     });
@@ -1437,6 +1463,7 @@ describe("Knowledge seam contract", () => {
   test("manual redistillation rejects a held WorkAction Raw", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("人工提炼前仍待验收"),
     });
@@ -1467,6 +1494,7 @@ describe("Knowledge seam contract", () => {
   test("accepting a WorkAction promotes its Raw into the Dream queue", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, input) => {
         if (/JSON Schema/.test(input.prompt) && /operations/.test(input.prompt)) {
@@ -1508,6 +1536,7 @@ describe("Knowledge seam contract", () => {
   test("acceptance fails closed before committing when its held Raw is missing", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("缺失证据不能验收"),
     });
@@ -1546,6 +1575,7 @@ describe("Knowledge seam contract", () => {
   test("human acceptance cannot commit after the WorkItem action boundary changes", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => "写入完成",
     });
@@ -1597,6 +1627,7 @@ describe("Knowledge seam contract", () => {
     });
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         await providerGate;
@@ -1633,6 +1664,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -1710,6 +1742,7 @@ describe("Knowledge seam contract", () => {
   test("rejecting a WorkAction permanently excludes its Raw from knowledge", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("结果不满足验收要求"),
     });
@@ -1749,6 +1782,7 @@ describe("Knowledge seam contract", () => {
   test("cancelling after Raw capture excludes the orphaned WorkAction evidence", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("取消前已经生成候选结果"),
     });
@@ -1787,6 +1821,7 @@ describe("Knowledge seam contract", () => {
   test("a failure after Raw capture excludes the WorkAction evidence", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("候选结果已捕获但终态写入失败"),
     });
@@ -1819,6 +1854,7 @@ describe("Knowledge seam contract", () => {
   test("startup holds legacy unaccepted WorkAction Raw and removes pages it polluted", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("旧版本留下的待验收结果"),
     });
@@ -1862,7 +1898,7 @@ describe("Knowledge seam contract", () => {
       workActionId: undefined,
     }));
 
-    engine = new KnowledgeEngine({ dataDir: dir });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir });
     const migrated = engine.registry.store(SPACE);
 
     expect(migrated.index().getRaw(report.rawId!)).toEqual(expect.objectContaining({
@@ -1933,6 +1969,7 @@ describe("Knowledge seam contract", () => {
 
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       recoverInterruptedTaskRuns: true,
     });
@@ -1957,6 +1994,7 @@ describe("Knowledge seam contract", () => {
   test("startup restores WorkItem Raw evidence after capture attachment crashes", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("Raw 已落库但 WorkItem 关联写入失败"),
     });
@@ -1981,7 +2019,7 @@ describe("Knowledge seam contract", () => {
     expect(engine.workItems.get(item.id)?.rawIds).not.toContain(rawId);
 
     engine.close();
-    engine = new KnowledgeEngine({ dataDir: dir });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir });
 
     expect(engine.getTaskRun(started.run.id)?.rawId).toBe(rawId);
     expect(engine.registry.store(SPACE).index().getRaw(rawId)).toEqual(expect.objectContaining({
@@ -2062,7 +2100,7 @@ describe("Knowledge seam contract", () => {
 
     engine.close();
     writeFileSync(join(dir, "config", "work-continuation.json"), "{broken", "utf8");
-    engine = new KnowledgeEngine({ dataDir: dir });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir });
     const recovered = engine.registry.store(SPACE);
 
     expect(engine.getTaskRun(run.id)?.rawId).toBe(raw.id);
@@ -2081,6 +2119,7 @@ describe("Knowledge seam contract", () => {
   test("startup excludes TaskRun-owned Raw when the WorkContinuation file is corrupt", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("动作记录损坏前已生成的敏感结果"),
     });
@@ -2118,7 +2157,7 @@ describe("Knowledge seam contract", () => {
     }));
     writeFileSync(join(dir, "config", "work-continuation.json"), "{broken", "utf8");
 
-    engine = new KnowledgeEngine({ dataDir: dir });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir });
     const recovered = engine.registry.store(SPACE);
     expect(recovered.index().getRaw(rawId)).toEqual(expect.objectContaining({
       admission: "excluded",
@@ -2135,6 +2174,7 @@ describe("Knowledge seam contract", () => {
   test("startup excludes a uniquely matched cancelled-action Raw after its TaskRun is lost", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("TaskRun 丢失前捕获的敏感结果"),
     });
@@ -2186,7 +2226,7 @@ describe("Knowledge seam contract", () => {
     delete taskRunFile.runs[started.run.id];
     writeFileSync(taskRunPath, `${JSON.stringify(taskRunFile, null, 2)}\n`, "utf8");
 
-    engine = new KnowledgeEngine({ dataDir: dir });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir });
     const recovered = engine.registry.store(SPACE);
     expect(engine.getTaskRun(started.run.id)).toBeUndefined();
     expect(recovered.index().getRaw(rawId!)).toEqual(expect.objectContaining({
@@ -2204,6 +2244,7 @@ describe("Knowledge seam contract", () => {
   test("startup fails closed when a missing TaskRun leaves ambiguous WorkAction Raw evidence", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("无法唯一归属的动作结果"),
     });
@@ -2252,7 +2293,7 @@ describe("Knowledge seam contract", () => {
     delete taskRunFile.runs[started.run.id];
     writeFileSync(taskRunPath, `${JSON.stringify(taskRunFile, null, 2)}\n`, "utf8");
 
-    expect(() => new KnowledgeEngine({ dataDir: dir }))
+    expect(() => new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir }))
       .toThrow(`work action Raw evidence is ambiguous: ${actionId}`);
     Bun.gc(true);
   });
@@ -2260,6 +2301,7 @@ describe("Knowledge seam contract", () => {
   test("startup fails closed instead of rebinding TaskRun Raw owned by another action", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("已有冲突 owner 的动作结果"),
     });
@@ -2282,7 +2324,7 @@ describe("Knowledge seam contract", () => {
       workActionId: conflictingActionId,
     }));
 
-    expect(() => new KnowledgeEngine({ dataDir: dir }))
+    expect(() => new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir }))
       .toThrow(`work action Raw belongs to another action: ${rawId}`);
     Bun.gc(true);
   });
@@ -2290,6 +2332,7 @@ describe("Knowledge seam contract", () => {
   test("startup removes pages that cite a missing rejected WorkAction Raw", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("最终被拒绝的敏感动作结果"),
     });
@@ -2325,7 +2368,7 @@ describe("Knowledge seam contract", () => {
     engine.close();
     deleteAuthoritativeRaw(store.root, [rawId]);
 
-    engine = new KnowledgeEngine({ dataDir: dir });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir });
     const recovered = engine.registry.store(SPACE);
     expect(recovered.index().getRaw(rawId)).toBeNull();
     expect(recovered.readPageFile(pollutedSlug)).toBeNull();
@@ -2338,6 +2381,7 @@ describe("Knowledge seam contract", () => {
   test("startup fails closed when accepted WorkAction Raw evidence is missing", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("已自动验收但随后丢失的结果"),
     });
@@ -2360,7 +2404,7 @@ describe("Knowledge seam contract", () => {
     engine.close();
     deleteAuthoritativeRaw(store.root, [rawId]);
 
-    expect(() => new KnowledgeEngine({ dataDir: dir }))
+    expect(() => new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir }))
       .toThrow(`accepted WorkAction Raw evidence is missing: ${rawId}`);
     Bun.gc(true);
   });
@@ -2368,6 +2412,7 @@ describe("Knowledge seam contract", () => {
   test("startup excludes an early missing-attempt Raw after a later retry was accepted", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => completedWorkActionOutput("多次尝试产生的动作结果"),
     });
@@ -2424,7 +2469,7 @@ describe("Knowledge seam contract", () => {
     delete taskRunFile.runs[first.run.id];
     writeFileSync(taskRunPath, `${JSON.stringify(taskRunFile, null, 2)}\n`, "utf8");
 
-    engine = new KnowledgeEngine({ dataDir: dir });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir });
     const recovered = engine.registry.store(SPACE);
     expect(recovered.index().getRaw(earlyRawId)).toEqual(expect.objectContaining({
       admission: "excluded",
@@ -2443,6 +2488,7 @@ describe("Knowledge seam contract", () => {
   test("abandoning a rejected action releases its owned blocker after the WorkItem head changes", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => "旧动作执行结果",
     });
@@ -2502,6 +2548,7 @@ describe("Knowledge seam contract", () => {
   test("a crash after persisting retry intent fails closed and can retry again", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => "首次写入结果",
     });
@@ -2532,6 +2579,7 @@ describe("Knowledge seam contract", () => {
     engine.close();
 
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => "修正后的写入结果",
     });
@@ -2559,6 +2607,7 @@ describe("Knowledge seam contract", () => {
   test("a failed work continuation becomes a visible blocker without consuming the next action", async () => {
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         throw new Error("发布检查服务不可用");
@@ -2592,6 +2641,7 @@ describe("Knowledge seam contract", () => {
     let shouldFail = true;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         if (shouldFail) throw new Error("临时检查故障");
@@ -2632,6 +2682,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -2701,6 +2752,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -2766,6 +2818,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -2846,6 +2899,7 @@ describe("Knowledge seam contract", () => {
     let shouldFail = true;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         if (shouldFail) {
@@ -2892,6 +2946,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -2959,6 +3014,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -3004,6 +3060,7 @@ describe("Knowledge seam contract", () => {
   test("restart repairs an automatic retry Run created before its action attempt was linked", async () => {
     const recoveryDir = join(dir, "automatic-work-retry-link-recovery");
     const first = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: recoveryDir,
       runProvider: async () => {
         throw new ProviderRunError("claude", "API Error: 429 Too Many Requests", {
@@ -3032,11 +3089,13 @@ describe("Knowledge seam contract", () => {
     const taskRunsPath = join(recoveryDir, "config", "task-runs.json");
     const legacyTaskRuns = JSON.parse(readFileSync(taskRunsPath, "utf8"));
     legacyTaskRuns.version = 11;
+    for (const id of [parent.id, child.id]) legacyTaskRuns.runs[id].executionPlan.version = 1;
     delete legacyTaskRuns.runs[child.id].launchAdmission;
     writeFileSync(taskRunsPath, JSON.stringify(legacyTaskRuns, null, 2), "utf8");
 
     let providerCalls = 0;
     const reopened = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: recoveryDir,
       runProvider: async () => {
         providerCalls += 1;
@@ -3063,6 +3122,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -3103,6 +3163,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -3157,6 +3218,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -3196,6 +3258,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -3249,6 +3312,7 @@ describe("Knowledge seam contract", () => {
     let workActionProviderCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, input) => {
         if (input.prompt.includes("占用同空间执行槽")) {
@@ -3300,6 +3364,7 @@ describe("Knowledge seam contract", () => {
     let workActionProviderCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, input) => {
         if (input.prompt.includes("占用 readiness 执行槽")) {
@@ -3353,6 +3418,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -3409,7 +3475,7 @@ describe("Knowledge seam contract", () => {
     }));
 
     engine.close();
-    engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "" });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, runProvider: async () => "" });
     expect(engine.workContinuations.get(full.id)).toEqual(expect.objectContaining({
       status: "blocked",
       attempt: 100,
@@ -3421,6 +3487,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     engine.close();
     engine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -3648,7 +3715,7 @@ describe("Knowledge seam contract", () => {
 
   test("retracting an ingested source removes affected pages and requeues surviving sources", async () => {
     const fake = new FakeLlm();
-    const retractEngine = new KnowledgeEngine({ dataDir: join(dir, "retraction"), llm: fake });
+    const retractEngine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: join(dir, "retraction"), llm: fake });
     const removedId = await retractEngine.remember({
       space: SPACE,
       source: "message",
@@ -3708,7 +3775,7 @@ describe("Knowledge seam contract", () => {
   test("retracting a quarantined source clears the stale failure and requeues surviving sources", async () => {
     engine.close();
     const fake = new FakeLlm();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     const removedId = await engine.remember({
       space: SPACE,
       source: "message",
@@ -3846,7 +3913,7 @@ describe("Knowledge seam contract", () => {
 
   test("space restore rebuilds missing digest pages from the sanitized archive", async () => {
     const sourceDir = join(dir, "digest-restore-source");
-    const source = new KnowledgeEngine({ dataDir: sourceDir });
+    const source = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: sourceDir });
     source.ensureSpace(SPACE);
     await source.upsertPage(
       SPACE,
@@ -3881,7 +3948,7 @@ describe("Knowledge seam contract", () => {
   test("quarantined distillations are visible through the knowledge seam", async () => {
     engine.close();
     const fake = new FakeLlm();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     const rawId = await engine.remember({
       space: SPACE,
       source: "message",
@@ -3909,7 +3976,7 @@ describe("Knowledge seam contract", () => {
   test("a quarantined distillation retries its frozen generate plan without re-analysis", async () => {
     engine.close();
     const fake = new FakeLlm();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     const rawId = await engine.remember({
       space: SPACE,
       source: "message",
@@ -3936,7 +4003,7 @@ describe("Knowledge seam contract", () => {
       }),
     }));
     engine.close();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
 
     fake.queueJSON({
       title: "Retry Me",
@@ -3968,7 +4035,7 @@ describe("Knowledge seam contract", () => {
 
   test("space export and restore retain exact original source files", async () => {
     const sourceDir = join(dir, "original-source-export");
-    let source = new KnowledgeEngine({ dataDir: sourceDir });
+    let source = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: sourceDir });
     const original = new Uint8Array([0, 10, 13, 42, 128, 255]);
     const rawId = await source.rememberFile(
       {
@@ -3982,7 +4049,7 @@ describe("Knowledge seam contract", () => {
       },
     );
     source.close();
-    source = new KnowledgeEngine({ dataDir: sourceDir });
+    source = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: sourceDir });
     const archive = await source.exportSpace(SPACE);
     source.close();
 
@@ -4005,7 +4072,7 @@ describe("Knowledge seam contract", () => {
   test("a legacy quarantine upgrades its fixed slug without re-analysis", async () => {
     engine.close();
     const fake = new FakeLlm();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     const rawId = await engine.remember({
       space: SPACE,
       source: "message",
@@ -4031,7 +4098,7 @@ describe("Knowledge seam contract", () => {
       "utf8",
     );
     engine.close();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     fake.queueJSON({
       title: "Legacy Retry",
       summary: "旧记录恢复成功",
@@ -4052,7 +4119,7 @@ describe("Knowledge seam contract", () => {
   test("quarantine retry refuses a source that is no longer admitted", async () => {
     engine.close();
     const fake = new FakeLlm();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     const rawId = await engine.remember({
       space: SPACE,
       source: "task",
@@ -4081,7 +4148,7 @@ describe("Knowledge seam contract", () => {
   test("a retry generation failure replaces the quarantine and returns a fixed public reason", async () => {
     engine.close();
     const fake = new FakeLlm();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     const rawId = await engine.remember({ space: SPACE, source: "message", content: "分析重试失败" });
     fake.queueJSON({
       operations: [{ type: "concept", name: "analysis-failure", title: "Failure", rawIds: [rawId] }],
@@ -4105,7 +4172,7 @@ describe("Knowledge seam contract", () => {
   test("a missing source keeps the quarantine and returns a fixed public reason", async () => {
     engine.close();
     const fake = new FakeLlm();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     const rawId = await engine.remember({ space: SPACE, source: "message", content: "来源稍后丢失" });
     fake.queueJSON({
       operations: [{ type: "concept", name: "missing-source", title: "Missing", rawIds: [rawId] }],
@@ -4127,7 +4194,7 @@ describe("Knowledge seam contract", () => {
   test("a retry that fails generation replaces the old record with fresh evidence", async () => {
     engine.close();
     const fake = new FakeLlm();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     const rawId = await engine.remember({ space: SPACE, source: "message", content: "仍会失败" });
     const analyze = {
       operations: [{ type: "concept", name: "still-bad", title: "Still Bad", rawIds: [rawId] }],
@@ -4151,7 +4218,7 @@ describe("Knowledge seam contract", () => {
   test("batch retry attempts the current quarantine snapshot once", async () => {
     engine.close();
     const fake = new FakeLlm();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     const first = await engine.remember({ space: SPACE, source: "message", content: "first" });
     const second = await engine.remember({ space: SPACE, source: "message", content: "second" });
     fake.queueJSON({
@@ -4226,7 +4293,7 @@ describe("Knowledge seam contract", () => {
   test("raw retention preserves sources needed to recover a quarantine", async () => {
     engine.close();
     const fake = new FakeLlm();
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     const createdAt = Date.now();
     const rawId = await engine.remember({
       space: SPACE,
@@ -4249,6 +4316,7 @@ describe("Knowledge seam contract", () => {
 
   test("health reports CLI execution success and failure without probing the old gateway", async () => {
     const healthEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: join(dir, "health"),
       runProvider: async (_provider, input) => {
         if (input.prompt.includes("失败主题")) throw new Error("CLI authentication failed");
@@ -4352,6 +4420,7 @@ describe("Knowledge seam contract", () => {
   test("a task rejects a second run while its first run is active", async () => {
     const completions: Array<(value: string) => void> = [];
     const healthEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: join(dir, "concurrent-health"),
       runProvider: async () => new Promise<string>((resolve) => completions.push(resolve)),
     });
@@ -4395,6 +4464,7 @@ describe("Knowledge seam contract", () => {
   test("task runs in the same space queue behind the conversation layer", async () => {
     const completions: Array<(value: string) => void> = [];
     const queuedEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: join(dir, "layered-task-queue"),
       runProvider: async () => new Promise<string>((resolve) => completions.push(resolve)),
     });
@@ -4432,6 +4502,7 @@ describe("Knowledge seam contract", () => {
   test("a queued task can be cancelled before provider execution starts", async () => {
     const completions: Array<(value: string) => void> = [];
     const queuedEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: join(dir, "queued-task-cancel"),
       runProvider: async () => new Promise<string>((resolve) => completions.push(resolve)),
     });
@@ -4466,6 +4537,7 @@ describe("Knowledge seam contract", () => {
   test("a queued task times out before provider execution when its deadline expires", async () => {
     const completions: Array<(value: string) => void> = [];
     const queuedEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: join(dir, "queued-task-timeout"),
       runProvider: async () => new Promise<string>((resolve) => completions.push(resolve)),
     });
@@ -4502,6 +4574,7 @@ describe("Knowledge seam contract", () => {
 
   test("task setup failures become durable failed runs and clear running health", async () => {
     const healthEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: join(dir, "setup-failure-health"),
       runProvider: async () => "unused",
     });
@@ -4847,6 +4920,7 @@ describe("Knowledge seam contract", () => {
   test("runTask: research output is captured as a raw 'task' entry + lastRun recorded", async () => {
     // A dedicated engine whose CLI runner returns research text for the task.
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => "要点一：...\n要点二：...",
     });
@@ -4867,6 +4941,7 @@ describe("Knowledge seam contract", () => {
   test("runTask lets research use commands needed to collect evidence", async () => {
     let providerPrompt = "";
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_id, input) => {
         providerPrompt = input.prompt;
@@ -5066,6 +5141,7 @@ describe("Knowledge seam contract", () => {
       permission: "read-only",
       workdir: undefined,
       skills: ["code-review", "lark-doc"],
+      executionMode: "isolated",
       skillMode: "all",
       research: true,
     });
@@ -5155,6 +5231,7 @@ describe("Knowledge seam contract", () => {
     const agent = taskEngine.agents.create({
       name: "bound",
       provider: "codex",
+      executionMode: "local-full-access",
       permission: "full",
       workdir,
       skills: [{
@@ -5185,6 +5262,7 @@ describe("Knowledge seam contract", () => {
   test("web research explicitly opens a read-only provider execution", async () => {
     let execution: unknown;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_id, input) => {
         execution = input.execution;
@@ -5233,7 +5311,8 @@ describe("Knowledge seam contract", () => {
     const agent = chatEngine.agents.create({
       name: "全能力聊天助手",
       provider: "codex",
-      permission: "full",
+      executionMode: "isolated",
+      permission: "write",
       workdir,
       skills: [],
     });
@@ -5250,7 +5329,8 @@ describe("Knowledge seam contract", () => {
 
     expect(result.answer).toBe("已读取飞书文档");
     expect(snapshot.executionPlan.execution).toEqual({
-      permission: "full",
+      executionMode: "isolated",
+      permission: "write",
       workdir: realpathSync(workdir),
       skills: ["code-review", "lark-doc"],
       skillMode: "all",
@@ -5264,6 +5344,7 @@ describe("Knowledge seam contract", () => {
       execution: snapshot.executionPlan.execution,
       skills: ["code-review", "lark-doc"],
       workdir: realpathSync(workdir),
+      prompt: expect.stringContaining("完成可用的取数步骤前，不要直接要求用户导出或粘贴记录"),
     }));
   });
 
@@ -5440,7 +5521,7 @@ describe("Knowledge seam contract", () => {
       protectedDataRoot: realpathSync(chatDir),
     }]);
     expect(providerInputs).toHaveLength(2);
-    expect(providerInputs.every((input) => input.nativeSessionIsolation === true)).toBe(true);
+    expect(providerInputs.every((input) => input.nativeTopic === true)).toBe(true);
     expect(providerInputs.every((input) => input.protectedDataRoot === realpathSync(chatDir))).toBe(true);
     expect(providerInputs.every((input) =>
       JSON.stringify(input.skillInputs) === JSON.stringify([expectedSkillInput])
@@ -5449,7 +5530,7 @@ describe("Knowledge seam contract", () => {
     expect(providerInputs[1]?.nativeSession).toEqual({ mode: "start" });
   });
 
-  test("native Chat rejects full access and protected-data Workdirs before custom seams", async () => {
+  test("native Chat rejects unconfirmed full access and protected-data Workdirs before custom seams", async () => {
     for (const scenario of ["full", "workdir-inside-data", "workdir-contains-data"] as const) {
       const scenarioRoot = join(dir, `native-session-admission-${scenario}`);
       const chatDir = scenario === "workdir-contains-data"
@@ -5479,6 +5560,7 @@ describe("Knowledge seam contract", () => {
       const agent = chatEngine.agents.create({
         name: `native admission ${scenario}`,
         provider: "codex",
+        ...(scenario === "full" ? { executionMode: "local-full-access" } : {}),
         permission: scenario === "full" ? "full" : "read-only",
         workdir,
         skills: [],
@@ -5494,7 +5576,7 @@ describe("Knowledge seam contract", () => {
         { nativeSession: { mode: "start" } },
         agent.id,
       )).rejects.toThrow(scenario === "full"
-        ? "provider codex native session rejects full permission"
+        ? "本机完全访问尚未确认或绑定范围已变化"
         : "provider codex native session isolation is unavailable");
       expect(preflightCalls).toBe(0);
       expect(providerCalls).toBe(0);
@@ -5762,6 +5844,7 @@ describe("Knowledge seam contract", () => {
     let executedProvider: string | undefined;
     let executedModel: string | undefined;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (provider, input) => {
         executedProvider = provider;
@@ -5799,6 +5882,7 @@ describe("Knowledge seam contract", () => {
   test("runTask does not start a writable provider without a valid Workdir", async () => {
     let providerCalls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -5830,6 +5914,7 @@ describe("Knowledge seam contract", () => {
     // Runner serves both the research (text) and the dream steps (JSON schemas).
     let engineRef: KnowledgeEngine | undefined;
     const taskEngine: KnowledgeEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_id, input): Promise<string> => {
         const p = input.prompt;
@@ -5861,6 +5946,7 @@ describe("Knowledge seam contract", () => {
   test("runTask: distillOnRun=false captures raw but writes no page immediately", async () => {
     let calls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => { calls++; return "研究结论内容"; },
     });
@@ -5878,6 +5964,7 @@ describe("Knowledge seam contract", () => {
   test("task runs expose an id immediately and persist their completed output", async () => {
     let finishResearch: ((value: string) => void) | undefined;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => new Promise<string>((resolve) => {
         finishResearch = resolve;
@@ -5906,7 +5993,7 @@ describe("Knowledge seam contract", () => {
     expect(report.ok).toBe(true);
     taskEngine.close();
 
-    const reopened = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "" });
+    const reopened = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, runProvider: async () => "" });
     expect(reopened.getTaskRun(started.run.id)).toEqual(expect.objectContaining({
       status: "succeeded",
       output: "完整研究输出",
@@ -5919,6 +6006,7 @@ describe("Knowledge seam contract", () => {
   test("persists reported and unknown Task Run usage honestly across restart", async () => {
     let providerCalls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -5964,7 +6052,7 @@ describe("Knowledge seam contract", () => {
     expect(taskEngine.getTaskRun(report.runId)?.usage).toEqual(expectedUsage);
     taskEngine.close();
 
-    const reopened = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "" });
+    const reopened = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, runProvider: async () => "" });
     expect(reopened.getTaskRun(report.runId)?.usage).toEqual(expectedUsage);
     reopened.close();
   });
@@ -5972,6 +6060,7 @@ describe("Knowledge seam contract", () => {
   test("write Task Runs wait for durable approval before invoking the frozen execution plan", async () => {
     let providerCalls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, input) => {
         providerCalls += 1;
@@ -6028,6 +6117,7 @@ describe("Knowledge seam contract", () => {
   test("expired write approval remains durable and can never invoke the provider", () => {
     let providerCalls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -6070,6 +6160,7 @@ describe("Knowledge seam contract", () => {
     taskEngine.close();
 
     const reopened = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -6088,6 +6179,7 @@ describe("Knowledge seam contract", () => {
   test("an approval request arriving at the deadline records expired task health", () => {
     let providerCalls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -6128,7 +6220,7 @@ describe("Knowledge seam contract", () => {
   });
 
   test("approval notification retries with one durable idempotency key after restart", async () => {
-    const taskEngine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "" });
+    const taskEngine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, runProvider: async () => "" });
     taskEngine.ensureSpace(SPACE);
     const agent = taskEngine.agents.create({
       name: "Notified writer",
@@ -6157,7 +6249,7 @@ describe("Knowledge seam contract", () => {
     const retryAt = taskEngine.getTaskRun(pending.id)!.approvalNotification!.nextAttemptAt!;
     taskEngine.close();
 
-    const reopened = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "" });
+    const reopened = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, runProvider: async () => "" });
     let accepted = 0;
     await reopened.deliverTaskRunApprovalNotification(
       pending.id,
@@ -6191,6 +6283,7 @@ describe("Knowledge seam contract", () => {
     mkdirSync(workdir);
     let providerCalls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -6232,6 +6325,7 @@ describe("Knowledge seam contract", () => {
     mkdirSync(originalWorkdir);
     mkdirSync(changedWorkdir);
     const first = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         throw new Error("provider must not run before approval");
@@ -6262,6 +6356,7 @@ describe("Knowledge seam contract", () => {
 
     let providerCalls = 0;
     const reopened = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, input) => {
         providerCalls += 1;
@@ -6288,6 +6383,7 @@ describe("Knowledge seam contract", () => {
   test("rejecting or cancelling pending approval never invokes the provider and retry asks again", async () => {
     let providerCalls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -6297,7 +6393,7 @@ describe("Knowledge seam contract", () => {
     taskEngine.ensureSpace(SPACE);
     const agent = taskEngine.agents.create({
       name: "Full access",
-      provider: "codex",
+      provider: "claude",
       permission: "full",
       workdir: dir,
     });
@@ -6331,6 +6427,7 @@ describe("Knowledge seam contract", () => {
   test("an active task run can be cancelled and records a durable cancelled outcome", async () => {
     let providerSignal: AbortSignal | undefined;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, _input, _timeoutMs, signal) => {
         providerSignal = signal;
@@ -6370,6 +6467,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     let settleFirst!: (value: string) => void;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -6434,6 +6532,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     let settleFirst!: (value: string) => void;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -6496,6 +6595,7 @@ describe("Knowledge seam contract", () => {
     let attempts = 0;
     let timedOutSignal: AbortSignal | undefined;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, _input, _timeoutMs, signal) => {
         attempts += 1;
@@ -6529,7 +6629,7 @@ describe("Knowledge seam contract", () => {
 
     taskEngine.tasks.update(task.id, { timeoutMinutes: 420 });
     const retried = taskEngine.retryTaskRun(timedOut.runId);
-    expect(retried.run.timeoutMs).toBe(420 * 60_000);
+    expect(retried.run.timeoutMs).toBe(10);
     expect((await retried.completion).status).toBe("succeeded");
 
     const longOverride = taskEngine.startTaskRun(task.id, { timeoutMs: 420 * 60_000 });
@@ -6541,6 +6641,7 @@ describe("Knowledge seam contract", () => {
   test("a timeout during immediate distillation preserves research without quarantining it", async () => {
     let calls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, _input, _timeoutMs, signal) => {
         calls += 1;
@@ -6578,6 +6679,7 @@ describe("Knowledge seam contract", () => {
 
   test("notification failures remain durable and can be retried to a sent outcome", async () => {
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => "需要推送的研究摘要",
     });
@@ -6617,7 +6719,7 @@ describe("Knowledge seam contract", () => {
     ]);
     taskEngine.close();
 
-    const reopened = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "" });
+    const reopened = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, runProvider: async () => "" });
     const delivered: string[] = [];
     const sent = await reopened.deliverTaskRunNotification(
       report.runId,
@@ -6643,6 +6745,7 @@ describe("Knowledge seam contract", () => {
       releaseNotification = resolve;
     });
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => "notification audit must survive",
     });
@@ -6679,6 +6782,7 @@ describe("Knowledge seam contract", () => {
     const blockerSpace: SpaceId = "team/oc_background_blocker";
     const targetSpace: SpaceId = "team/oc_background_target";
     const backgroundEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => "",
       runConcurrency: { global: 1 },
@@ -6726,6 +6830,7 @@ describe("Knowledge seam contract", () => {
     let attempts = 0;
     const prompts: string[] = [];
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, input) => {
         prompts.push(input.prompt);
@@ -6774,6 +6879,7 @@ describe("Knowledge seam contract", () => {
     let providerCalls = 0;
     const observed: Array<{ system?: string; model?: string; prompt: string }> = [];
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async (_provider, input) => {
         providerCalls += 1;
@@ -6865,6 +6971,7 @@ describe("Knowledge seam contract", () => {
   test("exhausts a due retry while its scheduled task is disabled", async () => {
     let providerCalls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -6921,6 +7028,7 @@ describe("Knowledge seam contract", () => {
 
   test("can explicitly cancel a waiting retry and unblock space export or deletion", async () => {
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         throw new Error("provider overloaded (503)");
@@ -6952,6 +7060,7 @@ describe("Knowledge seam contract", () => {
   test("a successful manual retry supersedes the pending automatic retry", async () => {
     let providerCalls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -6987,6 +7096,7 @@ describe("Knowledge seam contract", () => {
   test("exhausts the fixed two-attempt policy without creating a third run", async () => {
     let providerCalls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -7022,6 +7132,7 @@ describe("Knowledge seam contract", () => {
   test("never arms automatic retry for write or full provider execution", async () => {
     let providerCalls = 0;
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         providerCalls += 1;
@@ -7078,6 +7189,7 @@ describe("Knowledge seam contract", () => {
       }),
     ];
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => {
         throw failures.shift();
@@ -7107,6 +7219,7 @@ describe("Knowledge seam contract", () => {
 
   test("a failed run preserves provider output when capture fails afterwards", async () => {
     const taskEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: dir,
       runProvider: async () => "已经生成但尚未落库的输出",
     });
@@ -7141,7 +7254,7 @@ describe("Knowledge seam contract", () => {
     const changedWorkdir = join(recoveryDir, "changed-workdir");
     mkdirSync(originalWorkdir, { recursive: true });
     mkdirSync(changedWorkdir, { recursive: true });
-    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const first = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     first.ensureSpace(SPACE);
     const agent = first.agents.create({
       name: "queued execution",
@@ -7186,6 +7299,7 @@ describe("Knowledge seam contract", () => {
       instruction: "Use the changed live persona.",
       provider: "codex",
       model: "gpt-changed",
+      executionMode: "local-full-access",
       permission: "full",
       workdir: changedWorkdir,
     });
@@ -7198,6 +7312,7 @@ describe("Knowledge seam contract", () => {
       execution?: unknown;
     } | undefined;
     const reopened = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: recoveryDir,
       runProvider: async (provider, input) => {
         providerCall = {
@@ -7331,7 +7446,7 @@ describe("Knowledge seam contract", () => {
 
   test("an orphaned claimed action fails closed after restart and can be retried", async () => {
     const recoveryDir = join(dir, "orphaned-work-action-recovery");
-    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const first = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     first.ensureSpace(SPACE);
     const item = first.workItems.create({
       space: SPACE,
@@ -7342,6 +7457,7 @@ describe("Knowledge seam contract", () => {
     first.close();
 
     const reopened = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: recoveryDir,
       runProvider: async () => completedWorkActionOutput("恢复后的检查通过"),
     });
@@ -7376,7 +7492,7 @@ describe("Knowledge seam contract", () => {
     const recoveryDir = join(dir, "blocked-work-action-projection-recovery");
     const restoreDir = join(dir, "blocked-work-action-projection-restore");
     engine.close();
-    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const first = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     first.ensureSpace(SPACE);
     const item = first.workItems.create({
       space: SPACE,
@@ -7398,7 +7514,7 @@ describe("Knowledge seam contract", () => {
     }));
     first.close();
 
-    engine = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     const projectedMessage = `执行发布检查：${error}`;
     expect(engine.workContinuations.get(action.id)).toEqual(expect.objectContaining({
       status: "blocked",
@@ -7412,7 +7528,7 @@ describe("Knowledge seam contract", () => {
     }));
 
     engine.close();
-    engine = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     expect(engine.workItems.get(item.id)).toEqual(expect.objectContaining({
       phase: "blocked",
       blockers: [projectedMessage],
@@ -7421,7 +7537,7 @@ describe("Knowledge seam contract", () => {
     const archive = parseSpaceArchive(await engine.exportSpace(SPACE));
 
     engine.close();
-    engine = new KnowledgeEngine({ dataDir: restoreDir, runProvider: async () => "" });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: restoreDir, runProvider: async () => "" });
     expect(await engine.restoreSpace(archive)).toBe(SPACE);
     expect(engine.workContinuations.get(action.id)).toEqual(expect.objectContaining({
       status: "blocked",
@@ -7437,7 +7553,7 @@ describe("Knowledge seam contract", () => {
 
   test("restart clears an abandoned action blocker while preserving blocked action projections", () => {
     const recoveryDir = join(dir, "abandoned-work-action-projection-recovery");
-    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const first = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     first.ensureSpace(SPACE);
 
     const abandonedItem = first.workItems.create({
@@ -7510,11 +7626,11 @@ describe("Knowledge seam contract", () => {
       }));
     };
 
-    let reopened = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    let reopened = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     assertRecoveredState(reopened);
     reopened.close();
 
-    reopened = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    reopened = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     assertRecoveredState(reopened);
     reopened.close();
   });
@@ -7522,6 +7638,7 @@ describe("Knowledge seam contract", () => {
   test("a writable successful result remains pending acceptance after restart", async () => {
     const recoveryDir = join(dir, "pending-work-acceptance-recovery");
     const first = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: recoveryDir,
       runProvider: async () => "写入已完成",
     });
@@ -7542,7 +7659,7 @@ describe("Knowledge seam contract", () => {
     first.agents.update(agent.id, { permission: "read-only" });
     first.close();
 
-    const reopened = new KnowledgeEngine({ dataDir: recoveryDir });
+    const reopened = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir });
 
     expect(reopened.workContinuations.get(pending.run.workActionId!)).toEqual(
       expect.objectContaining({
@@ -7561,7 +7678,7 @@ describe("Knowledge seam contract", () => {
 
   test("a read-only pending acceptance converges once after restart without replaying the provider", async () => {
     const recoveryDir = join(dir, "automatic-work-acceptance-recovery");
-    const first = new KnowledgeEngine({ dataDir: recoveryDir });
+    const first = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir });
     first.ensureSpace(SPACE);
     const item = first.workItems.create({
       space: SPACE,
@@ -7631,6 +7748,7 @@ describe("Knowledge seam contract", () => {
 
     let providerCalls = 0;
     const reopened = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: recoveryDir,
       runProvider: async () => {
         providerCalls += 1;
@@ -7654,7 +7772,7 @@ describe("Knowledge seam contract", () => {
 
   test("a queued work action resumes after restart from its frozen action boundary", async () => {
     const recoveryDir = join(dir, "queued-work-action-recovery");
-    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const first = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     first.ensureSpace(SPACE);
     const agent = first.agents.create({
       name: "queued continuation agent",
@@ -7701,6 +7819,7 @@ describe("Knowledge seam contract", () => {
 
     let observedSystem: string | undefined;
     const reopened = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: recoveryDir,
       recoverInterruptedTaskRuns: true,
       runProvider: async (_provider, input) => {
@@ -7723,7 +7842,7 @@ describe("Knowledge seam contract", () => {
 
   test("an interrupted running work action becomes blocked instead of replaying after restart", () => {
     const recoveryDir = join(dir, "interrupted-work-action-recovery");
-    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const first = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     first.ensureSpace(SPACE);
     const item = first.workItems.create({
       space: SPACE,
@@ -7766,6 +7885,7 @@ describe("Knowledge seam contract", () => {
 
     let providerCalls = 0;
     const reopened = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: recoveryDir,
       recoverInterruptedTaskRuns: true,
       runProvider: async () => {
@@ -7790,7 +7910,7 @@ describe("Knowledge seam contract", () => {
 
   test("recovery keeps a WorkAction cancelled when its running Run is recovered as failed", () => {
     const recoveryDir = join(dir, "cancelled-running-work-action-recovery");
-    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const first = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     first.ensureSpace(SPACE);
     const item = first.workItems.create({
       space: SPACE,
@@ -7837,6 +7957,7 @@ describe("Knowledge seam contract", () => {
     let reopened: KnowledgeEngine | undefined;
     expect(() => {
       reopened = new KnowledgeEngine({
+        skillCatalog: new SkillCatalog({ roots: [] }),
         dataDir: recoveryDir,
         recoverInterruptedTaskRuns: true,
         runProvider: async () => "must not replay",
@@ -7862,7 +7983,7 @@ describe("Knowledge seam contract", () => {
 
   test("a late succeeded Run cannot resurrect a cancelled WorkAction", () => {
     const recoveryDir = join(dir, "cancelled-late-success-work-action-recovery");
-    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const first = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     first.ensureSpace(SPACE);
     const item = first.workItems.create({
       space: SPACE,
@@ -7914,7 +8035,7 @@ describe("Knowledge seam contract", () => {
     expect(first.workContinuations.get(action.id)?.status).toBe("cancelled");
     first.close();
 
-    const reopened = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const reopened = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     expect(reopened.getTaskRun(run.id)?.status).toBe("succeeded");
     expect(reopened.workContinuations.get(action.id)).toEqual(expect.objectContaining({
       status: "cancelled",
@@ -7932,7 +8053,7 @@ describe("Knowledge seam contract", () => {
 
   test("a legacy queued task without an execution plan fails closed on recovery", async () => {
     const recoveryDir = join(dir, "legacy-queued-task-recovery");
-    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const first = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     first.ensureSpace(SPACE);
     const agent = first.agents.create({
       name: "legacy queued execution",
@@ -7956,6 +8077,7 @@ describe("Knowledge seam contract", () => {
 
     let providerCalls = 0;
     const reopened = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: recoveryDir,
       runProvider: async () => {
         providerCalls += 1;
@@ -7982,7 +8104,7 @@ describe("Knowledge seam contract", () => {
 
   test("recovered interrupted runs update the task's latest health", () => {
     const recoveryDir = join(dir, "interrupted-task-health");
-    const first = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const first = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     first.ensureSpace(SPACE);
     const task = first.tasks.create({
       name: "中断任务",
@@ -7998,11 +8120,12 @@ describe("Knowledge seam contract", () => {
     first.taskRuns.begin(interrupted.id);
     first.close();
 
-    const secondary = new KnowledgeEngine({ dataDir: recoveryDir, runProvider: async () => "" });
+    const secondary = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: recoveryDir, runProvider: async () => "" });
     expect(() => secondary.startTaskRun(task.id)).toThrow(interrupted.id);
     secondary.close();
 
     const reopened = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: recoveryDir,
       runProvider: async () => "",
       recoverInterruptedTaskRuns: true,
@@ -8033,7 +8156,7 @@ describe("answer quality tracing", () => {
         gaps: [],
       };
     });
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     await engine.upsertPage(SPACE, page("entities/alice", "Alice", "Alice 负责后端。"));
 
     const result = await engine.ask([SPACE], "谁负责后端？");
@@ -8059,7 +8182,7 @@ describe("answer quality tracing", () => {
       if ("relevant" in properties) return { slugs: ["entities/alice"], relevant: true };
       throw new Error("synthesis exploded");
     });
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     await engine.upsertPage(SPACE, page("entities/alice", "Alice", "Alice 负责后端。"));
 
     await expect(engine.ask([SPACE], "谁负责后端？")).rejects.toThrow("synthesis exploded");
@@ -8071,7 +8194,7 @@ describe("answer quality tracing", () => {
   test("records feedback only when the trace belongs to the requested space", async () => {
     engine.close();
     const fake = new FakeLlm().queueText("这不在知识库记录中，以下是我的一般性回答。");
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     const result = await engine.ask([SPACE], "一个没有知识库记录的问题");
 
     expect(engine.recordAnswerFeedback(
@@ -8090,7 +8213,7 @@ describe("answer quality tracing", () => {
   test("exposes the feedback review workflow through the engine", async () => {
     engine.close();
     const fake = new FakeLlm().queueText("这不在知识库记录中，以下是我的一般性回答。");
-    engine = new KnowledgeEngine({ dataDir: dir, llm: fake });
+    engine = new KnowledgeEngine({ skillCatalog: new SkillCatalog({ roots: [] }), dataDir: dir, llm: fake });
     const result = await engine.ask([SPACE], "线上故障该找谁？");
     engine.recordAnswerFeedback(result.traceId!, SPACE, "unhelpful", "没有给出负责人");
 

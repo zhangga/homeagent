@@ -3,7 +3,7 @@
  * tweak). The plan calls out coldStartNote (Q3): the honest nudge appended when answering from general
  *     knowledge while the space's knowledge base is still empty.
  */
-import { isProviderTimeoutError, providerPreparationFailure, NATIVE_SESSION_ISSUE_LABELS } from "@homeagent/llm";
+import { isProviderTimeoutError, providerPreparationFailure, NATIVE_SESSION_ISSUE_LABELS, EXECUTION_POLICY_ISSUE_LABELS } from "@homeagent/llm";
 
 /**
  * Shown when a message can't be answered because no runnable LLM provider is
@@ -80,6 +80,9 @@ export const NATIVE_SESSION_UNAVAILABLE_NOTICE = [
 export function providerNotice(error: unknown): string {
   const message = String(error);
   const preparation = providerPreparationFailure(error);
+  if (preparation?.stage === "execution-policy") {
+    return `⚠️ Agent 执行已停止：${EXECUTION_POLICY_ISSUE_LABELS[preparation.reason]}。本轮不会自动更换模式，也不能据此判断账号未登录。`;
+  }
   if (preparation?.stage === "skill-staging") {
     return "⚠️ 冻结 Skill 目录超过本轮准备预算，已停止执行，没有使用删减后的目录。请在管理后台查看执行证据；缩减本机 Skill 资源体积后重新发起请求，重试旧运行不会更换冻结目录。";
   }

@@ -3,6 +3,18 @@
 This file applies to the whole repository. Keep it focused on durable engineering
 contracts; do not copy temporary roadmap or release status into it.
 
+## 开发优先级与修复原则
+
+- 当前以功能开发和端到端可用为主，优先完成用户明确要求的行为。安全加固、权限体系扩展和额外约束不作为普通功能任务的默认目标。
+- 修复应针对实际根因，并保留原有可用能力。不得通过缩小功能范围、禁用原有路径或增加用户操作步骤来代替修复。
+- 新增限制必须来自明确产品需求、实际接口限制或已复现且与本次任务直接相关的问题；不能仅因假设风险、未来规模或“更安全”而加入白名单、审批、确认、隔离层或新的上限。
+- 用户已明确指定目标、范围或保存位置时，按该意图执行并复用已有能力；能由现有工具查询得到的信息应主动查询，不反复要求用户确认或手工提供。只有影响正确实现且无法合理确定的信息才需要澄清。
+- 区分查询来源、消息投递位置与数据归属。某一步的限制只作用于该步骤，不能推导成整个流程的禁令；例如入库归属不能覆盖用户指定的查询群。
+- 实现优先复用现有接口与简单路径。与当前交付无关的安全增强、通用框架和重构留待明确任务，不附带扩展实施。
+- 回归测试须覆盖用户原始操作场景及修复前可用的路径，不能只验证新增约束生效。完成标准是用户目标可实现、已有功能未被意外收窄。
+
+下文的数据正确性、凭据保护和明确授权约定按其原有适用范围执行；不得将这些约定扩张解释为用户未要求的产品限制或额外审批流程。
+
 ## Sources of truth
 
 - Read `README.md` for supported product behavior, setup, and operator workflows.
@@ -87,8 +99,15 @@ files. Add or extend a public export when a cross-package seam is genuinely need
 - Preserve provider isolation: restricted calls must not inherit ambient user
   rules, hooks, plugins, or unrelated conversation history. The sole conversation
   exception is an explicitly routed Feishu topic Chat turn using its compatible
-  Provider-native parent; shared topic turns may read only their Team Space. Tool
-  and Skill access comes only from the frozen HomeAgent execution contract.
+  Provider-native parent. HomeAgent supplies only the routed Team Space to shared
+  topic turns. Codex `isolated` topic calls also require verified filesystem
+  isolation. Explicit `local-full-access` Chat/Task calls are permitted only by a
+  frozen Agent revision and a valid persisted local execution grant, rechecked
+  at each model process launch. They provide no Provider filesystem/network
+  isolation; Workdir and prompts are not access controls. Never enable this mode
+  by fallback, legacy `full`, archive import, or a group message. Both modes keep
+  ambient configuration suppressed and Skills frozen; `write`/`full` Tasks still
+  need their own positive per-Run human approval.
 - Do not perform real Feishu mutations, live provider calls, downloads, signing,
   notarization, or release publication unless the task explicitly requests them
   and the required environment is available.
@@ -123,7 +142,9 @@ files. Add or extend a public export when a cross-package seam is genuinely need
 
 1. Inspect `git status` and nearby tests before editing. Preserve unrelated user
    changes in a dirty worktree.
-2. Make the smallest change that preserves the boundaries and invariants above.
+2. Apply the development priorities above. Make the smallest change that fixes
+   the requested behavior while preserving existing supported user workflows and
+   the applicable boundaries and invariants.
 3. Run the narrowest relevant test files while iterating, for example:
 
    ```bash

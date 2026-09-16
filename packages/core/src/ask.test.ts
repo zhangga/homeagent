@@ -744,6 +744,73 @@ describe("ask pipeline", () => {
     expect(call?.opts.images).toEqual([{ path: "/tmp/dinner.png" }]);
   });
 
+  test.each([false, true])("tool-enabled synthesis completes external research once (native=%s)", async (native) => {
+    const slug = "sources/pst-requests";
+    store.writePage(page(slug, "PST 提炼请求", "只有四条重复提炼请求，没有群聊原文。"));
+    const fake = scriptedLlm({
+      routeSlugs: [slug], relevant: true, grounded: false, usedSlugs: [],
+      answer: "已查询该群最近一周记录；原文尚未入库。",
+    });
+    const res = await ask([store], "提炼最近一周群聊，并记录原始数据", {
+      sourceCaptureInstruction: "host-scoped-raw-capture-instruction",
+      ...(native ? { nativeSession: { mode: "start" as const } } : {}),
+    }, { client: fake, toolExecution: true });
+
+    expect(fake.calls).toHaveLength(2);
+    expect(fake.calls.map(call => call.kind)).toEqual(["json", "json"]);
+    const [routing, final] = fake.calls;
+    expect(routing?.opts.nativeSession).toBeUndefined();
+    expect(String(routing?.opts.prompt)).not.toContain("先使用本轮已提供的相关 Skill");
+    expect(String(routing?.opts.prompt)).not.toContain("host-scoped-raw-capture-instruction");
+    expect(String(final?.opts.prompt)).toContain("host-scoped-raw-capture-instruction");
+    expect(final?.opts.nativeSession).toEqual(native ? { mode: "start" } : undefined);
+    expect(String(final?.opts.prompt)).toContain("先使用本轮已提供的相关 Skill");
+    expect(String(final?.opts.prompt)).toContain("命中页面不代表完成取数");
+    expect(String(final?.opts.prompt)).toContain("lark-im");
+    expect(String(final?.opts.prompt)).toContain("只有 HomeAgent 入库接口确认成功");
+    expect(String(final?.opts.prompt)).toContain("核对分页、时间范围和截断状态");
+    expect(String(final?.opts.prompt)).not.toContain("只依据上面页面作答");
+    expect(String(final?.opts.system)).not.toContain("只依据给定材料");
+    expect(res.answer).toBe("已查询该群最近一周记录；原文尚未入库。");
+    expect(res.source).toBe("general");
+    expect(res.citations).toEqual([]);
+    expect(res.gaps).toBeUndefined();
+  });
+
+  test.each([undefined, "agent-workdir", "message-source"] as const)(
+    "empty KB still requests authorized tools without adding obsolete gaps (context=%s)",
+    async (fallbackContext) => {
+      const fake = scriptedLlm({
+        routeSlugs: [], relevant: false, grounded: false, answer: "",
+        generalText: "已从指定群取得记录。",
+      });
+      const res = await ask([store], "提炼群聊最近一周内容", { fallbackContext }, {
+        client: fake, toolExecution: true,
+      });
+      expect(fake.calls).toHaveLength(1);
+      const system = String(fake.calls[0]?.opts.system);
+      expect(system).toContain("完成可用的取数步骤前，不要直接要求用户导出或粘贴记录");
+      expect(system).toContain("跨 Space 授权不明确时先澄清");
+      expect(system).toContain("HomeAgent 已明确同步本轮来源正文时");
+      if (fallbackContext === "agent-workdir") {
+        expect(system).toContain("用户需要外部来源时按相关 Skill 取数");
+      }
+      expect(res.gaps).toBeUndefined();
+    },
+  );
+
+  test.each([false, true])("knowledge-only synthesis never requests external tools (tool context=%s)", async (toolExecution) => {
+    store.writePage(page("sources/request", "请求", "待取得原文"));
+    const fake = scriptedLlm({
+      routeSlugs: ["sources/request"], relevant: true, grounded: false, answer: "缺少原文",
+    });
+    await ask([store], "查飞书群", { knowledgeOnly: true }, { client: fake, toolExecution });
+    expect(fake.calls).toHaveLength(2);
+    const prompt = String(fake.calls[1]?.opts.prompt);
+    expect(prompt).toContain("只依据上面页面作答");
+    expect(prompt).not.toContain("先使用本轮已提供的相关 Skill");
+  });
+
   test("general conversation asks one natural clarification when the user's goal is unclear", async () => {
     const fake = scriptedLlm({
       routeSlugs: [],

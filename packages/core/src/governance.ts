@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import {
   CODEX_REASONING_EFFORTS,
   isCliProvider,
+  isCodexExecutionMode,
   isCodexReasoningEffortSupported,
   normalizeProviderSkills,
 } from "@homeagent/llm";
@@ -60,9 +61,10 @@ import {
   type ChatRun,
 } from "./chat-runs.ts";
 import {
-  cloneResolvedExecutionPlan,
+  cloneStoredExecutionPlan,
+  isArchivedExecutionPlan,
   isResolvedExecutionPlan,
-  type ResolvedExecutionPlan,
+  type StoredExecutionPlan,
 } from "./execution-plan.ts";
 import type { Reminder } from "./reminders.ts";
 import type {
@@ -132,7 +134,8 @@ export const RAW_ADMISSION_SPACE_ARCHIVE_VERSION = 16 as const;
 export const KNOWLEDGE_MAPS_SPACE_ARCHIVE_VERSION = 17 as const;
 export const AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION = 18 as const;
 export const RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION = 19 as const;
-export const SPACE_ARCHIVE_VERSION = RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION;
+export const CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION = 20 as const;
+export const SPACE_ARCHIVE_VERSION = CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION;
 
 export interface RawSourceFileArchive {
   digest: string;
@@ -247,8 +250,13 @@ export interface SpaceArchiveV19 extends Omit<SpaceArchiveV18, "version"> {
   sourceFiles: RawSourceFileArchive[];
 }
 
+/** Mode intent is portable; local execution grants are deliberately not part of this DTO. */
+export interface SpaceArchiveV20 extends Omit<SpaceArchiveV19, "version"> {
+  version: typeof CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION;
+}
+
 /** Current normalized archive shape returned by export and parsing. */
-export type SpaceArchive = SpaceArchiveV19;
+export type SpaceArchive = SpaceArchiveV20;
 
 export interface SpaceDeleteResult {
   status: "deleted" | "not_found";
@@ -489,6 +497,12 @@ function parseAgent(
   if (!isCliProvider(provider)) throw new Error("agent.provider is invalid");
   const permission = text(item.permission, "agent.permission") as Agent["permission"];
   if (!AGENT_PERMISSIONS.includes(permission)) throw new Error("agent.permission is invalid");
+  const executionMode = item.executionMode;
+  if (executionMode !== undefined && (
+    version < CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION || provider !== "codex"
+    || !isCodexExecutionMode(executionMode)
+    || (executionMode === "local-full-access" ? permission !== "full" : permission === "full")
+  )) throw new Error("agent.executionMode is invalid");
   const visibility = (optionalText(item.visibility, "agent.visibility") ?? defaultVisibility) as Agent["visibility"];
   if (!AGENT_VISIBILITIES.includes(visibility)) throw new Error("agent.visibility is invalid");
   const model = text(item.model, "agent.model");
@@ -502,6 +516,7 @@ function parseAgent(
     visibility,
     workdir: optionalText(item.workdir, "agent.workdir"),
     permission,
+    ...(executionMode === undefined ? {} : { executionMode }),
     skills: parseAgentSkills(item.skills, version),
     publishedRevisionId: optionalText(
       item.publishedRevisionId,
@@ -627,8 +642,16 @@ function parseAgentRevisions(
     if (!isAgentRevision(entry, agent)) {
       throw new Error(`agentRevisions[${index}] is invalid`);
     }
+    if (version < CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION && entry.snapshot.executionMode !== undefined) {
+      throw new Error(`agentRevisions[${index}].snapshot.executionMode requires archive v20`);
+    }
     return {
-      ...entry,
+      id: entry.id,
+      agentId: entry.agentId,
+      number: entry.number,
+      source: entry.source,
+      ...(entry.basedOnRevisionId === undefined ? {} : { basedOnRevisionId: entry.basedOnRevisionId }),
+      createdAt: entry.createdAt,
       snapshot: {
         ...entry.snapshot,
         skills: entry.snapshot.skills.map((binding) => ({ ...binding })),
@@ -842,17 +865,18 @@ function parseRunExecutionPlan(
   value: unknown,
   label: string,
   version: number,
-): ResolvedExecutionPlan | undefined {
+): StoredExecutionPlan | undefined {
   if (
     version < RUN_EXECUTION_PLAN_SPACE_ARCHIVE_VERSION
     || value === undefined
   ) {
     return undefined;
   }
-  if (!isResolvedExecutionPlan(value)) {
+  if (!(isResolvedExecutionPlan(value) && value.version === 1)
+    && !(version >= 20 && isArchivedExecutionPlan(value))) {
     throw new Error(`${label} is invalid`);
   }
-  return cloneResolvedExecutionPlan(value);
+  return cloneStoredExecutionPlan(value);
 }
 
 function parseTaskRun(
@@ -1201,7 +1225,7 @@ function parseChatRun(
     model: normalized.model,
     reasoningEffort: normalized.reasoningEffort,
     executionPlan: normalized.executionPlan
-      ? cloneResolvedExecutionPlan(normalized.executionPlan)
+      ? cloneStoredExecutionPlan(normalized.executionPlan)
       : undefined,
     timeoutMs: normalized.timeoutMs,
     skillEvidence: normalized.skillEvidence
@@ -1972,6 +1996,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       && version !== KNOWLEDGE_MAPS_SPACE_ARCHIVE_VERSION
       && version !== AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION
       && version !== RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION
+      && version !== CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION
     )
   ) {
     throw new Error("unsupported space archive format or version");

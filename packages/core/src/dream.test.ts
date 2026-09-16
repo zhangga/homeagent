@@ -21,6 +21,7 @@ import { regeneratePageFromSources, runDreamCycle, isCacheHit } from "./dream.ts
 import { FakeLlm } from "./testing.ts";
 import type { Page } from "@homeagent/shared";
 import { makeCliClient } from "./cli-client.ts";
+import { chatRawImportId, parseChatRawImport } from "./chat-raw-import.ts";
 
 let dir: string;
 let store: SpaceStore;
@@ -44,6 +45,23 @@ afterEach(() => {
 function seedRaw(content: string): string {
   return store.index().insertRaw({ space: SPACE, source: "message", content });
 }
+
+test("Dream distinguishes captured chat editions from administrator corrections", async () => {
+  const entry = parseChatRawImport(JSON.stringify({ version: 1, chatId: "oc_dream", startAt: 0, endAt: 3000,
+    mainComplete: true, threadsComplete: true, olderThreadsScanned: true, failedMessageIds: [],
+    messages: [{ messageId: "om_revision", createdAt: 1000, updatedAt: 2000, text: "已完成恢复", attachments: [] }] }), SPACE, "oc_dream").entries[0]!;
+  const id = chatRawImportId(SPACE, "oc_dream", "om_revision", 2000);
+  store.index().captureImportedRaw(id, entry);
+  const fake = new FakeLlm();
+  fake.queueJSON({ operations: [{ type: "source", name: "incident", title: "应急记录", rawIds: [id] }], skippedRawIds: [] });
+  fake.queueJSON({ title: "应急记录", summary: "已恢复", aliases: [], tags: [], links: [], content: "# 应急记录\n已完成恢复。" });
+  await runDreamCycle(store, {}, { client: fake });
+  const prompt = fake.calls.find(call => call.opts.prompt?.includes("## 相关原始来源"))?.opts.prompt ?? "";
+  expect(prompt).toContain('type="chat-source-snapshot"');
+  expect(prompt).toContain("旧版本只用于变更历史");
+  expect(prompt).not.toContain("## 人工纠错规则");
+  expect(store.index().getPage("sources/incident")?.sources).toEqual([id]);
+});
 
 function writeDreamCodexProvider(directory: string): { bin: string; calls: string } {
   const script = join(directory, "dream-codex.js");

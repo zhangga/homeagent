@@ -20,6 +20,7 @@
  * are refreshed and a log entry is appended.
  */
 import type { DreamReport, Page, RawRecord } from "@homeagent/shared";
+import { isChatSourceSnapshot } from "./chat-raw-import.ts";
 import {
   AI_GENERATION_MAX_TOKENS,
   AI_ROUTING_MAX_TOKENS,
@@ -301,7 +302,8 @@ function generatePrompt(
       const part = fragment.totalParts > 1
         ? ` part="${fragment.part}/${fragment.totalParts}"`
         : "";
-      return `<source id="${fragment.raw.id}" type="${fragment.raw.source}"${part}>\n${fragment.content}\n</source>`;
+      const type = isChatSourceSnapshot(fragment.raw) ? "chat-source-snapshot" : fragment.raw.source;
+      return `<source id="${fragment.raw.id}" type="${type}"${part}>\n${fragment.content}\n</source>`;
     })
     .join("\n\n");
   const parts = [
@@ -322,12 +324,16 @@ function generatePrompt(
       "",
     );
   }
-  if (sources.some((source) => source.raw.source === "manual")) {
+  if (sources.some((source) => source.raw.source === "manual" && !isChatSourceSnapshot(source.raw))) {
     parts.push(
       "## 人工纠错规则",
       "标记为 type=\"manual\" 的来源是管理员明确提交的纠错，若与旧内容或更早来源冲突，以人工纠错为准，并移除被纠正的错误说法。",
       "",
     );
+  }
+  if (sources.some((source) => isChatSourceSnapshot(source.raw))) {
+    parts.push("## 群消息版本规则",
+      "type=\"chat-source-snapshot\" 是 Agent 查询所得的消息快照，不是管理员人工纠错。对同一群、同一 messageId，按来源 metadata 的 updatedAt（缺失时 createdAt）区分版本；最新版本用于描述当前消息，旧版本只用于变更历史。不得把同一消息的多个版本计为多起事件，也不能让旧版本覆盖较新的已知内容。", "");
   }
   parts.push(
     "## 相关原始来源",

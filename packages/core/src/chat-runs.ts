@@ -23,9 +23,12 @@ import { isSpaceId, type SpaceId } from "@homeagent/shared";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 import {
   cloneResolvedExecutionPlan,
+  cloneStoredExecutionPlan,
   isProviderExecution,
   isResolvedExecutionPlan,
+  isStoredExecutionPlan,
   type ResolvedExecutionPlan,
+  type StoredExecutionPlan,
 } from "./execution-plan.ts";
 import {
   isTaskRunSkillEvidence,
@@ -88,7 +91,7 @@ export interface ChatRun {
   reasoningEffort?: CodexReasoningEffort;
   skillEvidence?: TaskRunSkillEvidence;
   execution?: ProviderExecution;
-  executionPlan?: ResolvedExecutionPlan;
+  executionPlan?: StoredExecutionPlan;
   /** Fail-closed marker: this run was queued with a durable native-session plan. */
   topicNativeSessionExpected?: true;
   /** provider runtime limit frozen when this Chat Run is queued */
@@ -179,7 +182,7 @@ interface TopicNativeSessionRecord {
   chatId: string;
   rootMessageId: string;
   provider: "codex";
-  compatibilityVersion: 1;
+  compatibilityVersion: 1 | 2;
   compatibilityKey: string;
   sessionId: string;
   lastChatRunId: string;
@@ -189,7 +192,7 @@ interface TopicNativeSessionRecord {
 }
 
 interface ChatRunsFile {
-  version: 1 | 2 | 3 | 4 | 5 | 6;
+  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
   runs: Record<string, ChatRun>;
   topicNativeSessionPlans?: Record<string, TopicNativeSessionPlan>;
   topicNativeSessions?: Record<string, TopicNativeSessionRecord>;
@@ -204,7 +207,7 @@ export const MAX_TOPIC_NATIVE_SESSIONS_PER_SPACE = 100;
 export const MAX_TOPIC_NATIVE_SESSIONS = 5_000;
 export const MAX_TOPIC_NATIVE_SESSION_PLANS = 10_000;
 
-const TOPIC_NATIVE_SESSION_COMPATIBILITY_VERSION = 1;
+const TOPIC_NATIVE_SESSION_COMPATIBILITY_VERSION = 2;
 const TOPIC_NATIVE_SESSION_ID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const OPAQUE_UUID_RE =
@@ -214,7 +217,7 @@ const TOPIC_NATIVE_SESSION_EXTERNAL_ID_RE = /^[a-zA-Z0-9_-]{1,256}$/u;
 
 export interface TopicNativeSessionCompatibilityInput {
   agentId?: string;
-  executionPlan?: ResolvedExecutionPlan;
+  executionPlan?: StoredExecutionPlan;
   skillEvidence?: TaskRunSkillEvidence;
 }
 
@@ -243,7 +246,7 @@ export function topicNativeSessionCompatibilityKey(
     throw new Error("Skill evidence is invalid or exceeds persistence limits");
   }
   return createHash("sha256").update(canonicalJson({
-    version: TOPIC_NATIVE_SESSION_COMPATIBILITY_VERSION,
+    version: input.executionPlan?.version === 2 ? TOPIC_NATIVE_SESSION_COMPATIBILITY_VERSION : 1,
     agentId: input.agentId ?? null,
     executionPlan: input.executionPlan
       ? cloneResolvedExecutionPlan(input.executionPlan)
@@ -273,7 +276,7 @@ function clone(run: ChatRun): ChatRun {
       ? { ...run.execution, skills: [...run.execution.skills] }
       : undefined,
     executionPlan: run.executionPlan
-      ? cloneResolvedExecutionPlan(run.executionPlan)
+      ? cloneStoredExecutionPlan(run.executionPlan)
       : undefined,
     delivery: { ...run.delivery },
     usage: run.usage ? cloneAggregatedRunUsage(run.usage) : undefined,
@@ -348,7 +351,7 @@ function isTopicNativeSessionRecord(
     && isTopicExternalId(session.rootMessageId)
     && topicNativeSessionKey(session.space, session as TopicNativeSessionRecord) === key
     && session.provider === "codex"
-    && session.compatibilityVersion === TOPIC_NATIVE_SESSION_COMPATIBILITY_VERSION
+    && (session.compatibilityVersion === 1 || session.compatibilityVersion === TOPIC_NATIVE_SESSION_COMPATIBILITY_VERSION)
     && typeof session.compatibilityKey === "string"
     && TOPIC_NATIVE_SESSION_COMPATIBILITY_KEY_RE.test(session.compatibilityKey)
     && isNativeSessionId(session.sessionId)
@@ -373,6 +376,8 @@ function topicNativeSessionHasProvenance(
   const run = runs.get(session.lastChatRunId);
   const plan = plans.get(session.lastChatRunId);
   return run?.status === "succeeded"
+    && run.executionPlan?.archiveVersion === undefined
+    && session.compatibilityVersion === (run.executionPlan?.version === 2 ? 2 : 1)
     && run.topicNativeSessionExpected === true
     && run.space === session.space
     && plan?.kind === session.kind
@@ -392,7 +397,7 @@ function topicNativeSessionIsContinuationEligible(
 }
 
 function assertTopicNativeSessionPlan(
-  input: StartChatRunInput,
+  input: Omit<StartChatRunInput, "executionPlan"> & { executionPlan?: StoredExecutionPlan },
   plan: TopicNativeSessionPlan,
 ): void {
   if (!isTopicNativeSessionPlan(plan)) {
@@ -571,7 +576,13 @@ export function isChatRun(value: unknown): value is ChatRun {
       || CODEX_REASONING_EFFORTS.includes(run.reasoningEffort))
     && (run.skillEvidence === undefined || isTaskRunSkillEvidence(run.skillEvidence))
     && (run.execution === undefined || isProviderExecution(run.execution))
-    && (run.executionPlan === undefined || isResolvedExecutionPlan(run.executionPlan))
+    && (run.executionPlan === undefined || (isStoredExecutionPlan(run.executionPlan)
+      && (run.executionPlan.archiveVersion === undefined || !["queued", "running"].includes(String(run.status)))
+      && (run.executionPlan.localExecution === undefined || (
+        run.executionPlan.localExecution.kind === "chat"
+        && run.executionPlan.localExecution.scope.spaceId === run.space
+        && typeof run.agentId === "string" && run.agentId.length > 0
+      ))))
     && (run.topicNativeSessionExpected === undefined
       || run.topicNativeSessionExpected === true)
     && (run.timeoutMs === undefined || (
@@ -663,13 +674,14 @@ export class ChatRunStore {
     } catch {
       throw new Error("Chat Run history is corrupt; refusing to overwrite it");
     }
-    if (![1, 2, 3, 4, 5, 6].includes(Number(parsed.version))) {
+    if (![1, 2, 3, 4, 5, 6, 7, 8].some(version => version === parsed.version)) {
       throw new Error("Chat Run history uses an unsupported newer version");
     }
     if (!parsed.runs || typeof parsed.runs !== "object" || Array.isArray(parsed.runs)) {
       throw new Error("Chat Run history is corrupt; refusing to overwrite it");
     }
-    if (parsed.version === 6 && (
+    const hasNativeSessions = parsed.version === 6 || parsed.version === 7 || parsed.version === 8;
+    if (hasNativeSessions && (
       (parsed.topicNativeSessionPlans !== undefined && (
         !parsed.topicNativeSessionPlans
         || typeof parsed.topicNativeSessionPlans !== "object"
@@ -697,13 +709,17 @@ export class ChatRunStore {
               queuedAt: legacy.startedAt,
               runStartedAt: legacy.status === "queued" ? undefined : legacy.startedAt,
             }
-          : parsed.version === 6
+          : hasNativeSessions
           ? legacy
           : legacyWithoutTopicNativeSessionExpected;
-        if (!isChatRun(normalized) || normalized.id !== id) continue;
+        if (normalized.executionPlan?.version === 2 && parsed.version !== 8) throw new Error("Unexpected v2 execution plan");
+        if (!isChatRun(normalized) || normalized.id !== id) {
+          if (parsed.version === 8) throw new Error("Invalid Chat Run");
+          continue;
+        }
         runs.set(id, clone(normalized));
       }
-      if (parsed.version === 6) {
+      if (hasNativeSessions) {
         for (const [runId, value] of Object.entries(parsed.topicNativeSessionPlans ?? {})) {
           const run = runs.get(runId);
           if (
@@ -764,7 +780,7 @@ export class ChatRunStore {
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const tempPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
     const file: ChatRunsFile = {
-      version: 6,
+      version: 8,
       runs: Object.fromEntries(runs),
       topicNativeSessionPlans: Object.fromEntries(topicNativeSessionPlans),
       topicNativeSessions: Object.fromEntries(topicNativeSessions),
@@ -904,6 +920,10 @@ export class ChatRunStore {
     if (input.executionPlan !== undefined && !isResolvedExecutionPlan(input.executionPlan)) {
       throw new Error("Resolved execution plan is invalid");
     }
+    const reference = input.executionPlan?.localExecution;
+    if (reference && (reference.kind !== "chat" || reference.scope.spaceId !== input.space || !input.agentId)) {
+      throw new Error("Chat execution scope does not match the frozen plan");
+    }
     if (input.skillEvidence !== undefined && !isTaskRunSkillEvidence(input.skillEvidence)) {
       throw new Error("Skill evidence is invalid or exceeds persistence limits");
     }
@@ -968,6 +988,22 @@ export class ChatRunStore {
   topicNativeSessionForRun(id: string): TopicNativeSessionPlan | undefined {
     const plan = this.topicNativeSessionPlans.get(id);
     return plan ? cloneTopicNativeSessionPlan(plan) : undefined;
+  }
+
+  /** User requests through this Run in the routed topic, for application workflow intent only. */
+  topicInputsThroughRun(id: string): string[] {
+    const current = this.runs.get(id);
+    if (!current) return [];
+    const topic = this.topicNativeSessionPlans.get(id);
+    if (!topic) return [current.input];
+    const inputs: string[] = [];
+    for (const run of this.runs.values()) {
+      const candidate = this.topicNativeSessionPlans.get(run.id);
+      if (run.space === current.space && candidate?.chatId === topic.chatId
+        && candidate.rootMessageId === topic.rootMessageId && !run.inputTruncated) inputs.push(run.input);
+      if (run.id === id) break;
+    }
+    return inputs;
   }
 
   prepareTopicNativeSession(id: string): NativeSessionRequest | undefined {
@@ -1126,14 +1162,14 @@ export class ChatRunStore {
         ) {
           throw new Error("Provider did not start a fresh native session");
         }
-        const finishedAt = Math.max(result.finishedAt, run.startedAt);
+        const finishedAt = Math.max(result.finishedAt, run.runStartedAt ?? run.startedAt);
         sessions.set(lease.topicKey, {
           space: run.space,
           kind: "feishu-topic",
           chatId: plan.chatId,
           rootMessageId: plan.rootMessageId,
           provider: plan.provider,
-          compatibilityVersion: TOPIC_NATIVE_SESSION_COMPATIBILITY_VERSION,
+          compatibilityVersion: run.executionPlan?.version === 2 ? TOPIC_NATIVE_SESSION_COMPATIBILITY_VERSION : 1,
           compatibilityKey: plan.compatibilityKey,
           sessionId: nativeSessionId,
           lastChatRunId: run.id,
@@ -1154,7 +1190,7 @@ export class ChatRunStore {
       }
       run.runStartedAt ??= run.startedAt;
       run.status = "succeeded";
-      run.finishedAt = Math.max(result.finishedAt, run.startedAt);
+      run.finishedAt = Math.max(result.finishedAt, run.runStartedAt ?? run.startedAt);
       run.output = result.output.slice(0, MAX_CHAT_RUN_OUTPUT_CHARACTERS);
       run.outputTruncated =
         result.output.length > MAX_CHAT_RUN_OUTPUT_CHARACTERS || undefined;
@@ -1278,6 +1314,17 @@ export class ChatRunStore {
       .filter((run) => !space || run.space === space)
       .sort((a, b) => b.startedAt - a.startedAt || a.id.localeCompare(b.id))
       .map(clone);
+  }
+
+  /** Unpaginated metadata only; terminal history is not execution authority. */
+  referencedLocalExecutionGrantIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const run of this.runs.values()) {
+      if (run.status !== "queued" && run.status !== "running") continue;
+      const plan = run.executionPlan;
+      if (plan && isResolvedExecutionPlan(plan) && plan.localExecution) ids.add(plan.localExecution.grantId);
+    }
+    return ids;
   }
 
   listByAgent(agentId: string, limit = 20): ChatRun[] {

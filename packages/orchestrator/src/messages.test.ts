@@ -18,6 +18,16 @@ test("full permission rejection is distinct from a failed host sandbox probe", (
   expect(notice).not.toContain("当前设备无法");
 });
 
+test("execution consent failures are fixed, bounded, and never reported as login failures", () => {
+  for (const reason of ["execution-mode-invalid", "local-execution-consent-required", "local-execution-consent-revoked", "managed-policy-disallows-mode"] as const) {
+    const notice = providerNotice(new ProviderPreparationError({ stage: "execution-policy", reason }));
+    expect(notice).toContain("执行已停止");
+    expect(notice).toContain("不会自动更换模式");
+    expect(notice).toContain("不能据此判断账号未登录");
+    expect(notice.length).toBeLessThan(250);
+  }
+});
+
 test("a failed root-deny proof has a precise notice, not login or setup advice", () => {
   const notice = providerNotice(new ProviderPreparationError({ stage: "native-session", reason: "protected-root-readable", exitCode: 75 }));
   expect(notice).toContain("受保护数据目录仍可读取");

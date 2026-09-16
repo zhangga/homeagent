@@ -512,7 +512,7 @@ describe("web backend (read-only)", () => {
     expect(verified.headers.get("cache-control")).toContain("no-store");
     expect(await verified.json()).toEqual({
       state: "ready",
-      message: "Codex 已完全可用",
+      message: "机器隔离探测已通过；实际运行仍检查 Workdir、Skill 和模型调用",
     });
   });
 
@@ -2337,10 +2337,11 @@ describe("management backend (read-write)", () => {
     const governanceBody = await governance.text();
     expect(governanceBody).toContain("数据治理");
     expect(governanceBody).toContain("原始消息保留");
-    expect(governanceBody).toContain("homeagent.space v1–v19");
+    expect(governanceBody).toContain("homeagent.space v1–v20");
     expect(governanceBody).toContain("v17 包含系统生成的分层知识地图");
     expect(governanceBody).toContain("v18 包含本地 Agent 知识消费反馈及处置记录");
     expect(governanceBody).toContain("v19 包含按 SHA-256 校验的完整原文件");
+    expect(governanceBody).toContain("v20 保留 Agent 执行模式意图但不包含本机完全访问确认");
 
     const exported = await app.request(`/spaces/${encodeURIComponent(SPACE)}/export`);
     expect(exported.status).toBe(200);
@@ -2349,7 +2350,7 @@ describe("management backend (read-write)", () => {
     expect(JSON.parse(archiveText)).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 19,
+        version: 20,
         sourceFiles: [],
         agentKnowledgeFeedback: [],
         agentRevisions: [],
@@ -5097,6 +5098,7 @@ describe("management backend (read-write)", () => {
     engine.close();
     engine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => "配置已更新，并完成核对",
     });
     engine.ensureSpace(SPACE);
@@ -5158,6 +5160,7 @@ describe("management backend (read-write)", () => {
     engine.close();
     engine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => "变更命令执行完成",
     });
     engine.ensureSpace(SPACE);
@@ -5203,6 +5206,7 @@ describe("management backend (read-write)", () => {
     engine.close();
     engine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => "旧发布动作已经执行",
     });
     engine.ensureSpace(SPACE);
@@ -5289,6 +5293,7 @@ describe("management backend (read-write)", () => {
     engine.close();
     engine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => "待复核的动作结果",
     });
     engine.ensureSpace(SPACE);
@@ -5492,6 +5497,7 @@ describe("management backend (read-write)", () => {
     const isolatedDir = join(dir, "web-approval");
     const isolatedEngine = new KnowledgeEngine({
       dataDir: isolatedDir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async (_provider, input) => {
         providerCalls += 1;
         expect(input.prompt).toContain("dangerous original topic");
@@ -5667,6 +5673,7 @@ describe("management backend (read-write)", () => {
   test("tasks: automatic retry state is visible and can be cancelled", async () => {
     const isolatedEngine = new KnowledgeEngine({
       dataDir: join(dir, "automatic-retry-view"),
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => {
         throw new Error("provider overloaded (503)");
       },
@@ -5705,6 +5712,7 @@ describe("management backend (read-write)", () => {
     let finish: ((value: string) => void) | undefined;
     const isolatedEngine = new KnowledgeEngine({
       dataDir: join(dir, "duplicate-run"),
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => new Promise<string>((resolve) => {
         finish = resolve;
       }),
@@ -5732,6 +5740,7 @@ describe("management backend (read-write)", () => {
   test("tasks: a running task can be cancelled from its detail page", async () => {
     const isolatedEngine = new KnowledgeEngine({
       dataDir: join(dir, "cancel-run"),
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async (_provider, _input, _timeoutMs, signal) =>
         new Promise<string>((_resolve, reject) => {
           signal?.addEventListener("abort", () => reject(signal.reason), { once: true });

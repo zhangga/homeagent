@@ -25,6 +25,8 @@ export interface DreamOptions {
 }
 
 export interface AskOptions {
+  /** Host-provided handoff instructions for a scoped, writable Chat Run. */
+  sourceCaptureInstruction?: string;
   onExecutionEvidence?: import("@homeagent/llm").RunInput["onExecutionEvidence"];
   /** model override for synthesis */
   model?: string;
@@ -127,6 +129,8 @@ export interface SpaceMeta {
   name?: string;
   /** id of the Agent assigned to answer in this space (undefined => default) */
   agentId?: string;
+  /** Local binding incarnation; never accepted from a patch or a Space archive. */
+  agentBindingEpoch?: string;
   /**
    * Whether replies thread ("Topic reply" in mew). Defaults to true for team
    * spaces and false for personal when unset (see runtime send()).

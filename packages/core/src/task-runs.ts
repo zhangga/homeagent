@@ -20,8 +20,11 @@ import type {
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 import {
   cloneResolvedExecutionPlan,
+  cloneStoredExecutionPlan,
   isResolvedExecutionPlan,
+  isStoredExecutionPlan,
   type ResolvedExecutionPlan,
+  type StoredExecutionPlan,
 } from "./execution-plan.ts";
 import type { RunPriority } from "./run-scheduler.ts";
 import {
@@ -89,7 +92,7 @@ export interface TaskRun {
   agentId?: string;
   provider?: ProviderId;
   model?: string;
-  executionPlan?: ResolvedExecutionPlan;
+  executionPlan?: StoredExecutionPlan;
   skillEvidence?: TaskRunSkillEvidence;
   retryOf?: string;
   distill: boolean;
@@ -128,7 +131,7 @@ export interface TaskRunSkillEvidence {
 }
 
 interface TaskRunsFile {
-  version: 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12;
+  version: 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13;
   runs: Record<string, TaskRun>;
 }
 
@@ -207,7 +210,7 @@ function clone(run: TaskRun): TaskRun {
   return {
     ...run,
     executionPlan: run.executionPlan
-      ? cloneResolvedExecutionPlan(run.executionPlan)
+      ? cloneStoredExecutionPlan(run.executionPlan)
       : undefined,
     approval: run.approval ? { ...run.approval } : undefined,
     approvalNotification: run.approvalNotification
@@ -384,7 +387,7 @@ function isTaskRunApproval(value: unknown): value is TaskRunApproval {
   );
 }
 
-function isRiskyTaskExecutionPlan(plan: ResolvedExecutionPlan | undefined): boolean {
+function isRiskyTaskExecutionPlan(plan: StoredExecutionPlan | undefined): boolean {
   return plan?.execution?.permission === "write"
     || plan?.execution?.permission === "full";
 }
@@ -548,7 +551,11 @@ function isTaskRun(value: unknown): value is TaskRun {
     && ["manual", "scheduled", "chat", "retry"].includes(String(run.trigger))
     && (run.provider === undefined || isCliProvider(run.provider))
     && (run.executionPlan === undefined || (
-      isResolvedExecutionPlan(run.executionPlan)
+      isStoredExecutionPlan(run.executionPlan)
+      && (run.executionPlan.archiveVersion === undefined || !["awaiting_approval", "queued", "running"].includes(String(run.status)))
+      && (run.executionPlan.localExecution === undefined || (
+        run.executionPlan.localExecution.kind === "task" && typeof run.agentId === "string" && run.agentId.length > 0
+      ))
       && (run.executionPlan.execution !== undefined
         || run.executionPlan.resolutionError !== undefined)
     ))
@@ -694,11 +701,15 @@ export class TaskRunStore {
     const runs = new Map<string, TaskRun>();
     if (!existsSync(this.configPath)) return runs;
     let migratedUnapprovedRun = false;
+    let version: number | undefined;
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<TaskRunsFile>;
-      const version = parsed.version;
-      if (version === undefined || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].includes(version)) {
-        return runs;
+      version = parsed.version;
+      if (version === undefined || ![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13].includes(version)) {
+        throw new Error("Task Run history uses an unsupported version");
+      }
+      if (!parsed.runs || typeof parsed.runs !== "object" || Array.isArray(parsed.runs)) {
+        throw new Error("Task Run history is invalid");
       }
       migratedUnapprovedRun = version < 9;
       for (const [id, value] of Object.entries(parsed.runs ?? {})) {
@@ -773,7 +784,11 @@ export class TaskRunStore {
               approvalNotification: { status: "pending", attempts: 0 },
             }
           : expiryNormalized;
-        if (!isTaskRun(normalized) || normalized.id !== id) continue;
+        if (normalized.executionPlan?.version === 2 && version !== 13) throw new Error("Unexpected v2 execution plan");
+        if (!isTaskRun(normalized) || normalized.id !== id) {
+          if (version === 13) throw new Error("Invalid Task Run");
+          continue;
+        }
         runs.set(id, clone(normalized));
         migratedUnapprovedRun ||= needsApprovalMigration
           || needsLegacyApprovalAudit
@@ -781,8 +796,7 @@ export class TaskRunStore {
           || needsApprovalNotificationMigration;
       }
     } catch {
-      // Corrupt history must not prevent the application from starting.
-      return runs;
+      throw new Error("Task Run history is invalid or unsupported; refusing to overwrite it");
     }
     if (migratedUnapprovedRun) this.persist(runs);
     return runs;
@@ -792,7 +806,7 @@ export class TaskRunStore {
     const configDir = dirname(this.configPath);
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const tempPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
-    const file: TaskRunsFile = { version: 12, runs: Object.fromEntries(runs) };
+    const file: TaskRunsFile = { version: 13, runs: Object.fromEntries(runs) };
     try {
       writeFileSync(tempPath, JSON.stringify(file, null, 2), { encoding: "utf8", mode: 0o600 });
       const fileDescriptor = openSync(tempPath, "r+");
@@ -939,6 +953,9 @@ export class TaskRunStore {
   start(input: StartTaskRunInput): TaskRun {
     if (input.executionPlan !== undefined && !isResolvedExecutionPlan(input.executionPlan)) {
       throw new Error("Resolved execution plan is invalid");
+    }
+    if (input.executionPlan?.localExecution && (input.executionPlan.localExecution.kind !== "task" || !input.agentId)) {
+      throw new Error("Task execution scope does not match the frozen plan");
     }
     if (
       input.executionPlan !== undefined
@@ -1277,6 +1294,17 @@ export class TaskRunStore {
       .map(clone);
   }
 
+  /** Include pending approvals and queued work; do not clone large outputs or paginate references. */
+  referencedLocalExecutionGrantIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const run of this.runs.values()) {
+      if (run.status !== "awaiting_approval" && run.status !== "queued" && run.status !== "running") continue;
+      const plan = run.executionPlan;
+      if (plan && isResolvedExecutionPlan(plan) && plan.localExecution) ids.add(plan.localExecution.grantId);
+    }
+    return ids;
+  }
+
   listDueRetries(now = Date.now()): TaskRun[] {
     if (!Number.isFinite(now) || now < 0) {
       throw new Error("Task Run retry time is invalid");
@@ -1328,6 +1356,7 @@ export class TaskRunStore {
     const existing = this.runs.get(id);
     if (
       existing?.status !== "failed"
+      || existing.executionPlan?.archiveVersion !== undefined
       || !isTaskRunLaunchAdmitted(existing)
       || existing.retry?.status !== "waiting"
       || existing.retry.nextAttemptAt === undefined
@@ -1391,7 +1420,7 @@ export class TaskRunStore {
         provider: parent.provider,
         model: parent.model,
         executionPlan: parent.executionPlan
-          ? cloneResolvedExecutionPlan(parent.executionPlan)
+          ? cloneStoredExecutionPlan(parent.executionPlan)
           : undefined,
         skillEvidence: parent.skillEvidence
           ? {

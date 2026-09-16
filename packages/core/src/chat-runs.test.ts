@@ -24,6 +24,44 @@ afterEach(() => {
 });
 
 describe("ChatRunStore", () => {
+  test("workflow requests survive reopen and stay within the current topic and Run boundary", () => {
+    let store = new ChatRunStore(dir);
+    const executionPlan: ResolvedExecutionPlan = { version: 1, provider: "codex", instruction: "topic" };
+    const start = (input: string, rootMessageId = "om_root", space = SPACE, chatId = "oc_chat_runs") => store.start({
+      space, chatId, input, trigger: "message", executionPlan, startedAt: 100,
+      topicNativeSession: { kind: "feishu-topic", provider: "codex", chatId, rootMessageId,
+        compatibilityKey: topicNativeSessionCompatibilityKey({ executionPlan }) },
+    });
+    const first = start("飞书群：PST 提炼一周并保存原始数据");
+    start("其他话题的要求", "om_other");
+    start("其他空间的要求", "om_root", "team/oc_other", "oc_other");
+    store = new ChatRunStore(dir);
+    const next = start("再提炼最近两周");
+    start("后续才取消保存");
+    expect(store.topicInputsThroughRun(next.id)).toEqual([first.input, next.input]);
+    const values = store.topicInputsThroughRun(next.id); values.push("不能修改 Store");
+    expect(store.topicInputsThroughRun(next.id)).toHaveLength(2);
+    const standalone = store.start({ space: SPACE, input: "普通消息", trigger: "message" });
+    expect(store.topicInputsThroughRun(standalone.id)).toEqual(["普通消息"]);
+  });
+
+  test("reads v6 history without inventing mode evidence and writes new metadata as v8", () => {
+    const path = join(dir, "config", "chat-runs.json");
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ version: 6, runs: {
+      legacy: { id: "legacy", space: SPACE, input: "legacy", trigger: "message", priority: "interactive",
+        queuedAt: 100, startedAt: 100, status: "queued", delivery: { status: "pending", attempts: 0 } },
+    }, topicNativeSessionPlans: {}, topicNativeSessions: {} }));
+    const store = new ChatRunStore(dir);
+    expect(store.get("legacy")?.executionEvidence).toBeUndefined();
+    store.fail("legacy", { finishedAt: 110, error: { kind: "provider_unavailable", message: "not started" }, executionEvidence: {
+      truncated: false, calls: [{ source: "codex-jsonl", events: [], truncated: false, execution: {
+        executionMode: "local-full-access", sandboxCheck: "not-applicable", effectiveSandbox: "danger-full-access", process: "not-started", model: "unknown",
+      } }],
+    } });
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(8);
+    expect(new ChatRunStore(dir).get("legacy")?.executionEvidence?.calls[0]?.execution?.sandboxCheck).toBe("not-applicable");
+  });
   test("execution evidence survives reopen and cannot be mutated or polluted", () => {
     const store = new ChatRunStore(dir);
     const run = store.start({ space: SPACE, input: "audit", trigger: "message", startedAt: 100 });
@@ -159,10 +197,10 @@ describe("ChatRunStore", () => {
     expect(new ChatRunStore(dir).get(run.id)?.executionPlan).toEqual(executionPlan);
     expect(new ChatRunStore(dir).get(run.id)?.timeoutMs).toBe(7 * 60_000);
     expect(JSON.parse(readFileSync(join(dir, "config", "chat-runs.json"), "utf8")).version)
-      .toBe(6);
+      .toBe(8);
   });
 
-  test("reuses a successfully delivered Feishu topic session after its Chat Run commit", () => {
+  test.each([6, 7])("reuses a successfully delivered Feishu topic session after its Chat Run commit (v%s)", (version) => {
     const store = new ChatRunStore(dir);
     const executionPlan: ResolvedExecutionPlan = {
       version: 1,
@@ -214,6 +252,11 @@ describe("ChatRunStore", () => {
       nativeSessionId: firstSessionId,
     });
     store.deliverySent(first.id, 111);
+
+    const file = join(dir, "config", "chat-runs.json");
+    const saved = JSON.parse(readFileSync(file, "utf8"));
+    saved.version = version;
+    writeFileSync(file, JSON.stringify(saved));
 
     const reopened = new ChatRunStore(dir);
     const second = reopened.start({
@@ -1346,7 +1389,7 @@ describe("ChatRunStore", () => {
     const path = join(dir, "config", "chat-runs.json");
     mkdirSync(dirname(path), { recursive: true });
     const future = JSON.stringify({
-      version: 7,
+      version: 9,
       runs: { future_run: { privateFutureState: "preserve-me" } },
     });
     writeFileSync(path, future, "utf8");

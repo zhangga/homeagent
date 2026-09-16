@@ -34,3 +34,24 @@ test("Chat Run explains preparation failure even without Provider output", async
   expect(rendered).toContain("退出码 75");
   expect(rendered).toContain("protected-root-readable");
 });
+
+test("full access evidence says no sandbox, not sandbox passed or model verified", async () => {
+  const rendered = String(await chatRunView({ ...run, executionEvidence: {
+    truncated: false, calls: [{ source: "codex-jsonl", events: [], truncated: false, execution: {
+      executionMode: "local-full-access", sandboxCheck: "not-applicable", effectiveSandbox: "danger-full-access",
+      process: "started", model: "unknown",
+    } }],
+  } }));
+  expect(rendered).toContain("本机完全访问 · 未隔离");
+  expect(rendered).toContain("不适用（未启用沙箱）");
+  expect(rendered).toContain("进程已启动");
+  expect(rendered).toContain("模型调用未验证");
+  expect(rendered).not.toContain("隔离已通过");
+});
+
+test("Run details distinguish current authorization from the historical execution evidence", async () => {
+  const body = String(await chatRunView(run, undefined, undefined, [], "冻结运行的本机确认已撤销、失效或未授权"));
+  expect(body).toContain("当前本机授权");
+  expect(body).toContain("已撤销、失效或未授权");
+  expect(body).toContain("未记录执行证据");
+});

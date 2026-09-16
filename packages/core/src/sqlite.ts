@@ -27,6 +27,7 @@ import type {
 } from "@homeagent/shared";
 import type { MessageRetractionRecord } from "./governance.ts";
 import { RawJournal } from "./raw-journal.ts";
+import { chatRawEntryUpdatedAt, chatRawVersionContent } from "./chat-raw-import.ts";
 import { toMatchQuery, toSearchText } from "./tokenize.ts";
 
 export const MAX_SEARCH_RESULTS = 100;
@@ -373,6 +374,29 @@ export class SpaceIndex {
     this.rawJournal?.insert(record);
     this.insertRawProjection(record);
     return id;
+  }
+
+  /** Idempotent source snapshot capture; repair only the rebuildable projection on retry. */
+  captureImportedRaw(id: string, entry: RawEntry): boolean {
+    if (!/^chat-import-[a-f0-9]{64}$/.test(id) || entry.source !== "manual" || entry.workActionId || entry.admission) {
+      throw new Error("Invalid imported Raw capture");
+    }
+    // The journal may already have committed when a previous projection write failed.
+    const existing = this.rawJournal ? this.rawJournal.getRaw(id) : this.getRaw(id);
+    if (existing) {
+      if (existing.space !== entry.space || existing.chatId !== entry.chatId || existing.messageId !== entry.messageId) {
+        throw new Error("Imported Raw identity mismatch");
+      }
+      if (chatRawEntryUpdatedAt(entry) !== undefined && chatRawVersionContent(existing) !== chatRawVersionContent(entry)) {
+        throw new Error("Imported Raw version conflict");
+      }
+      if (!this.getRaw(id)) this.insertRawProjection(existing);
+      return false;
+    }
+    const record: RawRecord = { ...structuredClone(entry), id, admission: "ready", ingested: false, createdAt: entry.createdAt ?? Date.now() };
+    this.rawJournal?.insert(record);
+    this.insertRawProjection(record);
+    return true;
   }
 
   /** Restore one exact raw record, preserving its provenance id and state. */

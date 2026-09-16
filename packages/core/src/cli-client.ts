@@ -25,6 +25,7 @@ import type {
   ProviderSkillInput,
   ProviderId,
   NativeSessionRequest,
+  RunInput,
 } from "@homeagent/llm";
 import { runProviderDetailed as realRunProvider } from "@homeagent/llm";
 import {
@@ -67,7 +68,8 @@ export type RunProviderFn = (
     outputSchema?: Record<string, unknown>;
     maxTokens?: number;
     nativeSession?: NativeSessionRequest;
-    nativeSessionIsolation?: boolean;
+    nativeTopic?: boolean;
+    acquireExecutionPermit?: RunInput["acquireExecutionPermit"];
     onExecutionEvidence?: import("@homeagent/llm").RunInput["onExecutionEvidence"];
   },
   timeoutMs?: number,
@@ -195,7 +197,8 @@ export function makeCliClient(
   skills: string[] = execution?.skills ?? [],
   workdir?: string,
   skillInputs: ProviderSkillInput[] = [],
-  nativeSessionIsolation = false,
+  nativeTopic = false,
+  acquireExecutionPermit?: RunInput["acquireExecutionPermit"],
 ): LlmClient {
   if (typeof accountingDataDir !== "string" || !accountingDataDir.trim()) {
     throw new Error("accounting data directory is required");
@@ -240,7 +243,8 @@ export function makeCliClient(
             maxTokens: opts.maxTokens,
             nativeSession: opts.nativeSession,
             ...(opts.onExecutionEvidence ? { onExecutionEvidence: opts.onExecutionEvidence } : {}),
-            ...(nativeSessionIsolation ? { nativeSessionIsolation: true } : {}),
+            ...(nativeTopic ? { nativeTopic: true } : {}),
+            ...(acquireExecutionPermit ? { acquireExecutionPermit } : {}),
           },
           timeoutMs,
           signal,
@@ -297,7 +301,8 @@ export function makeCliClient(
             ...(opts.onExecutionEvidence ? { onExecutionEvidence: opts.onExecutionEvidence } : {}),
             maxTokens: opts.maxTokens,
             nativeSession: opts.nativeSession,
-            ...(nativeSessionIsolation ? { nativeSessionIsolation: true } : {}),
+            ...(nativeTopic ? { nativeTopic: true } : {}),
+            ...(acquireExecutionPermit ? { acquireExecutionPermit } : {}),
           },
           timeoutMs,
           signal,

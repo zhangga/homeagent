@@ -5,6 +5,8 @@
 node_modules/
 dist/
 coverage/
+# Opt-in Codex acceptance owns and removes these directories (contains temporary auth).
+/.codex-live-*/
 *.log
 
 .idea/

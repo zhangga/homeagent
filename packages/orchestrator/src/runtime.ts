@@ -38,6 +38,7 @@ import {
 import {
   resolveGroupParticipationLevel,
   isKnowledgeContentRef,
+  isResolvedExecutionPlan,
   type AnswerOutcome,
   type AskFailureTrace,
   type ChatRun,
@@ -1160,7 +1161,7 @@ export class Orchestrator {
             timeoutMs: this.chatAnswerTimeoutMs ?? config().chatTimeoutMinutes * 60_000,
           };
         })();
-    if (!snapshot.executionPlan) {
+    if (!isResolvedExecutionPlan(snapshot.executionPlan)) {
       throw new Error("Chat Run requires an immutable execution plan");
     }
     const rawWorkItemId = rawId && this.engine.registry.has(writeSpace)
@@ -1494,13 +1495,14 @@ export class Orchestrator {
     let outcome: AnswerOutcome | undefined;
     try {
       const run = this.engine.chatRuns.get(runId);
-      if (!run?.executionPlan) {
+      if (!run || !isResolvedExecutionPlan(run.executionPlan)) {
         throw new Error("Chat Run has no immutable execution plan");
       }
       const nativeSession = this.engine.chatRuns.prepareTopicNativeSession(runId);
       const effectiveReadSpaces = nativeSession ? [writeSpace] : readSpaces;
       let context: ConversationContext = { text: userText, images: [] };
       let failureTrace: AskFailureTrace | undefined;
+      const rawImport = this.engine.prepareChatRawImport(runId);
       let res;
       try {
         context = await this.withReplyContext(
@@ -1525,6 +1527,7 @@ export class Orchestrator {
               failureTrace = trace;
             },
             onExecutionEvidence: (evidence) => appendExecutionEvidence(executionEvidence, evidence),
+            ...(rawImport ? { sourceCaptureInstruction: rawImport.instruction } : {}),
           },
           run.agentId,
         );
@@ -1583,6 +1586,7 @@ export class Orchestrator {
       // Cold-start honesty (Q3): if general and the KB is essentially empty, add a
       // gentle nudge to feed knowledge.
       let text = formatAnswer(res);
+      if (rawImport) text += `\n\n${await rawImport.finish(signal)}`;
       if (
         res.source === "general"
         && !res.context

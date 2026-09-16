@@ -2,8 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FakeLlm, KnowledgeEngine } from "@homeagent/core";
+import { FakeLlm, KnowledgeEngine, SkillCatalog } from "@homeagent/core";
 import { createSystemHealthReporter } from "./health.ts";
+import { ProviderPreparationError } from "@homeagent/llm";
 
 const loopHealth = {
   started: true,
@@ -354,6 +355,46 @@ describe("system health reporter", () => {
     engine.close();
   });
 
+  test("health reads only required Agent readiness and never lets isolated failure mask a confirmed full mode", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-mode-")); dirs.push(dir);
+    const workdir = mkdtempSync(join(tmpdir(), "hb-health-work-")); dirs.push(workdir);
+    let probes = 0;
+    const engine = new KnowledgeEngine({ dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }), runProvider: async () => { throw new Error("No model calls"); },
+      nativeSessionPreflight: async (_id, _timeout, _signal, _workdir, execution) => {
+        probes++;
+        if (execution?.executionMode === "isolated") throw new ProviderPreparationError({ stage: "native-session", reason: "protected-root-readable", exitCode: 75 });
+      } });
+    try {
+      const space = "team/oc_mode" as const; await engine.ensureSpace(space);
+      const agent = engine.agents.create({ name: "private-agent-name", provider: "codex", workdir, executionMode: "isolated" });
+      engine.registry.updateMeta(space, { agentId: agent.id });
+      engine.feishuBindings.connect({ spaceId: space, chatId: "oc_mode", boundAppId: "cli_private", responseMode: "mentions_only", replyInThread: true });
+      const report = createSystemHealthReporter({ engine, connectorHealth: () => ({ name: "feishu", ready: true, consumers: [] }),
+        dreamSchedulerHealth: () => loopHealth, taskSchedulerHealth: () => loopHealth,
+        detectProviders: async () => [{ id: "codex", name: "Codex", bin: "codex", available: true, detail: "fixture", nativeSessions: false }], requiredProviderIds: () => ["codex"] });
+      expect((await report()).components.agentExecution?.status).toBe("degraded");
+      expect(probes).toBe(0);
+      await engine.agentReadiness.check(agent.id);
+      expect((await report()).ready).toBe(false);
+      const draft = engine.saveAgentDraft(agent.id, { executionMode: "local-full-access", permission: "full" })!;
+      engine.releaseAgent(agent.id, draft.id, draft.id, { termsVersion: 1, source: "local-operator", taskExecutionEnabled: false,
+        expectedScopeFingerprint: engine.localExecution.preview(agent.id, draft.id).fingerprint });
+      await engine.agentReadiness.check(agent.id);
+      const snapshot = await report();
+      expect(snapshot.ready).toBe(true);
+      expect(snapshot.components.agentExecution?.status).toBe("ok");
+      expect(JSON.stringify(snapshot.components.agentExecution)).not.toMatch(/private-agent-name|cli_private|grantId|oc_mode/);
+      expect(probes).toBe(2);
+      engine.agents.revokeLocalExecutionGrants(agent.id, engine.agents.get(agent.id)!.publishedRevisionId!);
+      expect((await report()).ready).toBe(false);
+      expect(probes).toBe(2);
+      engine.feishuBindings.disconnect(space);
+      expect((await report()).ready).toBe(true);
+      engine.tasks.create({ name: "Configured full task", space, topic: "probe", distillOnRun: false });
+      expect((await report()).ready).toBe(false);
+    } finally { engine.close(); }
+  });
+
   test("reports the Agent knowledge governance backlog without exposing feedback content", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hb-health-agent-feedback-"));
     dirs.push(dir);
@@ -645,6 +686,7 @@ describe("system health reporter", () => {
     dirs.push(dir);
     const engine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async (_provider, _input, _timeoutMs, signal) =>
         new Promise<string>((_resolve, reject) => {
           signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
@@ -696,6 +738,7 @@ describe("system health reporter", () => {
     dirs.push(dir);
     const engine = new KnowledgeEngine({
       dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => {
         throw new Error("provider codex timed out after 30000ms");
       },
@@ -742,6 +785,8 @@ describe("system health reporter", () => {
     dirs.push(dir);
     const engine = new KnowledgeEngine({
       dataDir: dir,
+      // This checks runtime health, not discovery of the developer's installed Skills.
+      skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => {
         throw new Error("authentication expired");
       },

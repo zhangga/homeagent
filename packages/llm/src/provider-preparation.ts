@@ -5,8 +5,20 @@ export const NATIVE_SESSION_ISSUES = [
   "native-cli-unavailable", "mcp-not-isolated", "invalid-execution-contract",
 ] as const;
 export type NativeSessionIssue = typeof NATIVE_SESSION_ISSUES[number];
+export const EXECUTION_POLICY_ISSUES = [
+  "execution-mode-invalid", "local-execution-consent-required", "local-execution-consent-revoked",
+  "managed-policy-disallows-mode",
+] as const;
+export type ExecutionPolicyIssue = typeof EXECUTION_POLICY_ISSUES[number];
+export const EXECUTION_POLICY_ISSUE_LABELS: Record<ExecutionPolicyIssue, string> = {
+  "execution-mode-invalid": "执行模式、权限、工作目录或冻结 Skill 不符合要求",
+  "local-execution-consent-required": "缺少有效的本机完全访问确认，请确认模式并重新发布",
+  "local-execution-consent-revoked": "本次运行的完全访问确认已撤销，请按当前配置新建运行",
+  "managed-policy-disallows-mode": "机器管理策略不允许该执行模式",
+};
 export type ProviderPreparationFailure =
   | { stage: "native-session"; reason: NativeSessionIssue; exitCode?: number }
+  | { stage: "execution-policy"; reason: ExecutionPolicyIssue }
   | { stage: "skill-staging"; reason: "capacity-exceeded"; requestedSkills: number; stagedSkills: number };
 
 export const NATIVE_SESSION_ISSUE_LABELS: Record<NativeSessionIssue, string> = {
@@ -24,6 +36,10 @@ export const NATIVE_SESSION_ISSUE_LABELS: Record<NativeSessionIssue, string> = {
 export function isProviderPreparationFailure(value: unknown): value is ProviderPreparationFailure {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const item = value as Record<string, unknown>;
+  if (item.stage === "execution-policy") {
+    return Object.keys(item).every(key => ["stage", "reason"].includes(key))
+      && EXECUTION_POLICY_ISSUES.some(reason => reason === item.reason);
+  }
   if (item.stage === "native-session") {
     return Object.keys(item).every(key => ["stage", "reason", "exitCode"].includes(key))
       && NATIVE_SESSION_ISSUES.some(reason => reason === item.reason)
@@ -44,6 +60,7 @@ export class ProviderPreparationError extends Error {
     if (!isProviderPreparationFailure(evidence)) throw new Error("Invalid Provider preparation evidence");
     super(evidence.stage === "native-session"
       ? `provider codex native session isolation is unavailable (${evidence.reason})`
+      : evidence.stage === "execution-policy" ? `provider execution policy is unavailable (${evidence.reason})`
       : "provider Skill staging capacity exceeded; frozen catalog was not executed");
     this.name = "ProviderPreparationError";
     this.evidence = Object.freeze(structuredClone(evidence));

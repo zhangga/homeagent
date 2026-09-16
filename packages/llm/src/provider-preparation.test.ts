@@ -12,6 +12,17 @@ test("preparation evidence is bounded, cloned, and cannot contain raw diagnostic
   expect(providerPreparationFailure(new Error("provider output"))).toBeUndefined();
 });
 
+test("execution policy reasons cannot smuggle diagnostics into private or public evidence", () => {
+  for (const reason of ["execution-mode-invalid", "local-execution-consent-required", "local-execution-consent-revoked", "managed-policy-disallows-mode"] as const) {
+    const failure = { stage: "execution-policy" as const, reason };
+    expect(providerPreparationFailure(new ProviderPreparationError(failure))).toEqual(failure);
+    expect(isProviderPreparationFailure({ ...failure, exitCode: 75 })).toBe(false);
+    expect(isProviderPreparationFailure({ ...failure, stderr: "private" })).toBe(false);
+    expect(isProviderPreparationFailure({ ...failure, grantId: "private" })).toBe(false);
+  }
+  expect(isProviderPreparationFailure({ stage: "execution-policy", reason: "unknown" })).toBe(false);
+});
+
 test("catalog capacity includes the boundary and rejects the whole next Skill", () => {
   for (const dimension of ["bytes", "entries"]) {
     const budget = new SkillStagingBudget(2);

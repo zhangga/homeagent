@@ -18,6 +18,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { formatFeishuLocalFileLinks } from "./feishu-markdown.ts";
 import type {
   Connector,
   ConnectorHealth,
@@ -434,7 +435,7 @@ export class FeishuConnector implements Connector {
       "--as",
       "bot",
       "--markdown",
-      out.markdown,
+      formatFeishuLocalFileLinks(out.markdown),
     ];
     if (out.replyToMessageId) cmd.push("--message-id", out.replyToMessageId);
     if (out.inThread) cmd.push("--reply-in-thread");
@@ -479,7 +480,7 @@ export class FeishuConnector implements Connector {
       "--chat-id",
       chatId,
       "--markdown",
-      markdown,
+      formatFeishuLocalFileLinks(markdown),
     ];
     if (opts.idempotencyKey) {
       cmd.push("--idempotency-key", opts.idempotencyKey.slice(0, 50));

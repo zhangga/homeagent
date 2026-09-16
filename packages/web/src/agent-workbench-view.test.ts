@@ -18,6 +18,14 @@ const selected: Agent = {
 };
 
 describe("Agent workbench view", () => {
+  test("a mode error opens the create execution controls instead of hiding the required correction", async () => {
+    const view = buildAgentWorkbench({ agents: [], mode: "create", selected: null,
+      providers: [], models: {}, defaults: { provider: "codex", model: "gpt-5.6-sol" }, bindings: [], runs: [],
+      errors: { executionMode: "请选择执行模式" },
+    });
+    const body = String(await agentWorkbenchView(view));
+    expect(body).toContain('<details class="agent-task-execution" open>');
+  });
   test("a readable protected root is not presented as a login or UAC setup problem", async () => {
     const view = buildAgentWorkbench({ agents: [selected], mode: "edit", selected,
       providers: [{ id: "codex", name: "Codex", bin: "codex", available: true, nativeSessions: false,
@@ -27,6 +35,7 @@ describe("Agent workbench view", () => {
     const body = String(await agentWorkbenchView(view));
     expect(body).toContain("原生话题隔离未通过");
     expect(body).toContain("受保护数据目录仍可读取");
+    expect(body).toContain("可明确选择本机完全访问并确认风险");
     expect(body).toContain("重新检测");
     expect(body).not.toContain("启用 Windows 安全沙箱");
     expect(body).not.toContain("恢复 Codex 连接");
@@ -58,9 +67,9 @@ describe("Agent workbench view", () => {
     expect(body).toContain(">恢复 Codex<");
     expect(body).toContain('href="/settings"');
     expect(body).toContain("打开设置");
-    expect(body).toContain("Codex 群话题不支持 full，也不会自动降级");
-    expect(body).toContain("需要写工作目录选 write");
-    expect(body).toContain("修改后需发布");
+    expect(body).toContain("本机完全访问（无沙箱）");
+    expect(body).toContain("隔离模式使用 read-only/write");
+    expect(body).toContain("发布前须明确确认");
   });
 
   test("renders a safe CLI check and re-detection action for another unavailable Provider", async () => {

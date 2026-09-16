@@ -44,6 +44,7 @@ import {
   type CodexLoginSession,
   type CodexWindowsSandboxSetupSession,
   type DetectedProvider,
+  type ProviderDetectionOptions,
 } from "@homeagent/llm";
 import {
   isGroupParticipationLevel,
@@ -67,6 +68,7 @@ import {
 } from "@homeagent/core";
 import { layout } from "./layout.ts";
 import { agentWorkbenchView } from "./agent-workbench-view.ts";
+import { localExecutionConfirmationUrl, localExecutionRunStatus, localExecutionWorkbenchState, registerAgentLocalExecutionRoutes } from "./agent-local-execution.ts";
 import { buildSkillInventory, skillInventoryView } from "./skill-inventory-view.ts";
 import {
   agentInputForEditor,
@@ -169,7 +171,7 @@ export interface WebOptions {
   /** process-level health reporter; production wires all runtime components */
   health?: () => Promise<SystemHealthSnapshot>;
   /** injected for tests; defaults to probing local CLIs. */
-  detectProviders?: () => Promise<DetectedProvider[]>;
+  detectProviders?: (options?: ProviderDetectionOptions) => Promise<DetectedProvider[]>;
   /** injected for tests; defaults to the live gateway + curated CLI catalog. */
   providerModels?: () => Promise<Record<string, string[]>>;
   /** Configure and verify the local lark-cli application without persisting its secret. */
@@ -411,6 +413,7 @@ export function createWebApp(opts: WebOptions): Hono {
   const { engine } = opts;
   const app = new Hono();
   const instanceId = randomUUID();
+  const localExecutionCsrfToken = randomUUID();
   const localAgentKnowledge = new LocalAgentKnowledge(engine);
 
   if (opts.adminToken) {
@@ -594,7 +597,7 @@ export function createWebApp(opts: WebOptions): Hono {
   });
 
   // Detect local agent CLIs once, lazily, then cache (probing spawns processes).
-  const detect = opts.detectProviders ?? detectProviders;
+  const detect = opts.detectProviders ?? ((options?: ProviderDetectionOptions) => detectProviders(undefined, options));
   const listModels = opts.providerModels ?? providerModels;
   const reportHealth =
     opts.health ??
@@ -632,11 +635,21 @@ export function createWebApp(opts: WebOptions): Hono {
     }
   };
   let providerCache: DetectedProvider[] | null = null;
+  let isolatedCodexCache: DetectedProvider | undefined;
+  const resetProviderDiagnostics = () => {
+    providerCache = null;
+    isolatedCodexCache = undefined;
+    engine.agentReadiness.invalidate();
+  };
   let modelCache: Record<string, string[]> | null = null;
   let codexLoginError: string | undefined;
   const getProviders = async (): Promise<DetectedProvider[]> => {
     if (!providerCache) providerCache = await detect();
     return providerCache;
+  };
+  const probeCodexIsolation = async (): Promise<DetectedProvider | undefined> => {
+    isolatedCodexCache = (await detect({ codexNativeIsolation: true })).find(provider => provider.id === "codex");
+    return isolatedCodexCache;
   };
   // Model catalog: gateway list is fetched live from /v1/models (cached here so
   // we don't hit it on every render); CLI lists are curated.
@@ -664,7 +677,7 @@ export function createWebApp(opts: WebOptions): Hono {
       "skillSourceKeys" | "legacySkillNames"
     >;
     const value = (name: TextField): string => (
-      typeof body[name] === "string" ? body[name] : fallback[name]
+      typeof body[name] === "string" ? body[name] : fallback[name] ?? ""
     );
     const list = (name: "skillSourceKeys" | "legacySkillNames"): string[] => {
       const raw = body[name];
@@ -685,6 +698,7 @@ export function createWebApp(opts: WebOptions): Hono {
         : "",
       visibility: value("visibility"),
       permission: value("permission"),
+      executionMode: typeof body.executionMode === "string" ? body.executionMode : "",
       workdir: value("workdir"),
       skills: value("skills"),
       ...(catalogSelector
@@ -707,7 +721,10 @@ export function createWebApp(opts: WebOptions): Hono {
   }) => {
     const agents = engine.agents.list();
     const selected = input.selected ?? null;
-    const providers = await getProviders();
+    const commonProviders = await getProviders();
+    const providers = selected?.executionMode !== "local-full-access" && isolatedCodexCache
+      ? commonProviders.map(provider => provider.id === "codex" ? isolatedCodexCache! : provider)
+      : commonProviders;
     const models = await getModels();
     let catalog;
     try {
@@ -745,8 +762,13 @@ export function createWebApp(opts: WebOptions): Hono {
       revisions: selected ? engine.agents.listRevisions(selected.id) : [],
       draft: selected ? engine.agents.getDraft(selected.id) : undefined,
       expectedHeadRevisionId: input.expectedHeadRevisionId,
+      localExecution: selected ? localExecutionWorkbenchState(engine, selected.id, localExecutionCsrfToken) : undefined,
+      readiness: selected?.provider === "codex" ? {
+        csrfToken: localExecutionCsrfToken, snapshot: engine.agentReadiness.status(selected.id)!,
+      } : undefined,
     }));
   };
+  registerAgentLocalExecutionRoutes(app, { engine, csrfToken: localExecutionCsrfToken, authenticated: Boolean(opts.adminToken), providers: getProviders });
   const idleCodexLogin = (): CodexLoginSession => ({
     state: "idle",
     message: "HomeAgent 尚未连接当前 Codex 账号",
@@ -769,7 +791,7 @@ export function createWebApp(opts: WebOptions): Hono {
     if (session.state !== "ready") return;
     // Refresh provider discovery so first-run setup can offer the newly logged-in
     // Codex for ordinary conversations and explicit Agent tasks.
-    providerCache = null;
+    resetProviderDiagnostics();
   };
   const startCodexLogin = (): void => {
     if (!opts.codexSetup) return;
@@ -1203,7 +1225,7 @@ export function createWebApp(opts: WebOptions): Hono {
   });
 
   app.post("/setup/providers/refresh", (c) => {
-    providerCache = null;
+    resetProviderDiagnostics();
     return c.redirect("/setup");
   });
 
@@ -2034,16 +2056,21 @@ export function createWebApp(opts: WebOptions): Hono {
       }
     }
 
-    providerCache = null;
+    resetProviderDiagnostics();
     let provider: DetectedProvider | undefined;
     try {
-      provider = (await getProviders()).find((item) => item.id === agent.provider);
+      provider = agent.provider === "codex" && agent.executionMode !== "local-full-access"
+        ? await probeCodexIsolation()
+        : (await getProviders()).find((item) => item.id === agent.provider);
     } catch {
       return c.redirect(
         `${returnTo}?ok=${encodeURIComponent("Provider 检测暂时失败，请稍后重试")}`,
       );
     }
 
+    if (provider?.available && agent.executionMode === "local-full-access") {
+      return c.redirect(`${returnTo}?ok=${encodeURIComponent("CLI 连接可用；本机完全访问不启用沙箱，确认范围及实际模型调用请分别核验")}`);
+    }
     if (provider?.available && provider.id === "codex" && provider.nativeSessions === false) {
       return c.redirect(`${returnTo}?ok=${encodeURIComponent("CLI 连接可用，但原生话题隔离仍未通过；请查看具体检查原因")}`);
     }
@@ -2076,18 +2103,19 @@ export function createWebApp(opts: WebOptions): Hono {
     if (!agent) return c.notFound();
     const returnTo = `/agents/${encodeURIComponent(id)}`;
     if (agent.provider !== "codex") return c.notFound();
+    if (agent.executionMode === "local-full-access") return c.text("当前使用本机完全访问，不需要设置 Windows 沙箱。", 409);
 
-    providerCache = null;
+    resetProviderDiagnostics();
     let provider: DetectedProvider | undefined;
     try {
-      provider = (await getProviders()).find((item) => item.id === "codex");
+      provider = await probeCodexIsolation();
     } catch {
       return c.redirect(
         `${returnTo}?ok=${encodeURIComponent("Codex 检测暂时失败，请稍后重试")}`,
       );
     }
     if (provider?.available && provider.nativeSessions === true) {
-      return c.redirect(`${returnTo}?ok=${encodeURIComponent("Codex 已完全可用")}`);
+      return c.redirect(`${returnTo}?ok=${encodeURIComponent("机器隔离探测已通过；实际运行仍检查 Workdir、Skill 和模型调用")}`);
     }
     if (
       !provider?.available
@@ -2106,7 +2134,7 @@ export function createWebApp(opts: WebOptions): Hono {
       session = { state: "failed", message: "Windows 安全沙箱设置未完成，请重试" };
     }
     if (session.state === "ready") {
-      providerCache = null;
+      resetProviderDiagnostics();
       return c.redirect(
         `${returnTo}?ok=${encodeURIComponent("Windows 安全沙箱设置已完成，正在重新检测 Codex")}`,
       );
@@ -2125,15 +2153,16 @@ export function createWebApp(opts: WebOptions): Hono {
     const id = decodeURIComponent(c.req.param("id"));
     const agent = engine.agents.get(id);
     if (!agent || agent.provider !== "codex") return c.notFound();
+    if (agent.executionMode === "local-full-access") return c.json({ state: "idle", message: "当前使用本机完全访问，沙箱检查不适用。" });
 
     const session = getCodexWindowsSandbox();
     let result = session;
     if (session.state === "ready") {
-      providerCache = null;
+      resetProviderDiagnostics();
       try {
-        const provider = (await getProviders()).find((item) => item.id === "codex");
+        const provider = await probeCodexIsolation();
         result = provider?.available && provider.nativeSessions === true
-          ? { state: "ready", message: "Codex 已完全可用" }
+          ? { state: "ready", message: "机器隔离探测已通过；实际运行仍检查 Workdir、Skill 和模型调用" }
           : {
               state: "failed",
               message: "Windows 安全沙箱已完成，但 Codex 安全验证仍未通过，请重新检测",
@@ -2186,6 +2215,7 @@ export function createWebApp(opts: WebOptions): Hono {
       );
     }
     const agent = engine.agents.create(agentInputForEditor(values, catalog, null));
+    if (agent.executionMode === "local-full-access") return c.redirect(localExecutionConfirmationUrl(agent.id, agent.publishedRevisionId!));
     return c.redirect(
       `/agents/${encodeURIComponent(agent.id)}?ok=${encodeURIComponent("已创建")}`,
     );
@@ -2247,6 +2277,7 @@ export function createWebApp(opts: WebOptions): Hono {
         successMessage = "草稿已保存，线上版本未变化";
       } else if (action === "publish") {
         const draft = engine.saveAgentDraft(id, input, expectedHeadRevisionId);
+        if (draft?.snapshot.executionMode === "local-full-access") return c.redirect(localExecutionConfirmationUrl(id, draft.id));
         if (!draft || !engine.releaseAgent(id, draft.id, draft.id)) {
           throw new Error("没有可发布的 Agent 草稿");
         }
@@ -2289,6 +2320,11 @@ export function createWebApp(opts: WebOptions): Hono {
     try {
       if (!expectedHeadRevisionId) {
         throw new Error("缺少 Agent 版本校验信息，请刷新后重试");
+      }
+      const target = engine.agents.listRevisions(id).find(revision => revision.id === revisionId);
+      if (target?.snapshot.executionMode === "local-full-access") {
+        if (engine.agents.listRevisions(id)[0]?.id !== expectedHeadRevisionId) throw new Error("Agent 版本已变化，请刷新后重试");
+        return c.redirect(localExecutionConfirmationUrl(id, revisionId));
       }
       const rolledBack = engine.rollbackAgent(id, revisionId, expectedHeadRevisionId);
       if (!rolledBack) return c.notFound();
@@ -2370,6 +2406,7 @@ export function createWebApp(opts: WebOptions): Hono {
           ok,
           engine.runScheduler.queueInfo(run.id),
           engine.quality.rerunsForChatRun(run.id),
+          localExecutionRunStatus(engine, run.space, run.agentId, run.executionPlan, "chat"),
         ),
         "agents",
       ),
@@ -2714,6 +2751,7 @@ export function createWebApp(opts: WebOptions): Hono {
           ok,
           engine.runScheduler.queueInfo(run.id),
           workContext,
+          localExecutionRunStatus(engine, run.space, run.agentId, run.executionPlan, "task"),
         ),
         workContext ? "work" : "tasks",
       ),

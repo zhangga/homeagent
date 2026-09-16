@@ -323,6 +323,12 @@ export class RawJournal {
       .map((record) => ({ ...record }));
   }
 
+  getRaw(id: string): RawRecord | undefined {
+    this.assertReady();
+    const record = this.records.get(id);
+    return record ? cloneRaw(record) : undefined;
+  }
+
   insert(record: RawRecord): void {
     this.assertReady();
     this.assertRecord(record);

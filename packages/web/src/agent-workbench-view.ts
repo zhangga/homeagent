@@ -1,6 +1,6 @@
 import { html, raw } from "hono/html";
 import type { HtmlEscapedString } from "hono/utils/html";
-import { codexReasoningEffortsForModel } from "@homeagent/llm";
+import { codexReasoningEffortsForModel, EXECUTION_POLICY_ISSUE_LABELS, NATIVE_SESSION_ISSUE_LABELS } from "@homeagent/llm";
 import {
   reasoningEffortsForEditor,
   type AgentFieldErrors,
@@ -691,6 +691,7 @@ const AGENT_STYLE = `
     main.agent-page { height:auto; min-height:100vh; overflow:visible; }
     .agent-workbench { display:block; min-height:100vh; height:auto; }
     .agent-pane { height:auto; min-height:100vh; overflow:visible; }
+    .agent-inspector-pane { height:100vh; height:100dvh; min-height:0; overflow:auto; overscroll-behavior:contain; }
     .agent-workbench.has-editor .agent-list-pane { display:none; }
     .agent-workbench:not(.has-editor) .agent-editor-pane { display:none; }
     .agent-list-pane { border-right:0; }
@@ -1031,11 +1032,26 @@ export function agentWorkbenchView(
   const reasoningAttrs = invalidAttrs(view.errors, "reasoningEffort");
   const visibilityAttrs = invalidAttrs(view.errors, "visibility");
   const permissionAttrs = invalidAttrs(view.errors, "permission");
+  const executionModeAttrs = invalidAttrs(view.errors, "executionMode");
+  const executionModeField = html`
+    <div class="agent-property-field" data-codex-mode ${values.provider !== "codex" ? "hidden" : ""}>
+      <label class="agent-property-label" for="agent-execution-mode">执行模式 <span class="agent-property-hint">仅 Codex</span></label>
+      <div class="agent-property-control">
+        <select id="agent-execution-mode" name="executionMode" form="agent-editor-form"
+          ${values.provider !== "codex" ? "disabled" : ""} aria-invalid="${executionModeAttrs.invalid}" aria-describedby="${executionModeAttrs.describedBy}">
+          ${values.permission === "full" && !values.executionMode ? html`<option value="" selected>旧 full 配置：请选择模式并重新确认</option>` : ""}
+          <option value="isolated" ${values.executionMode === "isolated" || (!values.executionMode && values.permission !== "full") ? "selected" : ""}>隔离模式（默认）</option>
+          <option value="local-full-access" ${values.executionMode === "local-full-access" ? "selected" : ""}>本机完全访问（无沙箱）</option>
+        </select>
+        ${errorFor(view.errors, "executionMode")}
+        <p class="agent-field-hint">完全访问使用 full，可能访问工作目录外文件和网络；保存草稿不会授权，发布前须单独确认。切回隔离请明确选择 read-only 或 write，不自动降级。</p>
+      </div>
+    </div>`;
   const workdirAttrs = invalidAttrs(view.errors, "workdir");
   const skillsAttrs = invalidAttrs(view.errors, "skills");
 
   const selectedProvider = providerOptions.find((provider) => provider.id === values.provider);
-  const taskExecutionOpen = Boolean(view.errors.permission || view.errors.workdir);
+  const taskExecutionOpen = Boolean(view.errors.executionMode || view.errors.permission || view.errors.workdir);
   const skillSelector = html`
     <details class="agent-skill-selector" ${view.errors.skills ? "open" : ""}>
       <summary class="agent-skill-summary">
@@ -1327,6 +1343,7 @@ export function agentWorkbenchView(
             </span>
           </summary>
           <div class="agent-task-fields">
+            ${executionModeField}
             <div class="agent-field agent-create-field">
               <label class="agent-field-label" for="agent-permission">
                 Permission
@@ -1336,15 +1353,16 @@ export function agentWorkbenchView(
                 <select
                   id="agent-permission"
                   name="permission"
-                  aria-invalid="${permissionAttrs.invalid}"
+                  required aria-invalid="${permissionAttrs.invalid}"
                   aria-describedby="${permissionAttrs.describedBy}"
                 >
+                  <option value="" disabled>请选择权限</option>
                   ${Object.entries(PERMISSION_LABELS).map(([permission, label]) => html`
                     <option value="${permission}" ${values.permission === permission ? "selected" : ""}>${label}</option>
                   `)}
                 </select>
                 ${errorFor(view.errors, "permission")}
-                <p class="agent-field-hint">Codex 群话题不支持 full，也不会自动降级。只读选 read-only，需要写工作目录选 write；两者仍须通过隔离检查。</p>
+                <p class="agent-field-hint">隔离模式的群话题仍须通过隔离检查；完全访问须使用 full 并明确确认，不能只修改权限。</p>
               </div>
             </div>
             <div class="agent-field agent-create-field">
@@ -1414,7 +1432,7 @@ export function agentWorkbenchView(
             form="agent-editor-form"
             name="agentAction"
             value="publish"
-          >发布</button>
+          >${values.executionMode === "local-full-access" ? "继续：确认发布" : "发布"}</button>
         ` : html`<button class="agent-primary" type="submit" form="agent-editor-form">创建 Agent</button>`}
       </div>
     </div>
@@ -1616,6 +1634,7 @@ export function agentWorkbenchView(
             ${errorFor(view.errors, "reasoningEffort")}
           </div>
         </div>
+        ${executionModeField}
         <div class="agent-property-field">
           <label class="agent-property-label" for="agent-permission">Permission</label>
           <div class="agent-property-control">
@@ -1623,15 +1642,16 @@ export function agentWorkbenchView(
               id="agent-permission"
               name="permission"
               form="agent-editor-form"
-              aria-invalid="${permissionAttrs.invalid}"
+              required aria-invalid="${permissionAttrs.invalid}"
               aria-describedby="${permissionAttrs.describedBy}"
             >
+              <option value="" disabled>请选择权限</option>
               ${Object.entries(PERMISSION_LABELS).map(([permission, label]) => html`
                 <option value="${permission}" ${values.permission === permission ? "selected" : ""}>${label}</option>
               `)}
             </select>
             ${errorFor(view.errors, "permission")}
-            <p class="agent-field-hint">Codex 群话题不支持 full，也不会自动降级。只读选 read-only，需要写工作目录选 write；修改后需发布。</p>
+            <p class="agent-field-hint">隔离模式使用 read-only/write；本机完全访问使用 full，发布前须明确确认。</p>
           </div>
         </div>
       </section>
@@ -1672,8 +1692,41 @@ export function agentWorkbenchView(
           </div>
         </div>
       </section>
+      ${view.localExecution ? html`
+        <section class="agent-inspector-section">
+          <h3 class="agent-inspector-label">本机完全访问 · 未隔离</h3>
+          <p class="agent-field-hint">${view.localExecution.confirmed ? `已确认 ${view.localExecution.confirmedScopes} 个 Chat 范围` : "当前发布版本等待本机确认"}；${view.localExecution.pendingScopes} 个范围待确认。</p>
+          <p class="agent-field-hint">Task ${view.localExecution.taskExecutionEnabled ? "已允许，仍须逐次审批" : "未启用"}。CLI 已连接不代表实际模型调用或飞书权限已经验证；此处只显示已发布版本。</p>
+          ${view.localExecution.confirmationUrl ? html`<p><a href="${view.localExecution.confirmationUrl}">查看完整范围并确认发布</a></p>` : ""}
+          ${view.localExecution.activeGrants > 0 ? html`<form method="post" action="/agents/${encodeURIComponent(view.selected!.id)}/local-execution/revoke"
+            onsubmit="return confirm('撤销此 Agent 全部版本的完全访问确认并请求取消相关调用？已发生的外部效果不能回滚。')">
+            <input type="hidden" name="csrfToken" value="${view.localExecution.csrfToken}" />
+            <input type="hidden" name="expectedHeadRevisionId" value="${view.revision!.headRevisionId}" />
+            <button class="agent-secondary" type="submit">撤销完全访问</button>
+          </form>` : ""}
+        </section>
+      ` : ""}
       <section class="agent-inspector-section">
         <h3 class="agent-inspector-label">Provider status</h3>
+        ${view.readiness ? html`
+          <div class="agent-provider-recovery" data-agent-readiness="${view.readiness.snapshot.state}" aria-live="polite">
+            <div class="agent-provider-recovery-title">${{
+              unknown: "当前配置待检测", checking: "当前配置检测中", ready: "当前配置准备通过", unavailable: "当前配置准备未通过",
+            }[view.readiness.snapshot.state]}</div>
+            <p class="agent-field-hint">${view.readiness.snapshot.mode === "local-full-access" ? "本机完全访问 · 未隔离" : view.readiness.snapshot.mode === "isolated" ? "隔离模式" : "执行模式未确认"}；实际模型调用未验证。</p>
+            ${view.readiness.snapshot.failure ? html`<p class="agent-field-hint">${view.readiness.snapshot.failure.stage === "execution-policy"
+              ? EXECUTION_POLICY_ISSUE_LABELS[view.readiness.snapshot.failure.reason]
+              : view.readiness.snapshot.failure.stage === "native-session" ? NATIVE_SESSION_ISSUE_LABELS[view.readiness.snapshot.failure.reason] : "冻结 Skill 副本容量超限"}</p>` : ""}
+            <p class="agent-field-hint">${view.readiness.snapshot.reason === "configuration-changed" ? "配置、身份或目录已变化，请重新检测。" : view.readiness.snapshot.reason === "expired" ? "上次结果已过期，请重新检测。" : view.readiness.snapshot.reason === "check-failed" && !view.readiness.snapshot.failure ? "准备检查失败，请恢复 CLI 连接或检查执行配置后重试。" : "仅核验当前发布配置，不调用模型，不修改授权，也不设置 Windows 沙箱。"}</p>
+            ${view.readiness.snapshot.checkedAt ? html`<p class="agent-field-hint">检查时间 ${formatTime(view.readiness.snapshot.checkedAt)} · 结果最多保留 60 秒，执行前仍重新核验。</p>` : ""}
+            <form method="post" action="/agents/${encodeURIComponent(view.selected!.id)}/readiness">
+              <input type="hidden" name="csrfToken" value="${view.readiness.csrfToken}" />
+              <input type="hidden" name="expectedPublishedRevisionId" value="${view.selected!.publishedRevisionId}" />
+              <button type="submit" class="agent-secondary" ${view.readiness.snapshot.state === "checking" ? "disabled" : ""}>检测当前发布配置</button>
+            </form>
+          </div>` : ""}
+        ${view.selected?.provider === "codex" ? html`<p class="agent-field-hint">连接、原生命令、执行授权和实际模型调用是独立状态；未请求的隔离能力保持未检测。</p>` : ""}
+        ${view.inspector.provider.nativeCommandsLabel ? html`<p class="agent-field-hint">原生命令：${view.inspector.provider.nativeCommandsLabel}。机器诊断不覆盖上方的发布配置检查。</p>` : ""}
         <div class="agent-provider-state">
           <span class="agent-status-mark ${view.inspector.provider.available && !view.inspector.provider.recovery ? "ready" : "unavailable"}" aria-hidden="true"></span>
           <div>
@@ -1681,6 +1734,9 @@ export function agentWorkbenchView(
             <div class="agent-provider-detail">${view.inspector.provider.detail}</div>
           </div>
         </div>
+        ${view.selected?.provider === "codex" && !view.inspector.provider.recovery ? html`<form method="post" action="/agents/${encodeURIComponent(view.selected.id)}/provider/recover">
+          <button type="submit" class="agent-secondary">${view.selected.executionMode === "local-full-access" ? "重新检测 CLI 连接" : "检测隔离能力"}</button>
+        </form>` : ""}
         ${view.inspector.provider.recovery ? html`
           <div
             class="agent-provider-recovery"
@@ -1740,6 +1796,7 @@ export function agentWorkbenchView(
                 ${revision.provider} / ${revision.model} · ${PERMISSION_LABELS[revision.permission] ?? revision.permission}
                 · ${formatTime(revision.createdAt)}
               </div>
+              ${revision.executionMode ? html`<div class="agent-binding-meta">版本模式：${revision.executionMode === "local-full-access" ? "本机完全访问（未隔离）" : revision.executionMode === "isolated" ? "隔离模式" : "旧 full（未确认）"}</div>` : ""}
               ${!revision.published && revision.source !== "draft" ? html`
                 <form
                   method="post"
@@ -1824,6 +1881,22 @@ export function agentWorkbenchView(
   var provider = document.getElementById('agent-provider');
   var model = document.getElementById('agent-model');
   var reasoning = document.getElementById('agent-reasoning-effort');
+  var executionMode = document.getElementById('agent-execution-mode');
+  var permission = document.getElementById('agent-permission');
+  function syncExecutionMode(changed) {
+    if (!executionMode || !provider || !permission) return;
+    var codex = provider.value === 'codex';
+    executionMode.disabled = !codex;
+    executionMode.closest('[data-codex-mode]').hidden = !codex;
+    var publish = document.querySelector('button[form="agent-editor-form"][name="agentAction"][value="publish"]');
+    if (publish) publish.textContent = codex && executionMode.value === 'local-full-access' ? '继续：确认发布' : '发布';
+    if (!codex || !changed) return;
+    if (executionMode.value === 'local-full-access') permission.value = 'full';
+    else if (permission.value === 'full') permission.value = '';
+  }
+  if (executionMode) executionMode.addEventListener('change', function () { syncExecutionMode(true); markDirty(); });
+  if (provider) provider.addEventListener('change', function () { syncExecutionMode(false); });
+  syncExecutionMode(false);
   var providerReadiness = document.querySelector('[data-provider-readiness]');
   var windowsSandboxStatus = document.querySelector(
     '[data-windows-sandbox-status]:not([data-windows-sandbox-status=""])'

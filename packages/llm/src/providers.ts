@@ -44,8 +44,9 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ImageInput } from "./gateway.ts";
-import { collectCodexExecutionEvidence, type ProviderExecutionEvidence } from "./execution-evidence.ts";
+import { collectCodexExecutionEvidence, type ProviderExecutionEvidence, type ProviderExecutionMetadata } from "./execution-evidence.ts";
 import { ProviderPreparationError, SkillStagingBudget, NATIVE_SESSION_ISSUE_LABELS, type NativeSessionIssue } from "./provider-preparation.ts";
+import { resolveCodexExecutionPolicy, type CodexExecutionMode } from "./codex-execution-policy.ts";
 
 const log = logger.child("providers");
 
@@ -166,6 +167,8 @@ interface CliSpec {
 }
 
 export interface RunInput {
+  /** Core owns authorization. Held only through synchronous spawn/cancel registration. */
+  acquireExecutionPermit?: () => ProviderExecutionPermit;
   /** Private, redacted metadata only; never part of the model prompt or argv. */
   onExecutionEvidence?: (evidence: ProviderExecutionEvidence) => void;
   prompt: string;
@@ -194,7 +197,15 @@ export interface RunInput {
    * Apply the same frozen Codex topic boundary to an internal routing or
    * classification call that intentionally does not join Provider history.
    */
+  nativeTopic?: boolean;
+  /** @deprecated Use nativeTopic; this flag never selects a filesystem policy. */
   nativeSessionIsolation?: boolean;
+}
+
+export interface ProviderExecutionPermit {
+  /** Register cancellation before releasing the launch/revoke lock; return an unregister callback. */
+  register(cancel: () => void): () => void;
+  release(): void;
 }
 
 /** Ephemeral path evidence for one frozen Skill; never persisted or returned to clients. */
@@ -228,6 +239,7 @@ export type ProviderExecutionPermission = "read-only" | "write" | "full";
 
 export interface ProviderExecution {
   permission: ProviderExecutionPermission;
+  executionMode?: CodexExecutionMode;
   /** Validated, canonical working directory for the provider process. */
   workdir?: string;
   /** Complete-catalog or pinned Skill identifiers visible to the provider. */
@@ -425,6 +437,7 @@ interface StagedProviderSkillInputs {
   inputs: ProviderSkillInput[];
   readRoot?: string;
   cleanup: () => void;
+  verify?: () => void;
 }
 
 function stageProviderSkillInputs(
@@ -483,7 +496,21 @@ function stageProviderSkillInputs(
         bundleHash: input.bundleHash,
       });
     });
-    return { inputs: staged, readRoot: stageRoot, cleanup };
+    const rootIdentity = lstatSync(stageRoot);
+    const verify = () => {
+      const root = lstatSync(stageRoot);
+      const children = readdirSync(stageRoot, { withFileTypes: true });
+      if (root.isSymbolicLink() || !root.isDirectory() || root.dev !== rootIdentity.dev || root.ino !== rootIdentity.ino
+        || !samePath(realpathSync(stageRoot), stageRoot) || children.length !== staged.length
+        || children.some(child => child.isSymbolicLink() || !child.isDirectory()
+          || !staged.some(skill => samePath(skill.directory, join(stageRoot, child.name))))) {
+        throw new Error("staged Skill bundle failed verification");
+      }
+      for (const skill of staged) {
+        if (hashProviderSkillBundle(skill.skillFile) !== skill.bundleHash) throw new Error("staged Skill bundle failed verification");
+      }
+    };
+    return { inputs: staged, readRoot: stageRoot, cleanup, verify };
   } catch (error) {
     cleanup();
     if (signal?.aborted) throw signal.reason ?? error;
@@ -580,11 +607,27 @@ function codexUntrustedProjectOverride(workdir: string | undefined): string {
 
 const CODEX_NATIVE_PERMISSION_PROFILE = "homeagent_topic";
 
-function usesCodexNativeIsolation(input: Pick<
+function isCodexTopicCall(input: Pick<
   RunInput,
-  "nativeSession" | "nativeSessionIsolation"
+  "nativeSession" | "nativeSessionIsolation" | "nativeTopic"
 >): boolean {
-  return input.nativeSession !== undefined || input.nativeSessionIsolation === true;
+  return input.nativeSession !== undefined || input.nativeTopic === true || input.nativeSessionIsolation === true;
+}
+
+/** Full access keeps path integrity, not filesystem isolation. Never create proof sentinels here. */
+export function validateCodexFullAccessWorkdir(input: Pick<RunInput, "execution" | "workdir" | "protectedDataRoot">): string {
+  const path = input.execution?.workdir ?? input.workdir;
+  try {
+    if (!path || !isAbsolute(path) || (input.workdir && !samePath(input.workdir, path))) throw new Error("invalid");
+    const meta = lstatSync(path);
+    if (!meta.isDirectory() || meta.isSymbolicLink() || !samePath(realpathSync(path), path)) throw new Error("invalid");
+    for (const root of [providerCodexHome(), canonicalProtectedDataRoot(input.protectedDataRoot)]) {
+      if (pathIsWithinOrEqual(path, root) || pathIsWithinOrEqual(root, path)) throw new Error("overlap");
+    }
+    return path;
+  } catch {
+    throw new ProviderPreparationError({ stage: "execution-policy", reason: "execution-mode-invalid" });
+  }
 }
 
 function codexSkillIsolationOverrides(): string[] {
@@ -1101,8 +1144,10 @@ export interface DetectedProvider {
   name: string;
   bin: string;
   available: boolean;
-  /** Whether this installed CLI can safely continue Provider-owned conversations. */
+  /** Legacy isolation result. Undefined means isolation has not been requested, never full-access readiness. */
   nativeSessions?: boolean;
+  /** Version and fork command support only; not a Workdir/Skill/MCP or model-call proof. */
+  nativeSessionCommands?: boolean;
   /** Safe, bounded reason native conversations are unavailable when recovery is known. */
   nativeSessionIssue?: NativeSessionIssue;
   /** version string when available; else a short reason it is not */
@@ -1204,6 +1249,7 @@ const KNOWN: CliSpec[] = [
       protectedDataRoot,
       nativeSession,
       nativeSessionIsolation,
+      nativeTopic,
       nativeIsolationReadRoot,
       nativeSkillReadRoot,
       codexCredentialStore,
@@ -1255,10 +1301,8 @@ const KNOWN: CliSpec[] = [
         'web_search="disabled"',
       ];
       args.push(...codexSkillIsolationOverrides());
-      const nativeIsolation = usesCodexNativeIsolation({
-        nativeSession,
-        nativeSessionIsolation,
-      });
+      const policy = resolveCodexExecutionPolicy(execution, isCodexTopicCall({ nativeSession, nativeTopic, nativeSessionIsolation }));
+      const nativeIsolation = policy.filesystemProof === "required";
       if (nativeIsolation) {
         args.push(...codexNativeIsolationOverrides(
           execution,
@@ -1277,7 +1321,6 @@ const KNOWN: CliSpec[] = [
       }
       if (reasoningEffort) args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
       if (execution?.webSearch || execution?.research) args.push("--search");
-      const sandbox = sandboxForPermission(execution?.permission);
       // Codex 0.147+ scopes these isolation flags to the `exec` subcommand.
       // Keeping them before `exec` makes the CLI exit during argument parsing.
       args.push("exec");
@@ -1290,7 +1333,7 @@ const KNOWN: CliSpec[] = [
       );
       // Legacy --sandbox takes precedence over permission profiles. Native
       // topic turns must use the exact root-deny profile built above.
-      if (!nativeIsolation) args.push("--sandbox", sandbox);
+      if (!nativeIsolation) args.push("--sandbox", policy.sandbox);
       args.push("--skip-git-repo-check");
       if (outputSchemaPath) args.push("--output-schema", outputSchemaPath);
       if (outputLastMessagePath) args.push("-o", outputLastMessagePath);
@@ -1340,6 +1383,9 @@ const CLAUDE_ORDINARY_REQUIRED_FLAGS = [
 const MAX_CLAUDE_AUTH_STATUS_BYTES = 16 * 1024;
 const CLAUDE_AUTH_UNAVAILABLE_DETAIL = "Claude 认证不可用";
 const CODEX_AUTH_UNAVAILABLE_DETAIL = "HomeAgent 尚未连接当前 Codex 账号";
+class CodexAuthenticationUnavailableError extends Error {
+  constructor() { super("provider codex authentication is unavailable"); }
+}
 const CODEX_NATIVE_SESSION_UNAVAILABLE_DETAIL = "Codex 原生会话能力不可用";
 const CODEX_NATIVE_SESSION_PREFLIGHT_ERROR =
   "provider codex native session isolation is unavailable";
@@ -1365,6 +1411,31 @@ const CODEX_KEYRING_LOGIN_STATUS_ARGS = [
   "status",
 ] as const;
 const codexCredentialStoreByBin = new Map<string, "file" | "keyring">();
+
+async function selectCodexCredentialStore(bin: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+  for (const [store, args] of [
+    ["file", CODEX_LOGIN_STATUS_ARGS], ["keyring", CODEX_KEYRING_LOGIN_STATUS_ARGS],
+  ] as const) {
+    try {
+      const probe = await runCmd(bin, [...args], timeoutMs, signal);
+      if (probe.aborted) throw signal?.reason ?? new Error("provider capability probe cancelled");
+      if (!probe.timedOut && probe.code === 0) {
+        codexCredentialStoreByBin.set(codexCredentialStoreKey(bin), store);
+        return true;
+      }
+    } catch (error) {
+      if (signal?.aborted) throw error;
+    }
+  }
+  codexCredentialStoreByBin.delete(codexCredentialStoreKey(bin));
+  return false;
+}
+
+async function assertCodexFullAccessCapability(bin: string, timeoutMs: number, signal: AbortSignal | undefined, workdir: string): Promise<void> {
+  const capability = await codexNativeSessionsCapability(bin, timeoutMs, signal, undefined, workdir);
+  if (!capability.available) throw new ProviderPreparationError({ stage: "native-session", reason: capability.issue ?? "native-cli-unavailable" });
+  if (!await selectCodexCredentialStore(bin, timeoutMs, signal)) throw new CodexAuthenticationUnavailableError();
+}
 
 function codexCredentialStoreKey(bin: string): string {
   return `${bin}\u0000${providerCodexHome()}`;
@@ -1911,6 +1982,14 @@ export async function preflightProviderNativeSession(
   let stagedSkillInputs: StagedProviderSkillInputs | undefined;
   try {
     const normalizedSkillInputs = normalizeProviderSkillInputs(skillInputs);
+    const policy = resolveCodexExecutionPolicy(execution, true);
+    if (policy.mode === "local-full-access") {
+      const fullWorkdir = validateCodexFullAccessWorkdir({ execution, workdir, protectedDataRoot });
+      stagedSkillInputs = stageProviderSkillInputs(normalizedSkillInputs, signal);
+      await assertCodexFullAccessCapability(providerBin(spec), timeoutMs, signal, fullWorkdir);
+      stagedSkillInputs.verify?.();
+      return;
+    }
     context = stageCodexNativeIsolationContext(execution, workdir, protectedDataRoot);
     const effectiveExecution = { ...execution!, workdir: context.workdir };
     // Validate the live source paths before replacing them with private staged
@@ -1949,7 +2028,7 @@ export async function preflightProviderNativeSession(
     if (signal?.aborted) {
       throw signal.reason ?? error;
     }
-    if (error instanceof ProviderPreparationError) throw error;
+    if (error instanceof ProviderPreparationError || error instanceof CodexAuthenticationUnavailableError) throw error;
     throw new ProviderPreparationError({ stage: "native-session", reason: "invalid-execution-contract" });
   } finally {
     context?.cleanup();
@@ -1985,6 +2064,9 @@ async function runCmd(
   signal?: AbortSignal,
   cwd?: string,
   stdin?: string,
+  acquireExecutionPermit?: RunInput["acquireExecutionPermit"],
+  beforeSpawn?: () => void,
+  onStarted?: () => void,
 ): Promise<{
   code: number | null;
   stdout: string;
@@ -1993,17 +2075,18 @@ async function runCmd(
   aborted: boolean;
 }> {
   if (signal?.aborted) throw signal.reason ?? new Error("provider run cancelled");
-  const proc = Bun.spawn([bin, ...args], {
-    cwd,
-    env: providerChildEnvironment(),
-    stdout: "pipe",
-    stderr: "pipe",
+  // Core stores commit synchronously. Never yield between final authorization
+  // and spawn/cancel registration: an async permit would reopen the revoke race.
+  const permit = acquireExecutionPermit?.();
+  if (acquireExecutionPermit && (!permit || typeof permit.register !== "function" || typeof permit.release !== "function")) {
+    throw new ProviderPreparationError({ stage: "execution-policy", reason: "local-execution-consent-required" });
+  }
+  let unregister: (() => void) | undefined;
+  const spawn = () => Bun.spawn([bin, ...args], {
+    cwd, env: providerChildEnvironment(), stdout: "pipe", stderr: "pipe",
     stdin: stdin === undefined ? "ignore" : "pipe",
   });
-  if (stdin !== undefined && proc.stdin && typeof proc.stdin !== "number") {
-    proc.stdin.write(stdin);
-    proc.stdin.end();
-  }
+  let proc: ReturnType<typeof spawn>;
   let timedOut = false;
   let aborted = false;
   let terminating = false;
@@ -2011,28 +2094,47 @@ async function runCmd(
   const terminate = () => {
     if (terminating) return;
     terminating = true;
-    proc.kill(); // SIGTERM
-    forceKillTimer = setTimeout(() => {
-      proc.kill(9); // SIGKILL if the CLI ignored graceful termination
-    }, 2_000);
+    proc.kill();
+    forceKillTimer = setTimeout(() => proc.kill(9), 2_000);
   };
+  const onAbort = () => { aborted = true; terminate(); };
+  try {
+    if (signal?.aborted) throw signal.reason ?? new Error("provider run cancelled");
+    beforeSpawn?.();
+    proc = spawn();
+    try { unregister = permit?.register(() => onAbort()); }
+    catch (error) {
+      proc.kill(9);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      throw error;
+    }
+    onStarted?.();
+  } finally {
+    permit?.release();
+  }
   const timer = setTimeout(() => {
     timedOut = true;
     terminate();
   }, timeoutMs);
-  const onAbort = () => {
-    aborted = true;
-    terminate();
-  };
   signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
   try {
+    if (!aborted && stdin !== undefined && proc.stdin && typeof proc.stdin !== "number") {
+      proc.stdin.write(stdin);
+      proc.stdin.end();
+    }
     const [stdout, stderr, code] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
       proc.exited,
     ]);
     return { code, stdout, stderr, timedOut, aborted };
+  } catch (error) {
+    // No output wait remains to keep the graceful termination timer alive.
+    proc.kill(9);
+    throw error;
   } finally {
+    unregister?.();
     clearTimeout(timer);
     if (forceKillTimer) clearTimeout(forceKillTimer);
     signal?.removeEventListener("abort", onAbort);
@@ -2047,7 +2149,12 @@ async function runCmd(
  * isolation flag exists and each CLI considers its current auth usable.
  * Bounded so a hanging CLI can't stall the backend.
  */
-export async function detectProviders(timeoutMs = 6000): Promise<DetectedProvider[]> {
+export interface ProviderDetectionOptions {
+  /** Explicit operator diagnostic only; normal startup/page/health detection never creates a sandbox probe. */
+  codexNativeIsolation?: boolean;
+}
+
+export async function detectProviders(timeoutMs = 6000, options: ProviderDetectionOptions = {}): Promise<DetectedProvider[]> {
   const out: DetectedProvider[] = [];
   for (const spec of KNOWN) {
     const bin = providerBin(spec);
@@ -2069,23 +2176,7 @@ export async function detectProviders(timeoutMs = 6000): Promise<DetectedProvide
           } catch {
             // Keep probing: the keyring store may still hold usable credentials.
           }
-          let credentialStore: "file" | "keyring" | undefined;
-          for (const [store, args] of [
-            ["file", CODEX_LOGIN_STATUS_ARGS],
-            ["keyring", CODEX_KEYRING_LOGIN_STATUS_ARGS],
-          ] as const) {
-            try {
-              const authProbe = await runCmd(bin, [...args], timeoutMs);
-              if (!authProbe.timedOut && authProbe.code === 0) {
-                credentialStore = store;
-                break;
-              }
-            } catch {
-              // Try the other official credential cache before declaring auth unavailable.
-            }
-          }
-          if (!credentialStore) {
-            codexCredentialStoreByBin.delete(codexCredentialStoreKey(bin));
+          if (!await selectCodexCredentialStore(bin, timeoutMs)) {
             out.push({
               ...base(spec, bin),
               available: false,
@@ -2093,7 +2184,17 @@ export async function detectProviders(timeoutMs = 6000): Promise<DetectedProvide
             });
             continue;
           }
-          codexCredentialStoreByBin.set(codexCredentialStoreKey(bin), credentialStore);
+          if (options.codexNativeIsolation !== true) {
+            let commands = false;
+            if (codexVersionSupportsNativeSessions(version)) {
+              try {
+                const fork = await runCmd(bin, ["exec", "fork", "--help"], timeoutMs);
+                commands = fork.code === 0 && !fork.timedOut;
+              } catch { /* Fixed metadata only; never publish raw CLI diagnostics. */ }
+            }
+            out.push({ ...base(spec, bin), available: true, nativeSessionCommands: commands, detail: version });
+            continue;
+          }
           let nativeCapability: CodexNativeSessionCapability = { available: false };
           let nativeContext: CodexNativeIsolationContext | undefined;
           try {
@@ -2214,6 +2315,22 @@ function providerBin(spec: CliSpec): string {
   return brandedEnv(process.env, spec.envBin)?.trim() || spec.bin;
 }
 
+/** Opaque diagnostic cache key. No processes, credential contents, or user diagnostics. */
+export function codexPreparationIdentity(): string {
+  const bin = providerBin(specById.get("codex")!);
+  const resolved = Bun.which(bin) ?? bin;
+  const home = providerCodexHome();
+  const metadata = (path: string): unknown => {
+    try {
+      const stat = lstatSync(path);
+      return [path, stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs, stat.isSymbolicLink()];
+    } catch { return [path, "unavailable"]; }
+  };
+  return createHash("sha256").update(JSON.stringify([bin, metadata(resolved), home,
+    metadata(join(home, "auth.json")), metadata(join(home, "config.toml")),
+    process.env.PATH, process.env.PATHEXT])).digest("hex");
+}
+
 function base(spec: CliSpec, bin: string): Omit<DetectedProvider, "available" | "detail"> {
   return { id: spec.id, name: spec.name, bin };
 }
@@ -2288,6 +2405,7 @@ function injectProviderSkills(id: ProviderId, input: RunInput): RunInput {
       ? {
           execution: {
             permission: normalizeProviderPermission(input.execution.permission),
+            ...(input.execution.executionMode ? { executionMode: input.execution.executionMode } : {}),
             workdir: typeof input.execution.workdir === "string"
               ? input.execution.workdir
               : undefined,
@@ -2322,6 +2440,7 @@ function injectProviderSkills(id: ProviderId, input: RunInput): RunInput {
       prompt: [
         instruction,
         "以下是本轮唯一有效的技能映射；忽略会话历史中的旧技能路径。使用某个技能前，必须先读取下列映射中的 SKILL.md；只可从对应目录读取技能资源，禁止搜索、发现或加载其他技能。",
+        "技能文档若用 ../<技能名>/SKILL.md 引用另一个技能，必须按该名称在本轮映射中解析，不能假设副本目录仍是原来的相邻布局。依赖未列入映射时报告缺失，不读取原始目录或自行安装。",
         ...skillInputs.map((skill) => `- ${skill.name}: ${JSON.stringify(skill.skillFile)}`),
         "如果任一所需技能或资源不可读取，停止执行并明确报告，不要假装已经使用。",
         "",
@@ -2501,9 +2620,17 @@ export async function runProviderDetailed(
   const spec = specById.get(id);
   if (!spec) throw new Error(`unknown provider: ${id}`);
   validateNativeSessionRequest(id, input.nativeSession);
-  const nativeIsolation = usesCodexNativeIsolation(input);
-  if (nativeIsolation && id !== "codex") {
+  const nativeTopic = isCodexTopicCall(input);
+  if (nativeTopic && id !== "codex") {
     throw new Error(`provider ${id} does not support isolated native sessions`);
+  }
+  if (id !== "codex" && input.execution?.executionMode !== undefined) {
+    throw new ProviderPreparationError({ stage: "execution-policy", reason: "execution-mode-invalid" });
+  }
+  const policy = id === "codex" ? resolveCodexExecutionPolicy(input.execution, nativeTopic) : undefined;
+  const nativeIsolation = policy?.filesystemProof === "required";
+  if (policy?.mode === "local-full-access" && !input.acquireExecutionPermit) {
+    throw new ProviderPreparationError({ stage: "execution-policy", reason: "local-execution-consent-required" });
   }
   if ((input.images?.length ?? 0) > 4) {
     throw new Error("provider calls accept at most 4 images");
@@ -2514,9 +2641,17 @@ export async function runProviderDetailed(
   let isolationContext: CodexNativeIsolationContext | undefined;
   let stagedSchema: ReturnType<typeof stageCodexOutputSchema> | undefined;
   let stagedSkillInputs: StagedProviderSkillInputs | undefined;
+  const metadata: ProviderExecutionMetadata | undefined = policy ? {
+    executionMode: policy.mode,
+    sandboxCheck: policy.mode === "local-full-access" ? "not-applicable" : "not-checked",
+    effectiveSandbox: policy.sandbox, process: "not-started", model: "unknown",
+  } : undefined;
+  let collectedEvidence: ProviderExecutionEvidence | undefined;
+  let fullWorkdirIdentity: ReturnType<typeof lstatSync> | undefined;
   try {
     const normalizedSkillInputs = normalizeProviderSkillInputs(input.skillInputs);
     let effectiveInput: RunInput = { ...input, skillInputs: normalizedSkillInputs };
+    if (policy?.mode === "local-full-access") fullWorkdirIdentity = lstatSync(validateCodexFullAccessWorkdir(input));
     if (nativeIsolation) {
       isolationContext = stageCodexNativeIsolationContext(
         input.execution,
@@ -2549,6 +2684,9 @@ export async function runProviderDetailed(
     };
     const prepared = injectProviderSkills(id, effectiveInput);
     const bin = providerBin(spec);
+    if (policy?.mode === "local-full-access") {
+      await assertCodexFullAccessCapability(bin, timeoutMs, signal, validateCodexFullAccessWorkdir(prepared));
+    }
     if (nativeIsolation) {
       await assertCodexNativeIsolationContext(
         bin,
@@ -2561,6 +2699,7 @@ export async function runProviderDetailed(
         prepared.protectedDataRoot,
         stagedSkillInputs.readRoot,
       );
+      if (metadata) metadata.sandboxCheck = "passed";
     }
     if (!prepared.execution && id === "trae-cli") {
       throw new Error(`provider ${id} cannot provide a no-tools execution mode`);
@@ -2599,7 +2738,7 @@ export async function runProviderDetailed(
         : {}),
     };
     const args = spec.buildRun(providerInput);
-    log.info("running local provider", { id, bin });
+    if (policy?.mode === "local-full-access") validateCodexFullAccessWorkdir(prepared);
     const { code, stdout, stderr, timedOut, aborted } = await runCmd(
       bin,
       args,
@@ -2607,8 +2746,20 @@ export async function runProviderDetailed(
       signal,
       prepared.execution?.workdir ?? prepared.workdir,
       id === "claude" || id === "codex" ? prepared.prompt : undefined,
+      input.acquireExecutionPermit,
+      policy?.mode === "local-full-access" ? () => {
+        const current = lstatSync(validateCodexFullAccessWorkdir(prepared));
+        if (current.dev !== fullWorkdirIdentity?.dev || current.ino !== fullWorkdirIdentity?.ino) {
+          throw new ProviderPreparationError({ stage: "execution-policy", reason: "execution-mode-invalid" });
+        }
+        stagedSkillInputs?.verify?.();
+      } : undefined,
+      () => { if (metadata) metadata.process = "started"; log.info("running local provider", { id, bin }); },
     );
-    if (id === "codex") input.onExecutionEvidence?.(collectCodexExecutionEvidence(stdout));
+    if (id === "codex") {
+      collectedEvidence = collectCodexExecutionEvidence(stdout);
+      if (metadata && hasCodexModelExecutionEvidence(stdout)) metadata.model = "verified";
+    }
     if (aborted) throw signal?.reason ?? new Error(`provider ${id} cancelled`);
     if (timedOut) throw new Error(`provider ${id} timed out after ${timeoutMs}ms`);
     if (code !== 0) {
@@ -2656,11 +2807,32 @@ export async function runProviderDetailed(
       );
     }
     return unavailableResult(stdout, "trae-text");
+  } catch (error) {
+    if (metadata && error instanceof ProviderPreparationError && error.evidence.stage === "native-session"
+      && ["protected-root-readable", "codex-home-readable", "allowed-path-unreadable", "filesystem-probe-timeout", "filesystem-probe-failed", "windows-elevated-sandbox-required"].includes(error.evidence.reason)
+      && metadata.effectiveSandbox === "permission-profile") metadata.sandboxCheck = "failed";
+    throw error;
   } finally {
     stagedSchema?.cleanup();
     isolationContext?.cleanup();
     stagedSkillInputs?.cleanup();
+    if (metadata) input.onExecutionEvidence?.({
+      ...(collectedEvidence ?? { source: "codex-jsonl", events: [], truncated: false }), execution: { ...metadata },
+    });
   }
+}
+
+function hasCodexModelExecutionEvidence(stdout: string): boolean {
+  return stdout.split(/\r?\n/u).some(line => {
+    if (line.length > 1_048_576) return false;
+    try {
+      const value: unknown = JSON.parse(line);
+      if (!value || typeof value !== "object" || !("type" in value) || value.type !== "item.completed"
+        || !("item" in value) || !value.item || typeof value.item !== "object") return false;
+      return "type" in value.item && value.item.type === "agent_message"
+        && "text" in value.item && typeof value.item.text === "string" && value.item.text.trim().length > 0;
+    } catch { return false; }
+  });
 }
 
 /** Backward-compatible text-only provider API. */

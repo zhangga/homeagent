@@ -50,3 +50,18 @@ test("quoted option values and malformed shell tokens cannot fabricate an identi
   expect(inspect('lark-cli im +chat-list --as "user')).toBeUndefined();
   expect(inspect('lark-cli im +chat-list --as u"ser"')).toBeUndefined();
 });
+
+test("execution mode evidence distinguishes no sandbox and unverified model calls", () => {
+  const execution = {
+    executionMode: "local-full-access", sandboxCheck: "not-applicable", effectiveSandbox: "danger-full-access",
+    process: "started", model: "unknown",
+  };
+  const call = { source: "codex-jsonl", events: [], truncated: false, execution };
+  expect(isExecutionEvidence({ calls: [call], truncated: false })).toBe(true);
+  for (const patch of [
+    { sandboxCheck: "passed" }, { effectiveSandbox: "permission-profile" }, { executionMode: "future" },
+    { process: "not-started", model: "verified" }, { command: "secret" },
+  ]) {
+    expect(isExecutionEvidence({ calls: [{ ...call, execution: { ...execution, ...patch } }], truncated: false })).toBe(false);
+  }
+});
