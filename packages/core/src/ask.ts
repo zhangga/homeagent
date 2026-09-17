@@ -31,6 +31,8 @@ import type { AskOptions } from "./types.ts";
 import { gatewayClient, type LlmClient } from "./llm.ts";
 import { isKnowledgeContentRef } from "./digest.ts";
 import { buildKnowledgePageTrace } from "./traceability.ts";
+import { requestsStoredRawQuery } from "./chat-raw-import.ts";
+import { askStoredRaw } from "./ask-raw.ts";
 
 const log = logger.child("ask");
 
@@ -636,6 +638,7 @@ export async function ask(
   deps: AskDeps = {},
 ): Promise<AskResult> {
   const client = deps.client ?? gatewayClient;
+  if (requestsStoredRawQuery(question)) return askStoredRaw(stores, question, client, opts);
   const toolExecution = deps.toolExecution === true && !opts.knowledgeOnly;
   const maxPages = opts.maxPages ?? DEFAULT_MAX_PAGES;
   const model = opts.model ?? config().model;

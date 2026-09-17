@@ -8,7 +8,7 @@ import { SkillCatalog } from "./skill-catalog.ts";
 import { RawJournal } from "./raw-journal.ts";
 import { parseSpaceArchive } from "./governance.ts";
 import * as durable from "./durable-file.ts";
-import { chatRawImportId, chatRawSourceScope, createChatRawCapture, isChatRawScopeSkip, MAX_CHAT_IMPORT_BYTES, MAX_CHAT_IMPORT_MESSAGES, MAX_CHAT_IMPORT_TEXT, parseChatRawImport, readChatRawCapture, requestsChatRawImport, resolveChatRawImportRequest } from "./chat-raw-import.ts";
+import { chatRawImportId, chatRawSourceScope, createChatRawCapture, isChatRawScopeSkip, MAX_CHAT_IMPORT_BYTES, MAX_CHAT_IMPORT_MESSAGES, MAX_CHAT_IMPORT_TEXT, parseChatRawImport, readChatRawCapture, requestsChatRawImport, requestsStoredRawQuery, resolveChatRawImportRequest } from "./chat-raw-import.ts";
 
 const space = "team/oc_capture" as const;
 let dir: string;
@@ -97,6 +97,16 @@ test("ordinary message queries and explicit summary-only requests do not request
   }
   expect(resolveChatRawImportRequest(["飞书群：PST 提炼并保存相关信息", "这次只保存总结"]))
     .toBeUndefined();
+});
+
+test("looking up already imported Raw never opens a new capture, including in a preservation topic", () => {
+  const query = "只使用当前群 HomeAgent 知识库中已入库的 Raw，不调用飞书 Skill、不重新拉取群消息、不读取 D:\\Client 下的文件。查询「PST 高峰期拉扯卡顿专项」中关于“国际服更新后 150—200ms 长帧”的记录，给出原文摘录、来源群、消息时间和对应 Raw ID。查不到请明确说明。";
+  expect(requestsStoredRawQuery(query)).toBe(true);
+  expect(requestsChatRawImport(query)).toBe(false);
+  expect(resolveChatRawImportRequest([query])).toBeUndefined();
+  expect(resolveChatRawImportRequest(["飞书群：PST 提炼并记录相关信息", query])).toBeUndefined();
+  expect(resolveChatRawImportRequest(["飞书群：PST 提炼并记录相关信息", query, "继续补查最近两周"]))
+    .toEqual({ requestedName: "PST" });
 });
 
 test("named external source is saved only in the requesting Space with actual provenance", async () => {

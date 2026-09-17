@@ -116,6 +116,9 @@ Space 目录下 `.chat-source-progress.json` v1 是本机查询工作流状态�
 Raw 的权威、可读存储 module。当前状态按 UTC 创建日期写入
 `raw/records/YYYY/MM/DD.jsonl`，撤回标记写入 `raw/retractions.jsonl`。修改使用同目录临时文件、
 fsync 与原子替换；首次升级从旧 SQLite Raw 回填，之后负责恢复 SQLite projection。
+SQLite projection 的 `raw_fts` 使用与知识页一致的中文双字分词，供显式 Raw 原文查询预筛选；只返回 `ready` 且未撤回的记录。
+原文查询不需要已生成的 Knowledge page。现有数据库首次创建该 FTS 时回填 Raw；重开有 journal 的 Space 或重建 SQLite 后，从 Raw journal 恢复索引。
+Raw 和 FTS 的 SQL 写入在同一事务中；权威 journal 已提交而 SQL 投影失败时，沿用重开恢复路径。查询结果的原文摘录需通过逐字匹配，来源字段由 Raw 生成，不把 Raw 引用伪装成知识页 slug。
 
 手动上传或对话收录的原文件按 SHA-256 内容寻址，不可变地保存在同一 Space 的 `raw/sources/`；
 Raw attachment 保存摘要、字节数和文件名。提炼文本可以有独立的模型输入上限，但不得截断或替代原文件。

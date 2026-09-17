@@ -76,9 +76,10 @@ function boolean(value: unknown): boolean { if (typeof value !== "boolean") inva
 
 /** Explicit preservation intent only; never inspect fetched source text for authorization. */
 function requestsRawPreservation(text: string): boolean {
-  const preservation = /保存|收录|入库|留存/u.test(text)
+  const actionText = text.replace(/已(?:经)?(?:保存|收录|入库|留存)/gu, "");
+  const preservation = /保存|收录|入库|留存/u.test(actionText)
     // Match the action “记录相关信息” / “把消息记录下来”, not the noun “聊天记录”.
-    || /(?:^|[，,。；;\s]|并|请|再|同时|以及)记录|记录(?:下来|一下|到|进)/u.test(text);
+    || /(?:^|[，,。；;\s]|并|请|再|同时|以及)记录|记录(?:下来|一下|到|进)/u.test(actionText);
   return preservation && !declinesRawPreservation(text);
 }
 
@@ -91,6 +92,13 @@ export function requestsChatRawImport(text: string): boolean {
   return text.length <= 20_000 && /群|聊天|飞书/u.test(text) && requestsRawPreservation(text);
 }
 
+/** A lookup of stored evidence is not a new external-source capture. */
+export function requestsStoredRawQuery(text: string): boolean {
+  return /\bRaw\b|原文|原始记录/iu.test(text)
+    && /查询|检索|查找|查阅|核验|摘录|给出|提供/iu.test(text)
+    && /已(?:经)?(?:入库|收录|保存)|知识库|\bRaw\s*ID\b/iu.test(text);
+}
+
 /** Resolve workflow intent from durable user turns; never replay conversation text to the Provider. */
 export function resolveChatRawImportRequest(inputs: readonly string[]): ChatRawSourceScope | undefined {
   let enabled = false;
@@ -99,7 +107,7 @@ export function resolveChatRawImportRequest(inputs: readonly string[]): ChatRawS
   let captureThisTurn = false;
   for (const input of inputs) {
     captureThisTurn = false;
-    if (input.length > 20_000) continue;
+    if (input.length > 20_000 || requestsStoredRawQuery(input)) continue;
     const declared = chatRawSourceScope(input);
     if (declared.requestedName || declared.requestedChatId || /本群|当前群|这个群/u.test(input)) {
       scope = declared;

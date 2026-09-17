@@ -163,6 +163,14 @@ export class SpaceIndex {
        ON raw(agent_id, agent_handled, created DESC)`,
     );
     this.db.run(`CREATE INDEX IF NOT EXISTS pages_type ON pages(type)`);
+    const rawFtsProbe = this.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'raw_fts'");
+    let hasRawFts: unknown;
+    try { hasRawFts = rawFtsProbe.get(); } finally { rawFtsProbe.finalize(); }
+    this.db.transaction(() => {
+      this.db.run(`CREATE VIRTUAL TABLE IF NOT EXISTS raw_fts USING fts5(id UNINDEXED, body)`);
+      this.db.run(`DROP TRIGGER IF EXISTS raw_fts_delete`);
+      if (!hasRawFts) for (const record of this.listRaw()) this.insertRawFts(record);
+    })();
   }
 
   /**
@@ -179,6 +187,7 @@ export class SpaceIndex {
     const raw = journal.listRaw();
     const retractions = journal.listRetractions();
     const replace = this.db.transaction(() => {
+      this.db.run(`DELETE FROM raw_fts`);
       this.db.run(`DELETE FROM raw`);
       this.db.run(`DELETE FROM message_retractions`);
       for (const record of raw) this.insertRawProjection(record);
@@ -188,6 +197,7 @@ export class SpaceIndex {
   }
 
   private insertRawProjection(record: RawRecord): void {
+    this.db.transaction(() => {
     this.db
       .query(
         `INSERT INTO raw (id, space, source, work_item_id, work_action_id, agent_id, agent_handled, agent_response, agent_responded_at, author, chat_id, message_id, content, attachments_json, created, ingested, admission)
@@ -212,6 +222,15 @@ export class SpaceIndex {
         $ingested: record.ingested ? 1 : 0,
         $admission: record.admission,
       });
+      this.insertRawFts(record);
+    })();
+  }
+
+  private insertRawFts(record: RawRecord): void {
+    // Finalize these extra FTS statements instead of extending Bun's query cache;
+    // otherwise complex Space workflows can retain Windows database handles on close.
+    this.db.run(`INSERT INTO raw_fts (rowid, id, body) VALUES ((SELECT rowid FROM raw WHERE id = ?), ?, ?)`, [record.id, record.id,
+      toSearchText([record.id, record.chatId, record.messageId, record.author, record.content].filter(Boolean).join("\n"))]);
   }
 
   private insertRetractionProjection(record: MessageRetractionRecord): void {
@@ -348,6 +367,21 @@ export class SpaceIndex {
   }
 
   // ---- raw -----------------------------------------------------------------
+
+  /** FTS projection of admitted Raw, including records not yet distilled into pages. */
+  searchRaw(query: string, limit = 20): RawRecord[] {
+    const safeLimit = normalizeSearchLimit(limit);
+    const match = toMatchQuery(query.slice(0, 4000));
+    if (!safeLimit || !match) return [];
+    const statement = this.db.prepare(`SELECT r.* FROM raw_fts f JOIN raw r ON r.id = f.id
+      WHERE raw_fts MATCH ? AND r.admission = 'ready'
+        AND NOT EXISTS (SELECT 1 FROM message_retractions m WHERE m.chat_id = r.chat_id AND m.message_id = r.message_id)
+      ORDER BY bm25(raw_fts), r.created DESC, r.id LIMIT ?`);
+    try {
+      const rows = statement.all(match, safeLimit) as Record<string, unknown>[];
+      return rows.map(rowToRaw);
+    } finally { statement.finalize(); }
+  }
 
   insertRaw(entry: RawEntry): string {
     const admission = entry.admission ?? "ready";
@@ -627,7 +661,10 @@ export class SpaceIndex {
 
   deleteRaw(id: string): void {
     this.rawJournal?.deleteMany([id]);
-    this.db.query(`DELETE FROM raw WHERE id = ?`).run(id);
+    this.db.transaction(() => {
+      this.db.run(`DELETE FROM raw_fts WHERE rowid = (SELECT rowid FROM raw WHERE id = ?)`, [id]);
+      this.db.query(`DELETE FROM raw WHERE id = ?`).run(id);
+    })();
   }
 
   getMessageRetraction(
@@ -731,7 +768,10 @@ export class SpaceIndex {
     let deleted = 0;
     const remove = this.db.transaction((ids: string[]) => {
       const statement = this.db.query(`DELETE FROM raw WHERE id = ?`);
-      for (const id of ids) deleted += statement.run(id).changes;
+      for (const id of ids) {
+        this.db.run(`DELETE FROM raw_fts WHERE rowid = (SELECT rowid FROM raw WHERE id = ?)`, [id]);
+        deleted += statement.run(id).changes;
+      }
     });
     remove(records.map(({ id }) => id));
     return deleted;
