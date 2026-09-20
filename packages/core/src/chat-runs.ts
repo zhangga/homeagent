@@ -64,12 +64,22 @@ export interface ChatRunError {
   message: string;
 }
 
+export interface ChatRunLiveReply {
+  provider: "feishu";
+  messageId: string;
+  /** CardKit entity id. Legacy message-patch handles omit this field. */
+  cardId?: string;
+  revision: number;
+  lastAppliedSeq: number;
+}
+
 export interface ChatRunDelivery {
   status: ChatRunDeliveryStatus;
   attempts: number;
   lastAttemptAt?: number;
   sentAt?: number;
   error?: string;
+  liveReply?: ChatRunLiveReply;
 }
 
 export interface ChatRun {
@@ -278,7 +288,10 @@ function clone(run: ChatRun): ChatRun {
     executionPlan: run.executionPlan
       ? cloneStoredExecutionPlan(run.executionPlan)
       : undefined,
-    delivery: { ...run.delivery },
+    delivery: {
+      ...run.delivery,
+      liveReply: run.delivery.liveReply ? { ...run.delivery.liveReply } : undefined,
+    },
     usage: run.usage ? cloneAggregatedRunUsage(run.usage) : undefined,
     error: run.error ? { ...run.error } : undefined,
   };
@@ -618,6 +631,16 @@ export function isChatRun(value: unknown): value is ChatRun {
     && (delivery.error === undefined || typeof delivery.error === "string")
     && (delivery.error === undefined
       || delivery.error.length <= MAX_CHAT_RUN_ERROR_CHARACTERS)
+    && (delivery.liveReply === undefined || (
+      delivery.liveReply.provider === "feishu"
+      && /^om_[a-zA-Z0-9_-]{1,256}$/u.test(delivery.liveReply.messageId)
+      && (delivery.liveReply.cardId === undefined
+        || /^[0-9]{1,20}$/u.test(delivery.liveReply.cardId))
+      && Number.isSafeInteger(delivery.liveReply.revision)
+      && delivery.liveReply.revision >= 0
+      && Number.isSafeInteger(delivery.liveReply.lastAppliedSeq)
+      && delivery.liveReply.lastAppliedSeq >= 0
+    ))
     && (
       run.status === "queued"
       || run.status === "running"
@@ -1256,14 +1279,42 @@ export class ChatRunStore {
     return failed;
   }
 
+  setLiveReply(id: string, liveReply: ChatRunLiveReply): ChatRun | undefined {
+    if (!this.runs.has(id)) return undefined;
+    if (!/^om_[a-zA-Z0-9_-]{1,256}$/u.test(liveReply.messageId)
+      || (liveReply.cardId !== undefined && !/^[0-9]{1,20}$/u.test(liveReply.cardId))
+      || !Number.isSafeInteger(liveReply.revision) || liveReply.revision < 0
+      || !Number.isSafeInteger(liveReply.lastAppliedSeq) || liveReply.lastAppliedSeq < 0) {
+      throw new Error("Chat Run live reply metadata is invalid");
+    }
+    return this.commit((candidate) => {
+      const run = candidate.get(id)!;
+      run.delivery = { ...run.delivery, liveReply: { ...liveReply } };
+      return clone(run);
+    });
+  }
+  clearLiveReply(id: string): ChatRun | undefined {
+    if (!this.runs.has(id)) return undefined;
+    return this.commit((candidate) => {
+      const run = candidate.get(id)!;
+      if (!run.delivery.liveReply) return clone(run);
+      const { liveReply: _liveReply, ...delivery } = run.delivery;
+      run.delivery = delivery;
+      return clone(run);
+    });
+  }
+
   startDeliveryAttempt(id: string, attemptedAt: number): ChatRun | undefined {
     if (!this.runs.has(id)) return undefined;
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
       run.delivery = {
+        ...run.delivery,
         status: "pending",
         attempts: run.delivery.attempts + 1,
         lastAttemptAt: attemptedAt,
+        sentAt: undefined,
+        error: undefined,
       };
       return clone(run);
     });

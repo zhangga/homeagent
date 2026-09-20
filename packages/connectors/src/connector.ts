@@ -73,6 +73,35 @@ export interface OutboundReply {
   inThread?: boolean;
 }
 
+export interface LiveReplyStep {
+  seq: number;
+  title: string;
+  status?: string;
+}
+
+export interface LiveReplySnapshot {
+  runId: string;
+  seq: number;
+  state: "queued" | "running" | "waiting" | "succeeded" | "failed" | "cancelled" | "timed_out";
+  phase?: string;
+  steps: LiveReplyStep[];
+  commentary: string[];
+  toolCallCount: number;
+  answerPreview?: string;
+  startedAt: number;
+  detailUrl?: string;
+  canCancel: boolean;
+  canRetry: boolean;
+}
+
+export interface LiveReplyHandle {
+  /** Feishu message that contains the card entity. */
+  messageId: string;
+  /** CardKit entity id used for all incremental updates. */
+  cardId?: string;
+  revision: number;
+}
+
 /** The source message a user replied to when issuing a control command. */
 export interface ReplyTarget {
   messageId: string;
@@ -115,6 +144,12 @@ export interface Connector {
   start(onEvent: (event: InboundEvent) => void | Promise<void>): Promise<void>;
   stop(): Promise<void>;
   reply(out: OutboundReply): Promise<void>;
+  /** Create a platform-native live reply when the transport supports updates. */
+  createLiveReply?(out: OutboundReply, snapshot: LiveReplySnapshot): Promise<LiveReplyHandle>;
+  /** Update the same live reply; implementations must ignore stale revisions. */
+  updateLiveReply?(handle: LiveReplyHandle, snapshot: LiveReplySnapshot): Promise<LiveReplyHandle>;
+  /** Final update for a live reply. */
+  finalizeLiveReply?(handle: LiveReplyHandle, snapshot: LiveReplySnapshot): Promise<void>;
   /** send a standalone message to a chat (e.g. group-added notice) */
   notice(chatId: string, markdown: string, opts?: NoticeOptions): Promise<void>;
   /** add a platform-native reaction while a response is being prepared */

@@ -1970,6 +1970,48 @@ export function chatRunView(
       <div><strong>冻结权限：</strong>${run.executionPlan?.execution?.permission ?? run.execution?.permission ?? "未记录"}</div>
       ${localAuthorization ? html`<div><strong>当前本机授权：</strong>${localAuthorization}</div>` : ""}
       ${executionEvidenceView(run)}
+      <div id="live-run" data-run-id="${run.id}" data-terminal="${["succeeded", "failed", "cancelled", "timed_out"].includes(run.status) ? "1" : "0"}">
+        <strong>实时执行轨迹</strong>
+        <ol id="live-run-events" style="margin:8px 0 0;padding-left:22px"><li class="muted">正在加载事件…</li></ol>
+        <div id="live-run-answer" class="contentbox" style="margin-top:10px;display:${run.output ? "block" : "none"}">${run.output ?? ""}</div>
+      </div>
+      <script>
+        (() => {
+          const root = document.getElementById("live-run");
+          const list = document.getElementById("live-run-events");
+          const answer = document.getElementById("live-run-answer");
+          if (!root || !list || !answer) return;
+          const runId = root.dataset.runId;
+          let lastSeq = 0;
+          let answerText = "";
+          const terminal = new Set(["run.succeeded", "run.failed", "run.cancelled", "run.timed_out"]);
+          const render = (event) => {
+            if (!event || event.seq <= lastSeq) return;
+            lastSeq = event.seq;
+            if (list.children.length === 1 && list.firstElementChild?.classList.contains("muted")) list.textContent = "";
+            if (!event.kind.startsWith("assistant.")) {
+              const item = document.createElement("li");
+              item.textContent = event.title + (event.detail ? " · " + event.detail : "");
+              list.appendChild(item);
+            }
+            if (event.kind === "assistant.delta") answerText += event.delta || "";
+            if (event.kind === "assistant.snapshot" || event.kind === "run.succeeded") answerText = event.delta || answerText;
+            if (answerText) { answer.textContent = answerText; answer.style.display = "block"; }
+            if (terminal.has(event.kind)) source?.close();
+          };
+          let source;
+          fetch("/api/chats/runs/" + encodeURIComponent(runId) + "/snapshot", { credentials: "same-origin", cache: "no-store" })
+            .then(response => response.ok ? response.json() : Promise.reject(new Error("snapshot failed")))
+            .then(snapshot => {
+              for (const event of snapshot.events || []) render(event);
+              if (snapshot.run?.output) { answerText = snapshot.run.output; answer.textContent = answerText; answer.style.display = "block"; }
+              if (["succeeded", "failed", "cancelled", "timed_out"].includes(snapshot.run?.status)) return;
+              source = new EventSource("/api/chats/runs/" + encodeURIComponent(runId) + "/events?after=" + lastSeq);
+              source.onmessage = message => { try { render(JSON.parse(message.data)); } catch {} };
+            })
+            .catch(() => { if (list.textContent?.includes("正在加载")) list.innerHTML = '<li class="muted">实时连接不可用，可刷新页面查看持久化状态。</li>'; });
+        })();
+      </script>
       <div><strong>空间：</strong>${run.space}</div>
       <div><strong>投递：</strong>${deliveryLabel} · 已尝试 ${run.delivery.attempts} 次</div>
       ${run.usage ? runUsageView(run.usage) : ""}

@@ -71,6 +71,7 @@ export type RunProviderFn = (
     nativeTopic?: boolean;
     acquireExecutionPermit?: RunInput["acquireExecutionPermit"];
     onExecutionEvidence?: import("@homeagent/llm").RunInput["onExecutionEvidence"];
+    onProgress?: import("@homeagent/llm").RunInput["onProgress"];
   },
   timeoutMs?: number,
   signal?: AbortSignal,
@@ -243,6 +244,7 @@ export function makeCliClient(
             maxTokens: opts.maxTokens,
             nativeSession: opts.nativeSession,
             ...(opts.onExecutionEvidence ? { onExecutionEvidence: opts.onExecutionEvidence } : {}),
+            ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
             ...(nativeTopic ? { nativeTopic: true } : {}),
             ...(acquireExecutionPermit ? { acquireExecutionPermit } : {}),
           },
@@ -299,6 +301,7 @@ export function makeCliClient(
             execution,
             ...(provider === "codex" ? { outputSchema: opts.schema } : {}),
             ...(opts.onExecutionEvidence ? { onExecutionEvidence: opts.onExecutionEvidence } : {}),
+            ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
             maxTokens: opts.maxTokens,
             nativeSession: opts.nativeSession,
             ...(nativeTopic ? { nativeTopic: true } : {}),

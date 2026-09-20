@@ -28,6 +28,7 @@ export interface AskOptions {
   /** Host-provided handoff instructions for a scoped, writable Chat Run. */
   sourceCaptureInstruction?: string;
   onExecutionEvidence?: import("@homeagent/llm").RunInput["onExecutionEvidence"];
+  onProgress?: import("@homeagent/shared").ProviderProgressEvent extends infer T ? (event: T) => void | Promise<void> : never;
   /** model override for synthesis */
   model?: string;
   /** agent persona / extra system instruction injected into synthesis + fallback */

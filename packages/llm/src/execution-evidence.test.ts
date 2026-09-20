@@ -1,8 +1,20 @@
 import { expect, test } from "bun:test";
-import { collectCodexExecutionEvidence, isExecutionEvidence, appendExecutionEvidence } from "./execution-evidence.ts";
+import { collectCodexExecutionEvidence, codexExecutionEvidenceFromLine, isExecutionEvidence, appendExecutionEvidence } from "./execution-evidence.ts";
 
 const event = (command: string, aggregated_output: string, exit_code = 0) => JSON.stringify({
   type: "item.completed", item: { type: "command_execution", command, aggregated_output, exit_code },
+});
+
+test("parses one completed Codex tool line for live progress without retaining payloads", () => {
+  const parsed = codexExecutionEvidenceFromLine(event(
+    'lark-cli im +messages-search --as user --query "sensitive" --json',
+    JSON.stringify({ ok: true, identity: "user", data: { messages: [{ body: "private" }], has_more: true } }),
+  ));
+  expect(parsed).toEqual({
+    kind: "command", status: "completed", exitCode: 0,
+    lark: { operation: "messages-search", requestedIdentity: "user", reportedIdentity: "user", ok: true, count: 1, hasMore: true },
+  });
+  expect(JSON.stringify(parsed)).not.toMatch(/sensitive|private/);
 });
 
 test("captures bounded CLI metadata without commands, credentials, names or message bodies", () => {

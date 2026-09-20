@@ -143,26 +143,33 @@ function larkEvidence(command: unknown, output: unknown): ToolExecutionEvidence[
   return result;
 }
 
+export function codexExecutionEvidenceFromLine(line: string): ToolExecutionEvidence | undefined {
+  if (line.length > 1_048_576) return undefined;
+  let raw: unknown;
+  try { raw = JSON.parse(line); } catch { return undefined; }
+  if (!record(raw) || raw.type !== "item.completed" || !record(raw.item)) return undefined;
+  const item = raw.item;
+  const kind = item.type === "command_execution" ? "command" : item.type === "file_change" ? "file-change"
+    : item.type === "mcp_tool_call" ? "mcp" : item.type === "web_search" ? "web-search" : undefined;
+  if (!kind) return undefined;
+  const exitCode = Number.isSafeInteger(item.exit_code) && Math.abs(Number(item.exit_code)) <= 2147483648 ? Number(item.exit_code) : undefined;
+  const evidence: ToolExecutionEvidence = {
+    kind, status: item.status === "failed" || (exitCode !== undefined && exitCode !== 0) ? "failed"
+      : item.status === "completed" || exitCode === 0 ? "completed" : "unknown",
+    ...(exitCode !== undefined ? { exitCode } : {}),
+  };
+  const lark = kind === "command" ? larkEvidence(item.command, item.aggregated_output) : undefined;
+  if (lark) evidence.lark = lark;
+  return evidence;
+}
+
 export function collectCodexExecutionEvidence(stdout: string): ProviderExecutionEvidence {
   const result: ProviderExecutionEvidence = { source: "codex-jsonl", events: [], truncated: false };
   for (const line of stdout.split(/\r?\n/)) {
     if (line.length > 1_048_576) { result.truncated = true; continue; }
-    let raw: unknown;
-    try { raw = JSON.parse(line); } catch { continue; }
-    if (!record(raw) || raw.type !== "item.completed" || !record(raw.item)) continue;
-    const item = raw.item;
-    const kind = item.type === "command_execution" ? "command" : item.type === "file_change" ? "file-change"
-      : item.type === "mcp_tool_call" ? "mcp" : item.type === "web_search" ? "web-search" : undefined;
-    if (!kind) continue;
+    const evidence = codexExecutionEvidenceFromLine(line);
+    if (!evidence) continue;
     if (result.events.length >= MAX_EVENTS) { result.truncated = true; continue; }
-    const exitCode = Number.isSafeInteger(item.exit_code) && Math.abs(Number(item.exit_code)) <= 2147483648 ? Number(item.exit_code) : undefined;
-    const evidence: ToolExecutionEvidence = {
-      kind, status: item.status === "failed" || (exitCode !== undefined && exitCode !== 0) ? "failed"
-        : item.status === "completed" || exitCode === 0 ? "completed" : "unknown",
-      ...(exitCode !== undefined ? { exitCode } : {}),
-    };
-    const lark = kind === "command" ? larkEvidence(item.command, item.aggregated_output) : undefined;
-    if (lark) evidence.lark = lark;
     result.events.push(evidence);
   }
   return result;

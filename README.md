@@ -19,9 +19,24 @@ Bun workspaces monorepo，依赖严格单向：`web/app → orchestrator → cor
 | `packages/core` | 知识层 seam `Knowledge` + llm_wiki 式引擎：markdown/SQLite(FTS5)/dream cycle/Wiki Maintenance/ask 检索问答 |
 | `packages/connectors` | `Connector` 抽象 + `cli`（调试）+ `feishu`（lark-cli 子进程守护） |
 | `packages/orchestrator` | runtime 单消费者 + 对话解释 + 应答网关 + 空间归属 + 冷启动话术 |
-| `packages/web` | Hono 管理后台（空间/知识、Agents、任务、学习、提醒、Integrations、运行状态、数据治理、日志、设置） |
+| `packages/web` | Hono 管理后台（空间/知识、Agents、任务、学习、提醒、Integrations、运行状态、数据治理、日志、设置）；Chat Run 详情通过 snapshot + SSE 实时展示安全执行轨迹与回答 |
 | `packages/app` | 入口：feishu 连接器 + orchestrator + web + 调度器（含 catch-up） |
 
+### 实时执行可见性
+
+每个 Chat Run 的排队、开始、Provider 阶段、公开工具状态、回答增量、投递状态和终态都会按序追加到
+`data/runs/chat-events/<runId>.jsonl`。该 journal 是 Web 与飞书展示的共同实时数据源；不保存或展示模型
+reasoning/thinking 原文、完整命令、工具输出正文、路径或凭据。管理后台 Run 详情页先读取
+`GET /api/chats/runs/:runId/snapshot`，再通过 `GET /api/chats/runs/:runId/events?after=<seq>` 的 SSE
+断点续传后续事件。
+
+飞书连接器会先创建一张 CardKit Card 2.0 实体，以 Bot 身份回复到原话题，再按序、合并、节流地更新
+同一实体；运行中开启 CardKit streaming mode，展示最近公开步骤、阶段性说明和累计工具调用次数，终态关闭
+streaming mode。过程卡与最终 Markdown 回答是两个独立投影，因此中间过程失败不会吞掉最终结果。卡片实体 ID、
+消息 ID 和最后应用序号保存在 Chat Run delivery 元数据中；创建或更新失败会写入 operator 事件并自动回退到
+最终 Markdown 回复。只有最终回答成功投递并持久化为 `delivery.status=sent` 后，才提交 Provider 原生话题
+会话。卡片默认不放管理页跳转，因为后台默认仅监听本机回环地址；部署方提供经过认证的可访问 HTTPS 地址后，
+才应向卡片传入详情 URL。当前未开放取消/重试卡片回调，相关操作继续在管理后台执行。
 ### 双层空间模型
 
 - `personal/<open_id>`：每人一个（私聊知识）

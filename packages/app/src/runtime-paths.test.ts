@@ -67,6 +67,19 @@ describe("resolveRuntimePaths", () => {
     });
   });
 
+  test("uses the npm command shim by default on Windows source runs", () => {
+    const paths = resolveRuntimePaths({
+      execPath: "C:\\tools\\bun.exe",
+      homeDir: "C:\\Users\\example",
+      repoRoot: "C:\\work\\homeagent",
+      platform: "win32",
+      env: {},
+    });
+
+    expect(paths.bundled).toBe(false);
+    expect(paths.larkBin).toBe("lark-cli.cmd");
+  });
+
   test("accepts pre-rename runtime overrides", () => {
     const paths = resolveRuntimePaths({
       execPath: "/opt/bun/bin/bun",

@@ -70,7 +70,11 @@ export function resolveRuntimePaths(input: {
     logDir,
     larkBin:
       brandedEnv(env, "LARK_BIN") ??
-      (bundled ? join(resourceDir, "bin", "lark-cli") : "lark-cli"),
+      (bundled
+        ? join(resourceDir, "bin", "lark-cli")
+        : (input.platform ?? process.platform) === "win32"
+          ? "lark-cli.cmd"
+          : "lark-cli"),
     attachmentHelper: bundled
       ? join(resourceDir, "bin", "attachment-extract")
       : undefined,

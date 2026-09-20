@@ -2,6 +2,7 @@ import {
   BudgetExceededError,
   ProviderRunError,
   type CompletionUsage,
+  type CompleteOptions,
   type JSONOptions,
 } from "@homeagent/llm";
 import type { LlmClient } from "./llm.ts";
@@ -179,11 +180,17 @@ export function observeLlmUsage(
   client: LlmClient,
   record: (usage?: CompletionUsage) => void,
   onExecutionEvidence?: import("@homeagent/llm").RunInput["onExecutionEvidence"],
+  onProgress?: import("@homeagent/llm").RunInput["onProgress"],
 ): LlmClient {
+  const observe = <T extends CompleteOptions>(options: T): T => ({
+    ...options,
+    ...(onExecutionEvidence ? { onExecutionEvidence } : {}),
+    ...(onProgress ? { onProgress } : {}),
+  });
   return {
     async complete(options) {
       try {
-        const result = await client.complete(onExecutionEvidence ? { ...options, onExecutionEvidence } : options);
+        const result = await client.complete(observe(options));
         record(result.usage);
         return result;
       } catch (error) {
@@ -195,7 +202,7 @@ export function observeLlmUsage(
     },
     async completeJSON<T>(options: JSONOptions<T>) {
       try {
-        const output = await client.completeJSON<T>(onExecutionEvidence ? { ...options, onExecutionEvidence } : options);
+        const output = await client.completeJSON<T>(observe(options));
         record(output.result.usage);
         return output;
       } catch (error) {

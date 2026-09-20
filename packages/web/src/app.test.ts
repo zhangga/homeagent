@@ -97,6 +97,32 @@ afterEach(() => {
 });
 
 describe("web backend (read-only)", () => {
+  test("replays durable Chat Run events through snapshot and terminal SSE", async () => {
+    const run = engine.chatRuns.start({ space: SPACE, input: "实时查看", trigger: "message", startedAt: 100 });
+    engine.runEvents.append({ runId: run.id, at: 100, kind: "run.queued", visibility: "public", title: "请求已进入队列" });
+    engine.chatRuns.begin(run.id, 110);
+    engine.runEvents.append({ runId: run.id, at: 110, kind: "run.started", visibility: "public", title: "开始执行" });
+    engine.chatRuns.succeed(run.id, { finishedAt: 120, output: "完成" });
+    engine.runEvents.append({ runId: run.id, at: 120, kind: "run.succeeded", visibility: "public", title: "执行完成", delta: "完成" });
+
+    const snapshot = await app.request(`/api/chats/runs/${encodeURIComponent(run.id)}/snapshot`);
+    expect(snapshot.status).toBe(200);
+    expect(await snapshot.json()).toEqual(expect.objectContaining({
+      run: expect.objectContaining({ id: run.id, status: "succeeded" }),
+      events: expect.arrayContaining([expect.objectContaining({ seq: 3, kind: "run.succeeded" })]),
+    }));
+
+    const stream = await app.request(`/api/chats/runs/${encodeURIComponent(run.id)}/events?after=1`);
+    expect(stream.status).toBe(200);
+    const body = await stream.text();
+    expect(body).toContain("id: 2");
+    expect(body).toContain('"kind":"run.succeeded"');
+    expect(body).not.toContain("id: 1");
+
+    const detail = await app.request(`/chats/runs/${encodeURIComponent(run.id)}`);
+    expect(await detail.text()).toContain("实时执行轨迹");
+  });
+
   test("serves only the injected HomeAgent Feishu avatar with manual-upload guidance", async () => {
     const avatarPath = join(dir, "homeagent-feishu-avatar-512.png");
     const avatarBytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);

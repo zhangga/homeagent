@@ -2356,6 +2356,9 @@ describe("space data governance", () => {
         sources: ["codex-jsonl"],
       },
     });
+    source.chatRuns.setLiveReply(chatRun.id, {
+      provider: "feishu", messageId: "om_local_live", revision: 3, lastAppliedSeq: 3,
+    });
     source.reminders.create({
       title: "提交每日报告",
       space: SPACE,
@@ -2468,6 +2471,7 @@ describe("space data governance", () => {
     expect(restored.tasks.list()).toEqual(archive.tasks);
     expect(restored.listTaskRuns(task.id)).toEqual(archive.taskRuns);
     expect(archive.chatRuns[0]?.executionEvidence).toBeUndefined();
+    expect(archive.chatRuns[0]?.delivery.liveReply).toBeUndefined();
     expect(restored.chatRuns.list(SPACE)).toEqual(archive.chatRuns);
     expect(restored.reminders.list()).toEqual(archive.reminders);
     expect(restored.learning.exportBySpace(SPACE)).toEqual(archive.learning);

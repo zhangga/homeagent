@@ -20,7 +20,7 @@
  * gateway.ts, not here; it is always available and is the default.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { AI_OPERATION_TIMEOUT_MS, brandedEnv, config, logger } from "@homeagent/shared";
+import { AI_OPERATION_TIMEOUT_MS, brandedEnv, config, logger, type ProviderProgressEvent, type PublicRunTool } from "@homeagent/shared";
 import {
   chmodSync,
   closeSync,
@@ -44,7 +44,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ImageInput } from "./gateway.ts";
-import { collectCodexExecutionEvidence, type ProviderExecutionEvidence, type ProviderExecutionMetadata } from "./execution-evidence.ts";
+import { codexExecutionEvidenceFromLine, collectCodexExecutionEvidence, type ProviderExecutionEvidence, type ProviderExecutionMetadata } from "./execution-evidence.ts";
 import { ProviderPreparationError, SkillStagingBudget, NATIVE_SESSION_ISSUE_LABELS, type NativeSessionIssue } from "./provider-preparation.ts";
 import { resolveCodexExecutionPolicy, type CodexExecutionMode } from "./codex-execution-policy.ts";
 
@@ -171,6 +171,8 @@ export interface RunInput {
   acquireExecutionPermit?: () => ProviderExecutionPermit;
   /** Private, redacted metadata only; never part of the model prompt or argv. */
   onExecutionEvidence?: (evidence: ProviderExecutionEvidence) => void;
+  /** Public/operator progress events; observer failures never affect execution. */
+  onProgress?: (event: ProviderProgressEvent) => void | Promise<void>;
   prompt: string;
   system?: string;
   model?: string;
@@ -2056,6 +2058,87 @@ function claudeAuthIsLoggedIn(stdout: string): boolean {
   }
 }
 
+export function codexProgressEventFromLine(line: string, at = Date.now()): ProviderProgressEvent | undefined {
+  if (!line.trim() || line.length > 1_048_576) return undefined;
+  let raw: unknown;
+  try { raw = JSON.parse(line); } catch { return undefined; }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const event = raw as Record<string, unknown>;
+  if (event.type === "thread.started") {
+    return { kind: "phase", at, title: "Provider 会话已建立", phase: "provider", visibility: "operator" };
+  }
+  if ((event.type === "item.started" || event.type === "item.completed") && event.item && typeof event.item === "object") {
+    const item = event.item as Record<string, unknown>;
+    if (item.type === "agent_message" && event.type === "item.completed" && typeof item.text === "string" && item.text.trim()) {
+      return { kind: "assistant_snapshot", at, title: "正在生成回答", phase: "answer", visibility: "public", delta: item.text };
+    }
+    if (["command_execution", "file_change", "mcp_tool_call", "web_search"].includes(String(item.type))) {
+      const evidence = event.type === "item.completed" ? codexExecutionEvidenceFromLine(line) : undefined;
+      const type = item.type === "command_execution" ? "command" : item.type === "file_change" ? "file-change"
+        : item.type === "mcp_tool_call" ? "mcp" : "web-search";
+      const tool: PublicRunTool = evidence
+        ? {
+            type: evidence.kind,
+            status: evidence.status,
+            ...(evidence.exitCode !== undefined ? { exitCode: evidence.exitCode } : {}),
+            ...(evidence.lark ? { lark: { ...evidence.lark } } : {}),
+          }
+        : { type, status: event.type === "item.started" ? "running" as const : "unknown" as const };
+      return {
+        kind: "tool",
+        at,
+        title: event.type === "item.started" ? "工具开始执行" : "工具执行完成",
+        phase: "tool",
+        visibility: "public",
+        tool,
+      };
+    }
+  }
+  if (event.type === "turn.completed") {
+    return { kind: "phase", at, title: "Provider 执行完成", phase: "provider", visibility: "public" };
+  }
+  return undefined;
+}
+
+async function publishCodexProgress(
+  line: string,
+  observer: NonNullable<RunInput["onProgress"]>,
+): Promise<void> {
+  const progress = codexProgressEventFromLine(line);
+  if (!progress) return;
+  try { await observer(progress); } catch (error) {
+    log.warn("provider progress observer failed", { err: String(error) });
+  }
+}
+
+async function readTextStream(
+  stream: ReadableStream<Uint8Array>,
+  onLine: (line: string) => void | Promise<void>,
+): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let pending = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const text = decoder.decode(value, { stream: true });
+    chunks.push(text);
+    pending += text;
+    let newline = pending.indexOf("\n");
+    while (newline >= 0) {
+      const line = pending.slice(0, newline).replace(/\r$/u, "");
+      pending = pending.slice(newline + 1);
+      await onLine(line);
+      newline = pending.indexOf("\n");
+    }
+  }
+  const final = decoder.decode();
+  if (final) { chunks.push(final); pending += final; }
+  if (pending) await onLine(pending.replace(/\r$/u, ""));
+  return chunks.join("");
+}
+
 /** Spawn a command with a hard timeout; resolve stdout/stderr/exit code. */
 async function runCmd(
   bin: string,
@@ -2067,6 +2150,7 @@ async function runCmd(
   acquireExecutionPermit?: RunInput["acquireExecutionPermit"],
   beforeSpawn?: () => void,
   onStarted?: () => void,
+  onStdoutLine?: (line: string) => void | Promise<void>,
 ): Promise<{
   code: number | null;
   stdout: string;
@@ -2123,8 +2207,11 @@ async function runCmd(
       proc.stdin.write(stdin);
       proc.stdin.end();
     }
+    const stdoutPromise = onStdoutLine
+      ? readTextStream(proc.stdout, onStdoutLine)
+      : new Response(proc.stdout).text();
     const [stdout, stderr, code] = await Promise.all([
-      new Response(proc.stdout).text(),
+      stdoutPromise,
       new Response(proc.stderr).text(),
       proc.exited,
     ]);
@@ -2755,6 +2842,7 @@ export async function runProviderDetailed(
         stagedSkillInputs?.verify?.();
       } : undefined,
       () => { if (metadata) metadata.process = "started"; log.info("running local provider", { id, bin }); },
+      id === "codex" && input.onProgress ? (line) => publishCodexProgress(line, input.onProgress!) : undefined,
     );
     if (id === "codex") {
       collectedEvidence = collectCodexExecutionEvidence(stdout);

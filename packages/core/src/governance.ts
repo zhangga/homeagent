@@ -1207,6 +1207,8 @@ function parseChatRun(
   if (normalized.status === "queued" || normalized.status === "running") {
     throw new Error(`chatRuns[${index}] cannot restore an active record`);
   }
+  const { liveReply: _localLiveReply, ...portableDelivery } = normalized.delivery;
+
   return {
     id: nonemptyText(normalized.id, `chatRuns[${index}].id`),
     space,
@@ -1241,7 +1243,7 @@ function parseChatRun(
     retryOf: normalized.retryOf,
     priority: normalized.priority,
     status: normalized.status,
-    delivery: { ...normalized.delivery },
+    delivery: portableDelivery,
     queuedAt: normalized.queuedAt,
     startedAt: normalized.startedAt,
     runStartedAt: normalized.runStartedAt,

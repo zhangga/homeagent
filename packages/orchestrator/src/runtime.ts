@@ -57,8 +57,10 @@ import type {
   DownloadedAttachment,
   InboundEvent,
   InboundMessage,
+  LiveReplyHandle,
 } from "@homeagent/connectors";
 import { extractAttachmentText } from "./attachment-extractor.ts";
+import { isLiveReplyTerminal, liveReplySnapshot } from "@homeagent/connectors";
 import { attribute } from "./attribution.ts";
 import { gate } from "./gateway.ts";
 import { decideGroupParticipation } from "./group-participation.ts";
@@ -299,6 +301,11 @@ export class Orchestrator {
   private pendingReminderConfirmations = new Map<string, PendingReminderConfirmation>();
   private chatRunControllers = new Map<string, AbortController>();
   private pendingEvents = new Set<Promise<void>>();
+  private liveReplies = new Map<string, LiveReplyHandle>();
+  private liveReplyUpdates = new Map<string, Promise<void>>();
+  private liveReplyCreates = new Map<string, Promise<void>>();
+  private liveReplyNextAt = new Map<string, number>();
+  private liveReplyDirty = new Set<string>();
   private dedupSize: number;
   private docFetcher?: (urlOrToken: string) => Promise<string | null>;
   private attachmentDownloader?: (messageId: string) => Promise<DownloadedAttachment[]>;
@@ -363,8 +370,12 @@ export class Orchestrator {
   }
 
   async stop(): Promise<void> {
+    await Promise.allSettled([
+      ...this.pendingEvents,
+      ...this.liveReplyCreates.values(),
+      ...this.liveReplyUpdates.values(),
+    ]);
     await this.connector.stop();
-    await Promise.allSettled([...this.pendingEvents]);
   }
 
   /**
@@ -1237,6 +1248,11 @@ export class Orchestrator {
       ...(topicNativeSession ? { topicNativeSession } : {}),
     });
     if (workItemId) this.engine.workItems.attachChatRun(workItemId, run.id);
+    this.recordRunEvent({ runId: run.id, at: run.queuedAt, kind: "run.queued", visibility: "public", phase: "queue", status: "pending", title: "请求已进入队列" });
+    const liveReplyCreate = this.startLiveReply(msg, run.id).finally(() => {
+      if (this.liveReplyCreates.get(run.id) === liveReplyCreate) this.liveReplyCreates.delete(run.id);
+    });
+    this.liveReplyCreates.set(run.id, liveReplyCreate);
     return run;
   }
 
@@ -1275,6 +1291,7 @@ export class Orchestrator {
           if (!this.engine.chatRuns.begin(run.id)) {
             throw new Error(`queued chat run is no longer active: ${run.id}`);
           }
+          this.recordRunEvent({ runId: run.id, at: Date.now(), kind: "run.started", visibility: "public", phase: "provider", status: "running", title: "开始执行" });
           const timeoutMs = run.timeoutMs ?? LEGACY_CHAT_PROVIDER_TIMEOUT_MS;
           const timeout = setTimeout(() => {
             controller.abort(new ChatRunTimeoutError(timeoutMs));
@@ -1308,6 +1325,7 @@ export class Orchestrator {
           );
         }
         if (!failed) return;
+        this.recordTerminalRunEvent(run.id, "failed", failed.finishedAt ?? Date.now(), failed.error?.message);
         await this.send(msg, error.notice, run.id);
         return;
       }
@@ -1325,32 +1343,38 @@ export class Orchestrator {
             },
           });
           if (!timedOut) return;
-          await this.send(msg, "当前请求排队时间过长，请稍后重试。");
+          this.recordTerminalRunEvent(run.id, "timed_out", finishedAt, timedOut.error?.message);
+          await this.send(msg, "当前请求排队时间过长，请稍后重试。", run.id);
           return;
         }
         if (error instanceof RunQueueCancelledError) {
-          this.engine.chatRuns.cancel(run.id, {
+          const cancelled = this.engine.chatRuns.cancel(run.id, {
             finishedAt,
             error: {
               kind: "cancelled",
               message: "Chat Run was cancelled while queued.",
             },
           });
+          if (cancelled) this.recordTerminalRunEvent(run.id, "cancelled", finishedAt, cancelled.error?.message);
           return;
         }
-        this.engine.chatRuns.fail(run.id, {
+        const failed = this.engine.chatRuns.fail(run.id, {
           finishedAt,
           error: chatRunError(error),
         });
+        if (failed) this.recordTerminalRunEvent(run.id, "failed", finishedAt, failed.error?.message);
       } else if (current?.status === "running") {
         const finishedAt = Date.now();
         const failure = chatRunError(error);
         if (failure.kind === "cancelled") {
-          this.engine.chatRuns.cancel(run.id, { finishedAt, error: failure });
+          const cancelled = this.engine.chatRuns.cancel(run.id, { finishedAt, error: failure });
+          if (cancelled) this.recordTerminalRunEvent(run.id, "cancelled", finishedAt, cancelled.error?.message);
         } else if (failure.kind === "timeout") {
-          this.engine.chatRuns.timeout(run.id, { finishedAt, error: failure });
+          const timedOut = this.engine.chatRuns.timeout(run.id, { finishedAt, error: failure });
+          if (timedOut) this.recordTerminalRunEvent(run.id, "timed_out", finishedAt, timedOut.error?.message);
         } else {
-          this.engine.chatRuns.fail(run.id, { finishedAt, error: failure });
+          const failed = this.engine.chatRuns.fail(run.id, { finishedAt, error: failure });
+          if (failed) this.recordTerminalRunEvent(run.id, "failed", finishedAt, failed.error?.message);
         }
       }
       throw error;
@@ -1364,13 +1388,14 @@ export class Orchestrator {
     if (!run || !["queued", "running"].includes(run.status)) return false;
     if (run.status === "queued") {
       if (!this.engine.runScheduler.cancel(runId)) return false;
-      this.engine.chatRuns.cancel(runId, {
+      const cancelled = this.engine.chatRuns.cancel(runId, {
         finishedAt: Date.now(),
         error: {
           kind: "cancelled",
           message: "Chat Run was cancelled while queued.",
         },
       });
+      if (cancelled) this.recordTerminalRunEvent(runId, "cancelled", cancelled.finishedAt ?? Date.now(), cancelled.error?.message);
       return true;
     }
     const controller = this.chatRunControllers.get(runId);
@@ -1385,36 +1410,39 @@ export class Orchestrator {
       .sort((a, b) => a.queuedAt - b.queuedAt || a.id.localeCompare(b.id));
     for (const run of queued) {
       if (!run.executionPlan) {
-        this.engine.chatRuns.fail(run.id, {
+        const failed = this.engine.chatRuns.fail(run.id, {
           finishedAt: Date.now(),
           error: {
             kind: "interrupted",
             message: "Queued Chat Run has no immutable execution plan; refusing to use live Agent state.",
           },
         });
+        if (failed) this.recordTerminalRunEvent(run.id, "failed", failed.finishedAt ?? Date.now(), failed.error?.message);
         continue;
       }
       if (
         run.topicNativeSessionExpected
         && !this.engine.chatRuns.topicNativeSessionForRun(run.id)
       ) {
-        this.engine.chatRuns.fail(run.id, {
+        const failed = this.engine.chatRuns.fail(run.id, {
           finishedAt: Date.now(),
           error: {
             kind: "interrupted",
             message: "Queued Chat Run expects a Provider native session but its local topic plan is missing.",
           },
         });
+        if (failed) this.recordTerminalRunEvent(run.id, "failed", failed.finishedAt ?? Date.now(), failed.error?.message);
         continue;
       }
       if (!run.chatId || !run.messageId) {
-        this.engine.chatRuns.fail(run.id, {
+        const failed = this.engine.chatRuns.fail(run.id, {
           finishedAt: Date.now(),
           error: {
             kind: "interrupted",
             message: "Queued Chat Run cannot resume without a delivery target.",
           },
         });
+        if (failed) this.recordTerminalRunEvent(run.id, "failed", failed.finishedAt ?? Date.now(), failed.error?.message);
         continue;
       }
       const msg: InboundMessage = {
@@ -1433,6 +1461,7 @@ export class Orchestrator {
         ...this.topicMessageIdentity(run.id),
       };
       const { readSpaces } = attribute(msg);
+      this.recordRunEvent({ runId: run.id, at: Date.now(), kind: "run.recovered", visibility: "public", phase: "queue", status: "pending", title: "已恢复排队任务" });
       const interpretation = interpretConversation(run.input);
       const pending = this.scheduleChatRun(
         msg,
@@ -1479,9 +1508,159 @@ export class Orchestrator {
       output: markdown,
     });
     if (!succeeded) return;
+    this.recordRunEvent({ runId, at: succeeded.finishedAt ?? Date.now(), kind: "run.succeeded", visibility: "public", phase: "answer", status: "succeeded", title: "执行完成", delta: markdown });
     await this.send(msg, markdown, runId);
   }
 
+  private recordRunEvent(event: import("@homeagent/shared").NewRunEvent): void {
+    try {
+      this.engine.runEvents.append(event);
+      this.queueLiveReplyUpdate(event.runId);
+    } catch (error) {
+      log.warn("run event persistence failed", { runId: event.runId, kind: event.kind, err: String(error) });
+    }
+  }
+
+  private recordTerminalRunEvent(
+    runId: string,
+    status: "failed" | "cancelled" | "timed_out",
+    at = Date.now(),
+    _detail?: string,
+  ): void {
+    const kind = status === "cancelled" ? "run.cancelled"
+      : status === "timed_out" ? "run.timed_out" : "run.failed";
+    const title = status === "cancelled" ? "执行已取消"
+      : status === "timed_out" ? "执行已超时" : "执行失败";
+    try {
+      if (this.engine.runEvents.list(runId).some((event) => event.kind === kind)) return;
+      this.recordRunEvent({ runId, at, kind, visibility: "public", phase: "answer", status, title });
+    } catch (error) {
+      log.warn("terminal run event inspection failed", { runId, kind, err: String(error) });
+    }
+  }
+  private liveReplyTarget(msg: InboundMessage, runId: string): import("@homeagent/connectors").OutboundReply {
+    const groupBinding = msg.chatType === "group" ? this.activeGroupBinding(msg.chatId) : undefined;
+    return {
+      chatId: msg.chatId,
+      replyToMessageId: msg.messageId,
+      idempotencyKey: runId,
+      markdown: "",
+      inThread: groupBinding?.replyInThread ?? false,
+    };
+  }
+
+  private async startLiveReply(msg: InboundMessage, runId: string): Promise<void> {
+    if (!this.connector.createLiveReply || !this.connector.updateLiveReply) return;
+    try {
+      const handle = await this.connector.createLiveReply(
+        this.liveReplyTarget(msg, runId),
+        liveReplySnapshot(runId, this.engine.runEvents.list(runId)),
+      );
+      this.liveReplies.set(runId, handle);
+      this.engine.chatRuns.setLiveReply(runId, {
+        provider: "feishu",
+        messageId: handle.messageId,
+        cardId: handle.cardId,
+        revision: handle.revision,
+        lastAppliedSeq: handle.revision,
+      });
+      this.queueLiveReplyUpdate(runId);
+    } catch (error) {
+      try {
+        this.engine.runEvents.append({
+          runId,
+          at: Date.now(),
+          kind: "delivery.failed",
+          visibility: "operator",
+          phase: "delivery",
+          status: "failed",
+          title: "飞书实时过程创建失败",
+          detail: "已自动切换为最终回复兜底。",
+        });
+      } catch (eventError) {
+        log.warn("live reply creation failure event could not be persisted", {
+          runId, err: String(eventError),
+        });
+      }
+      log.warn("live reply creation failed; keeping final markdown fallback", { runId, err: String(error) });
+    }
+  }
+
+  private queueLiveReplyUpdate(runId: string): void {
+    this.liveReplyDirty.add(runId);
+    if (this.liveReplyUpdates.has(runId)) return;
+    const update = (async () => {
+      while (this.liveReplyDirty.delete(runId)) {
+        const waitMs = Math.max(0, (this.liveReplyNextAt.get(runId) ?? 0) - Date.now());
+        if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+        const persisted = this.engine.chatRuns.get(runId)?.delivery.liveReply;
+        const handle = this.liveReplies.get(runId)
+          ?? (persisted ? { messageId: persisted.messageId, cardId: persisted.cardId, revision: persisted.revision } : undefined);
+        if (!handle || !this.connector.updateLiveReply) return;
+        const snapshot = liveReplySnapshot(runId, this.engine.runEvents.list(runId));
+        const next = await this.connector.updateLiveReply(handle, snapshot);
+        this.liveReplies.set(runId, next);
+        this.engine.chatRuns.setLiveReply(runId, {
+          provider: "feishu", messageId: next.messageId, cardId: next.cardId,
+          revision: next.revision, lastAppliedSeq: snapshot.seq,
+        });
+        this.liveReplyNextAt.set(runId, Date.now() + 750);
+        if (isLiveReplyTerminal(snapshot)) {
+          this.liveReplies.delete(runId);
+          this.liveReplyNextAt.delete(runId);
+          this.liveReplyDirty.delete(runId);
+          return;
+        }
+      }
+    })().catch((error) => {
+      this.liveReplies.delete(runId);
+      this.liveReplyDirty.delete(runId);
+      this.liveReplyNextAt.delete(runId);
+      this.engine.chatRuns.clearLiveReply(runId);
+      try {
+        this.engine.runEvents.append({
+          runId,
+          at: Date.now(),
+          kind: "delivery.failed",
+          visibility: "operator",
+          phase: "delivery",
+          status: "failed",
+          title: "飞书实时过程更新失败",
+          detail: "最终回复仍会通过原投递链路发送。",
+        });
+      } catch (eventError) {
+        log.warn("live reply update failure event could not be persisted", {
+          runId, err: String(eventError),
+        });
+      }
+      log.warn("live reply update failed", { runId, err: String(error) });
+    }).finally(() => {
+      this.liveReplyUpdates.delete(runId);
+      if (this.liveReplyDirty.has(runId)) this.queueLiveReplyUpdate(runId);
+    });
+    this.liveReplyUpdates.set(runId, update);
+  }
+  private async finalizeLiveReply(runId: string): Promise<boolean> {
+    const creating = this.liveReplyCreates.get(runId);
+    if (creating) await creating;
+    let pending = this.liveReplyUpdates.get(runId);
+    while (pending) {
+      await pending;
+      pending = this.liveReplyUpdates.get(runId);
+    }
+    const persisted = this.engine.chatRuns.get(runId)?.delivery.liveReply;
+    const handle = this.liveReplies.get(runId)
+      ?? (persisted ? { messageId: persisted.messageId, cardId: persisted.cardId, revision: persisted.revision } : undefined);
+    if (!handle || !this.connector.finalizeLiveReply) return false;
+    await this.connector.finalizeLiveReply(
+      handle,
+      liveReplySnapshot(runId, this.engine.runEvents.list(runId)),
+    );
+    this.liveReplies.delete(runId);
+    this.liveReplyDirty.delete(runId);
+    this.liveReplyNextAt.delete(runId);
+    return true;
+  }
   private async answer(
     msg: InboundMessage,
     readSpaces: SpaceId[],
@@ -1527,6 +1706,24 @@ export class Orchestrator {
               failureTrace = trace;
             },
             onExecutionEvidence: (evidence) => appendExecutionEvidence(executionEvidence, evidence),
+            onProgress: (progress) => {
+              const kind = progress.kind === "tool"
+                ? progress.tool?.status === "running" ? "tool.started" : "tool.completed"
+                : progress.kind === "assistant_delta" ? "assistant.delta"
+                : progress.kind === "assistant_snapshot" ? "assistant.snapshot"
+                : progress.title.includes("完成") ? "phase.completed" : "phase.started";
+              this.recordRunEvent({
+                runId,
+                at: progress.at,
+                kind,
+                visibility: progress.visibility ?? "public",
+                phase: progress.phase,
+                title: progress.title,
+                detail: progress.detail,
+                delta: progress.delta,
+                tool: progress.tool,
+              });
+            },
             ...(rawImport ? { sourceCaptureInstruction: rawImport.instruction } : {}),
           },
           run.agentId,
@@ -1578,6 +1775,9 @@ export class Orchestrator {
           finished = this.engine.chatRuns.fail(runId, failureResult);
         }
         if (!finished) return;
+        const terminalStatus = failure.kind === "cancelled" ? "cancelled"
+          : outcome === "timed_out" ? "timed_out" : "failed";
+        this.recordTerminalRunEvent(runId, terminalStatus, finished.finishedAt ?? Date.now(), finished.error?.message);
         await this.send(msg, notice, runId);
         return;
       } finally {
@@ -1606,30 +1806,23 @@ export class Orchestrator {
         nativeSessionId: res.nativeSessionId,
       });
       if (!succeeded) return;
+      this.recordRunEvent({ runId, at: succeeded.finishedAt ?? Date.now(), kind: "run.succeeded", visibility: "public", phase: "answer", status: "succeeded", title: "执行完成", delta: text });
       await this.send(msg, text, runId);
       outcome = "succeeded";
     } catch (err) {
       if (err instanceof NativeTopicFailureCommitError) throw err;
       if (this.engine.chatRuns.get(runId)?.status === "running") {
         const failure = chatRunError(err);
-        if (failure.kind === "cancelled") {
-          this.engine.chatRuns.cancel(runId, {
-            executionEvidence,
-            finishedAt: Date.now(),
-            error: failure,
-          });
-        } else if (failure.kind === "timeout") {
-          this.engine.chatRuns.timeout(runId, {
-            executionEvidence,
-            finishedAt: Date.now(),
-            error: failure,
-          });
-        } else {
-          this.engine.chatRuns.fail(runId, {
-            executionEvidence,
-            finishedAt: Date.now(),
-            error: failure,
-          });
+        const finishedAt = Date.now();
+        const finished = failure.kind === "cancelled"
+          ? this.engine.chatRuns.cancel(runId, { executionEvidence, finishedAt, error: failure })
+          : failure.kind === "timeout"
+          ? this.engine.chatRuns.timeout(runId, { executionEvidence, finishedAt, error: failure })
+          : this.engine.chatRuns.fail(runId, { executionEvidence, finishedAt, error: failure });
+        if (finished) {
+          const terminalStatus = failure.kind === "cancelled" ? "cancelled"
+            : failure.kind === "timeout" ? "timed_out" : "failed";
+          this.recordTerminalRunEvent(runId, terminalStatus, finished.finishedAt ?? finishedAt, finished.error?.message);
         }
       }
       outcome ??= isProviderTimeoutError(err) ? "timed_out" : "failed";
@@ -2132,11 +2325,25 @@ export class Orchestrator {
       chatRunId
       && !this.engine.chatRuns.startDeliveryAttempt(chatRunId, Date.now())
     ) return;
+    if (chatRunId) {
+      this.recordRunEvent({ runId: chatRunId, at: Date.now(), kind: "delivery.started", visibility: "public", phase: "delivery", status: "running", title: "正在更新飞书回复" });
+    }
     try {
+      if (chatRunId) {
+        try {
+          await this.finalizeLiveReply(chatRunId);
+        } catch (error) {
+          log.warn("live reply finalization failed; falling back to markdown", { runId: chatRunId, err: String(error) });
+          this.liveReplies.delete(chatRunId);
+          this.liveReplyDirty.delete(chatRunId);
+          this.liveReplyNextAt.delete(chatRunId);
+          this.engine.chatRuns.clearLiveReply(chatRunId);
+        }
+      }
       await this.connector.reply({
         chatId: msg.chatId,
         replyToMessageId: msg.messageId,
-        idempotencyKey: chatRunId ?? `source:${msg.messageId}`,
+        idempotencyKey: chatRunId ? `${chatRunId}:final` : `source:${msg.messageId}`,
         markdown,
         inThread,
       });
@@ -2144,6 +2351,7 @@ export class Orchestrator {
       if (chatRunId) {
         try {
           this.engine.chatRuns.deliveryFailed(chatRunId, errorMessage(err));
+          this.recordRunEvent({ runId: chatRunId, at: Date.now(), kind: "delivery.failed", visibility: "public", phase: "delivery", status: "failed", title: "飞书回复更新失败" });
         } catch (persistenceError) {
           log.error("chat delivery failure persistence failed", {
             runId: chatRunId,
@@ -2156,6 +2364,7 @@ export class Orchestrator {
     if (chatRunId) {
       try {
         this.engine.chatRuns.deliverySent(chatRunId, Date.now());
+        this.recordRunEvent({ runId: chatRunId, at: Date.now(), kind: "delivery.updated", visibility: "public", phase: "delivery", status: "succeeded", title: "飞书回复已更新" });
       } catch (err) {
         // Delivery already succeeded; never throw and invite an external retry.
         log.warn("chat delivery success persistence failed", {

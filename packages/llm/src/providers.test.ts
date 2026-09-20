@@ -18,6 +18,7 @@ import { delimiter, join, resolve } from "node:path";
 import { providerPreparationFailure, ProviderPreparationError } from "./provider-preparation.ts";
 import type { ProviderExecutionEvidence } from "./execution-evidence.ts";
 import {
+  codexProgressEventFromLine,
   codexReasoningEffortsForModel,
   curatedProviderModels,
   detectProviders,
@@ -39,6 +40,23 @@ const READ_ONLY_EXECUTION = {
   skills: [],
 };
 
+test("maps Codex JSONL to safe live progress and drops reasoning", () => {
+  expect(codexProgressEventFromLine(JSON.stringify({
+    type: "item.completed",
+    item: { type: "agent_message", text: "阶段结果" },
+  }), 123)).toEqual({
+    kind: "assistant_snapshot", at: 123, title: "正在生成回答", phase: "answer", visibility: "public", delta: "阶段结果",
+  });
+  expect(codexProgressEventFromLine(JSON.stringify({
+    type: "item.started", item: { type: "web_search", query: "private query" },
+  }), 124)).toEqual({
+    kind: "tool", at: 124, title: "工具开始执行", phase: "tool", visibility: "public",
+    tool: { type: "web-search", status: "running" },
+  });
+  expect(codexProgressEventFromLine(JSON.stringify({
+    type: "item.completed", item: { type: "reasoning", text: "hidden chain" },
+  }), 125)).toBeUndefined();
+});
 test.each([[73, "codex-home-readable"], [74, "allowed-path-unreadable"], [75, "protected-root-readable"]] as const)(
   "native preflight preserves the precise failed filesystem check (%s)", async (code, reason) => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-native-failure-evidence-")));

@@ -19,6 +19,7 @@ import {
   type Logger,
 } from "@homeagent/shared";
 import { estimateCost } from "./pricing.ts";
+import type { ProviderProgressEvent } from "@homeagent/shared";
 import type { CompletionUsage, NativeSessionRequest } from "./providers.ts";
 import type { ProviderExecutionEvidence } from "./execution-evidence.ts";
 import {
@@ -40,6 +41,7 @@ export interface ImageInput {
 
 export interface CompleteOptions {
   onExecutionEvidence?: (evidence: ProviderExecutionEvidence) => void;
+  onProgress?: (event: ProviderProgressEvent) => void | Promise<void>;
   model?: string;
   system?: string;
   messages?: Message[];

@@ -26,8 +26,11 @@ import type {
   InboundEvent,
   NoticeOptions,
   OutboundReply,
+  LiveReplyHandle,
+  LiveReplySnapshot,
   ReplyTarget,
 } from "./connector.ts";
+import { buildLiveReplyCard } from "./feishu-live-card.ts";
 import {
   normalizeBotAdded,
   normalizeMessage,
@@ -56,6 +59,42 @@ function replyIdempotencyKey(out: OutboundReply): string | undefined {
   }
   const digest = createHash("sha256").update(identity).digest("hex").slice(0, 32);
   return `ha-reply-${digest}`;
+}
+
+function nestedStringField(
+  value: unknown,
+  names: ReadonlySet<string>,
+  depth = 0,
+): string | undefined {
+  if (depth > 8 || value === null || typeof value !== "object") return undefined;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = nestedStringField(item, names, depth + 1);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  for (const [key, child] of Object.entries(record)) {
+    if (names.has(key) && typeof child === "string" && child.trim()) return child.trim();
+  }
+  for (const child of Object.values(record)) {
+    const found = nestedStringField(child, names, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function parseFeishuJson(raw: string, context: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error(`${context} returned invalid JSON`);
+  }
+}
+
+function cardUpdateUuid(runId: string, seq: number): string {
+  return createHash("sha256").update(`${runId}:${seq}`).digest("hex").slice(0, 32);
 }
 
 export interface CancellableDeadline {
@@ -426,6 +465,85 @@ export class FeishuConnector implements Connector {
 
   // ---- outbound -----------------------------------------------------------
 
+  async createLiveReply(out: OutboundReply, snapshot: LiveReplySnapshot): Promise<LiveReplyHandle> {
+    if (!out.replyToMessageId) throw new Error("Feishu live reply requires a source message id");
+    const cardPayload = JSON.stringify({
+      type: "card_json",
+      data: JSON.stringify(buildLiveReplyCard(snapshot)),
+    });
+    const cardRaw = await this.runCommand([
+      this.larkBin,
+      "api",
+      "POST",
+      "/open-apis/cardkit/v1/cards",
+      "--as",
+      "bot",
+      "--data",
+      "-",
+      "--json",
+    ], { stdin: cardPayload });
+    const cardId = nestedStringField(
+      parseFeishuJson(cardRaw, "Feishu CardKit create"),
+      new Set(["card_id", "cardId"]),
+    );
+    if (!cardId || !/^[0-9]{1,20}$/u.test(cardId)) {
+      throw new Error("Feishu CardKit create did not return a valid card id");
+    }
+
+    const idempotencyKey = replyIdempotencyKey(out);
+    const cmd = [this.larkBin, "im", "+messages-reply", "--as", "bot",
+      "--msg-type", "interactive", "--content", JSON.stringify({
+        type: "card",
+        data: { card_id: cardId },
+      }), "--json", "--message-id", out.replyToMessageId];
+    if (out.inThread) cmd.push("--reply-in-thread");
+    if (idempotencyKey) cmd.push("--idempotency-key", idempotencyKey);
+    const sentRaw = await this.runCommand(cmd);
+    const messageId = nestedStringField(
+      parseFeishuJson(sentRaw, "Feishu live reply"),
+      new Set(["message_id", "messageId"]),
+    );
+    if (!messageId || !/^om_[a-zA-Z0-9_-]{1,256}$/u.test(messageId)) {
+      throw new Error("Feishu live reply did not return a valid message id");
+    }
+    return { messageId, cardId, revision: snapshot.seq };
+  }
+
+  async updateLiveReply(handle: LiveReplyHandle, snapshot: LiveReplySnapshot): Promise<LiveReplyHandle> {
+    if (snapshot.seq <= handle.revision) return { ...handle };
+    if (handle.cardId) {
+      const updatePayload = JSON.stringify({
+        card: {
+          type: "card_json",
+          data: JSON.stringify(buildLiveReplyCard(snapshot)),
+        },
+        uuid: cardUpdateUuid(snapshot.runId, snapshot.seq),
+        sequence: snapshot.seq,
+      });
+      await this.runCommand([
+        this.larkBin,
+        "api",
+        "PUT",
+        `/open-apis/cardkit/v1/cards/${handle.cardId}`,
+        "--as",
+        "bot",
+        "--data",
+        "-",
+        "--json",
+      ], { stdin: updatePayload });
+      return { ...handle, revision: snapshot.seq };
+    }
+
+    // Handles persisted by versions before CardKit remain updatable until they settle.
+    const data = JSON.stringify({ content: JSON.stringify(buildLiveReplyCard(snapshot)) });
+    await this.runCommand([this.larkBin, "im", "messages", "patch", "--as", "bot",
+      "--message-id", handle.messageId, "--data", data, "--json"]);
+    return { ...handle, revision: snapshot.seq };
+  }
+
+  async finalizeLiveReply(handle: LiveReplyHandle, snapshot: LiveReplySnapshot): Promise<void> {
+    await this.updateLiveReply(handle, snapshot);
+  }
   async reply(out: OutboundReply): Promise<void> {
     const idempotencyKey = replyIdempotencyKey(out);
     const cmd = [

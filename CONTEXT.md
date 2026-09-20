@@ -63,6 +63,21 @@ Core 从这些真实持久化状态生成最多 256 个 scope，并在确认发�
 归档使用单独的 `ArchivedExecutionPlan`（`version=2, archiveVersion=1`）保存历史意图，剥离本机授权关联；
 只能作为终态历史存储，执行、重试和重评入口不接受它。它不是 Raw，也不改变知识内容的权威归属。
 
+## Run event journal and live projections
+
+Chat Run 的实时展示以本机 `runs/chat-events/<runId>.jsonl` 为权威事件流。每个事件在单个 Run 内按
+`seq` 单调递增，先 fsync 再通知订阅者；管理后台使用 snapshot + SSE 按 `after/Last-Event-ID` 重放。
+公开事件只包含生命周期、阶段、公开工具类型/状态、回答增量与投递状态，不记录模型 reasoning/thinking、
+完整命令、工具输出、文件路径或凭据。最终回答仍以 ChatRun.output 为校准源。
+
+飞书实时过程是同一事件流的可失败投影：Connector 先创建 CardKit Card 2.0 实体并回复到原话题，随后以
+Bot 身份按序、合并和节流地更新同一实体；运行态开启 streaming mode，终态关闭。过程卡展示公开步骤、
+阶段性说明和工具调用计数，但不展示隐藏推理、完整命令或工具输出。过程卡与最终 Markdown 回答是两个独立投影；
+过程投影失败会记录 operator 事件并回退，但不能吞掉最终回答。`delivery.liveReply` 保存 provider、messageId、
+可选 cardId、revision 与 lastAppliedSeq，旧 ChatRun 记录缺失 cardId 仍可按旧 message patch 路径收尾；
+该字段不参与 Provider 原生会话提交条件。只有最终回答成功投递且 `delivery.status=sent` 持久化后，Provider
+child 才能成为下一轮 parent。管理后台默认仅本机可达，因此未配置受认证的公开 HTTPS 地址时，过程卡不生成
+详情跳转；当前也不暴露未经验证的卡片 callback 取消/重试入口。
 ## Provider execution evidence
 
 Chat Run 可在本机 `config/chat-runs.json` 附带有界、脱敏的 Provider 工具执行证据；这不是 Raw、

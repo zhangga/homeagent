@@ -24,6 +24,25 @@ afterEach(() => {
 });
 
 describe("ChatRunStore", () => {
+  test("persists live reply handle without changing delivery commit status", () => {
+    let store = new ChatRunStore(dir);
+    const run = store.start({ space: SPACE, input: "live", trigger: "message", startedAt: 100 });
+    store.setLiveReply(run.id, {
+      provider: "feishu", messageId: "om_live_1", cardId: "7355372766134157313",
+      revision: 3, lastAppliedSeq: 3,
+    });
+    expect(store.get(run.id)?.delivery).toEqual({
+      status: "pending", attempts: 0,
+      liveReply: {
+        provider: "feishu", messageId: "om_live_1", cardId: "7355372766134157313",
+        revision: 3, lastAppliedSeq: 3,
+      },
+    });
+    store = new ChatRunStore(dir);
+    expect(store.get(run.id)?.delivery.liveReply?.messageId).toBe("om_live_1");
+    store.startDeliveryAttempt(run.id, 120);
+    expect(store.get(run.id)?.delivery.liveReply?.lastAppliedSeq).toBe(3);
+  });
   test("workflow requests survive reopen and stay within the current topic and Run boundary", () => {
     let store = new ChatRunStore(dir);
     const executionPlan: ResolvedExecutionPlan = { version: 1, provider: "codex", instruction: "topic" };

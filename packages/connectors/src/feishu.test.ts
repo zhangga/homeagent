@@ -591,6 +591,73 @@ describe("FeishuConnector outbound", () => {
     expect(existsSync(resourceDirectory!)).toBe(false);
   });
 
+  test("creates a CardKit entity, replies with it, and updates the entity", async () => {
+    const commands: Array<{ cmd: string[]; stdin?: string }> = [];
+    const responses = [
+      JSON.stringify({ ok: true, data: { card_id: "7355372766134157313" } }),
+      JSON.stringify({ ok: true, data: { message_id: "om_live" } }),
+      JSON.stringify({ ok: true }),
+    ];
+    connector = new FeishuConnector({
+      spawner: new FakeSpawner(),
+      runCommand: async (cmd, opts) => {
+        commands.push({ cmd, stdin: opts?.stdin });
+        return responses.shift()!;
+      },
+    });
+    const snapshot = {
+      runId: "chat_run_live", seq: 1, state: "running" as const, steps: [], commentary: [], toolCallCount: 0, startedAt: 100,
+      canCancel: true, canRetry: false,
+    };
+    const handle = await connector.createLiveReply!({
+      chatId: "oc_1", replyToMessageId: "om_source", markdown: "", inThread: true,
+      idempotencyKey: "chat_run_live",
+    }, snapshot);
+    expect(handle).toEqual({
+      messageId: "om_live", cardId: "7355372766134157313", revision: 1,
+    });
+    expect(commands[0]!.cmd).toEqual(expect.arrayContaining([
+      "api", "POST", "/open-apis/cardkit/v1/cards", "--as", "bot", "--json",
+    ]));
+    expect(commands[0]!.cmd.slice(commands[0]!.cmd.indexOf("--data"), commands[0]!.cmd.indexOf("--data") + 2)).toEqual(["--data", "-"]);
+    const createData = JSON.parse(commands[0]!.stdin!);
+    expect(createData.type).toBe("card_json");
+    expect(JSON.parse(createData.data).config.streaming_mode).toBeTrue();
+
+    expect(commands[1]!.cmd).toEqual(expect.arrayContaining([
+      "+messages-reply", "--as", "bot", "--msg-type", "interactive", "--json",
+      "--reply-in-thread",
+    ]));
+    expect(JSON.parse(commands[1]!.cmd![commands[1]!.cmd!.indexOf("--content") + 1]!)).toEqual({
+      type: "card", data: { card_id: "7355372766134157313" },
+    });
+
+    const updated = await connector.updateLiveReply!(handle, {
+      ...snapshot, seq: 2, state: "succeeded", answerPreview: "done",
+    });
+    expect(updated).toEqual({
+      messageId: "om_live", cardId: "7355372766134157313", revision: 2,
+    });
+    expect(commands[2]!.cmd).toEqual(expect.arrayContaining([
+      "api", "PUT", "/open-apis/cardkit/v1/cards/7355372766134157313", "--as", "bot", "--json",
+    ]));
+    expect(commands[2]!.cmd.slice(commands[2]!.cmd.indexOf("--data"), commands[2]!.cmd.indexOf("--data") + 2)).toEqual(["--data", "-"]);
+    const updateData = JSON.parse(commands[2]!.stdin!);
+    expect(updateData.sequence).toBe(2);
+    expect(JSON.parse(updateData.card.data).config.streaming_mode).toBeFalse();
+  });
+  test("ignores stale live reply revisions", async () => {
+    const commands: string[][] = [];
+    connector = new FeishuConnector({ spawner: new FakeSpawner(), runCommand: async cmd => {
+      commands.push(cmd); return JSON.stringify({ ok: true });
+    } });
+    const handle = await connector.updateLiveReply!({ messageId: "om_live", revision: 5 }, {
+      runId: "chat_run_live", seq: 4, state: "running", steps: [], commentary: [], toolCallCount: 0, startedAt: 100,
+      canCancel: true, canRetry: false,
+    });
+    expect(handle).toEqual({ messageId: "om_live", revision: 5 });
+    expect(commands).toEqual([]);
+  });
   test("reply builds the correct lark-cli command", async () => {
     const spawner = new FakeSpawner();
     const commands: string[][] = [];

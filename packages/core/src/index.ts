@@ -14,6 +14,7 @@ export * from "./managed-skills.ts";
 export * from "./tasks.ts";
 export * from "./task-runs.ts";
 export * from "./chat-runs.ts";
+export * from "./run-events.ts";
 export * from "./run-scheduler.ts";
 export * from "./reminders.ts";
 export * from "./work-items.ts";

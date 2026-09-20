@@ -12,6 +12,7 @@
  * flash so a refresh doesn't re-POST.
  */
 import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   accessSync,
@@ -2380,6 +2381,65 @@ export function createWebApp(opts: WebOptions): Hono {
         500,
       );
     }
+  });
+
+  // ---- Chat Run live events ------------------------------------------------
+
+  app.get("/api/chats/runs/:runId/snapshot", (c) => {
+    const runId = decodeURIComponent(c.req.param("runId"));
+    const run = engine.chatRuns.get(runId);
+    if (!run) return c.notFound();
+    c.header("cache-control", "no-store");
+    return c.json({ run, events: engine.runEvents.list(runId) });
+  });
+
+  app.get("/api/chats/runs/:runId/events", (c) => {
+    const runId = decodeURIComponent(c.req.param("runId"));
+    const run = engine.chatRuns.get(runId);
+    if (!run) return c.notFound();
+    const headerSeq = Number(c.req.header("last-event-id") ?? "0");
+    const querySeq = Number(c.req.query("after") ?? "0");
+    const afterSeq = Math.max(
+      Number.isSafeInteger(headerSeq) && headerSeq >= 0 ? headerSeq : 0,
+      Number.isSafeInteger(querySeq) && querySeq >= 0 ? querySeq : 0,
+    );
+    c.header("cache-control", "no-cache, no-store");
+    c.header("x-accel-buffering", "no");
+    return streamSSE(c, async (stream) => {
+      let lastSeq = afterSeq;
+      let closed = false;
+      let wake: (() => void) | undefined;
+      const inbox: import("@homeagent/shared").RunEvent[] = [];
+      const write = async (event: import("@homeagent/shared").RunEvent) => {
+        if (event.seq <= lastSeq) return;
+        lastSeq = event.seq;
+        await stream.writeSSE({ id: String(event.seq), data: JSON.stringify(event) });
+        if (["run.succeeded", "run.failed", "run.cancelled", "run.timed_out"].includes(event.kind)) closed = true;
+      };
+      const unsubscribe = engine.runEvents.subscribe(runId, (event) => {
+        inbox.push(event);
+        wake?.();
+        wake = undefined;
+      });
+      try {
+        for (const event of engine.runEvents.list(runId, lastSeq)) await write(event);
+        const latest = engine.chatRuns.get(runId);
+        if (latest && !["queued", "running"].includes(latest.status)) closed = true;
+        while (!closed && !stream.aborted) {
+          inbox.sort((left, right) => left.seq - right.seq);
+          while (inbox.length > 0) await write(inbox.shift()!);
+          if (closed) break;
+          await Promise.race([
+            new Promise<void>((resolve) => { wake = resolve; }),
+            stream.sleep(1_000),
+          ]);
+        }
+        inbox.sort((left, right) => left.seq - right.seq);
+        while (inbox.length > 0) await write(inbox.shift()!);
+      } finally {
+        unsubscribe();
+      }
+    });
   });
 
   // ---- Chat Runs -----------------------------------------------------------

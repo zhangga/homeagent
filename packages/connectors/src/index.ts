@@ -3,6 +3,7 @@ export * from "./cli.ts";
 export * from "./process.ts";
 export * from "./feishu-normalize.ts";
 export * from "./feishu.ts";
+export * from "./feishu-live-card.ts";
 export * from "./bytetech.ts";
 export * from "./lark-app-registration.ts";
 export * from "./lark-setup.ts";

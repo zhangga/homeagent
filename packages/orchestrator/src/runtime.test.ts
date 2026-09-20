@@ -17,7 +17,13 @@ import {
   type AgentInput,
   type LlmClient,
 } from "@homeagent/core";
-import { CliConnector, type Connector } from "@homeagent/connectors";
+import {
+  CliConnector,
+  type Connector,
+  type LiveReplyHandle,
+  type LiveReplySnapshot,
+  type OutboundReply,
+} from "@homeagent/connectors";
 import { Orchestrator } from "./runtime.ts";
 
 let dir: string;
@@ -180,6 +186,59 @@ afterEach(async () => {
 });
 
 describe("orchestrator trunk (cli connector, no feishu)", () => {
+  test("projects one Chat Run onto a progress card and still sends the final reply", async () => {
+    const created: LiveReplySnapshot[] = [];
+    const liveTargets: OutboundReply[] = [];
+    const updated: LiveReplySnapshot[] = [];
+    const finalized: LiveReplySnapshot[] = [];
+    const liveConnector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" }) as CliConnector & Connector;
+    liveConnector.createLiveReply = async (out: OutboundReply, snapshot: LiveReplySnapshot) => {
+      liveTargets.push(out);
+      created.push(snapshot);
+      return { messageId: "om_live_runtime", revision: snapshot.seq };
+    };
+    liveConnector.updateLiveReply = async (handle: LiveReplyHandle, snapshot: LiveReplySnapshot) => {
+      updated.push(snapshot);
+      return { messageId: handle.messageId, revision: snapshot.seq };
+    };
+    liveConnector.finalizeLiveReply = async (_handle: LiveReplyHandle, snapshot: LiveReplySnapshot) => {
+      finalized.push(snapshot);
+    };
+    orch = new Orchestrator({ engine, connector: liveConnector, llm: fake });
+    await orch.start();
+    await liveConnector.sendP2P("请回答一个问题");
+
+    const run = engine.chatRuns.list("personal/ou_me")[0]!;
+    expect(created).toHaveLength(1);
+    expect(created[0]?.state).toBe("queued");
+    expect(updated.length).toBeGreaterThan(0);
+    expect(finalized).toHaveLength(1);
+    expect(finalized[0]?.state).toBe("succeeded");
+    expect(liveConnector.sent).toHaveLength(1);
+    expect(run.delivery.status).toBe("sent");
+    expect(liveTargets[0]?.idempotencyKey).toBe(run.id);
+    expect(run.delivery.liveReply?.messageId).toBe("om_live_runtime");
+    expect(engine.runEvents.list(run.id).some((event) => event.kind === "delivery.updated")).toBeTrue();
+  });
+  test("falls back to the original markdown reply when live card finalization fails", async () => {
+    const liveConnector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" }) as CliConnector & Connector;
+    liveConnector.createLiveReply = async (_out: OutboundReply, snapshot: LiveReplySnapshot) => ({
+      messageId: "om_live_failed", revision: snapshot.seq,
+    });
+    liveConnector.updateLiveReply = async (handle: LiveReplyHandle, snapshot: LiveReplySnapshot) => ({
+      messageId: handle.messageId, revision: snapshot.seq,
+    });
+    liveConnector.finalizeLiveReply = async () => { throw new Error("patch unavailable"); };
+    orch = new Orchestrator({ engine, connector: liveConnector, llm: fake });
+    await orch.start();
+    await liveConnector.sendP2P("请给出一个简短回答");
+
+    const run = engine.chatRuns.list("personal/ou_me")[0]!;
+    expect(liveConnector.sent).toHaveLength(1);
+    expect(run.delivery.status).toBe("sent");
+    expect(run.delivery.liveReply).toBeUndefined();
+    expect(engine.runEvents.list(run.id).some((event) => event.kind === "delivery.updated")).toBeTrue();
+  });
   test("a new Chat Run is attached to the current work item", async () => {
     const workItem = engine.workItems.create({
       space: "team/oc_team",
@@ -384,9 +443,11 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       status: "succeeded",
     }));
     expect(connector.sent.map((reply) => reply.idempotencyKey)).toEqual([
-      failed.id,
-      retried.id,
+      `${failed.id}:final`,
+      `${retried.id}:final`,
     ]);
+    expect(engine.runEvents.list(failed.id).some((event) => event.kind === "run.failed")).toBeTrue();
+    expect(engine.runEvents.list(retried.id).some((event) => event.kind === "run.succeeded")).toBeTrue();
   });
 
   test("a provider failure links its quality trace and usage to the durable Chat Run", async () => {
@@ -665,7 +726,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       }),
     }));
     expect(connector.sent).toHaveLength(1);
-    expect(failedDeliveryIdentity).toBe(failedDeliveryRun.id);
+    expect(failedDeliveryIdentity).toBe(`${failedDeliveryRun.id}:final`);
     expect(connector.sent[0]!.idempotencyKey).toBe(failedDeliveryIdentity);
   });
 
@@ -1260,6 +1321,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       status: "cancelled",
       error: expect.objectContaining({ kind: "cancelled" }),
     }));
+    expect(engine.runEvents.list(running!.id).some((event) => event.kind === "run.cancelled")).toBeTrue();
   });
 
   test("cancellation after the provider returns cannot succeed during the cold-start check", async () => {
@@ -4910,6 +4972,8 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(cliConnector.sent[0]!.markdown).not.toContain("120 秒");
     expect(cliConnector.sent[0]!.markdown).toContain("gpt-5.6-luna");
     expect(cliConnector.sent[0]!.markdown).not.toContain("未配置");
+    const timedOut = cliEngine.chatRuns.list("personal/ou_me")[0]!;
+    expect(cliEngine.runEvents.list(timedOut.id).some((event) => event.kind === "run.timed_out")).toBeTrue();
   });
 
   test("CLI-only runtime freezes the configured chat timeout and passes it to the provider", async () => {

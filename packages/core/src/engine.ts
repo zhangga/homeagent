@@ -133,6 +133,7 @@ import {
   isChatRunDeliveryInFlight,
   type ChatRun,
 } from "./chat-runs.ts";
+import { RunEventStore } from "./run-events.ts";
 import {
   RunQueueCancelledError,
   RunQueueTimeoutError,
@@ -1445,6 +1446,7 @@ export class KnowledgeEngine implements Knowledge {
   readonly tasks: TaskStore;
   readonly taskRuns: TaskRunStore;
   readonly chatRuns: ChatRunStore;
+  readonly runEvents: RunEventStore;
   readonly reminders: ReminderStore;
   readonly workItems: WorkItemStore;
   readonly workContinuations: WorkContinuationStore;
@@ -1502,6 +1504,7 @@ export class KnowledgeEngine implements Knowledge {
     this.chatRuns = new ChatRunStore(this.dataDir, {
       recoverInterrupted: opts.recoverInterruptedChatRuns,
     });
+    this.runEvents = new RunEventStore(this.dataDir);
     this.reconcileTaskRunHealth();
     this.reconcileWorkContinuationState();
     for (const meta of this.registry.list()) {
@@ -4811,8 +4814,10 @@ export class KnowledgeEngine implements Knowledge {
           || (run.workActionId !== undefined && workActionIds.has(run.workActionId))
         ).map(run => ({ ...run, executionPlan: run.executionPlan ? archiveExecutionPlan(run.executionPlan) : undefined })),
         // Local execution audits are deliberately not portable Space content.
-        chatRuns: chatRuns.map(({ executionEvidence: _audit, ...run }) => ({
-          ...run, executionPlan: run.executionPlan ? archiveExecutionPlan(run.executionPlan) : undefined,
+        chatRuns: chatRuns.map(({ executionEvidence: _audit, delivery, ...run }) => ({
+          ...run,
+          delivery: (({ liveReply: _localLiveReply, ...portableDelivery }) => portableDelivery)(delivery),
+          executionPlan: run.executionPlan ? archiveExecutionPlan(run.executionPlan) : undefined,
         })),
         workItems,
         workActions: workContinuation.actions,
@@ -6863,7 +6868,7 @@ export class KnowledgeEngine implements Knowledge {
     traceExecution?: AnswerTraceExecution,
   ): Promise<AskResult> {
     const usage = new RunUsageAccumulator();
-    const client = observeLlmUsage(context.client, (item) => usage.record(item), opts.onExecutionEvidence);
+    const client = observeLlmUsage(context.client, (item) => usage.record(item), opts.onExecutionEvidence, opts.onProgress);
     const skillWarnings = skillWarningViews(context.skills);
     const startedAt = Date.now();
     let retrievalPages: AnswerTraceRetrievalPage[] = [];
