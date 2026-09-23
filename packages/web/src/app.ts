@@ -88,6 +88,7 @@ import {
   type SetupDataDirectoryStatus,
 } from "./setup.ts";
 import { localMaterialRawContent, prepareLocalMaterials } from "./local-materials.ts";
+import { dreamRunsFragment } from "./dream-progress-view.ts";
 import { restartingView, setupLayout, setupView } from "./setup-view.ts";
 import {
   resolveExternalSharingState,
@@ -1016,10 +1017,21 @@ export function createWebApp(opts: WebOptions): Hono {
           await getHealth(),
           c.req.query("ok") ?? undefined,
           opts.onServiceRestart !== undefined,
+          engine.listDreamRuns(),
         ),
         "health",
       ),
     );
+  });
+
+  app.get("/health/dream-runs", (c) => {
+    c.header("cache-control", "no-store");
+    return c.html(dreamRunsFragment(engine.listDreamRuns()));
+  });
+
+  app.get("/api/dream-runs", (c) => {
+    c.header("cache-control", "no-store");
+    return c.json({ checkedAt: Date.now(), runs: engine.listDreamRuns() });
   });
 
   app.post("/service/restart", async (c) => {
@@ -1533,21 +1545,38 @@ export function createWebApp(opts: WebOptions): Hono {
         },
       ));
     }
-    let message = rawIds.length === 1
+    const uploadCount = materials.filter((material) => !material.archive).length;
+    const label = uploadCount === 1 ? "资料" : `${uploadCount} 份资料`;
+    let message = uploadCount === 1
       ? "资料已导入，等待提炼"
-      : `已导入 ${rawIds.length} 份资料，等待提炼`;
+      : `已导入 ${uploadCount} 份资料，等待提炼`;
     if (checkbox(body, "distillNow")) {
       try {
         const model = engine.agentForSpace(space)?.model || undefined;
-        const report = await engine.runDreamCycle(space, { rawIds, model });
-        message = report.errors.length === 0
-          ? `${rawIds.length === 1 ? "资料" : `${rawIds.length} 份资料`}已导入并完成提炼：写入 ${report.pagesWritten} 个知识页`
-          : `${rawIds.length === 1 ? "资料" : `${rawIds.length} 份资料`}已导入，但立即提炼未完成：${report.errors.join("; ")}`;
+        let pagesWritten = 0;
+        const errors: string[] = [];
+        // ZIP members can exceed one Dream batch. Keep each call at the existing 40-Raw size.
+        for (let start = 0; start < rawIds.length; start += 40) {
+          const report = await engine.runDreamCycle(space, {
+            rawIds: rawIds.slice(start, start + 40), model, trigger: "import",
+            batch: { index: Math.floor(start / 40) + 1, total: Math.ceil(rawIds.length / 40) },
+          });
+          pagesWritten += report.pagesWritten;
+          errors.push(...report.errors);
+          if (errors.length > 0) break;
+        }
+        message = errors.length === 0
+          ? `${label}已导入并完成提炼：写入 ${pagesWritten} 个知识页`
+          : `${label}已导入，但立即提炼未完成：${errors.join("; ")}`;
       } catch (error) {
         const reason = (error instanceof Error ? error.message : String(error)).slice(0, 500);
-        message = `${rawIds.length === 1 ? "资料" : `${rawIds.length} 份资料`}已导入，但立即提炼失败：${reason}`;
+        message = `${label}已导入，但立即提炼失败：${reason}`;
       }
     }
+    const archiveMessages = materials
+      .filter((material) => !material.archive && material.name.toLowerCase().endsWith(".zip"))
+      .map((material) => material.content?.split("\n")[0]);
+    if (archiveMessages.length > 0) message += `；${archiveMessages.join("；")}`;
     const destination = rawIds.length === 1
       ? `/spaces/${encodeURIComponent(space)}/raw/${encodeURIComponent(rawIds[0]!)}`
       : `/spaces/${encodeURIComponent(space)}`;

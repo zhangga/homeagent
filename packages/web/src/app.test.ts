@@ -21,6 +21,7 @@ import {
 import { createWebApp } from "./app.ts";
 import { FeishuIntegrationService } from "./feishu-integration-service.ts";
 import type { LarkSetupPort } from "./integrations.ts";
+import { zipFixture } from "./local-materials.fixture.ts";
 
 let dir: string;
 let engine: KnowledgeEngine;
@@ -97,6 +98,33 @@ afterEach(() => {
 });
 
 describe("web backend (read-only)", () => {
+  test("Dream task details refresh from the engine without model calls or public-probe metadata exposure", async () => {
+    const rawId = await engine.rememberFile({ space: SPACE, source: "manual", content: "PRIVATE_RAW_BODY" }, {
+      attachment: { kind: "file", ref: "file", name: "提炼来源.md" }, bytes: new TextEncoder().encode("original"),
+    });
+    fake.queueJSON({ operations: [], skippedRawIds: [rawId] });
+    await engine.runDreamCycle(SPACE, { rawIds: [rawId], trigger: "import", batch: { index: 1, total: 3 } });
+    const calls = fake.calls.length;
+    const detailApp = createWebApp({ engine, adminToken: "test-admin", agentReadToken: "test-reader" });
+    for (const path of ["/health/dream-runs", "/api/dream-runs"]) {
+      expect((await detailApp.request(path)).status).toBe(401);
+      expect((await detailApp.request(path, { headers: { authorization: "Bearer test-reader" } })).status).toBe(401);
+      const response = await detailApp.request(path, { headers: { authorization: "Bearer test-admin" } });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      const body = await response.text();
+      expect(body).toContain("提炼来源.md");
+      expect(body).not.toContain("PRIVATE_RAW_BODY");
+    }
+    const body = await (await detailApp.request("/health", { headers: { authorization: "Bearer test-admin" } })).text();
+    expect(body).toContain('id="dream-runs"');
+    expect(body).toContain("提炼任务");
+    expect(body).toContain("第 1 / 3 批");
+    expect(body).toContain("已完成");
+    expect(await (await detailApp.request("/readyz")).text()).not.toContain("提炼来源.md");
+    expect(fake.calls.length).toBe(calls);
+  });
+
   test("replays durable Chat Run events through snapshot and terminal SSE", async () => {
     const run = engine.chatRuns.start({ space: SPACE, input: "实时查看", trigger: "message", startedAt: 100 });
     engine.runEvents.append({ runId: run.id, at: 100, kind: "run.queued", visibility: "public", title: "请求已进入队列" });
@@ -2123,6 +2151,104 @@ describe("web backend (read-only)", () => {
 });
 
 describe("management backend (read-write)", () => {
+  test("uploads ZIP members, distills their actual contents, and preserves source downloads after reopen", async () => {
+    const first = "发布必须完成双人复核。";
+    const second = "线上故障由小王负责恢复。";
+    const original = zipFixture([
+      { name: "发布/notes.md", content: first },
+      { name: "值班/notes.md", content: second, stored: true },
+      { name: "image.png", content: new Uint8Array([0xff, 0x00]) },
+    ]);
+    let sourceIds: string[] = [];
+    fake.onJSON((opts) => {
+      expect(opts.prompt).not.toContain("一条原始消息");
+      expect(opts.prompt).toContain(first);
+      expect(opts.prompt).toContain(second);
+      sourceIds = engine.registry.store(SPACE).index().listRaw({})
+        .filter((raw) => raw.content.includes("包内路径：")).map((raw) => raw.id);
+      const props = (opts.schema as { properties?: Record<string, unknown> }).properties ?? {};
+      if ("operations" in props) {
+        return {
+          operations: [{ type: "concept", name: "zip-knowledge", title: "发布与值班", rawIds: sourceIds }],
+          skippedRawIds: engine.registry.store(SPACE).index().listRaw({})
+            .filter((raw) => raw.content.includes("ZIP 已展开")).map((raw) => raw.id),
+        };
+      }
+      return { title: "发布与值班", summary: first, aliases: [], tags: [], links: [], content: `${first}\n${second}` };
+    });
+    const form = new FormData();
+    form.set("material", new File([original], "archive.zip"));
+    form.set("distillNow", "on");
+    const response = await app.request(`/spaces/${encodeURIComponent(SPACE)}/materials`, { method: "POST", body: form });
+    expect(response.status).toBe(302);
+    expect(decodeURIComponent(response.headers.get("location")!)).toContain("完成提炼：写入 1 个知识页");
+    expect(decodeURIComponent(response.headers.get("location")!)).toContain("2 个文本文件");
+    expect(sourceIds).toHaveLength(2);
+    expect((await engine.getPage(SPACE, "concepts/zip-knowledge"))?.sources).toEqual(sourceIds);
+    const imported = engine.registry.store(SPACE).index().listRaw({}).filter((raw) => raw.source === "manual");
+    expect(imported).toHaveLength(3);
+    const zipRaw = imported.find((raw) => raw.content.includes("ZIP 已展开"))!;
+    const firstRaw = imported.find((raw) => raw.content.includes("包内路径：发布/notes.md"))!;
+    expect(firstRaw.space).toBe(SPACE);
+    const downloadPath = `/spaces/${encodeURIComponent(SPACE)}/raw/${zipRaw.id}/attachments/0`;
+    expect(new Uint8Array(await (await app.request(downloadPath)).arrayBuffer())).toEqual(original);
+    const memberDownload = `/spaces/${encodeURIComponent(SPACE)}/raw/${firstRaw.id}/attachments/0`;
+    expect(await (await app.request(memberDownload)).text()).toBe(first);
+    const other = "team/oc_zip_other" as const;
+    engine.ensureSpace(other);
+    expect((await app.request(`/spaces/${encodeURIComponent(other)}/raw/${firstRaw.id}/attachments/0`)).status).toBe(404);
+    expect(engine.registry.store(other).index().countRaw()).toBe(0);
+
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
+    app = createWebApp({ engine });
+    expect(new Uint8Array(await (await app.request(downloadPath)).arrayBuffer())).toEqual(original);
+    expect(await (await app.request(memberDownload)).text()).toBe(first);
+    expect((await engine.getPage(SPACE, "concepts/zip-knowledge"))?.sources).toEqual(sourceIds);
+  });
+
+  test("immediate ZIP distillation processes every imported member in batches of at most 40", async () => {
+    const batchSizes: number[] = [];
+    fake.onJSON((opts) => {
+      expect(opts.prompt).not.toContain("一条原始消息");
+      const ids = [...(opts.prompt ?? "").matchAll(/<entry id="([^"]+)"/gu)].map((match) => match[1]!);
+      batchSizes.push(ids.length);
+      return { operations: [], skippedRawIds: ids };
+    });
+    const form = new FormData();
+    form.set("material", new File([zipFixture(Array.from({ length: 45 }, (_, index) => ({
+      name: `threads/${index}.jsonl`, content: JSON.stringify({ message: `消息 ${index}` }),
+    })))], "threads.zip"));
+    form.set("distillNow", "on");
+    const response = await app.request(`/spaces/${encodeURIComponent(SPACE)}/materials`, { method: "POST", body: form });
+    expect(decodeURIComponent(response.headers.get("location")!)).toContain("完成提炼");
+    expect(batchSizes).toEqual([40, 6]);
+    const pending = engine.registry.store(SPACE).index().listRaw({ onlyPending: true });
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.content).toBe("一条原始消息");
+  });
+
+  test("ZIP long text reaches Dream through its final segment and shares the exact original member", async () => {
+    const original = `${"甲".repeat(200_000)}末尾必须执行回归检查`;
+    const form = new FormData();
+    form.set("material", new File([zipFixture([{ name: "long.txt", content: original }])], "long.zip"));
+    await app.request(`/spaces/${encodeURIComponent(SPACE)}/materials`, { method: "POST", body: form });
+    const members = engine.registry.store(SPACE).index().listRaw({})
+      .filter((raw) => raw.content.includes("包内路径：long.txt"));
+    expect(members).toHaveLength(2);
+    const tail = members.find((raw) => raw.content.includes("末尾必须执行回归检查"))!;
+    expect(tail).toBeDefined();
+    fake.onJSON((opts) => {
+      expect(opts.prompt).toContain("末尾必须执行回归检查");
+      return { operations: [], skippedRawIds: [tail.id] };
+    });
+    await engine.runDreamCycle(SPACE, { rawIds: [tail.id] });
+    for (const member of members) {
+      const response = await app.request(`/spaces/${encodeURIComponent(SPACE)}/raw/${member.id}/attachments/0`);
+      expect(await response.text()).toBe(original);
+    }
+  });
+
   test("imports a local UTF-8 material into the selected space as pending Raw", async () => {
     const form = new FormData();
     form.set(

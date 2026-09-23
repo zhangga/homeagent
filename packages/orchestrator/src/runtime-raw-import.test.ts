@@ -56,7 +56,7 @@ test.each(["valid", "external", "invalid", "missing"] as const)("Feishu Chat app
       expectedScopeFingerprint: engine.localExecution.preview(agent.id, draft.id).fingerprint });
     await runtime.start();
     await transport.inject({ kind: "message", eventId: "evt_capture", chatType: "group", chatId: "oc_capture", senderId: "ou_fixture",
-      text: "@agent 飞书群 PST 提炼最近一周主要内容，并记录相关的原始数据", messageId: "om_request", mentionsBot: true, createdAt: 200 });
+      text: "@agent 飞书群 PST 提炼最近一周主要内容", messageId: "om_request", mentionsBot: true, createdAt: 200 });
     expect(finalCalls).toBe(1);
     expect(transport.sent).toHaveLength(1);
     expect(transport.sent[0]!.markdown).toContain(artifact === "valid" || artifact === "external" ? "原始记录入库：新增 1 条" : "原始记录入库未完成");

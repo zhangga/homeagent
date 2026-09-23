@@ -246,7 +246,7 @@ export class Scheduler {
             const report = await this.engine.scheduleBackgroundRun(
               `background:dream:${meta.id}:${now.getTime()}:${batch}`,
               meta.id,
-              () => this.engine.runDreamCycle(meta.id, { model, maxEntries: batchEntries }),
+              () => this.engine.runDreamCycle(meta.id, { model, maxEntries: batchEntries, trigger: "scheduled" }),
             );
             batchesRun += 1;
             spaceBatches += 1;

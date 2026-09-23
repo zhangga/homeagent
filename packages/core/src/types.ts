@@ -5,6 +5,7 @@
 import type { ImageInput, NativeSessionRequest } from "@homeagent/llm";
 import type { DreamReport, SpaceId } from "@homeagent/shared";
 import type { AggregatedRunUsage } from "./usage.ts";
+import type { DreamTrigger } from "./dream-progress.ts";
 
 export interface AskFailureTrace {
   traceId: string;
@@ -12,6 +13,9 @@ export interface AskFailureTrace {
 }
 
 export interface DreamOptions {
+  /** Observational labels; do not alter execution, permissions or persistence. */
+  trigger?: DreamTrigger;
+  batch?: { index: number; total: number };
   /** cap on Raw entries processed in one bounded prompt batch */
   maxEntries?: number;
   /** process only these raw entries; when set, the normal 40-entry batch cap is not applied */

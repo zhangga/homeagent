@@ -42,8 +42,10 @@ function fixture(input = "飞书群：本群 提炼最近一周，并记录相�
   return { engine, capture, file, run, agent, dataDir, workdir };
 }
 
-test("recognizes explicit preservation requests, not ordinary queries or source instructions", () => {
+test("defaults chat extraction to source capture while leaving plain queries opt-in", () => {
   expect(requestsChatRawImport("飞书群 PST 提炼最近一周，并记录相关的原始数据")).toBe(true);
+  expect(requestsChatRawImport("飞书群 PST 提炼最近一周的主要内容")).toBe(true);
+  expect(requestsChatRawImport("提取飞书群 PST 的全部可读历史并汇总")).toBe(true);
   expect(requestsChatRawImport("查询飞书群最近一周的内容")).toBe(false);
   expect(requestsChatRawImport("查询飞书群原始记录，不要保存")).toBe(false);
   expect(requestsChatRawImport("查询飞书群 PST 最近一周聊天记录")).toBe(false);
@@ -89,12 +91,19 @@ test.each([
     .toEqual({ requestedName: "PST高峰期拉扯卡顿专项" });
 });
 
-test("ordinary message queries and explicit summary-only requests do not request source capture", () => {
-  for (const request of ["飞书群：PST 查询聊天记录", "飞书群：PST 提炼最近两周，不用记录相关信息",
-    "飞书群：PST 提炼最近两周，只保存总结"]) {
+test("plain message queries stay query-only, extraction defaults to capture, and explicit summary-only intent persists", () => {
+  const queryOnly = "飞书群：PST 查询聊天记录";
+  expect(requestsChatRawImport(queryOnly)).toBe(false);
+  expect(resolveChatRawImportRequest([queryOnly])).toBeUndefined();
+  expect(resolveChatRawImportRequest([queryOnly, "继续提炼"])).toEqual({ requestedName: "PST" });
+  for (const request of ["飞书群：PST 提炼最近两周，不用记录相关信息",
+    "飞书群：PST 提炼最近两周，只保存总结", "飞书群：PST 提炼最近两周，只导出本地文件"]) {
     expect(requestsChatRawImport(request)).toBe(false);
     expect(resolveChatRawImportRequest([request, "继续提炼"])).toBeUndefined();
   }
+  expect(resolveChatRawImportRequest(["飞书群：PST 提炼最近两周"]))
+    .toEqual({ requestedName: "PST" });
+  expect(resolveChatRawImportRequest(["飞书群：PST 提炼最近两周", "继续提炼"])).toEqual({ requestedName: "PST" });
   expect(resolveChatRawImportRequest(["飞书群：PST 提炼并保存相关信息", "这次只保存总结"]))
     .toBeUndefined();
 });

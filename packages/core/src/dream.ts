@@ -21,6 +21,7 @@
  */
 import type { DreamReport, Page, RawRecord } from "@homeagent/shared";
 import { isChatSourceSnapshot } from "./chat-raw-import.ts";
+import { dreamSourceRefs, type DreamProgress } from "./dream-progress.ts";
 import {
   AI_GENERATION_MAX_TOKENS,
   AI_ROUTING_MAX_TOKENS,
@@ -377,11 +378,18 @@ async function generate(
   existing: Page | null,
   sources: RawRecord[],
   model: string | undefined,
+  onProgress?: (progress: DreamProgress) => void,
+  pageIndex = 1,
 ): Promise<GeneratedPage> {
   const groups = groupSourceFragments(splitSourceFragments(sources));
   let current = existing;
   let final: GeneratedPage | undefined;
-  for (const group of groups) {
+  for (const [index, group] of groups.entries()) {
+    onProgress?.({
+      stage: "generating", page: { slug, title: op.title.slice(0, 255), index: pageIndex },
+      chunk: { index: index + 1, total: groups.length },
+      sources: dreamSourceRefs(group.map((fragment) => fragment.raw)), sourceCount: group.length,
+    });
     const { value } = await client.completeJSON<GeneratedPage>({
       model,
       system: "你严格按 schema 输出结构化结果，content 为完整 markdown 正文。",
@@ -610,6 +618,8 @@ export async function retryQuarantinedDreamOperation(
   const client = deps.client ?? gatewayClient;
   const model = opts.model ?? config().model;
   try {
+    deps.onProgress?.({ stage: "preparing", rawCount: sources.length, pagesTotal: 1,
+      sources: dreamSourceRefs(sources), sourceCount: sources.length });
     const generated = await generate(
       client,
       store,
@@ -618,6 +628,7 @@ export async function retryQuarantinedDreamOperation(
       existing,
       sources,
       model,
+      deps.onProgress,
     );
     const page: Page = {
       slug: record.slug,
@@ -632,8 +643,10 @@ export async function retryQuarantinedDreamOperation(
       updatedAt: Date.now(),
       contentHash: sourceHash(sources, existing),
     };
+    deps.onProgress?.({ stage: "saving", page: { slug: record.slug, title: operation.title.slice(0, 255), index: 1 } });
     store.writePage(page);
     try {
+      deps.onProgress?.({ stage: "indexing" });
       refreshDigest(store);
     } catch (error) {
       if (existing) store.writePage(existing);
@@ -645,6 +658,7 @@ export async function retryQuarantinedDreamOperation(
     report.processedRawIds = [...operation.rawIds];
     report.distilled = operation.rawIds.length;
     report.pagesWritten = 1;
+    deps.onProgress?.({ stage: "indexing", pagesCompleted: 1, pagesWritten: 1, processedRaw: sources.length });
   } catch (error) {
     quarantine(store, record.slug, error, sources, op, existing);
     store.index().markIngested(operation.rawIds);
@@ -686,6 +700,7 @@ function appendLog(store: SpaceStore, report: DreamReport): void {
 
 export interface DreamDeps {
   client?: LlmClient;
+  onProgress?: (progress: DreamProgress) => void;
 }
 
 export async function runDreamCycle(
@@ -744,6 +759,8 @@ export async function runDreamCycle(
   let plan: AnalyzeResult;
   try {
     throwIfAborted();
+    deps.onProgress?.({ stage: "analyzing", rawCount: batch.length,
+      sources: dreamSourceRefs(batch), sourceCount: batch.length });
     plan = await analyze(client, store, batch, model);
     throwIfAborted();
   } catch (err) {
@@ -755,12 +772,17 @@ export async function runDreamCycle(
 
   const ingestedIds = new Set<string>(plan.skippedRawIds.filter((id) => rawById.has(id)));
   report.skipped = ingestedIds.size;
+  deps.onProgress?.({ stage: "preparing", pagesTotal: plan.operations.length,
+    pagesCompleted: 0, skippedRaw: report.skipped });
 
-  for (const op of plan.operations) {
+  for (const [operationIndex, op] of plan.operations.entries()) {
     throwIfAborted();
     const slug = canonicalSlug(op.type, op.name);
     const sources = op.rawIds.map((id) => rawById.get(id)).filter((r): r is RawRecord => !!r);
-    if (sources.length === 0) continue;
+    if (sources.length === 0) {
+      deps.onProgress?.({ stage: "preparing", pagesCompleted: operationIndex + 1 });
+      continue;
+    }
     const existing = idx.getPage(slug);
     const hash = sourceHash(sources, existing);
 
@@ -768,11 +790,12 @@ export async function runDreamCycle(
       // Unchanged source set — keep the page, mark its raw ingested.
       for (const s of sources) ingestedIds.add(s.id);
       report.distilled += sources.length;
+      deps.onProgress?.({ stage: "preparing", pagesCompleted: operationIndex + 1 });
       continue;
     }
 
     try {
-      const gen = await generate(client, store, op, slug, existing, sources, model);
+      const gen = await generate(client, store, op, slug, existing, sources, model, deps.onProgress, operationIndex + 1);
       throwIfAborted();
       const mergedSources = [...new Set([...(existing?.sources ?? []), ...sources.map((s) => s.id)])];
       const page: Page = {
@@ -788,6 +811,7 @@ export async function runDreamCycle(
         updatedAt: Date.now(),
         contentHash: hash,
       };
+      deps.onProgress?.({ stage: "saving", page: { slug, title: op.title.slice(0, 255), index: operationIndex + 1 } });
       store.writePage(page);
       report.pagesWritten += 1;
       report.distilled += sources.length;
@@ -802,15 +826,19 @@ export async function runDreamCycle(
       for (const s of sources) ingestedIds.add(s.id);
       errors.push(`generate ${slug} failed: ${String(err)}`);
     }
+    deps.onProgress?.({ stage: "preparing", pagesCompleted: operationIndex + 1,
+      pagesWritten: report.pagesWritten, pagesFailed: report.pagesQuarantined });
   }
 
   throwIfAborted();
+  deps.onProgress?.({ stage: "saving" });
   idx.markIngested([...ingestedIds]);
   report.processedRawIds = [...ingestedIds];
 
   // Refresh the deterministic map pages and append a log line.
   if (report.pagesWritten > 0) {
     try {
+      deps.onProgress?.({ stage: "indexing", processedRaw: ingestedIds.size });
       refreshDigest(store);
     } catch (err) {
       errors.push(`digest failed: ${String(err)}`);

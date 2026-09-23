@@ -74,7 +74,7 @@ function list(value: unknown, max: number): unknown[] {
 }
 function boolean(value: unknown): boolean { if (typeof value !== "boolean") invalid(); return value; }
 
-/** Explicit preservation intent only; never inspect fetched source text for authorization. */
+/** Explicit preservation intent; never inspect fetched source text for authorization. */
 function requestsRawPreservation(text: string): boolean {
   const actionText = text.replace(/已(?:经)?(?:保存|收录|入库|留存)/gu, "");
   const preservation = /保存|收录|入库|留存/u.test(actionText)
@@ -83,13 +83,20 @@ function requestsRawPreservation(text: string): boolean {
   return preservation && !declinesRawPreservation(text);
 }
 
+/** Extracting chat history is a knowledge-producing workflow, so capture its source by default. */
+function requestsDefaultChatRawImport(text: string): boolean {
+  return /提炼|提取|整理|总结|汇总/u.test(text) && !declinesRawPreservation(text);
+}
+
 function declinesRawPreservation(text: string): boolean {
   return /(?:不要|无需|不必|不用|别|不想|不需要|不再|不|取消|停止)\s*(?:自动)?\s*(?:保存|记录|收录|入库|留存)/u.test(text)
-    || /(?:只|仅)(?:要|需|需要)?\s*(?:保存|记录|收录|入库|留存)\s*(?:总结|摘要|周报|报告|结论|提炼结果)/u.test(text);
+    || /(?:只|仅)(?:要|需|需要)?\s*(?:保存|记录|收录|入库|留存)\s*(?:总结|摘要|周报|报告|结论|提炼结果|本地文件|文件)/u.test(text)
+    || /(?:只|仅)(?:要|需|需要)?\s*(?:导出|生成)\s*(?:总结|摘要|周报|报告|结论|提炼结果|本地文件|文件)/u.test(text);
 }
 
 export function requestsChatRawImport(text: string): boolean {
-  return text.length <= 20_000 && /群|聊天|飞书/u.test(text) && requestsRawPreservation(text);
+  return text.length <= 20_000 && /群|聊天|飞书/u.test(text)
+    && (requestsRawPreservation(text) || requestsDefaultChatRawImport(text));
 }
 
 /** A lookup of stored evidence is not a new external-source capture. */
@@ -102,6 +109,7 @@ export function requestsStoredRawQuery(text: string): boolean {
 /** Resolve workflow intent from durable user turns; never replay conversation text to the Provider. */
 export function resolveChatRawImportRequest(inputs: readonly string[]): ChatRawSourceScope | undefined {
   let enabled = false;
+  let explicitlyDeclined = false;
   let hasChatContext = false;
   let scope: ChatRawSourceScope = {};
   let captureThisTurn = false;
@@ -114,11 +122,12 @@ export function resolveChatRawImportRequest(inputs: readonly string[]): ChatRawS
       hasChatContext = true;
     }
     if (/群|聊天|飞书/u.test(input)) hasChatContext = true;
-    if (declinesRawPreservation(input)) enabled = false;
-    else if (hasChatContext && requestsRawPreservation(input)) enabled = true;
-    const continuation = /提炼|总结|整理|查询|拉取|读取|补查|补读|补全|增量|继续|再查|重试/u.test(input)
+    if (declinesRawPreservation(input)) { enabled = false; explicitlyDeclined = true; }
+    else if (hasChatContext && requestsRawPreservation(input)) { enabled = true; explicitlyDeclined = false; }
+    else if (hasChatContext && requestsDefaultChatRawImport(input) && !explicitlyDeclined) enabled = true;
+    const continuation = /提炼|提取|总结|汇总|整理|查询|拉取|读取|补查|补读|补全|增量|继续|再查|重试/u.test(input)
       || /(?:最近|过去|近)[一二两三四五六七八九十\d]+(?:天|周|个月)/u.test(input);
-    captureThisTurn = enabled && (requestsRawPreservation(input) || continuation);
+    captureThisTurn = enabled && (requestsRawPreservation(input) || requestsDefaultChatRawImport(input) || continuation);
   }
   return captureThisTurn ? { ...scope } : undefined;
 }
@@ -133,7 +142,7 @@ export function createChatRawCapture(workdir: string, chatId: string, sourceScop
       "## 本轮聊天原文自动入库交接",
       `当前消息发送与回答所在群 ID 是 ${JSON.stringify(chatId)}，它只用于当前 Space 的入库校验，不是用户指定的查询目标。用户明确指定的群名或群 ID 决定查询来源；不得用当前群替换目标群。`,
       CHAT_SOURCE_QUERY_INSTRUCTIONS,
-      `本轮由当前及同话题此前用户请求确定的查询来源范围：${JSON.stringify(sourceScope)}。沿用同话题已明确的原文保存要求，时间窗口按本轮请求执行。Raw 保存到发起请求的当前 Space，source chatId 保留实际来源；当范围含 requestedName 时，必须通过群搜索唯一匹配并在交接顶层提供实际返回的 chatName，名称忽略空白和全半角后须匹配；含 requestedChatId 时只能交接该 ID。范围为空时自动入库只接受当前群。`,
+      `本轮由当前及同话题此前用户请求确定的查询来源范围：${JSON.stringify(sourceScope)}。沿用同话题默认或明确的原文保存要求，时间窗口按本轮请求执行。Raw 保存到发起请求的当前 Space，source chatId 保留实际来源；当范围含 requestedName 时，必须通过群搜索唯一匹配并在交接顶层提供实际返回的 chatName，名称忽略空白和全半角后须匹配；含 requestedChatId 时只能交接该 ID。范围为空时自动入库只接受当前群。`,
       `将实际 CLI 查询结果用程序转换为 UTF-8 JSON，写入 ${JSON.stringify(file)}；不要在回答中转抄全文，也不要用总结改写原文。查询目标已匹配本轮来源范围时，即使与当前群不同也正常交接，不要求用户重复确认群 ID。不得把实际来源群 ID 改成当前群来绕过校验。`,
       '若查询目标不在上述可自动入库范围，继续完成用户明确指定的目标群查询、提炼及授权的 Workdir 文件保存。交接路径只写状态 {"version":1,"status":"source-outside-current-space","chatId":"实际目标群 ID"}，不附正文，说明未自动入库；不要因此停下查询。只有群名重名、无法解析或实际权限不足时才说明需要补充的信息。',
       "只使用本轮指定的交接路径，忽略历史会话中的旧交接路径；不要把旧文件当作本次查询结果。作者未知时省略 author，不猜测身份。",

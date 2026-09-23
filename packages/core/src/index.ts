@@ -29,6 +29,7 @@ export * from "./digest.ts";
 export * from "./llm.ts";
 export * from "./cli-client.ts";
 export * from "./dream.ts";
+export * from "./dream-progress.ts";
 export * from "./maintenance.ts";
 export * from "./traceability.ts";
 export * from "./local-agent-knowledge.ts";

@@ -85,6 +85,8 @@ import {
 } from "./feishu-provisioning-view.ts";
 import { safeLarkVerificationUrl } from "./verification-url.ts";
 import { learningMarkdownHtml } from "./learning-markdown.ts";
+import { dreamRunsPanel } from "./dream-progress-view.ts";
+import type { DreamRunSnapshot } from "@homeagent/core";
 
 const ANSWER_FEEDBACK_LABELS = {
   helpful: "有帮助",
@@ -296,6 +298,7 @@ export function spaceDetailView(
           <input class="material-file-input" id="local-material-${enc}" name="material" type="file"
             multiple required />
           <p class="field-help">可一次选择最多 20 份任意类型文件；单个文件不超过 20 MiB。原文件都会完整保存，可从 Raw 详情页下载；能识别的文本才会进入提炼。</p>
+          <p class="field-help">ZIP 会自动展开其中的 UTF-8 文本（TXT、Markdown、CSV、JSON、JSONL、LOG），保留内部路径，长文本分段提炼。未识别或无法解压的文件会在压缩包原始条目中说明，原 ZIP 仍可下载。</p>
         </div>
         <div class="material-import-actions">
           <label class="checkbox-row">
@@ -303,6 +306,7 @@ export function spaceDetailView(
             <span>导入后立即提炼 <small>未勾选时由夜间提炼兜底</small></span>
           </label>
           <button type="submit">导入资料</button>
+          <a href="/health#dream-runs">查看提炼任务</a>
         </div>
       </form>
     </section>
@@ -856,6 +860,7 @@ export function healthView(
   snapshot: SystemHealthSnapshot,
   flashMsg?: string,
   serviceRestartable = false,
+  dreamRuns: DreamRunSnapshot[] = [],
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const labels: Record<string, string> = {
     knowledge: "知识存储",
@@ -915,6 +920,7 @@ export function healthView(
         <span class="badge ${snapshot.status}">${snapshot.status}</span>
       </div>
     </div>
+    ${dreamRunsPanel(dreamRuns)}
     ${rows}`;
 }
 

@@ -50,6 +50,7 @@ import {
   type RunInput,
 } from "@homeagent/llm";
 import type { Knowledge } from "./knowledge.ts";
+import { DreamRunTracker, type DreamRunSnapshot } from "./dream-progress.ts";
 import {
   SPACE_ARCHIVE_FORMAT,
   SPACE_ARCHIVE_VERSION,
@@ -1462,6 +1463,7 @@ export class KnowledgeEngine implements Knowledge {
   private learningResearch?: LearningResearchProvider;
   private providerRuns = new Map<ProviderId, ProviderRunHealth>();
   private dreamCycles = new Map<SpaceId, DreamCycleHealth>();
+  private readonly dreamProgress = new DreamRunTracker();
   private maintenanceCycles = new Map<SpaceId, MaintenanceCycleHealth>();
   private activeTaskRuns = new Map<string, string>();
   private taskRunControllers = new Map<string, AbortController>();
@@ -2757,6 +2759,7 @@ export class KnowledgeEngine implements Knowledge {
           rawIds: [rawId],
           force: true,
           model,
+          trigger: "redistill",
         });
         const pageSlugs = store.index()
           .allPages()
@@ -4496,7 +4499,19 @@ export class KnowledgeEngine implements Knowledge {
   }
 
   async runDreamCycle(space: SpaceId, opts: DreamOptions = {}): Promise<DreamReport> {
-    return this.serializer.run(space, async () => this.executeDreamCycle(space, opts));
+    if (!this.registry.has(space)) throw new Error(`unknown space: ${space}`);
+    const runId = this.dreamProgress.enqueue(space, opts.trigger ?? "manual", opts.batch);
+    try {
+      return await this.serializer.run(space, async () => this.executeDreamCycle(space, opts, undefined, runId));
+    } catch (error) {
+      this.dreamProgress.finish(runId, undefined, opts.signal?.aborted);
+      throw error;
+    }
+  }
+
+  /** Management-only metadata; deliberately separate from public health probes. */
+  listDreamRuns(space?: SpaceId): DreamRunSnapshot[] {
+    return this.dreamProgress.list(space);
   }
 
   async runWikiMaintenanceCycle(
@@ -4541,8 +4556,11 @@ export class KnowledgeEngine implements Knowledge {
     space: SpaceId,
     opts: DreamOptions,
     fixedContext?: SpaceAgentCallContext,
+    queuedRunId?: string,
   ): Promise<DreamReport> {
     if (!this.registry.has(space)) throw new Error(`unknown space: ${space}`);
+    const runId = queuedRunId ?? this.dreamProgress.enqueue(space, opts.trigger ?? "manual", opts.batch);
+    this.dreamProgress.start(runId);
     const health = this.dreamCycles.get(space) ?? { space, running: false };
     health.running = true;
     health.lastStartedAt = Date.now();
@@ -4555,6 +4573,7 @@ export class KnowledgeEngine implements Knowledge {
       });
       const baseReport = await distillSpace(store, opts, {
         client: context.client,
+        onProgress: (progress) => this.dreamProgress.update(runId, progress),
       });
       const skillWarnings = skillWarningViews(context.skills);
       const report: DreamReport = {
@@ -4575,8 +4594,10 @@ export class KnowledgeEngine implements Knowledge {
         health.lastStatus = "error";
         health.lastError = report.errors.join("; ").slice(0, 500);
       }
+      this.dreamProgress.finish(runId, report);
       return report;
     } catch (err) {
+      this.dreamProgress.finish(runId, undefined, opts.signal?.aborted);
       health.lastFailureAt = Date.now();
       health.lastStatus = "error";
       health.lastError = String(err).slice(0, 500);
@@ -4625,6 +4646,8 @@ export class KnowledgeEngine implements Knowledge {
         };
       }
       let report: DreamReport;
+      const runId = this.dreamProgress.enqueue(space, "retry");
+      this.dreamProgress.start(runId);
       const health = this.dreamCycles.get(space) ?? { space, running: false };
       health.running = true;
       health.lastStartedAt = Date.now();
@@ -4634,12 +4657,14 @@ export class KnowledgeEngine implements Knowledge {
           store,
           record,
           { model },
-          { client: this.agentCallContext(space).client },
+          { client: this.agentCallContext(space).client,
+            onProgress: (progress) => this.dreamProgress.update(runId, progress) },
         );
         this.syncWorkItemPages(space);
         this.registry.setLastDream(space, report.finishedAt);
         health.lastExamined = report.examined;
         health.lastPagesWritten = report.pagesWritten;
+        this.dreamProgress.finish(runId, report);
         if (report.errors.length === 0) {
           health.lastSuccessAt = report.finishedAt;
           health.lastStatus = "ok";
@@ -4650,6 +4675,7 @@ export class KnowledgeEngine implements Knowledge {
           health.lastError = report.errors.join("; ").slice(0, 500);
         }
       } catch {
+        this.dreamProgress.finish(runId);
         health.lastFailureAt = Date.now();
         health.lastStatus = "error";
         health.lastError = "隔离记录重试未完成";
@@ -5113,6 +5139,7 @@ export class KnowledgeEngine implements Knowledge {
         throw err;
       }
       this.dreamCycles.delete(space);
+      this.dreamProgress.removeSpace(space);
       this.maintenanceCycles.delete(space);
       return {
         status: "deleted",
@@ -6536,7 +6563,7 @@ export class KnowledgeEngine implements Knowledge {
             task.space,
             async () => this.executeDreamCycle(
               task.space,
-              { signal: controller.signal },
+              { signal: controller.signal, trigger: "task" },
               dreamContext,
             ),
           );
