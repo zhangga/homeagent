@@ -93,6 +93,12 @@ function parseFeishuJson(raw: string, context: string): unknown {
   }
 }
 
+function jsonRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
 function cardUpdateUuid(runId: string, seq: number): string {
   return createHash("sha256").update(`${runId}:${seq}`).digest("hex").slice(0, 32);
 }
@@ -836,14 +842,21 @@ export class FeishuConnector implements Connector {
     ];
     try {
       const out = await this.runCommand(cmd);
-      // The CLI returns JSON; the markdown is under a content-ish field. Be
-      // permissive about the exact key so a CLI shape tweak degrades gracefully.
-      const parsed = JSON.parse(out) as Record<string, unknown>;
-      const content =
-        (parsed.markdown as string | undefined) ??
-        (parsed.content as string | undefined) ??
-        ((parsed.data as Record<string, unknown> | undefined)?.content as string | undefined);
-      return content ?? null;
+      const parsed = jsonRecord(JSON.parse(out));
+      const data = jsonRecord(parsed?.data);
+      const document = jsonRecord(data?.document);
+      // Current docs +fetch wraps the body in data.document; retain the older
+      // envelopes without treating reference metadata as document text.
+      for (const content of [
+        document?.content,
+        parsed?.markdown,
+        parsed?.content,
+        data?.markdown,
+        data?.content,
+      ]) {
+        if (typeof content === "string" && content.trim()) return content;
+      }
+      return null;
     } catch (err) {
       log.warn("doc fetch failed", { doc: docUrlOrToken, err: String(err) });
       return null;

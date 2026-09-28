@@ -19,6 +19,7 @@ import {
 } from "@homeagent/core";
 import {
   CliConnector,
+  FeishuConnector,
   type Connector,
   type LiveReplyHandle,
   type LiveReplySnapshot,
@@ -4344,6 +4345,55 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     const raws = engine.registry.store("team/oc_team").index().listRaw({});
     expect(raws.some((r) => r.source === "doc")).toBe(true);
     await orch2.stop();
+  });
+
+  test("a mentioned Feishu document is recorded from the current CLI envelope before answering", async () => {
+    const docUrl = "https://example.larkoffice.com/docx/doc_test";
+    const markdown = "# PST OB 问题记录\n\nOB 视角切换后画面停留，重新进入后恢复。";
+    const fetcher = new FeishuConnector({
+      runCommand: async () => JSON.stringify({
+        ok: true,
+        identity: "user",
+        data: { document: { document_id: "doc_test", revision_id: 1, content: markdown } },
+      }),
+    });
+    let answerPrompt = "";
+    fake.onText((opts) => {
+      answerPrompt = String(opts.prompt ?? "");
+      return "已收录文档中的 OB 视角切换问题。";
+    });
+    orch = new Orchestrator({
+      engine,
+      connector,
+      llm: fake,
+      docFetcher: (link) => fetcher.fetchDoc(link),
+    });
+    await orch.start();
+    await connector.inject({
+      kind: "message",
+      eventId: "lark-doc-envelope",
+      chatType: "group",
+      chatId: "oc_team",
+      senderId: "ou_me",
+      text: `[PST OB 问题记录](${docUrl}) @agent 记录上面的问题`,
+      messageId: "om_lark_doc_envelope",
+      mentionsBot: true,
+      docLinks: [docUrl],
+      createdAt: Date.now(),
+    });
+
+    expect(engine.registry.store("team/oc_team").index().listRaw({})).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: "doc",
+          messageId: "om_lark_doc_envelope",
+          content: `# 来源资料：${docUrl}\n\n${markdown}`,
+        }),
+      ]),
+    );
+    expect(answerPrompt).toContain(markdown);
+    expect(connector.sent.at(-1)?.markdown).toContain("已收录文档中的 OB 视角切换问题");
+    expect(connector.sent.at(-1)?.markdown).not.toContain("未能读取链接正文");
   });
 
   test("a ByteTech article is remembered and available to the same Chat response", async () => {

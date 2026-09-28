@@ -1076,6 +1076,64 @@ describe("FeishuConnector outbound", () => {
     expect(md).toContain("正文内容");
   });
 
+  test("fetchDoc reads the current docs +fetch document envelope", async () => {
+    const calls: string[][] = [];
+    const markdown = "# PST OB 问题记录\n\n" + "问题与复现步骤。\n".repeat(8_000);
+    connector = new FeishuConnector({
+      spawner: new FakeSpawner(),
+      runCommand: async (command) => {
+        calls.push(command);
+        return JSON.stringify({
+          ok: true,
+          identity: "user",
+          data: {
+            document: {
+              document_id: "doc_test",
+              revision_id: 12,
+              content: markdown,
+              reference_map: { comments: { c1: { data: "评论正文" } } },
+            },
+          },
+        });
+      },
+    });
+
+    const body = await connector.fetchDoc("https://example.larkoffice.com/docx/doc_test");
+    expect(body?.length).toBe(markdown.length);
+    expect(body).toBe(markdown);
+    expect(calls).toEqual([[
+      "lark-cli", "docs", "+fetch", "--doc",
+      "https://example.larkoffice.com/docx/doc_test",
+      "--doc-format", "markdown", "--as", "user", "--json",
+    ]]);
+  });
+
+  test.each([
+    { content: "旧版正文" },
+    { data: { content: "旧版正文" } },
+    { data: { markdown: "旧版正文" } },
+  ])("fetchDoc preserves legacy content envelopes: %j", async (response) => {
+    connector = new FeishuConnector({
+      spawner: new FakeSpawner(),
+      runCommand: async () => JSON.stringify(response),
+    });
+    expect(await connector.fetchDoc("doc_test")).toBe("旧版正文");
+  });
+
+  test.each([
+    null,
+    {},
+    { content: { text: "不是正文字符串" } },
+    { data: { content: 123 } },
+    { data: { document: { content: "   ", reference_map: { content: "不是正文" } } } },
+  ])("fetchDoc returns null without a text body: %j", async (response) => {
+    connector = new FeishuConnector({
+      spawner: new FakeSpawner(),
+      runCommand: async () => JSON.stringify(response),
+    });
+    expect(await connector.fetchDoc("doc_test")).toBeNull();
+  });
+
   test("fetchDoc returns null on command failure", async () => {
     const spawner = new FakeSpawner();
     connector = new FeishuConnector({
