@@ -378,6 +378,17 @@ function providerRecovery(
   };
 }
 
+export const AGENT_DEFAULT_MODEL_HELP = "未指定模型时，同 Provider 优先继承 HomeAgent「设置」中的全局模型；全局未指定或 Provider 不同时，由 CLI 自身选择默认模型。这里不会读取其他应用或终端会话当前选中的模型。";
+
+export function agentDefaultModelLabel(
+  provider: string,
+  defaults: { provider: string; model: string },
+): string {
+  return provider === defaults.provider && defaults.model
+    ? `继承 HomeAgent 全局：${defaults.model}`
+    : "由 CLI 自身选择默认模型";
+}
+
 function effectiveModel(
   agent: Pick<Agent, "provider" | "model">,
   defaults: { provider: string; model: string },

@@ -92,6 +92,26 @@ afterEach(async () => {
 });
 
 describe("FeishuConnector daemon (fake spawn)", () => {
+  test("pins event consumers, delivery and user document reads to the HomeAgent profile", async () => {
+    const spawner = new FakeSpawner();
+    const commands: string[][] = [];
+    connector = new FeishuConnector({
+      profile: "cli_homeagent", spawner,
+      runCommand: async command => {
+        commands.push(command);
+        return JSON.stringify({ data: { document: { content: "周报正文" } } });
+      },
+    });
+    await connector.start(() => {});
+    await connector.notice("oc_team", "本次运行结果");
+    expect(await connector.fetchDoc("https://example.feishu.cn/docx/weekly")).toBe("周报正文");
+    const all = [...spawner.procs.map(call => call.cmd), ...commands];
+    expect(all.length).toBe(4);
+    for (const command of all) {
+      expect(command.slice(0, 3)).toEqual(["lark-cli", "--profile", "cli_homeagent"]);
+    }
+  });
+
   test("does not process stdout until the ready marker appears", async () => {
     const spawner = new FakeSpawner();
     const events: InboundEvent[] = [];

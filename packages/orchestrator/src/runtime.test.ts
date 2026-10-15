@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ProviderRunError, ProviderPreparationError, type JSONOptions } from "@homeagent/llm";
+import { ProviderRunError, ProviderPreparationError, codexProgressEventFromLine, type JSONOptions } from "@homeagent/llm";
 import {
   AI_OPERATION_TIMEOUT_MS,
   resetConfig,
@@ -20,6 +20,7 @@ import {
 import {
   CliConnector,
   FeishuConnector,
+  buildLiveReplyCard,
   type Connector,
   type LiveReplyHandle,
   type LiveReplySnapshot,
@@ -187,6 +188,55 @@ afterEach(async () => {
 });
 
 describe("orchestrator trunk (cli connector, no feishu)", () => {
+  test.each(["p2p", "group"] as const)("unrelated conversations omit catalog warnings while explicitly requested Skills retain them: %s", async (chatType) => {
+    engine.askWithExecutionPlan = async () => ({
+      answer: "测试回复。", source: "general", context: "agent-workdir", citations: [],
+      skillWarnings: [{ name: "baoyu-post-to-wechat", code: "invalid_skill", message: "Skill 包体积超过加载上限，已跳过" }],
+    });
+    await orch.start();
+    const send = (text: string) => chatType === "p2p"
+      ? connector.sendP2P(text) : connector.sendGroup(`@HomeAgent ${text}`, true);
+    await send("测试会话");
+    await send("现在使用的模型是什么");
+    expect(connector.sent).toHaveLength(2);
+    for (const sent of connector.sent) expect(sent.markdown).not.toContain("Skill 提示");
+    await send("请使用 baoyu-post-to-wechat 发布文章");
+    expect(connector.sent[2]?.markdown).toContain("baoyu-post-to-wechat：Skill 包体积超过加载上限");
+    const run = engine.chatRuns.list(chatType === "p2p" ? "personal/ou_me" : "team/oc_team")
+      .find(item => item.input.includes("发布文章"))!;
+    expect(run.output).toBe(connector.sent[2]?.markdown);
+  });
+
+  test("a reported session model survives delivery failure, configuration changes, and restart", async () => {
+    engine.ensureSpace("personal/ou_me");
+    const agent = engine.agents.create({ name: "模型来源助手", provider: "claude", model: "sonnet", visibility: "Personal" });
+    engine.updateSpaceMeta("personal/ou_me", { agentId: agent.id });
+    let answers = 0;
+    engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
+      answers++;
+      await opts?.onProgress?.({ kind: "phase", at: 100, phase: "provider", title: "会话模型已确认", model: "claude-sonnet-4-6" });
+      return { answer: "这次使用了 Provider 返回的型号。", source: "general", context: "agent-workdir", citations: [] };
+    };
+    connector.reply = async () => { throw new Error("delivery unavailable"); };
+    await orch.start();
+    await expect(connector.sendP2P("请回答并显示模型")).rejects.toThrow("delivery unavailable");
+    const run = engine.chatRuns.list("personal/ou_me")[0]!;
+    expect(run.output).toBe("> 本次模型：Claude Code · `claude-sonnet-4-6`（Provider 返回）\n\n这次使用了 Provider 返回的型号。");
+    expect(run.model).toBe("sonnet");
+    engine.agents.update(agent.id, { model: "opus" });
+    await orch.stop();
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
+    connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
+    orch = new Orchestrator({ engine, connector, llm: fake });
+    await orch.start();
+    await orch.retryChatRun(run.id);
+    expect(connector.sent).toHaveLength(1);
+    expect(connector.sent[0]?.markdown).toBe(run.output);
+    expect(connector.sent[0]?.markdown.split("本次模型：")).toHaveLength(2);
+    expect(engine.chatRuns.get(run.id)?.delivery.status).toBe("sent");
+    expect(answers).toBe(1);
+  });
   test("projects one Chat Run onto a progress card and still sends the final reply", async () => {
     const created: LiveReplySnapshot[] = [];
     const liveTargets: OutboundReply[] = [];
@@ -205,6 +255,14 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     liveConnector.finalizeLiveReply = async (_handle: LiveReplyHandle, snapshot: LiveReplySnapshot) => {
       finalized.push(snapshot);
     };
+    const originalAsk = engine.askWithExecutionPlan.bind(engine);
+    engine.askWithExecutionPlan = async (spaces, question, plan, evidence, opts, agentId) => {
+      await opts?.onProgress?.({ kind: "assistant_snapshot", at: 100, title: "进度说明", visibility: "public", delta: "先检查构建，再更新环境。" });
+      await opts?.onProgress?.({ kind: "tool", at: 101, title: "工具开始执行", tool: { type: "command", status: "running" } });
+      await opts?.onProgress?.({ kind: "tool", at: 102, title: "工具执行完成", tool: { type: "command", status: "completed" } });
+      await opts?.onProgress?.({ kind: "assistant_snapshot", at: 103, title: "进度说明", visibility: "public", delta: "构建成功，正在更新。" });
+      return originalAsk(spaces, question, plan, evidence, opts, agentId);
+    };
     orch = new Orchestrator({ engine, connector: liveConnector, llm: fake });
     await orch.start();
     await liveConnector.sendP2P("请回答一个问题");
@@ -215,6 +273,9 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(updated.length).toBeGreaterThan(0);
     expect(finalized).toHaveLength(1);
     expect(finalized[0]?.state).toBe("succeeded");
+    expect(finalized[0]?.answerPreview).toContain("CLI 默认（未返回具体型号）");
+    expect(finalized[0]?.commentary).toEqual(["先检查构建，再更新环境。", "构建成功，正在更新。"]);
+    expect(finalized[0]?.toolCallCount).toBe(1);
     expect(liveConnector.sent).toHaveLength(1);
     expect(run.delivery.status).toBe("sent");
     expect(liveTargets[0]?.idempotencyKey).toBe(run.id);
@@ -239,6 +300,43 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(run.delivery.status).toBe("sent");
     expect(run.delivery.liveReply).toBeUndefined();
     expect(engine.runEvents.list(run.id).some((event) => event.kind === "delivery.updated")).toBeTrue();
+  });
+  test("a no-tool model question retains Provider summaries and sends the answer only outside the process card", async () => {
+    const finalized: LiveReplySnapshot[] = [];
+    const liveConnector = connector as CliConnector & Connector;
+    liveConnector.createLiveReply = async (_out, snapshot) => ({ messageId: "om_summary", revision: snapshot.seq });
+    liveConnector.updateLiveReply = async (handle, snapshot) => ({ ...handle, revision: snapshot.seq });
+    liveConnector.finalizeLiveReply = async (_handle, snapshot) => { finalized.push(snapshot); };
+    fake.onText(options => {
+      for (const item of [
+        { type: "reasoning", text: "需要依据会话返回的信息说明型号，无法确认时明确说明。" },
+        { type: "agent_message", text: "当前会话未返回具体型号。" },
+      ]) {
+        const progress = codexProgressEventFromLine(JSON.stringify({ type: "item.completed", item }));
+        if (progress) void options.onProgress?.(progress);
+      }
+      return "当前会话未返回具体型号。";
+    });
+    await orch.start();
+    await liveConnector.sendP2P("现在使用的模型是什么");
+    const run = engine.chatRuns.list("personal/ou_me")[0]!;
+    expect(finalized).toHaveLength(1);
+    expect(finalized[0]?.toolCallCount).toBe(0);
+    expect(finalized[0]?.commentary).toEqual(["需要依据会话返回的信息说明型号，无法确认时明确说明。"]);
+    const card = JSON.stringify(buildLiveReplyCard(finalized[0]!));
+    expect(card).toContain('"expanded":true');
+    expect(card).toContain("需要依据会话返回的信息说明型号");
+    expect(card).not.toContain("当前会话未返回具体型号。");
+    expect(liveConnector.sent).toHaveLength(1);
+    expect(liveConnector.sent[0]?.markdown).toBe(run.output);
+    expect(liveConnector.sent[0]?.markdown).toContain("本次模型：");
+    expect(liveConnector.sent[0]?.markdown).toContain("当前会话未返回具体型号。");
+    expect(run.delivery.status).toBe("sent");
+    await orch.stop();
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
+    expect(engine.runEvents.list(run.id).find(event => event.title === "思考摘要")?.delta)
+      .toBe("需要依据会话返回的信息说明型号，无法确认时明确说明。");
   });
   test("a new Chat Run is attached to the current work item", async () => {
     const workItem = engine.workItems.create({
@@ -1126,6 +1224,8 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       execution: undefined,
     }));
     expect(providerCall?.system).not.toContain("Use the changed live Chat persona.");
+    expect(connector.sent[0]?.markdown).toContain("`claude-original`（本次运行配置）");
+    expect(connector.sent[0]?.markdown).not.toContain("gpt-changed");
   });
 
   test("a legacy queued Chat Run without an execution plan fails closed on recovery", async () => {
@@ -2826,7 +2926,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
 
     await connector.sendP2P("谁负责后端？");
 
-    expect(connector.sent[0]!.markdown).toBe("后端由 Alice 负责。");
+    expect(connector.sent[0]!.markdown).toEndWith("后端由 Alice 负责。");
     expect(connector.sent[0]!.markdown).not.toContain("尚缺");
     expect(connector.sent[0]!.markdown).not.toContain("知识库还是空的");
   });

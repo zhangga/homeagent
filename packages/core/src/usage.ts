@@ -6,6 +6,7 @@ import {
   type JSONOptions,
 } from "@homeagent/llm";
 import type { LlmClient } from "./llm.ts";
+import type { ProviderProgressEvent } from "@homeagent/shared";
 
 export type AggregatedCostBasis = CompletionUsage["costBasis"] | "mixed";
 
@@ -182,10 +183,14 @@ export function observeLlmUsage(
   onExecutionEvidence?: import("@homeagent/llm").RunInput["onExecutionEvidence"],
   onProgress?: import("@homeagent/llm").RunInput["onProgress"],
 ): LlmClient {
-  const observe = <T extends CompleteOptions>(options: T): T => ({
+  const observe = <T extends CompleteOptions>(options: T, publicText = true, publicSummary = true): T => ({
     ...options,
     ...(onExecutionEvidence ? { onExecutionEvidence } : {}),
-    ...(onProgress ? { onProgress } : {}),
+    ...(onProgress ? { onProgress: (event: ProviderProgressEvent) => {
+      if (event.kind === "reasoning_summary" && !publicSummary) return;
+      if (!publicText && (event.kind === "assistant_snapshot" || event.kind === "assistant_delta")) return;
+      return onProgress(event);
+    } } : {}),
   });
   return {
     async complete(options) {
@@ -202,7 +207,7 @@ export function observeLlmUsage(
     },
     async completeJSON<T>(options: JSONOptions<T>) {
       try {
-        const output = await client.completeJSON<T>(observe(options));
+        const output = await client.completeJSON<T>(observe(options, false, options.publicReasoningSummary === true));
         record(output.result.usage);
         return output;
       } catch (error) {

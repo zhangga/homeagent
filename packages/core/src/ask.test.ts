@@ -207,6 +207,8 @@ describe("ask pipeline", () => {
     expect(res.answer).toContain("Alice");
     expect(fake.calls.filter((call) => call.kind === "json").map((call) => call.opts.maxTokens))
       .toEqual([AI_ROUTING_MAX_TOKENS, AI_GENERATION_MAX_TOKENS]);
+    const structuredCalls = fake.calls.filter(call => call.kind === "json").map(call => call.opts as JSONOptions<unknown>);
+    expect(structuredCalls.map(call => call.publicReasoningSummary)).toEqual([undefined, true]);
   });
 
   test("grounded citations expose bounded Raw provenance and evidence freshness", async () => {

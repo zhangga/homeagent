@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { KnowledgeEngine } from "@homeagent/core";
+import { readSettings } from "@homeagent/shared";
+import { LarkCliSetup } from "@homeagent/connectors";
 import {
   configureRuntimeEnvironment,
   prepareFeishuStartup,
@@ -16,6 +18,62 @@ afterEach(() => {
 });
 
 describe("compiled app command dispatch", () => {
+  test("does not probe or change bindings when the selected app cannot be persisted", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "homeagent-feishu-profile-failure-"));
+    temporary.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir });
+    engine.feishuBindings.connect({
+      chatId: "oc_weekly", spaceId: "team/oc_weekly", boundAppId: "cli_homeagent",
+      responseMode: "mentions_only", replyInThread: true,
+    });
+    mkdirSync(join(dir, "config", "settings.json"));
+    let probed = false;
+    try {
+      await expect(prepareFeishuStartup(engine, { status: async () => {
+        probed = true;
+        return { state: "unavailable", verified: false, message: "unexpected" };
+      } }, { dataDir: dir })).rejects.toThrow();
+      expect(probed).toBe(false);
+      expect(engine.feishuBindings.getByChatId("oc_weekly")?.state).toBe("active");
+    } finally { engine.close(); }
+  });
+
+  test("restores and persists the bound Feishu app before probing a changed CLI default", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "homeagent-feishu-profile-"));
+    temporary.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir });
+    engine.ensureSpace("team/oc_weekly", { chatId: "oc_weekly" });
+    engine.feishuBindings.connect({
+      chatId: "oc_weekly", spaceId: "team/oc_weekly", boundAppId: "cli_homeagent",
+      responseMode: "mentions_only", replyInThread: true,
+    });
+    const calls: string[][] = [];
+    const setup = new LarkCliSetup({ runner: { async run(command) {
+      calls.push(command.argv);
+      const profileAt = command.argv.indexOf("--profile");
+      const appId = profileAt >= 0 ? command.argv[profileAt + 1] : "cli_daily_avatar";
+      return { code: 0, stderr: "", stdout: JSON.stringify({
+        appId, brand: "feishu",
+        identities: { bot: { status: "ready", verified: true, appName: "HomeAgent", openId: "ou_bot" } },
+      }) };
+    } } });
+    try {
+      const startup = await prepareFeishuStartup(engine, setup, { dataDir: dir });
+      expect(startup.status.appId).toBe("cli_homeagent");
+      expect(startup.consumersEnabled).toBe(true);
+      expect(engine.feishuBindings.getByChatId("oc_weekly")?.state).toBe("active");
+      expect(readSettings(dir).feishuAppId).toBe("cli_homeagent");
+      const reopened = new LarkCliSetup({ runner: { async run(command) {
+        calls.push(command.argv);
+        return { code: 1, stdout: "", stderr: "temporary outage" };
+      } } });
+      const unavailable = await prepareFeishuStartup(engine, reopened, { dataDir: dir });
+      expect(unavailable.consumersEnabled).toBe(false);
+      expect(calls.at(-1)?.slice(0, 3)).toEqual(["lark-cli", "--profile", "cli_homeagent"]);
+      expect(readSettings(dir).feishuAppId).toBe("cli_homeagent");
+    } finally { engine.close(); }
+  });
+
   test("double-click defaults to desktop while source start defaults to serve", () => {
     expect(selectAppCommand([], true)).toBe("desktop");
     expect(selectAppCommand([], false)).toBe("serve");
@@ -61,7 +119,7 @@ describe("compiled app command dispatch", () => {
       message: "ready",
     });
 
-    const enabled = await prepareFeishuStartup(engine, { status });
+    const enabled = await prepareFeishuStartup(engine, { status }, { dataDir: dir });
     expect(enabled).toMatchObject({
       migrated: 1,
       locallyDisabled: false,
@@ -79,7 +137,7 @@ describe("compiled app command dispatch", () => {
     const disabled = await prepareFeishuStartup(
       disabledEngine,
       { status },
-      "cli_current",
+      { dataDir: disabledDir, disabledAppId: "cli_current" },
     );
     expect(disabled).toMatchObject({
       migrated: 1,
@@ -104,7 +162,9 @@ describe("compiled app command dispatch", () => {
         replyInThread: true,
       });
     }
-    const replaced = await prepareFeishuStartup(replacedEngine, { status });
+    const replaced = await prepareFeishuStartup(replacedEngine, { status }, {
+      dataDir: replacedDir, appId: "cli_current",
+    });
     expect(replaced.consumersEnabled).toBeTrue();
     expect(replacedEngine.feishuBindings.getByChatId("oc_old")?.state)
       .toBe("needs_reconnect");
@@ -147,7 +207,7 @@ describe("compiled app command dispatch", () => {
         botOpenId: "ou_bot",
         message: "ready",
       }),
-    });
+    }, { dataDir: dir });
 
     const demoBinding = engine.feishuBindings.getByChatId("oc_demo");
     const realBinding = engine.feishuBindings.getByChatId("oc_real");

@@ -501,6 +501,7 @@ async function synthesize(
     prompt: synthPrompt(pages, question, allowGeneralFallback, toolExecution, sourceCaptureInstruction),
     images,
     schema: SYNTH_SCHEMA as unknown as Record<string, unknown>,
+    publicReasoningSummary: true,
     validate: validateSynth,
     maxTokens: AI_GENERATION_MAX_TOKENS,
     purpose: "ask",

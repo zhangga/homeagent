@@ -4659,7 +4659,7 @@ describe("management backend (read-write)", () => {
       { appId: "cli_new", appSecret: "top-secret-value", brand: "feishu" },
     ]);
     expect(readSettings(dir)).toEqual(
-      expect.objectContaining({ feishuBotName: "新机器人", feishuBotOpenId: "ou_new" }),
+      expect.objectContaining({ feishuAppId: "cli_new", feishuBotName: "新机器人", feishuBotOpenId: "ou_new" }),
     );
     expect(JSON.stringify(readSettings(dir))).not.toContain("top-secret-value");
 
@@ -4667,6 +4667,7 @@ describe("management backend (read-write)", () => {
     expect(page).toContain("创建并切换机器人");
     expect(page).toContain("新机器人");
     expect(page).toContain("ou_new");
+    expect(page).toContain("lark-cli --profile cli_new auth login --domain docs --domain wiki --domain sheets");
     expect(page).toContain('<span class="muted">待启用</span>');
     expect(page).not.toContain("⌄");
     expect(page).not.toContain("top-secret-value");

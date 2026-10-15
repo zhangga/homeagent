@@ -26,6 +26,7 @@ import {
   Serializer,
   config,
   logger,
+  publicModelId,
   type SerializerSnapshot,
 } from "@homeagent/shared";
 import {
@@ -70,7 +71,7 @@ import {
   parseKnowledgeControl,
   type KnowledgeControl,
 } from "./conversation-interpreter.ts";
-import { formatAnswer } from "./format.ts";
+import { formatAnswer, withReplyModel } from "./format.ts";
 import {
   GROUP_REMINDER_AUTOMATION_DENIAL,
   coldStartNote,
@@ -1682,6 +1683,7 @@ export class Orchestrator {
       let context: ConversationContext = { text: userText, images: [] };
       let failureTrace: AskFailureTrace | undefined;
       const rawImport = this.engine.prepareChatRawImport(runId);
+      let reportedModel: string | undefined;
       let res;
       try {
         context = await this.withReplyContext(
@@ -1707,10 +1709,11 @@ export class Orchestrator {
             },
             onExecutionEvidence: (evidence) => appendExecutionEvidence(executionEvidence, evidence),
             onProgress: (progress) => {
+              reportedModel = publicModelId(progress.model) ?? reportedModel;
               const kind = progress.kind === "tool"
                 ? progress.tool?.status === "running" ? "tool.started" : "tool.completed"
                 : progress.kind === "assistant_delta" ? "assistant.delta"
-                : progress.kind === "assistant_snapshot" ? "assistant.snapshot"
+                : progress.kind === "assistant_snapshot" || progress.kind === "reasoning_summary" ? "assistant.snapshot"
                 : progress.title.includes("完成") ? "phase.completed" : "phase.started";
               this.recordRunEvent({
                 runId,
@@ -1785,7 +1788,7 @@ export class Orchestrator {
       }
       // Cold-start honesty (Q3): if general and the KB is essentially empty, add a
       // gentle nudge to feed knowledge.
-      let text = formatAnswer(res);
+      let text = formatAnswer(res, userText);
       if (rawImport) text += `\n\n${await rawImport.finish(signal)}`;
       if (
         res.source === "general"
@@ -1797,6 +1800,7 @@ export class Orchestrator {
       if (signal?.aborted) {
         throw signal.reason instanceof Error ? signal.reason : new ChatRunCancelledError();
       }
+      text = withReplyModel(text, run, reportedModel);
       const succeeded = this.engine.chatRuns.succeed(runId, {
         executionEvidence,
         finishedAt: Date.now(),

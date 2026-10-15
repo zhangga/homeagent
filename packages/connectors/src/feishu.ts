@@ -19,6 +19,7 @@ import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { formatFeishuLocalFileLinks } from "./feishu-markdown.ts";
+import { withLarkProfile } from "./lark-profile.ts";
 import type {
   Connector,
   ConnectorHealth,
@@ -137,6 +138,7 @@ type RunCommand = (cmd: string[], opts?: CommandOptions) => Promise<string>;
 
 export interface FeishuConnectorOptions {
   larkBin?: string;
+  profile?: string;
   identity?: FeishuIdentity;
   /** injected for tests; defaults to Bun.spawn */
   spawner?: ProcSpawner;
@@ -258,6 +260,7 @@ function collectRichText(value: unknown, parts: string[], depth = 0): void {
 export class FeishuConnector implements Connector {
   readonly name = "feishu";
   private larkBin: string;
+  private readonly profile?: string;
   private identity: FeishuIdentity;
   private spawner: ProcSpawner;
   private backoffBaseMs: number;
@@ -272,6 +275,7 @@ export class FeishuConnector implements Connector {
 
   constructor(opts: FeishuConnectorOptions = {}) {
     this.larkBin = opts.larkBin ?? "lark-cli";
+    this.profile = opts.profile;
     this.identity = opts.identity ?? {
       // Bot identity is snapshotted at startup from config() (settings.json +
       // env). Editing it in the management backend takes effect on next restart.
@@ -284,7 +288,8 @@ export class FeishuConnector implements Connector {
     this.maxNeverReady = opts.maxNeverReady ?? 5;
     this.maxAttachmentBytes = opts.maxAttachmentBytes ?? 20 * 1024 * 1024;
     this.replyRetryDelayMs = Math.max(0, Math.floor(opts.replyRetryDelayMs ?? 250));
-    this.runCommand = opts.runCommand ?? runFeishuCommand;
+    const runCommand = opts.runCommand ?? runFeishuCommand;
+    this.runCommand = (command, options) => runCommand(withLarkProfile(command, this.profile), options);
   }
 
   async start(onEvent: (event: InboundEvent) => void | Promise<void>): Promise<void> {
@@ -332,7 +337,7 @@ export class FeishuConnector implements Connector {
   private async runConsumer(c: Consumer): Promise<void> {
     while (!c.stopped && !this.stopping) {
       c.state = "starting";
-      const cmd = [this.larkBin, "event", "consume", c.key, "--as", "bot"];
+      const cmd = withLarkProfile([this.larkBin, "event", "consume", c.key, "--as", "bot"], this.profile);
       log.info("starting consumer", { key: c.key });
       let proc: ProcHandle;
       try {

@@ -77,6 +77,8 @@ import {
   type FeishuConnectionProgress,
 } from "./feishu-connection-progress.ts";
 import { feishuProgressBrowserScript } from "./feishu-progress-client.ts";
+import { chatRunLiveScript } from "./chat-run-live.ts";
+import { AGENT_DEFAULT_MODEL_HELP, agentDefaultModelLabel } from "./agent-workbench.ts";
 import type { FeishuExternalSharingStatus } from "./external-sharing.ts";
 import {
   feishuProvisioningPollScript,
@@ -1044,7 +1046,7 @@ export function agentsView(
   // different model list per provider).
   const initialModels = models[providerVal] ?? [];
   const modelOpts = [
-    html`<option value="" ${modelVal === "" ? "selected" : ""}>（使用全局默认）</option>`,
+    html`<option value="" ${modelVal === "" ? "selected" : ""}>${agentDefaultModelLabel(providerVal, defaults)}</option>`,
     ...initialModels.map((m) => html`<option value="${m}" ${m === modelVal ? "selected" : ""}>${m}</option>`),
   ];
   if (modelVal && !initialModels.includes(modelVal)) {
@@ -1065,6 +1067,10 @@ export function agentsView(
   // A tiny client script: on provider change, rebuild the Model <select> from
   // the embedded catalog. No framework — plain DOM.
   const catalogJson = JSON.stringify(models);
+  const defaultModelLabels = JSON.stringify(Object.fromEntries(
+    [...new Set([...providers.map(provider => provider.id), ...Object.keys(models), providerVal])]
+      .map(provider => [provider, agentDefaultModelLabel(provider, defaults)]),
+  )).replace(/</gu, "\\u003c");
   const reasoningCatalogJson = JSON.stringify(reasoningCatalog);
   const reasoningLabelsJson = JSON.stringify(reasoningEffortLabels);
   const modelScript = raw(`<script>
@@ -1097,7 +1103,7 @@ export function agentsView(
     var cur = model.value;
     model.innerHTML = '';
     var def = document.createElement('option');
-    def.value = ''; def.textContent = '（使用全局默认）';
+    def.value = ''; def.textContent = ${defaultModelLabels}[prov.value] || '由 CLI 自身选择默认模型';
     model.appendChild(def);
     list.forEach(function(m){
       var o = document.createElement('option');
@@ -1147,9 +1153,10 @@ export function agentsView(
             </div>
             <div class="field">
               <label>Model <span class="hint">随 Provider 变化</span></label>
-              <select name="model" id="agent-model">
+              <select name="model" id="agent-model" aria-describedby="agent-model-help">
                 ${modelOpts}
               </select>
+              <p class="field-help" id="agent-model-help">${AGENT_DEFAULT_MODEL_HELP}</p>
             </div>
             <div class="field">
               <label>推理强度 <span class="hint">仅 Codex；档位随模型变化，级别越高通常越慢</span></label>
@@ -1960,6 +1967,7 @@ export function chatRunView(
       ? `${milliseconds} ms`
       : `${(milliseconds / 1000).toFixed(1)} 秒`;
   const skillEvidence = run.skillEvidence;
+  const skillWarnings = skillEvidence ? skillWarningViews({ skipped: skillEvidence.skipped }) : [];
   return html`<h1>Chat Run 详情</h1>
     <p class="subtitle">${run.id}</p>
     ${flash(flashMsg)}
@@ -1977,47 +1985,25 @@ export function chatRunView(
       ${localAuthorization ? html`<div><strong>当前本机授权：</strong>${localAuthorization}</div>` : ""}
       ${executionEvidenceView(run)}
       <div id="live-run" data-run-id="${run.id}" data-terminal="${["succeeded", "failed", "cancelled", "timed_out"].includes(run.status) ? "1" : "0"}">
-        <strong>实时执行轨迹</strong>
-        <ol id="live-run-events" style="margin:8px 0 0;padding-left:22px"><li class="muted">正在加载事件…</li></ol>
+        <style>
+          .run-process { border:1px solid var(--border); border-radius:8px; padding:12px 16px; }
+          .run-process summary { cursor:pointer; font-weight:600; }
+          #live-run-events { list-style:none; margin:16px 0 0 5px; padding:0 0 0 20px; border-left:2px solid var(--border); }
+          #live-run-events li { position:relative; padding:0 0 16px; overflow-wrap:anywhere; }
+          #live-run-events li::before { content:""; position:absolute; left:-25px; top:7px; width:8px; height:8px; background:var(--border); border-radius:50%; }
+          #live-run-events .run-note { white-space:pre-wrap; line-height:1.75; }
+          #live-run-events .run-note::before { background:var(--accent); }
+          #live-run-events .run-tool, #live-run-events .run-status { color:var(--muted); font-size:13px; }
+          #live-run-events .run-tool-failed { color:var(--danger); }
+        </style>
+        <details class="run-process" ${["succeeded", "failed", "cancelled", "timed_out"].includes(run.status) ? "" : "open"}>
+          <summary>实时执行轨迹 <span id="live-run-summary" class="muted" role="status">正在加载…</span></summary>
+          <ol id="live-run-events"><li class="muted">正在加载事件…</li></ol>
+        </details>
         <div id="live-run-answer" class="contentbox" style="margin-top:10px;display:${run.output ? "block" : "none"}">${run.output ?? ""}</div>
+        ${run.outputTruncated ? html`<div class="muted">输出过长，运行记录仅保留前 100,000 个字符。</div>` : ""}
       </div>
-      <script>
-        (() => {
-          const root = document.getElementById("live-run");
-          const list = document.getElementById("live-run-events");
-          const answer = document.getElementById("live-run-answer");
-          if (!root || !list || !answer) return;
-          const runId = root.dataset.runId;
-          let lastSeq = 0;
-          let answerText = "";
-          const terminal = new Set(["run.succeeded", "run.failed", "run.cancelled", "run.timed_out"]);
-          const render = (event) => {
-            if (!event || event.seq <= lastSeq) return;
-            lastSeq = event.seq;
-            if (list.children.length === 1 && list.firstElementChild?.classList.contains("muted")) list.textContent = "";
-            if (!event.kind.startsWith("assistant.")) {
-              const item = document.createElement("li");
-              item.textContent = event.title + (event.detail ? " · " + event.detail : "");
-              list.appendChild(item);
-            }
-            if (event.kind === "assistant.delta") answerText += event.delta || "";
-            if (event.kind === "assistant.snapshot" || event.kind === "run.succeeded") answerText = event.delta || answerText;
-            if (answerText) { answer.textContent = answerText; answer.style.display = "block"; }
-            if (terminal.has(event.kind)) source?.close();
-          };
-          let source;
-          fetch("/api/chats/runs/" + encodeURIComponent(runId) + "/snapshot", { credentials: "same-origin", cache: "no-store" })
-            .then(response => response.ok ? response.json() : Promise.reject(new Error("snapshot failed")))
-            .then(snapshot => {
-              for (const event of snapshot.events || []) render(event);
-              if (snapshot.run?.output) { answerText = snapshot.run.output; answer.textContent = answerText; answer.style.display = "block"; }
-              if (["succeeded", "failed", "cancelled", "timed_out"].includes(snapshot.run?.status)) return;
-              source = new EventSource("/api/chats/runs/" + encodeURIComponent(runId) + "/events?after=" + lastSeq);
-              source.onmessage = message => { try { render(JSON.parse(message.data)); } catch {} };
-            })
-            .catch(() => { if (list.textContent?.includes("正在加载")) list.innerHTML = '<li class="muted">实时连接不可用，可刷新页面查看持久化状态。</li>'; });
-        })();
-      </script>
+      <script>${raw(chatRunLiveScript())}</script>
       <div><strong>空间：</strong>${run.space}</div>
       <div><strong>投递：</strong>${deliveryLabel} · 已尝试 ${run.delivery.attempts} 次</div>
       ${run.usage ? runUsageView(run.usage) : ""}
@@ -2044,15 +2030,16 @@ export function chatRunView(
                     sha256 ${skill.skillFileHash.slice(0, 12)}</li>`
                 )}</ul>`
               : ""}
+            ${skillWarnings.length > 0
+              ? html`<ul>${skillWarnings.map((warning) =>
+                  html`<li><code>${warning.name}</code>：${warning.message}</li>`
+                )}</ul>`
+              : ""}
           </div>`
         : ""}
       <div><strong>输入</strong><div class="contentbox" style="margin-top:8px">${run.input}</div>
         ${run.inputTruncated ? html`<div class="muted">输入过长，重试只会使用已保留的前 100,000 个字符。</div>` : ""}
       </div>
-      ${run.output
-        ? html`<div><strong>模型输出</strong><div class="contentbox" style="margin-top:8px">${run.output}</div>
-            ${run.outputTruncated ? html`<div class="muted">输出过长，运行记录仅保留前 100,000 个字符。</div>` : ""}</div>`
-        : ""}
       ${run.error
         ? html`<div><strong>${CHAT_RUN_ERROR_LABELS[run.error.kind]}</strong>
             <div class="contentbox" style="margin-top:8px">${run.error.message}</div></div>`
@@ -2703,6 +2690,16 @@ function feishuProvisioningControl(
   </form>`;
 }
 
+function feishuUserAuthorizationHelp(setup: LarkSetupStatus): HtmlEscapedString | Promise<HtmlEscapedString> {
+  if (!setup.appId) return html``;
+  return html`<details class="integration-detail">
+    <summary>文档与周报的用户授权</summary>
+    <p class="muted">用户授权与机器人连接分别验证。读取个人文档或运行周报前，在运行 HomeAgent 的电脑上为当前应用授权：</p>
+    <pre><code>${`lark-cli --profile ${setup.appId} auth login --domain docs --domain wiki --domain sheets`}</code></pre>
+    <p class="muted">显示登录成功后，再运行任务。HomeAgent 固定使用上方应用，其他工具切换默认应用不会改变此绑定。</p>
+  </details>`;
+}
+
 function externalSharingControl(
   sharing: FeishuExternalSharingStatus,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
@@ -2936,6 +2933,7 @@ export function integrationsView(
       <div class="integration-detail">
         <div class="muted">首次确认会申请完整权限：消息收发、群消息读取、附件、表情、群信息和两条事件订阅。企业管理员可能需要在这次确认中批准敏感权限；上述权限无需事后进入开放平台补配置。手动连接已有应用时仍需自行确认权限。对外共享由飞书限制在版本发布流程中：创建版本时开启“允许机器人被添加到外部群中使用”和“允许外部用户与机器人单聊”，再提交发布并完成管理员审批。</div>
       </div>
+      ${feishuUserAuthorizationHelp(setup)}
     </section>
 
     <h2>已连接群聊</h2>
@@ -3189,6 +3187,7 @@ function integrationsControlCenterView(
       </div>
       ${runtimeRecovery}
       ${capabilityRecovery}
+      ${feishuUserAuthorizationHelp(setup)}
       ${feishuAvatarControl(input.brandAvatarAvailable)}
       ${setup.state === "ready" && setup.verified && setup.brand !== "lark"
         ? html`<div class="integration-row"><div><strong>对外共享</strong><div class="muted">允许加入外部群和接受外部用户私聊。</div></div>${externalSharingControl(input.externalSharing)}</div>`

@@ -13,11 +13,14 @@ import {
   brandedEnv,
   config,
   logger,
+  normalizeFeishuAppId,
+  readSettings,
   saveSettings,
   type LarkSetupStatus,
 } from "@homeagent/shared";
 import { join } from "node:path";
 import { KnowledgeEngine, type TaskRun } from "@homeagent/core";
+import { preflightProviderNativeSession, runProviderDetailed } from "@homeagent/llm";
 import {
   ByteTechArticleFetcher,
   FeishuConnector,
@@ -83,6 +86,7 @@ export function configureRuntimeEnvironment(
 
 export interface FeishuStartupPreparation {
   status: LarkSetupStatus;
+  appId?: string;
   migrated: number;
   locallyDisabled: boolean;
   consumersEnabled: boolean;
@@ -90,12 +94,29 @@ export interface FeishuStartupPreparation {
 
 export async function prepareFeishuStartup(
   engine: KnowledgeEngine,
-  setup: { status(): Promise<LarkSetupStatus> },
-  disabledAppId?: string,
+  setup: { status(profile?: string): Promise<LarkSetupStatus> },
+  options: { dataDir: string; disabledAppId?: string; appId?: string },
 ): Promise<FeishuStartupPreparation> {
-  const status = await setup.status();
+  const { dataDir, disabledAppId } = options;
+  const configuredAppId = options.appId ?? readSettings(dataDir).feishuAppId;
+  const bindings = engine.feishuBindings.list().filter(binding => binding.chatId !== "oc_demo");
+  const active = bindings.filter(binding => binding.state === "active" || binding.state === "pending_confirmation");
+  const boundAppIds = [...new Set((active.length > 0 ? active : bindings)
+    .flatMap(binding => binding.boundAppId ? [binding.boundAppId] : []))];
+  let appId = normalizeFeishuAppId(configuredAppId)
+    ?? (boundAppIds.length === 1 ? normalizeFeishuAppId(boundAppIds[0]) : undefined);
+  // Recover older installations from durable bindings before querying the CLI:
+  // its current default may belong to a completely unrelated tool.
+  if (appId && readSettings(dataDir).feishuAppId !== appId) {
+    saveSettings({ feishuAppId: appId }, dataDir);
+  }
+  const status = await setup.status(appId);
   const currentAppId =
     status.state === "ready" && status.verified ? status.appId : undefined;
+  if (!appId && currentAppId) {
+    appId = normalizeFeishuAppId(currentAppId);
+    saveSettings({ feishuAppId: appId }, dataDir);
+  }
   const migrated = engine.feishuBindings.migrateLegacy(
     engine.registry.list(),
     currentAppId,
@@ -115,6 +136,7 @@ export async function prepareFeishuStartup(
   }
   return {
     status,
+    appId,
     migrated,
     locallyDisabled,
     consumersEnabled: Boolean(currentAppId) && !locallyDisabled,
@@ -155,19 +177,26 @@ async function run(
   // must never enter a user-initialized knowledge Git repository.
   ensureDataGitIgnoreForRepository(cfg.dataDir);
 
+  let feishuProfile: string | undefined;
   const engine = new KnowledgeEngine({
     recoverInterruptedTaskRuns: true,
     recoverInterruptedChatRuns: true,
+    // Supplying a production runner must preserve native session preflight.
+    nativeSessionPreflight: preflightProviderNativeSession,
+    runProvider: (provider, input, timeoutMs, signal) => runProviderDetailed(
+      provider, { ...input, larkProfile: feishuProfile }, timeoutMs, signal,
+    ),
   });
   const larkSetup = new LarkCliSetup({ larkBin: runtimePaths.larkBin });
   const feishuStartup = await prepareFeishuStartup(
     engine,
     larkSetup,
-    cfg.feishuConnectionDisabledAppId,
+    { dataDir: cfg.dataDir, disabledAppId: cfg.feishuConnectionDisabledAppId, appId: cfg.feishuAppId },
   );
+  feishuProfile = feishuStartup.appId;
 
   // 1. feishu connector + orchestrator
-  const connector = new FeishuConnector({ larkBin: runtimePaths.larkBin });
+  const connector = new FeishuConnector({ larkBin: runtimePaths.larkBin, profile: feishuProfile });
   const byteTechArticleFetcher = new ByteTechArticleFetcher({
     bin: brandedEnv(process.env, "BYTEDCLI_BIN"),
   });

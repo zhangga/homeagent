@@ -5,6 +5,21 @@
  * formatting minimal and feishu-friendly (markdown reply).
  */
 import type { AskResult, SkillWarningView } from "@homeagent/shared";
+import { publicModelId } from "@homeagent/shared";
+
+export function withReplyModel(
+  markdown: string,
+  run: { provider?: string; model?: string },
+  reportedModel?: string,
+): string {
+  const provider = { codex: "Codex", claude: "Claude Code", "trae-cli": "TRAE CLI", gateway: "LLM 网关" }[run.provider ?? ""] ?? "CLI";
+  const actual = publicModelId(reportedModel);
+  const configured = publicModelId(run.model);
+  const model = actual ? `\`${actual}\`（Provider 返回）`
+    : configured ? `\`${configured}\`（本次运行配置）`
+    : "CLI 默认（未返回具体型号）";
+  return `> 本次模型：${provider} · ${model}\n\n${markdown}`;
+}
 
 function plainWarningText(value: string, maxLength: number): string {
   return value
@@ -62,7 +77,7 @@ function citationEvidenceText(citation: AskResult["citations"][number]): string 
   return parts.length > 0 ? `（${parts.join(" · ")}）` : "";
 }
 
-export function formatAnswer(res: AskResult): string {
+export function formatAnswer(res: AskResult, question?: string): string {
   const parts: string[] = [res.answer.trim()];
 
   if (res.source === "knowledge" && res.citations.length > 0) {
@@ -82,7 +97,13 @@ export function formatAnswer(res: AskResult): string {
     parts.push("", `（尚缺：${res.gaps.join("；")}）`);
   }
 
-  const skillWarning = formatSkillWarnings(res.skillWarnings);
+  // Full-catalog admission records unrelated unavailable Skills too. Keep that
+  // evidence in the Run, but only attach notices the current user requested.
+  const relevantWarnings = question === undefined ? res.skillWarnings : res.skillWarnings?.filter((warning) => {
+    const name = warning.name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    return new RegExp(`(^|[^a-z0-9._:-])${name}(?=$|[^a-z0-9._:-])`, "iu").test(question);
+  });
+  const skillWarning = formatSkillWarnings(relevantWarnings);
   if (skillWarning) parts.push("", skillWarning);
 
   return parts.join("\n");

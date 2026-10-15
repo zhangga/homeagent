@@ -62,6 +62,8 @@ export interface Config {
   feishuBotName?: string;
   /** feishu bot open_id, for precise @-mention detection (optional) */
   feishuBotOpenId?: string;
+  /** HomeAgent's own lark-cli profile, addressed by stable App ID. */
+  feishuAppId?: string;
   /** configured app intentionally disabled inside HomeAgent */
   feishuConnectionDisabledAppId?: string;
   /** app id whose external-sharing publishing flow is being tracked */
@@ -97,6 +99,7 @@ export interface PersistedSettings {
   defaultModel?: string;
   feishuBotName?: string;
   feishuBotOpenId?: string;
+  feishuAppId?: string;
   feishuConnectionDisabledAppId?: string;
   feishuExternalSharingAppId?: string;
   feishuExternalSharingStartedAt?: number;
@@ -120,6 +123,7 @@ export const EDITABLE_KEYS: (keyof PersistedSettings)[] = [
   "defaultModel",
   "feishuBotName",
   "feishuBotOpenId",
+  "feishuAppId",
   "feishuConnectionDisabledAppId",
   "feishuExternalSharingAppId",
   "feishuExternalSharingStartedAt",
@@ -155,6 +159,14 @@ function chatTimeoutMinutes(value: number, fallback: number): number {
 
 function settingsPath(dataDir: string): string {
   return join(dataDir, "config", "settings.json");
+}
+
+export function normalizeFeishuAppId(value: unknown): string | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (typeof value !== "string" || value.length > 256 || !/^cli_[A-Za-z0-9_]+$/u.test(value)) {
+    throw new Error("Feishu App ID is invalid");
+  }
+  return value;
 }
 
 /** Prefer explicit model IDs over historical routing aliases in persisted config. */
@@ -216,6 +228,7 @@ export function loadConfig(env = process.env): Config {
     defaultModel: brandedEnv(env, "DEFAULT_MODEL") || "",
     feishuBotName: brandedEnv(env, "FEISHU_BOT_NAME") || undefined,
     feishuBotOpenId: brandedEnv(env, "FEISHU_BOT_OPEN_ID") || undefined,
+    feishuAppId: normalizeFeishuAppId(brandedEnv(env, "FEISHU_APP_ID")),
     feishuConnectionDisabledAppId: undefined,
     feishuExternalSharingAppId: undefined,
     feishuExternalSharingStartedAt: undefined,
@@ -245,6 +258,7 @@ export function loadConfig(env = process.env): Config {
   if (persisted.defaultProvider) base.defaultProvider = persisted.defaultProvider;
   if (persisted.defaultModel !== undefined) base.defaultModel = persisted.defaultModel;
   if (persisted.feishuBotName !== undefined) base.feishuBotName = persisted.feishuBotName || undefined;
+  if (persisted.feishuAppId !== undefined) base.feishuAppId = normalizeFeishuAppId(persisted.feishuAppId);
   if (persisted.feishuBotOpenId !== undefined) base.feishuBotOpenId = persisted.feishuBotOpenId || undefined;
   if (persisted.feishuConnectionDisabledAppId !== undefined) {
     base.feishuConnectionDisabledAppId =
@@ -296,6 +310,7 @@ export function config(): Config {
  * that snapshot at startup (feishu bot identity, web port) need a restart.
  */
 export function saveSettings(patch: PersistedSettings, dataDir = config().dataDir): PersistedSettings {
+  if (patch.feishuAppId !== undefined) normalizeFeishuAppId(patch.feishuAppId);
   const current = readSettings(dataDir);
   const next: PersistedSettings = { ...current };
   for (const key of EDITABLE_KEYS) {

@@ -13,6 +13,8 @@ import type {
   LarkSetupStatus,
 } from "@homeagent/shared";
 import { runFeishuCommandResult } from "./feishu.ts";
+import { withLarkProfile } from "./lark-profile.ts";
+import { normalizeFeishuAppId } from "@homeagent/shared";
 import {
   sdkLarkAppRegistrar,
   type LarkAppRegistrar,
@@ -36,6 +38,7 @@ export interface LarkSetupCommandRunner {
 
 export interface LarkCliSetupOptions {
   larkBin?: string;
+  profile?: string;
   runner?: LarkSetupCommandRunner;
   registrar?: LarkAppRegistrar;
   urlWaitMs?: number;
@@ -85,6 +88,7 @@ export const bunLarkSetupRunner: LarkSetupCommandRunner = {
 export class LarkCliSetup {
   private readonly larkBin: string;
   private readonly runner: LarkSetupCommandRunner;
+  private profile?: string;
   private readonly registrar: LarkAppRegistrar;
   private readonly urlWaitMs: number;
   private readonly provisioningTtlMs: number;
@@ -100,10 +104,15 @@ export class LarkCliSetup {
   constructor(opts: LarkCliSetupOptions = {}) {
     this.larkBin = opts.larkBin ?? "lark-cli";
     this.runner = opts.runner ?? bunLarkSetupRunner;
+    this.profile = normalizeFeishuAppId(opts.profile);
     this.registrar = opts.registrar ?? sdkLarkAppRegistrar;
     this.urlWaitMs = opts.urlWaitMs ?? URL_WAIT_MS;
     this.provisioningTtlMs = opts.provisioningTtlMs ?? PROVISIONING_TTL_MS;
     this.eventVerificationPollMs = opts.eventVerificationPollMs ?? 3_000;
+  }
+
+  private runCommand(command: LarkSetupCommand, profile = this.profile): Promise<LarkSetupCommandResult> {
+    return this.runner.run({ ...command, argv: withLarkProfile(command.argv, profile) });
   }
 
   async startAutomatic(brand: "feishu" | "lark"): Promise<LarkProvisioningSession> {
@@ -295,7 +304,7 @@ export class LarkCliSetup {
       ];
       let result: LarkSetupCommandResult;
       try {
-        result = await this.runner.run({ argv, timeoutMs: 15_000 });
+        result = await this.runCommand({ argv, timeoutMs: 15_000 });
       } catch {
         throw new Error("Unable to list Feishu groups");
       }
@@ -342,7 +351,7 @@ export class LarkCliSetup {
     if (!normalizedChatId) return undefined;
     let result: LarkSetupCommandResult;
     try {
-      result = await this.runner.run({
+      result = await this.runCommand({
         argv: [
           this.larkBin,
           "im",
@@ -376,7 +385,7 @@ export class LarkCliSetup {
     try {
       // `auth check` inspects user OAuth state. Query the tenant scope inventory
       // as the Bot so bot-only installations cannot be mistaken for a denial.
-      result = await this.runner.run({
+      result = await this.runCommand({
         argv: [
           this.larkBin,
           "api",
@@ -420,7 +429,7 @@ export class LarkCliSetup {
     for (const key of REQUIRED_EVENT_KEYS) {
       let result: LarkSetupCommandResult;
       try {
-        result = await this.runner.run({
+        result = await this.runCommand({
           argv: [
             this.larkBin,
             "event",
@@ -463,13 +472,14 @@ export class LarkCliSetup {
     return false;
   }
 
-  async status(): Promise<LarkSetupStatus> {
+  async status(profile = this.profile): Promise<LarkSetupStatus> {
+    this.profile = normalizeFeishuAppId(profile);
     let result: LarkSetupCommandResult;
     try {
-      result = await this.runner.run({
+      result = await this.runCommand({
         argv: [this.larkBin, "auth", "status", "--json", "--verify"],
         timeoutMs: 15_000,
-      });
+      }, profile);
     } catch {
       return {
         state: "unavailable",
@@ -500,6 +510,10 @@ export class LarkCliSetup {
       const botOpenId = stringValue(bot.openId);
       const verified = bot.verified === true && bot.available !== false;
       const ready = verified && bot.status === "ready" && Boolean(botName && botOpenId);
+      if (profile && appId !== profile) {
+        return { state: "invalid", verified: false, appId: profile, message: "飞书应用与 HomeAgent 绑定不一致" };
+      }
+      if (ready && appId && this.profile === profile) this.profile = normalizeFeishuAppId(appId);
       return {
         state: ready ? "ready" : appId ? "invalid" : "unconfigured",
         verified,
@@ -522,7 +536,7 @@ export class LarkCliSetup {
     const appId = input.appId.trim();
     const appSecret = input.appSecret;
     const brand = input.brand === "lark" ? "lark" : "feishu";
-    if (!appId || !appSecret) throw new Error("App ID and App Secret are required");
+    if (!normalizeFeishuAppId(appId) || !appSecret) throw new Error("App ID and App Secret are required");
 
     let result: LarkSetupCommandResult;
     try {
@@ -547,7 +561,7 @@ export class LarkCliSetup {
       throw new Error(`lark-cli configuration failed (${result.code})`);
     }
 
-    const status = await this.status();
+    const status = await this.status(appId);
     if (status.state !== "ready" || !status.verified) {
       throw new Error("lark-cli bot verification failed");
     }

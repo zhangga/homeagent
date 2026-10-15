@@ -35,6 +35,21 @@ test("Chat Run explains preparation failure even without Provider output", async
   expect(rendered).toContain("protected-root-readable");
 });
 
+test("Chat Run retains specific skipped-Skill diagnostics without exposing private errors", async () => {
+  const rendered = String(await chatRunView({ ...run, skillEvidence: {
+    requested: [], resolved: [], skipped: [
+      { name: "baoyu-post-to-wechat", code: "invalid_skill", message: "Skill bundle is too large" },
+      { name: "private-skill", code: "invalid_skill", message: "EACCES private/path/secret.txt token=secret" },
+    ],
+  } }));
+  expect(rendered).toContain("跳过 2");
+  expect(rendered).toContain("baoyu-post-to-wechat");
+  expect(rendered).toContain("Skill 包体积超过加载上限，已跳过");
+  expect(rendered).toContain("private-skill");
+  expect(rendered).not.toContain("secret.txt");
+  expect(rendered).not.toContain("token=secret");
+});
+
 test("full access evidence says no sandbox, not sandbox passed or model verified", async () => {
   const rendered = String(await chatRunView({ ...run, executionEvidence: {
     truncated: false, calls: [{ source: "codex-jsonl", events: [], truncated: false, execution: {

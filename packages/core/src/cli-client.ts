@@ -32,7 +32,7 @@ import {
   ProviderRunError,
   recordCall,
 } from "@homeagent/llm";
-import { logger } from "@homeagent/shared";
+import { logger, publicModelId } from "@homeagent/shared";
 import type { LlmClient } from "./llm.ts";
 
 const log = logger.child("cli-client");
@@ -94,6 +94,16 @@ function normalizeProviderResult(
     usage: { ...output.usage },
     nativeSessionId: output.nativeSessionId,
   };
+}
+
+async function publishReportedModel(output: string | ProviderRunResult, observer: RunInput["onProgress"]): Promise<void> {
+  const model = typeof output === "string" ? undefined : publicModelId(output.model);
+  if (!model || !observer) return;
+  try {
+    await observer({ kind: "phase", at: Date.now(), phase: "provider", visibility: "public", title: "会话模型已确认", detail: model, model });
+  } catch {
+    log.warn("provider model observer failed");
+  }
 }
 
 const unavailableUsage = (): CompletionUsage => ({
@@ -252,6 +262,7 @@ export function makeCliClient(
           signal,
         );
         result = normalizeProviderResult(out, cliModel ?? provider);
+        await publishReportedModel(out, opts.onProgress);
         ok = true;
         return result;
       } catch (error) {
@@ -334,6 +345,7 @@ export function makeCliClient(
             err,
           );
         }
+        await publishReportedModel(out, opts.onProgress);
         ok = true;
         return { value, result: { ...result, text: "" } };
       } catch (error) {

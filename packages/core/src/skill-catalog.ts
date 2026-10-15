@@ -6,6 +6,7 @@ import {
   hashProviderSkillBundle,
   providerCodexHome,
   providerSkillReference,
+  SKILL_STAGING_MAX_BYTES,
   type ProviderSkillInput,
   type ProviderId,
 } from "@homeagent/llm";
@@ -114,6 +115,29 @@ const warningMessages: Record<SkillSkipCode, string> = {
   no_tools_context: "普通 no-tools 调用不会加载本机 Skill，已跳过",
 };
 
+// Only fixed, recognized diagnostics may reach replies or durable Skill evidence.
+const invalidSkillMessages = new Map([
+  ["Skill metadata is invalid", "Skill 元数据无效，已跳过"],
+  ["Skill bundle is too large", "Skill 包体积超过加载上限，已跳过"],
+  ["Skill bundle has too many entries", "Skill 包文件数量超过加载上限，已跳过"],
+  ["Skill bundle is too deeply nested", "Skill 目录层级超过加载上限，已跳过"],
+  ["Skill bundle cannot contain symbolic links", "Skill 目录包含不支持的链接，已跳过"],
+  ["Skill bundle root is invalid", "Skill 根目录无效，已跳过"],
+  ["Skill bundle directory escapes its root", "Skill 目录路径无效，已跳过"],
+  ["Skill bundle entry escapes its root", "Skill 文件路径无效，已跳过"],
+  ["Skill bundle contains a non-regular file", "Skill 目录包含不支持的文件类型，已跳过"],
+  ["Skill bundle has no SKILL.md", "Skill 缺少 SKILL.md，已跳过"],
+  ["Skill bundle changed while it was being captured", "Skill 文件在读取期间发生变化，已跳过"],
+  ["Skill bundle directory changed while it was being captured", "Skill 目录在读取期间发生变化，已跳过"],
+  ["Skill bundle root changed while it was being captured", "Skill 根目录在读取期间发生变化，已跳过"],
+]);
+
+function skillBundleFailure(error: unknown): string {
+  return error instanceof Error && invalidSkillMessages.has(error.message)
+    ? error.message
+    : "Skill bundle is invalid or changed";
+}
+
 export function skillWarningViews(
   resolution: Pick<ResolvedAgentSkills, "skipped">,
   limit = 10,
@@ -127,7 +151,9 @@ export function skillWarningViews(
     warnings.push({
       name: skipped.name,
       code: skipped.code,
-      message: warningMessages[skipped.code],
+      message: skipped.code === "invalid_skill"
+        ? invalidSkillMessages.get(skipped.message) ?? warningMessages[skipped.code]
+        : warningMessages[skipped.code],
     });
     if (warnings.length >= Math.max(0, Math.trunc(limit))) break;
   }
@@ -151,6 +177,7 @@ export interface SkillCatalogOptions {
     maxFileBytes?: number;
     maxSkills?: number;
     maxTotalBytes?: number;
+    maxBundleBytes?: number;
     maxEntries?: number;
   };
 }
@@ -370,6 +397,7 @@ export class SkillCatalog {
   private readonly maxFileBytes: number;
   private readonly maxSkills: number;
   private readonly maxTotalBytes: number;
+  private readonly maxBundleBytes: number;
   private readonly maxEntries: number;
   private readonly cacheTtlMs: number;
   private readonly now: () => number;
@@ -385,7 +413,7 @@ export class SkillCatalog {
    * the whole installed Skill corpus; this keeps repeat resolves metadata-only
    * while still recomputing whenever any entry's metadata changes.
    */
-  private readonly bundleHashCache = new Map<string, string | null>();
+  private readonly bundleHashCache = new Map<string, string | { failure: string }>();
 
   constructor(options: SkillCatalogOptions) {
     this.roots = options.roots.map((root) => ({
@@ -398,6 +426,10 @@ export class SkillCatalog {
     this.maxTotalBytes = Math.max(
       1,
       Math.trunc(options.limits?.maxTotalBytes ?? 16 * 1024 * 1024),
+    );
+    this.maxBundleBytes = Math.max(
+      1,
+      Math.trunc(options.limits?.maxBundleBytes ?? SKILL_STAGING_MAX_BYTES),
     );
     this.maxEntries = Math.max(1, Math.trunc(options.limits?.maxEntries ?? 50_000));
     this.cacheTtlMs = Math.max(0, Math.trunc(options.cacheTtlMs ?? 30_000));
@@ -423,13 +455,11 @@ export class SkillCatalog {
     }
     if (signature !== undefined) {
       const cached = this.bundleHashCache.get(signature);
-      // `null` records a bundle that is deterministically unusable for this exact
-      // metadata shape (oversized, symlinked, escaping). Rejecting it from cache
-      // keeps the same fail-closed outcome without re-reading the whole tree.
-      if (cached === null) throw new Error("Skill bundle is invalid or changed");
+      // Retain the fixed failure reason when reusing a negative cache entry.
+      if (typeof cached === "object") throw new Error(cached.failure);
       if (cached !== undefined) return cached;
     }
-    const remember = (value: string | null): void => {
+    const remember = (value: string | { failure: string }): void => {
       if (signature === undefined) return;
       if (this.bundleHashCache.size >= MAX_BUNDLE_HASH_CACHE_ENTRIES) {
         this.bundleHashCache.clear();
@@ -438,10 +468,11 @@ export class SkillCatalog {
     };
     let hash: string;
     try {
-      hash = hashProviderSkillBundle(skillFile, this.maxEntries, this.maxTotalBytes);
+      hash = hashProviderSkillBundle(skillFile, this.maxEntries, this.maxBundleBytes);
     } catch (error) {
-      remember(null);
-      throw error;
+      const failure = skillBundleFailure(error);
+      remember({ failure });
+      throw new Error(failure);
     }
     remember(hash);
     return hash;
@@ -655,7 +686,7 @@ export class SkillCatalog {
           source
           && source.status === "available"
           && source.name === skill.name
-          && hashProviderSkillBundle(source.skillFile, this.maxEntries, this.maxTotalBytes)
+          && hashProviderSkillBundle(source.skillFile, this.maxEntries, this.maxBundleBytes)
             === skill.skillFileHash,
         );
       } catch {
@@ -839,11 +870,11 @@ export class SkillCatalog {
       let bundleHash: string;
       try {
         bundleHash = this.bundleHash(resolvedSource.skillFile);
-      } catch {
+      } catch (error) {
         skipped.push({
           ...binding,
           code: "invalid_skill",
-          message: "Skill bundle is invalid or changed",
+          message: skillBundleFailure(error),
         });
         continue;
       }

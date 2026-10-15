@@ -69,10 +69,19 @@ Chat Run 的实时展示以本机 `runs/chat-events/<runId>.jsonl` 为权威事�
 `seq` 单调递增，先 fsync 再通知订阅者；管理后台使用 snapshot + SSE 按 `after/Last-Event-ID` 重放。
 公开事件只包含生命周期、阶段、公开工具类型/状态、回答增量与投递状态，不记录模型 reasoning/thinking、
 完整命令、工具输出、文件路径或凭据。最终回答仍以 ChatRun.output 为校准源。
+Provider 明确返回的模型 ID 可作为有界阶段元数据进入事件流；回答顶部的“本次模型”区分实际返回型号、冻结配置与未返回具体型号的 CLI 默认。
+该标注随现有 ChatRun.output 一同保存，重试投递不按当前设置重算，也不改写 Run/执行计划中冻结的 model；不新增持久化 schema 或 Provider 会话映射。
 
 飞书实时过程是同一事件流的可失败投影：Connector 先创建 CardKit Card 2.0 实体并回复到原话题，随后以
 Bot 身份按序、合并和节流地更新同一实体；运行态开启 streaming mode，终态关闭。过程卡展示公开步骤、
-阶段性说明和工具调用计数，但不展示隐藏推理、完整命令或工具输出。过程卡与最终 Markdown 回答是两个独立投影；
+阶段性说明和工具调用计数，按事件顺序交错排列，默认展开、终态仍可手动折叠；不展示隐藏推理、完整命令或工具输出。
+Codex exec `reasoning.text` 是 Provider 明确返回的公开推理摘要，以 transient `reasoning_summary` 事件接入，
+在 journal 中复用 `assistant.snapshot`、`phase=provider` 和“思考摘要”标题，不增加持久化格式。
+Codex 与 Claude 的公开 assistant 文本也作为过程说明保留；最终回答通过 Run 成功事件校准去重，
+只在独立 Markdown 回复展示，过程卡不重复回答。内部路由/分类的摘要和结构化文本不外发；
+回答合成以 `publicReasoningSummary` 显式开放摘要，仍不公开其 JSON。缺少摘要时如实提示，不伪造过程。
+卡片超出平台 30 KiB 限制时明确标记省略数量，本机 journal 不因卡片裁剪而删除历史。管理后台通过同一 journal 展示可展开时间线。
+过程卡与最终 Markdown 回答是两个独立投影；
 过程投影失败会记录 operator 事件并回退，但不能吞掉最终回答。`delivery.liveReply` 保存 provider、messageId、
 可选 cardId、revision 与 lastAppliedSeq，旧 ChatRun 记录缺失 cardId 仍可按旧 message patch 路径收尾；
 该字段不参与 Provider 原生会话提交条件。只有最终回答成功投递且 `delivery.status=sent` 持久化后，Provider

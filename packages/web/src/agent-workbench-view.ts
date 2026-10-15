@@ -2,6 +2,8 @@ import { html, raw } from "hono/html";
 import type { HtmlEscapedString } from "hono/utils/html";
 import { codexReasoningEffortsForModel, EXECUTION_POLICY_ISSUE_LABELS, NATIVE_SESSION_ISSUE_LABELS } from "@homeagent/llm";
 import {
+  AGENT_DEFAULT_MODEL_HELP,
+  agentDefaultModelLabel,
   reasoningEffortsForEditor,
   type AgentFieldErrors,
   type AgentWorkbenchView,
@@ -1279,18 +1281,19 @@ export function agentWorkbenchView(
           <div class="agent-field agent-create-field">
             <label class="agent-field-label" for="agent-model">
               Model
-              <small>可继承默认配置</small>
+              <small>可继承 HomeAgent 全局模型</small>
             </label>
             <div class="agent-field-control">
               <select
                 id="agent-model"
                 name="model"
                 aria-invalid="${modelAttrs.invalid}"
-                aria-describedby="${modelAttrs.describedBy}"
+                aria-describedby="${["agent-model-help", modelAttrs.describedBy].filter(Boolean).join(" ")}"
               >
-                <option value="" ${values.model === "" ? "selected" : ""}>使用默认模型</option>
+                <option value="" ${values.model === "" ? "selected" : ""}>${agentDefaultModelLabel(values.provider, view.defaults)}</option>
                 ${modelOptions}
               </select>
+              <p class="agent-field-hint" id="agent-model-help">${AGENT_DEFAULT_MODEL_HELP}</p>
               ${errorFor(view.errors, "model")}
             </div>
           </div>
@@ -1606,11 +1609,12 @@ export function agentWorkbenchView(
               name="model"
               form="agent-editor-form"
               aria-invalid="${modelAttrs.invalid}"
-              aria-describedby="${modelAttrs.describedBy}"
+              aria-describedby="${["agent-model-help", modelAttrs.describedBy].filter(Boolean).join(" ")}"
             >
-              <option value="" ${values.model === "" ? "selected" : ""}>使用默认模型</option>
+              <option value="" ${values.model === "" ? "selected" : ""}>${agentDefaultModelLabel(values.provider, view.defaults)}</option>
               ${modelOptions}
             </select>
+            <p class="agent-field-hint" id="agent-model-help">${AGENT_DEFAULT_MODEL_HELP}</p>
             ${errorFor(view.errors, "model")}
           </div>
         </div>
@@ -1853,6 +1857,10 @@ export function agentWorkbenchView(
   `;
 
   const modelCatalog = scriptJson(view.models);
+  const defaultModelLabels = scriptJson(Object.fromEntries(
+    [...new Set([...providerOptions.map(provider => provider.id), ...Object.keys(view.models), values.provider])]
+      .map(provider => [provider, agentDefaultModelLabel(provider, view.defaults)]),
+  ));
   const generatedNames = scriptJson(view.generatedNames);
   const inheritedCodexModel = view.defaults.provider === "codex" ? view.defaults.model : "";
   const reasoningCatalog = scriptJson(Object.fromEntries(
@@ -2008,7 +2016,7 @@ export function agentWorkbenchView(
       model.replaceChildren();
       var inherited = document.createElement('option');
       inherited.value = '';
-      inherited.textContent = '使用默认模型';
+      inherited.textContent = ${defaultModelLabels}[provider.value] || '由 CLI 自身选择默认模型';
       model.appendChild(inherited);
       (MODELS[provider.value] || []).forEach(function (modelId) {
         var option = document.createElement('option');

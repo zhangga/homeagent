@@ -28,6 +28,23 @@ afterEach(() => {
 });
 
 describe("editable settings overlay", () => {
+  test("persists the selected Feishu app independently of the CLI default", () => {
+    saveSettings({ feishuAppId: "cli_homeagent", feishuBotName: "HomeAgent" }, dir);
+    resetConfig();
+    expect(loadConfig({ HOMEAGENT_DATA_DIR: dir, HOMEAGENT_FEISHU_APP_ID: "cli_other" }).feishuAppId)
+      .toBe("cli_homeagent");
+    expect(readSettings(dir).feishuAppId).toBe("cli_homeagent");
+    const before = readFileSync(join(dir, "config", "settings.json"), "utf8");
+    for (const invalid of ["daily-avatar", "cli_a\n--profile", `cli_${"x".repeat(253)}`]) {
+      expect(() => saveSettings({ feishuAppId: invalid }, dir)).toThrow("Feishu App ID is invalid");
+      expect(readFileSync(join(dir, "config", "settings.json"), "utf8")).toBe(before);
+    }
+    saveSettings({ feishuAppId: `cli_${"x".repeat(252)}` }, dir);
+    expect(loadConfig().feishuAppId?.length).toBe(256);
+    saveSettings({ feishuAppId: "" }, dir);
+    expect(loadConfig({ HOMEAGENT_DATA_DIR: dir }).feishuAppId).toBeUndefined();
+  });
+
   test("local CLI runtime starts without legacy gateway credentials", () => {
     const cfg = loadConfig({
       HOMEAGENT_DATA_DIR: dir,

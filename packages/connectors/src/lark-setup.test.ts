@@ -35,6 +35,58 @@ async function waitForProvisioningUrl(
 }
 
 describe("LarkCliSetup", () => {
+  test("an older status request cannot replace a newly selected app", async () => {
+    let finishOld!: () => void;
+    const oldReady = new Promise<void>(resolve => { finishOld = resolve; });
+    const setup = new LarkCliSetup({ runner: { async run(command) {
+      const profileAt = command.argv.indexOf("--profile");
+      const appId = command.argv[profileAt + 1];
+      if (appId === "cli_old") await oldReady;
+      return { code: 0, stderr: "", stdout: JSON.stringify({
+        appId, identities: { bot: { status: "ready", verified: true, appName: "HomeAgent", openId: "ou_bot" } },
+      }) };
+    } } });
+    const oldStatus = setup.status("cli_old");
+    expect((await setup.status("cli_new")).appId).toBe("cli_new");
+    finishOld();
+    await oldStatus;
+    expect((await setup.status()).appId).toBe("cli_new");
+  });
+
+  test("a missing selected profile never falls back to another app", async () => {
+    const commands: string[][] = [];
+    const setup = new LarkCliSetup({ profile: "cli_homeagent", runner: { async run(command) {
+      commands.push(command.argv);
+      return { code: 1, stdout: "", stderr: "selected profile unavailable" };
+    } } });
+    expect((await setup.status()).verified).toBe(false);
+    expect((await setup.status()).verified).toBe(false);
+    expect(commands).toHaveLength(2);
+    expect(commands.every(command => command.slice(0, 3).join(" ") === "lark-cli --profile cli_homeagent")).toBe(true);
+  });
+
+  test("pins status and group queries to the selected app when the CLI default changes", async () => {
+    const calls: LarkSetupCommand[] = [];
+    let defaultApp = "cli_homeagent";
+    const setup = new LarkCliSetup({
+      profile: "cli_homeagent",
+      runner: { async run(command) {
+        calls.push(command);
+        const profileAt = command.argv.indexOf("--profile");
+        const appId = profileAt >= 0 ? command.argv[profileAt + 1] : defaultApp;
+        return { code: 0, stderr: "", stdout: JSON.stringify(command.argv.includes("auth") ? {
+          appId, brand: "feishu",
+          identities: { bot: { status: "ready", verified: true, appName: "HomeAgent", openId: "ou_bot" } },
+        } : { data: { chats: [], has_more: false } }) };
+      } },
+    });
+    expect((await setup.status()).appId).toBe("cli_homeagent");
+    defaultApp = "cli_daily_avatar";
+    expect((await setup.status()).appId).toBe("cli_homeagent");
+    await setup.listBotChats();
+    expect(calls.every(call => call.argv.includes("--profile") && call.argv.includes("cli_homeagent"))).toBe(true);
+  });
+
   test("lists Bot-visible chats with only safe public fields", async () => {
     const calls: LarkSetupCommand[] = [];
     const setup = new LarkCliSetup({
@@ -540,6 +592,7 @@ describe("LarkCliSetup", () => {
     expect(calls.slice(2).map((call) => call.argv)).toEqual([
       [
         "lark-cli",
+        "--profile", "cli_sdk",
         "event",
         "consume",
         "im.message.receive_v1",
@@ -550,6 +603,7 @@ describe("LarkCliSetup", () => {
       ],
       [
         "lark-cli",
+        "--profile", "cli_sdk",
         "event",
         "consume",
         "im.chat.member.bot.added_v1",
@@ -788,6 +842,7 @@ describe("LarkCliSetup", () => {
     expect(calls[0]?.argv.join(" ")).not.toContain("top-secret-value");
     expect(calls[1]?.argv).toEqual([
       "lark-cli",
+      "--profile", "cli_new",
       "auth",
       "status",
       "--json",

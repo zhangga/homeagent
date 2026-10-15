@@ -24,15 +24,29 @@ Bun workspaces monorepo，依赖严格单向：`web/app → orchestrator → cor
 
 ### 实时执行可见性
 
+机器人问答回复顶部会显示“本次模型”：优先使用 Provider 明确返回的型号；未返回时显示该 Run
+冻结的模型并标注“本次运行配置”，两者都没有时明确显示“CLI 默认（未返回具体型号）”，不根据本机其他会话猜测。
+模型说明与原回答一同保存，投递重试或重启后仍使用原回答中的型号；固定指令直接返回的静态回复不附此标注。
+
 每个 Chat Run 的排队、开始、Provider 阶段、公开工具状态、回答增量、投递状态和终态都会按序追加到
 `data/runs/chat-events/<runId>.jsonl`。该 journal 是 Web 与飞书展示的共同实时数据源；不保存或展示模型
-reasoning/thinking 原文、完整命令、工具输出正文、路径或凭据。管理后台 Run 详情页先读取
+隐藏 reasoning/thinking 原文、完整命令、工具输出正文或凭据；Codex exec 明确提供的公开推理摘要会保留。
+管理后台 Run 详情页先读取
 `GET /api/chats/runs/:runId/snapshot`，再通过 `GET /api/chats/runs/:runId/events?after=<seq>` 的 SSE
 断点续传后续事件。
 
 飞书连接器会先创建一张 CardKit Card 2.0 实体，以 Bot 身份回复到原话题，再按序、合并、节流地更新
-同一实体；运行中开启 CardKit streaming mode，展示最近公开步骤、阶段性说明和累计工具调用次数，终态关闭
-streaming mode。过程卡与最终 Markdown 回答是两个独立投影，因此中间过程失败不会吞掉最终结果。卡片实体 ID、
+同一实体；运行中开启 CardKit streaming mode，展示公开步骤、阶段性说明和累计工具调用次数，终态关闭
+streaming mode。卡片采用简洁的“任务已完成／执行中”过程记录，默认展开，用户可手动折叠；
+过程按时间顺序交错展示公开推理摘要、Agent 进度说明与工具类型/状态。有工具调用时显示累计次数，
+没有调用时不显示“0 次工具”。Codex exec 的 `reasoning.text` 是官方 SDK 定义的
+[公开推理摘要](https://github.com/openai/codex/blob/main/sdk/typescript/src/items.ts)，按“思考摘要”接入；
+Claude 保留公开 assistant 文本。没有返回摘要或进度时如实提示，不补写虚构过程。
+摘要从升级后的新 Run 开始采集；旧 Run 中此前被过滤的摘要无法补回。
+最终回答（含本次模型）只在独立 Markdown 回复中完整展示，过程卡不重复回答。
+内部结构化路由的文本和摘要、回答合成的结构化 JSON、隐藏 reasoning/thinking 不进入过程展示；
+回答合成明确允许公开的 Provider 摘要仍可展示。卡片超过飞书 30 KiB 限制时保留最近的完整步骤，
+明确提示省略数量，完整过程仍可在管理后台的可展开时间线中查看。过程卡与最终 Markdown 回答是两个独立投影，因此中间过程失败不会吞掉最终结果。卡片实体 ID、
 消息 ID 和最后应用序号保存在 Chat Run delivery 元数据中；创建或更新失败会写入 operator 事件并自动回退到
 最终 Markdown 回复。只有最终回答成功投递并持久化为 `delivery.status=sent` 后，才提交 Provider 原生话题
 会话。卡片默认不放管理页跳转，因为后台默认仅监听本机回环地址；部署方提供经过认证的可访问 HTTPS 地址后，
@@ -208,6 +222,19 @@ HomeAgent 不会自动修改任何已有飞书应用；上传后请在飞书的�
   附件下载使用 bot 身份，应用需开通 `im:message:readonly` 权限。读取用户文档时的 user 授权仍由
   `lark-cli auth login` 管理。
 
+HomeAgent 会保存所连接应用的 App ID，并为消息监听、发送、文档读取、管理页检测及 Agent 内的飞书查询
+固定选择该应用。旧安装启动时优先从已有群绑定中唯一确定 App ID；无法确定时，保存 CLI 当前验证成功的应用。
+切换 `lark-cli` 的全局默认 profile（例如使用头像工具）不会切换 HomeAgent 的应用。
+机器人连接正常不代表用户文档授权仍有效；请在「飞书连接 → 文档与周报的用户授权」复制带有当前 App ID
+的登录命令，完成后再重跑任务，例如：
+
+```bash
+lark-cli --profile cli_your_homeagent_app auth login --domain docs --domain wiki --domain sheets
+```
+
+用户授权保存在该应用自己的 CLI 凭据中，不与其他应用共用；授权过期后也应使用同一个带 `--profile`
+的命令恢复。手动连接其他应用后仍需重启服务，事件监听和 Agent 查询才会共同切换到新应用。
+
 ### 环境变量
 
 ```bash
@@ -231,6 +258,8 @@ export HOMEAGENT_AGENT_FEEDBACK_TOKEN=replace-with-a-feedback-secret
 # 可选：精确 @ 识别（否则群内任意 @ 都视为叫机器人）
 export HOMEAGENT_FEISHU_BOT_NAME=homeagent
 export HOMEAGENT_FEISHU_BOT_OPEN_ID=ou_xxx
+# 可选：首次启动时指定已在 lark-cli 配置的应用，后续以保存的连接为准
+export HOMEAGENT_FEISHU_APP_ID=cli_your_homeagent_app
 # 可选：已安装并登录的 bytedcli；用于只读同步 ByteTech 文章正文
 export HOMEAGENT_BYTEDCLI_BIN=/absolute/path/to/bytedcli
 ```
@@ -377,6 +406,7 @@ Task 后的提炼使用独立无工具调用，不继承完全访问。完全访
 - **Agents**（三栏工作台）：左侧选择 Agent，中间编辑配置，右侧查看真实的 CLI 状态、当前空间/飞书群绑定和该 Agent 最近处理的 Chat / 研究任务运行。Chat 记录会固定归属到实际处理它的 Agent，并可从 Recent runs 进入对应的原始消息详情。支持新建 / 删除，以及配置 **名称、Provider、Instruction（人格，会注入到回答）、Model、推理强度、Visibility、Permission、Workdir**；旧版 Pinned Skill 绑定会保留兼容，但不再限制运行时能力。编辑先保存为草稿，显式发布后才影响未来运行，发布历史不可变并支持通过新版本回滚，避免在途运行被原地改写。
   - 桌面端保持三栏并可拖拽或用方向键调整栏宽；窄屏把右侧信息收进详情抽屉，手机端在 Agent 列表和详情之间切换。页面不显示 HomeAgent 没有实现的 Mew Device、Repository、Environment、Concurrency 或独立 Chats 模块。
   - **Provider = 本机已安装的 agent CLI**（`claude` / `codex` / `trae-cli`）。所有 LLM 工作都通过当前空间配置的本机 CLI 子进程执行，homeagent 不直连网络 API。普通聊天和研究任务使用绑定 Agent 的 Permission / Workdir，并显式传入全部兼容 Skill；提炼和后台学习继续使用受限 no-tools 调用。Codex 的飞书群话题会使用 Provider 原生会话保持 Agent 问答上下文；Claude 及其他调用仍是一次性的，TRAE 当前仍只用于显式任务。后台会探测本机 CLI 的安装和可运行状态。
+  - **默认模型来源**：Agent 的 Model 留空时，同 Provider 优先继承 HomeAgent「设置」中的全局模型，选项直接显示“继承 HomeAgent 全局：模型名”；全局未指定或 Provider 不同时，显示“由 CLI 自身选择默认模型”。这里不会读取 Codex App 或终端会话当前选中的模型；Codex 仍使用独立状态目录并忽略用户配置。切换 Provider 时，选项文案同步更新。
   - **不可用时可就地恢复**：Agent 详情右侧会显示恢复卡片。Codex 账号连接异常时，“恢复 Codex”会先尝试复用本机控制台登录，仍不可用则进入官方授权。默认检测只检查命令、身份和原生命令支持，不自动执行沙箱探针。隔离模式可显式点击“检测隔离能力”；仅明确报告 elevated 后端未就绪时提供 Windows 系统授权入口，通过后显示“机器隔离探测已通过”，不等于实际 Agent/模型调用已验证。完全访问页只重新检测 CLI 连接，不发起沙箱设置或受限探针。CLI 缺失时保留同机检查命令和设置入口。
   - **Skills 自动加载**：飞书群绑定团队空间，空间再绑定 Team Agent；个人空间绑定 Personal Agent。每次普通聊天或任务启动时，HomeAgent 都会扫描当前 Provider 可用的本机 Skill 目录，把完整兼容目录交给 Agent，再由 Agent 按当前请求加载相关 Skill，无需逐个固定。旧 Agent 的 Pinned Skill 仅作为兼容配置保留，不再形成能力白名单。
     普通聊天要求查询或整理外部来源时，回答阶段会指示 Agent 先使用相关 Skill 获取证据，即使命中了只记录请求或缺口的知识页，也不能把它当作已经完成查询。没有知识页支撑的工具答案直接返回，不额外启动一次通用回答。该行为仍取决于本轮冻结 Skill、实际工具权限与来源账号授权；本机完全访问不代表已获跨 Space 查询授权，工具不可用时须说明实际阻碍。明确要求仅依据知识库的查询不启用这项补查指引。
@@ -390,7 +420,7 @@ Task 后的提炼使用独立无工具调用，不继承完全访问。完全访
     取数指令要求按冻结 Skill 和本机 CLI 帮助核对命令：指定群名先用 `+chat-search` 解析目标；正文失败先用 `+messages-mget` 分批补读，再单条补读一次；旧主题通过限定目标群、同一时间窗口的无关键词 `+messages-search` 补查，并展开发现的线程。线程回复按自身时间过滤，所有分页必须检查实际结束标志；达到 `--page-all` 上限不能视为完整。搜索索引可能延迟，这套覆盖声明仍来自 Agent 的查询结果，不是 HomeAgent 对飞书历史的独立核验。
     本机 Space 下的 `.chat-source-progress.json` 保存待补查窗口、失败消息 ID 和已完成查询截止时间，采用原子写入；最多保存 1,000 个失败 ID，文件上限 512 KiB。先登记待处理窗口，再写 Raw，全部落盘且主消息、线程、旧主题检查均完成、无失败消息时才推进增量起点。较新的局部查询不能消除旧缺口，重启后继续使用该状态；文件损坏时拒绝自动交接，不按空状态覆盖。继续/增量请求需重叠回查时间边界；明确要求“最近一周”仍查询完整一周。超出本次指定窗口的历史缺口会提示，不自动扩大正文查询范围。历史编辑仅在消息被再次查询且返回编辑时间时发现，不保证扫描所有旧消息的编辑。
     明确来源目标的进度按声明的群名或 ID 存在 `.chat-source-progress/<摘要>.json`；与当前群默认进度分开，并记录实际 `sourceChatId`。同名目标解析到不同 ID 时重新建立基线，不沿用旧群的进度；通过其他名称或 ID 重新指定同一群时可能重新查询，Raw 仍按真实来源 ID 去重。失败消息不会作为正常正文入库，附件不自动下载。查询进度是本机工作流状态，不进入 Space 归档；群绑定或 Agent 绑定变更后旧进度不复用，删除 Space 时一并移除。没有实际入库回执，Agent 不应声称已入库或手工写运行中的数据目录。补查在下一次用户请求内执行，不创建后台定时任务。
-    Codex 单个 Skill bundle 最多 16 MiB / 50,000 个条目；完整目录的临时副本总预算为 128 MiB / 200,000 个条目，逐个捕获、散列核验后复制。总预算超限会停止整次调用并清理副本，不会删除尾部 Skill 后继续运行。隔离模式的原生调用只为本轮独占、已验证且仅含这些副本的临时根目录授予读取权限，避免逐个路径重复出现在 Windows 命令行中；不会授予本机 Skill 源目录或整个临时目录的访问权。完全访问仍使用冻结副本，但不提供文件访问隔离。
+    单个 Skill bundle 最多 128 MiB / 50,000 个条目，包含 `node_modules` 等已安装依赖并对其完整散列；元数据扫描的总读取预算仍为 16 MiB，与执行包体积分别计算。Codex 完整目录的临时副本总预算为 128 MiB / 200,000 个条目，逐个捕获、散列核验后复制。总预算超限会停止整次调用并清理副本，不会删除尾部 Skill 后继续运行。隔离模式的原生调用只为本轮独占、已验证且仅含这些副本的临时根目录授予读取权限，避免逐个路径重复出现在 Windows 命令行中；不会授予本机 Skill 源目录或整个临时目录的访问权。完全访问仍使用冻结副本，但不提供文件访问隔离。
   - **仍隔离环境规则**：运行不会继承用户级规则、Hooks、Plugins、Codex 自动 Skill 发现或无关 Provider 会话历史；唯一例外是显式匹配到同一飞书话题、且冻结执行配置兼容的 Codex 原生父会话。HomeAgent 会在每次调用前按冻结摘要捕获 Skill bundle，复制到本轮私有临时目录并对副本复验，只把这份副本的唯一 `name → SKILL.md` 映射交给 Codex；live 目录变化会 fail-closed，项目 `.agents/.codex`、ambient 用户目录和管理层 Skill 不会被自动注入。两种模式的路由/分类和最终生成都使用同一冻结契约，只有最终生成携带原生会话；fork prompt 会声明忽略历史 turn 中已清理的旧临时 Skill 路径。每个原生 turn 都会无模型验证 MCP 严格为空；隔离模式另外以 exact filesystem profile 验证允许目录可读、隔离 `CODEX_HOME` 与仅受根拒绝规则保护的数据目录 sentinel 均不可读。完全访问不运行这些文件隔离探针，但仍检查身份、版本、MCP、Workdir、Skill 和本机授权。门禁不成立时实际调用 fail-closed，不自动降级；机器级诊断通过不能代替本次 Agent 检查。任务和 Chat Run 会记录冻结的 Skill 列表，方便审计。
   - **一话题一条原生会话链**：Codex 话题按 `chatId + rootMessageId` 隔离，首轮新建、后续从最近一次成功且已确认送达的结果 fork；路由、分类和未触发回答的群消息不会伪装成 Provider 历史。当前消息正文以及明确回复目标的正文或图片仍可作为本 turn 的来源上下文，但不会用“同一 chat 最近两分钟的附件”启发式跨话题补上下文。Provider 回答与 Chat Run 成功状态会在同一原子提交中暂存新的 child，只有飞书送达状态也成功落盘后才允许后续 turn 复用；外发失败、送达落盘不确定或重启时仍 pending 都会废弃该 head，下次重新开始。Provider 在产出 child 前失败、取消、超时或进程中断则保留旧 head；父会话丢失、产生静态产品回复或执行一次 Claude 等无原生会话的可见 turn 时废弃旧 head。Agent revision、Instruction、Provider、Model、Permission、Workdir 或 Skill 证据变化也会开启新会话。共享话题只读取 Team Space，避免把某位成员的 Personal Space 内容留进多人可续接的 Provider 历史。
   - **群话题不自动降级**：Codex 原生会话预检失败后不会再次发起无话题记忆的普通调用，也不会自动把 `full` 改成 `write`。旧或未确认 `full` 的配置/授权问题会明确提示；只读需求选 `read-only`，需要写工作目录才选 `write`，保存并发布后仅影响新运行。两种受限权限仍须通过平台隔离检查；显式完全访问则须另行确认无沙箱风险，不能称作修好了 Windows 沙箱。重试继续使用原冻结计划；需要采用新权限或全量 Skill 目录时应新建一次请求。
@@ -399,6 +429,7 @@ Task 后的提炼使用独立无工具调用，不继承完全访问。完全访
     新运行的已识别准备失败另保留固定的阶段/原因码及退出码，或 Skill 超限时的请求数/已准备数；即使没有 Provider 工具输出，也能说明这次停在哪项检查。它们不是原始日志，不会把未识别的 Provider 文本直接展示给用户。
   - **本机会话边界**：HomeAgent 只保存有界的“话题 → Provider 会话 ID”路由，不自行维护消息历史。该路由可随同一数据目录重启，但不会进入 `homeagent.space` 导出；恢复备份或 Provider 本机历史不可用时会重新开始。删除 Space 或撤回相关消息会废弃 HomeAgent 路由，但 Provider CLI 账户下的本机副本仍由对应 Provider 管理。
   - **本机 Skill 目录**：共享 Skill 来自 `~/.agents/skills`；Codex 专属 Skill 只从与子进程相同的 `<dataDir>/provider-state/codex/skills`（或显式 `HOMEAGENT_CODEX_HOME/skills`）发现，不扫描 ambient `~/.codex` 的 Plugin/Vendor 目录，因为 Provider 运行已禁用这些插件。Claude 和 TRAE 仍使用各自可发现的原生目录。各来源按 Provider 兼容性、优先级和同名遮蔽规则生成有效目录；同名同内容合并展示，同名不同内容标出冲突，页面不暴露绝对路径或 `SKILL.md` 正文。跨 Provider 能力优先安装到共享目录，不要手工修改运行中的默认数据目录。
+    聊天回复只追加当前请求明确点名的不可用 Skill 告警，避免全量目录中的无关问题在每轮回复刷屏；跳过证据仍保留在 Run 中供管理后台查看。体积、文件数量、链接和读取期间内容变化等已识别原因分别显示，不再一律归为“配置无效”。
   - **当前全量模式边界**：普通聊天和研究任务都会冻结全部兼容 Skill 的名称、来源与完整目录摘要，并在调用 Provider 前重新扫描有效目录、散列完整 Skill bundle。Codex 随后把匹配内容复制到调用私有副本、对副本重算同一摘要，只授权该副本；原 Skill 目录不进入 prompt 或 permission profile。只要 `SKILL.md`、资源文件、目录路径、Skill 增删或同名来源优先级与冻结证据不一致，本次运行就会 fail-closed，Provider 不会被调用；需要按当前目录重新发起一次运行。提炼和后台学习不执行本机 Skill。
   - **图片输入的安全边界**：Codex 普通 Chat（包括飞书话题中的当前 turn）支持原生图片参数（每次最多 4 张）；其他不支持图片输入的 Provider 会明确失败，不会假装已经看过图片。
   - **Model 随 Provider 变化**：切 Provider 时 Model 下拉自动换成该 provider 的维护清单（CLI 无“列模型”接口）；Codex 当前提供 `gpt-6-astra / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna / gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex-spark`。其中 `gpt-5.6-sol` 是 GPT-5.6 Sol 的完整模型 ID；HomeAgent 日常问答优先选择较快、成本更低的 `gpt-5.6-luna`，复杂研究可选择 `gpt-5.6-terra` 或 `gpt-5.6-sol`。

@@ -43,6 +43,20 @@ describe("extractJson", () => {
 });
 
 describe("makeCliClient", () => {
+  test("reports only Provider-returned model ids for text and structured calls", async () => {
+    const seen: string[] = [];
+    const client = makeCliClient("claude", "sonnet", testAccountingDataDir, async () => ({
+      text: '{"ok":true}', model: "claude-sonnet-4-6", usage: { costBasis: "unavailable", source: "claude-json" },
+    }));
+    const onProgress = (event: import("@homeagent/shared").ProviderProgressEvent) => { if (event.model) seen.push(event.model); };
+    await client.complete({ prompt: "text", onProgress });
+    await client.completeJSON({ prompt: "json", schema: {}, onProgress });
+    expect(seen).toEqual(["claude-sonnet-4-6", "claude-sonnet-4-6"]);
+    const legacy = makeCliClient("codex", "gpt-5.6-sol", testAccountingDataDir, async () => "answer");
+    await legacy.complete({ prompt: "text", onProgress });
+    expect(seen).toHaveLength(2);
+    await expect(client.complete({ prompt: "text", onProgress: () => { throw new Error("observer failed"); } })).resolves.toEqual(expect.objectContaining({ text: '{"ok":true}' }));
+  });
   test("forwards the frozen full mode and per-process permit for routing and final calls", async () => {
     const seen: Parameters<RunProviderFn>[1][] = [];
     const permit = () => ({ register: () => () => {}, release: () => {} });

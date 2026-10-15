@@ -15,6 +15,7 @@ import {
   defaultSkillRoots,
   providerSkillRootKinds,
   SkillCatalog,
+  skillWarningViews,
 } from "./skill-catalog.ts";
 
 let dir: string;
@@ -984,6 +985,31 @@ describe("SkillCatalog", () => {
     }
   });
 
+  test("resolves installed dependencies above 16 MiB and freezes their contents", () => {
+    const root = join(dir, "skills");
+    const skillDir = join(root, "baoyu-post-to-wechat");
+    const dependencies = join(skillDir, "scripts", "node_modules", "fixture");
+    mkdirSync(dependencies, { recursive: true });
+    const skillFile = join(skillDir, "SKILL.md");
+    writeFileSync(skillFile, "---\nname: baoyu-post-to-wechat\n---\n");
+    const dependency = join(dependencies, "runtime.bin");
+    writeFileSync(dependency, Buffer.alloc(55 * 1024 * 1024, 1));
+    const catalog = new SkillCatalog({
+      roots: [{ kind: "shared-agents", path: root, providerIds: ["codex"] }],
+      // Metadata discovery has a separate budget from executable bundles.
+      limits: { maxTotalBytes: 1024 },
+    });
+    const frozen = catalog.resolveAll("codex");
+    expect(frozen.skipped).toEqual([]);
+    expect(frozen.resolved).toHaveLength(1);
+    expect(catalog.executionInputs(frozen.resolved)[0]?.directory).toBe(realpathSync(skillDir));
+
+    writeFileSync(dependency, Buffer.alloc(55 * 1024 * 1024, 2));
+    expect(catalog.resolveAll("codex").resolved[0]?.skillFileHash)
+      .not.toBe(frozen.resolved[0]!.skillFileHash);
+    expect(() => catalog.executionInputs(frozen.resolved)).toThrow("Skill snapshot changed after enqueue");
+  });
+
   test("keeps rejecting an oversized bundle and re-admits it once it shrinks", () => {
     const root = join(dir, "skills");
     const skillDir = join(root, "review");
@@ -998,7 +1024,7 @@ describe("SkillCatalog", () => {
     writeFileSync(bulky, "x".repeat(4096), "utf8");
     const catalog = new SkillCatalog({
       roots: [{ kind: "shared-agents", path: root, providerIds: ["codex"] }],
-      limits: { maxTotalBytes: 1024 },
+      limits: { maxBundleBytes: 1024 },
     });
     const source = catalog.refresh().sources[0]!;
     const binding = [{ sourceKey: source.sourceKey, name: source.name }];
@@ -1012,6 +1038,7 @@ describe("SkillCatalog", () => {
         sourceKey: source.sourceKey,
         code: "invalid_skill",
       });
+      expect(skillWarningViews(rejected)[0]?.message).toBe("Skill 包体积超过加载上限，已跳过");
     }
 
     // Shrinking the bundle changes its metadata, so it must be re-admitted.
@@ -1019,6 +1046,18 @@ describe("SkillCatalog", () => {
     const admitted = catalog.resolve(binding, "codex");
     expect(admitted.skipped).toEqual([]);
     expect(admitted.resolved[0]!.skillFileHash).toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  test("public invalid-Skill diagnostics never expose unknown filesystem errors", () => {
+    for (const [message, expected] of [
+      ["Skill metadata is invalid", "Skill 元数据无效，已跳过"],
+      ["Skill bundle cannot contain symbolic links", "Skill 目录包含不支持的链接，已跳过"],
+      ["Skill bundle has too many entries", "Skill 包文件数量超过加载上限，已跳过"],
+      ["EACCES: private/path/secret.txt token=secret", "Skill 配置无效，已跳过"],
+    ]) {
+      expect(skillWarningViews({ skipped: [{ name: "review", code: "invalid_skill", message: message! }] })[0]?.message)
+        .toBe(expected!);
+    }
   });
 
   test("returns a stable bundle hash while the bundle is untouched", () => {

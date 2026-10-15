@@ -20,7 +20,7 @@
  * gateway.ts, not here; it is always available and is the default.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { AI_OPERATION_TIMEOUT_MS, brandedEnv, config, logger, type ProviderProgressEvent, type PublicRunTool } from "@homeagent/shared";
+import { AI_OPERATION_TIMEOUT_MS, brandedEnv, config, logger, normalizeFeishuAppId, publicModelId, type ProviderProgressEvent, type PublicRunTool } from "@homeagent/shared";
 import {
   chmodSync,
   closeSync,
@@ -45,7 +45,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ImageInput } from "./gateway.ts";
 import { codexExecutionEvidenceFromLine, collectCodexExecutionEvidence, type ProviderExecutionEvidence, type ProviderExecutionMetadata } from "./execution-evidence.ts";
-import { ProviderPreparationError, SkillStagingBudget, NATIVE_SESSION_ISSUE_LABELS, type NativeSessionIssue } from "./provider-preparation.ts";
+import { ProviderPreparationError, SkillStagingBudget, SKILL_STAGING_MAX_BYTES, NATIVE_SESSION_ISSUE_LABELS, type NativeSessionIssue } from "./provider-preparation.ts";
 import { resolveCodexExecutionPolicy, type CodexExecutionMode } from "./codex-execution-policy.ts";
 
 const log = logger.child("providers");
@@ -167,6 +167,8 @@ interface CliSpec {
 }
 
 export interface RunInput {
+  /** Stable local app selected by HomeAgent, never the ambient CLI default. */
+  larkProfile?: string;
   /** Core owns authorization. Held only through synchronous spawn/cancel registration. */
   acquireExecutionPermit?: () => ProviderExecutionPermit;
   /** Private, redacted metadata only; never part of the model prompt or argv. */
@@ -297,7 +299,6 @@ function sandboxForPermission(
 // profile below also enforces a platform-specific encoded argv ceiling.
 const MAX_PROVIDER_SKILL_INPUTS = 2_000;
 const MAX_PROVIDER_SKILL_BUNDLE_ENTRIES = 50_000;
-const MAX_PROVIDER_SKILL_BUNDLE_BYTES = 16 * 1024 * 1024;
 const MAX_CODEX_NATIVE_PERMISSION_CONFIG_CHARS = process.platform === "win32"
   ? 20_000
   : 128_000;
@@ -330,7 +331,9 @@ function sameFileIdentity(
 function snapshotProviderSkillBundle(
   skillFile: string,
   maxEntries = MAX_PROVIDER_SKILL_BUNDLE_ENTRIES,
-  maxTotalBytes = MAX_PROVIDER_SKILL_BUNDLE_BYTES,
+  // Installed runtime dependencies are part of the frozen bundle. A single
+  // Skill may use the existing catalog staging budget; do not discard them.
+  maxTotalBytes = SKILL_STAGING_MAX_BYTES,
 ): ProviderSkillBundleSnapshot {
   const root = dirname(skillFile);
   const rootBefore = lstatSync(root);
@@ -870,6 +873,7 @@ const CODEX_TOOL_ENVIRONMENT_KEYS = process.platform === "win32"
  */
 export function providerChildEnvironment(
   source: NodeJS.ProcessEnv = process.env,
+  larkProfile?: string,
 ): Record<string, string> {
   const normalized = new Map<string, string>();
   for (const [key, value] of Object.entries(source)) {
@@ -886,6 +890,11 @@ export function providerChildEnvironment(
   environment.CODEX_HOME = providerCodexHome(source);
   const configuredClaudeHome = brandedEnv(source, "CLAUDE_CONFIG_DIR")?.trim();
   if (configuredClaudeHome) environment.CLAUDE_CONFIG_DIR = resolve(configuredClaudeHome);
+  const profile = normalizeFeishuAppId(larkProfile);
+  // Explicitly override ambient profile selection, including for launchers that
+  // repopulate omitted environment values. Empty allows CLI default discovery
+  // only when HomeAgent has not selected an app yet.
+  environment.LARKSUITE_CLI_PROFILE = profile ?? "";
   return environment;
 }
 
@@ -1171,7 +1180,7 @@ const KNOWN: CliSpec[] = [
     envBin: "CLAUDE_BIN",
     versionArgs: ["--version"],
     models: ["sonnet", "opus", "haiku", "claude-sonnet-4-6", "claude-opus-4-8"],
-    buildRun: ({ system, model, execution }) => {
+    buildRun: ({ system, model, execution, onProgress }) => {
       // Safe mode preserves OAuth/keychain authentication while disabling
       // ambient CLAUDE.md, hooks, plugins, MCP servers and custom commands.
       // Explicitly pinned native Skills need Claude's Skill discovery, so those
@@ -1186,8 +1195,9 @@ const KNOWN: CliSpec[] = [
       args.push(
         "--strict-mcp-config",
         "--output-format",
-        "json",
+        onProgress ? "stream-json" : "json",
       );
+      if (onProgress) args.push("--verbose");
       if (!execution) {
         // --allowedTools only changes approval; --tools "" actually removes
         // every built-in tool from the ordinary completion process.
@@ -1257,6 +1267,7 @@ const KNOWN: CliSpec[] = [
       codexCredentialStore,
       outputSchemaPath,
       outputLastMessagePath,
+      larkProfile,
     }) => {
       // Runtime overrides plus the exec isolation flags keep ambient
       // configuration out of the call. Only an explicit Codex topic
@@ -1281,7 +1292,12 @@ const KNOWN: CliSpec[] = [
         "-c",
         "shell_environment_policy.ignore_default_excludes=false",
         "-c",
-        `shell_environment_policy.include_only=${JSON.stringify(CODEX_TOOL_ENVIRONMENT_KEYS)}`,
+        `shell_environment_policy.include_only=${JSON.stringify([
+          ...CODEX_TOOL_ENVIRONMENT_KEYS, ...(larkProfile ? ["LARKSUITE_CLI_PROFILE"] : []),
+        ])}`,
+        ...(larkProfile ? [
+          "-c", `shell_environment_policy.set.LARKSUITE_CLI_PROFILE=${JSON.stringify(normalizeFeishuAppId(larkProfile))}`,
+        ] : []),
         "-c",
         "shell_environment_policy.experimental_use_profile=false",
         "-c",
@@ -2069,6 +2085,11 @@ export function codexProgressEventFromLine(line: string, at = Date.now()): Provi
   }
   if ((event.type === "item.started" || event.type === "item.completed") && event.item && typeof event.item === "object") {
     const item = event.item as Record<string, unknown>;
+    // Codex exec's ReasoningItem.text is the SDK's public reasoning summary,
+    // not raw reasoning content or encrypted Provider state.
+    if (item.type === "reasoning" && event.type === "item.completed" && typeof item.text === "string" && item.text.trim()) {
+      return { kind: "reasoning_summary", at, title: "思考摘要", phase: "provider", visibility: "public", delta: item.text.slice(0, 4_000) };
+    }
     if (item.type === "agent_message" && event.type === "item.completed" && typeof item.text === "string" && item.text.trim()) {
       return { kind: "assistant_snapshot", at, title: "正在生成回答", phase: "answer", visibility: "public", delta: item.text };
     }
@@ -2111,6 +2132,60 @@ async function publishCodexProgress(
   }
 }
 
+/** Only public assistant text and tool metadata cross the progress boundary. */
+export function createClaudeProgressParser(): (line: string, at?: number) => ProviderProgressEvent[] {
+  const tools = new Map<string, PublicRunTool["type"]>();
+  return (line, at = Date.now()) => {
+    if (!line.trim() || line.length > 1_048_576) return [];
+    let raw: unknown;
+    try { raw = JSON.parse(line); } catch { return []; }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+    const event = raw as Record<string, unknown>;
+    // Subagent messages have a different audience; the parent supplies public updates.
+    if (event.parent_tool_use_id) return [];
+    if (event.type !== "assistant" && event.type !== "user") return [];
+    if (!event.message || typeof event.message !== "object" || Array.isArray(event.message)) return [];
+    const content = (event.message as Record<string, unknown>).content;
+    if (!Array.isArray(content)) return [];
+    const progress: ProviderProgressEvent[] = [];
+    for (const rawBlock of content) {
+      if (!rawBlock || typeof rawBlock !== "object" || Array.isArray(rawBlock)) continue;
+      const block = rawBlock as Record<string, unknown>;
+      if (event.type === "assistant" && block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+        progress.push({ kind: "assistant_snapshot", at, title: "Agent 进度说明", phase: "answer", visibility: "public", delta: block.text });
+      } else if (event.type === "assistant" && block.type === "tool_use") {
+        const name = typeof block.name === "string" ? block.name : "";
+        const type: PublicRunTool["type"] = name === "Bash" ? "command"
+          : ["Read", "Glob", "Grep"].includes(name) ? "file-read"
+          : ["Edit", "Write", "NotebookEdit"].includes(name) ? "file-change"
+          : ["WebSearch", "WebFetch"].includes(name) ? "web-search"
+          : name.startsWith("mcp__") ? "mcp" : "other";
+        // Match the journal's event budget without retaining unbounded provider ids.
+        if (typeof block.id === "string" && block.id.length <= 200 && tools.size < 2_000) tools.set(block.id, type);
+        progress.push({ kind: "tool", at, title: "工具开始执行", phase: "tool", visibility: "public", tool: { type, status: "running" } });
+      } else if (event.type === "user" && block.type === "tool_result") {
+        const id = typeof block.tool_use_id === "string" ? block.tool_use_id : "";
+        const type = tools.get(id) ?? "other";
+        tools.delete(id);
+        const failed = block.is_error === true;
+        progress.push({ kind: "tool", at, title: failed ? "工具执行失败" : "工具执行完成", phase: "tool", visibility: "public", tool: { type, status: failed ? "failed" : "completed" } });
+      }
+    }
+    return progress;
+  };
+}
+
+function claudeProgressObserver(observer: NonNullable<RunInput["onProgress"]>): (line: string) => Promise<void> {
+  const parse = createClaudeProgressParser();
+  return async line => {
+    for (const progress of parse(line)) {
+      try { await observer(progress); } catch {
+        log.warn("provider progress observer failed", { provider: "claude" });
+      }
+    }
+  };
+}
+
 async function readTextStream(
   stream: ReadableStream<Uint8Array>,
   onLine: (line: string) => void | Promise<void>,
@@ -2151,6 +2226,7 @@ async function runCmd(
   beforeSpawn?: () => void,
   onStarted?: () => void,
   onStdoutLine?: (line: string) => void | Promise<void>,
+  larkProfile?: string,
 ): Promise<{
   code: number | null;
   stdout: string;
@@ -2167,7 +2243,7 @@ async function runCmd(
   }
   let unregister: (() => void) | undefined;
   const spawn = () => Bun.spawn([bin, ...args], {
-    cwd, env: providerChildEnvironment(), stdout: "pipe", stderr: "pipe",
+    cwd, env: providerChildEnvironment(process.env, larkProfile), stdout: "pipe", stderr: "pipe",
     stdin: stdin === undefined ? "ignore" : "pipe",
   });
   let proc: ReturnType<typeof spawn>;
@@ -2842,7 +2918,11 @@ export async function runProviderDetailed(
         stagedSkillInputs?.verify?.();
       } : undefined,
       () => { if (metadata) metadata.process = "started"; log.info("running local provider", { id, bin }); },
-      id === "codex" && input.onProgress ? (line) => publishCodexProgress(line, input.onProgress!) : undefined,
+      input.onProgress
+        ? id === "codex" ? (line) => publishCodexProgress(line, input.onProgress!)
+          : id === "claude" ? claudeProgressObserver(input.onProgress) : undefined
+        : undefined,
+      prepared.larkProfile,
     );
     if (id === "codex") {
       collectedEvidence = collectCodexExecutionEvidence(stdout);
@@ -2856,7 +2936,7 @@ export async function runProviderDetailed(
         if (parsed) {
           throw new ProviderRunError(
             id,
-            `provider ${id} exited ${code}: ${providerFailureDetail(stdout, stderr)}`,
+            `provider ${id} exited ${code}: ${input.onProgress ? "stream execution failed" : providerFailureDetail(stdout, stderr)}`,
             parsed.usage,
           );
         }
@@ -2871,10 +2951,12 @@ export async function runProviderDetailed(
           );
         }
       }
-      throw new Error(`provider ${id} exited ${code}: ${providerFailureDetail(stdout, stderr)}`);
+      const detail = id === "claude" && input.onProgress ? "stream execution failed" : providerFailureDetail(stdout, stderr);
+      throw new Error(`provider ${id} exited ${code}: ${detail}`);
     }
     if (id === "claude") {
       const parsed = parseClaudeResult(stdout);
+      if (input.onProgress && !parsed) throw new Error("provider claude did not return a final result");
       return validateNativeSessionResult(
         prepared.nativeSession,
         parsed ?? unavailableResult(stdout, "legacy-text"),
@@ -2886,6 +2968,7 @@ export async function runProviderDetailed(
         return validateNativeSessionResult(prepared.nativeSession, {
           text: readCodexFinalOutput(stagedSchema.outputPath, prepared.maxTokens),
           usage: parsed?.usage ?? unavailableResult("", "codex-jsonl").usage,
+          ...(parsed?.model ? { model: parsed.model } : {}),
           nativeSessionId: parsed?.nativeSessionId,
         });
       }
@@ -3005,7 +3088,17 @@ function parseClaudeResult(stdout: string): ProviderRunResult | undefined {
   try {
     raw = JSON.parse(stdout.trim());
   } catch {
-    return undefined;
+    // stream-json ends with the same result envelope as the one-shot JSON mode.
+    for (const line of stdout.trim().split(/\r?\n/u).reverse()) {
+      try {
+        const candidate: unknown = JSON.parse(line);
+        if (candidate && typeof candidate === "object" && !Array.isArray(candidate)
+          && "type" in candidate && candidate.type === "result") {
+          raw = candidate;
+          break;
+        }
+      } catch { /* Ignore non-result diagnostics. */ }
+    }
   }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const result = raw as Record<string, unknown>;
@@ -3040,9 +3133,30 @@ function parseClaudeResult(stdout: string): ProviderRunResult | undefined {
     );
   }
   if (typeof result.result !== "string") return undefined;
+  let model = publicModelId(result.model);
+  // stream-json identifies the root session and each root assistant message.
+  // Child tool/subagent messages cannot replace the model used for this reply.
+  for (const line of stdout.split(/\r?\n/u)) {
+    if (line.length > 1_048_576) continue;
+    try {
+      const event: unknown = JSON.parse(line);
+      if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+      const item = event as Record<string, unknown>;
+      if (item.parent_tool_use_id) continue;
+      if (item.type === "system" && item.subtype === "init") model = publicModelId(item.model) ?? model;
+      if (item.type === "assistant" && item.message && typeof item.message === "object" && !Array.isArray(item.message)) {
+        model = publicModelId((item.message as Record<string, unknown>).model) ?? model;
+      }
+    } catch { /* Legacy one-shot JSON may span multiple lines. */ }
+  }
+  if (!model && result.modelUsage && typeof result.modelUsage === "object" && !Array.isArray(result.modelUsage)) {
+    const models = Object.keys(result.modelUsage);
+    if (models.length === 1) model = publicModelId(models[0]);
+  }
   return {
     text: result.result.trim(),
     usage,
+    ...(model ? { model } : {}),
     nativeSessionId: nativeSessionId(result.session_id),
   };
 }
@@ -3055,6 +3169,7 @@ function parseCodexResult(
   let failure: string | undefined;
   let rawUsage: Record<string, unknown> | undefined;
   let parsedNativeSessionId: string | undefined;
+  let model: string | undefined;
   for (const line of stdout.split(/\r?\n/u)) {
     if (!line.trim()) continue;
     let raw: unknown;
@@ -3065,6 +3180,9 @@ function parseCodexResult(
     }
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
     const event = raw as Record<string, unknown>;
+    if (["thread.started", "turn.started", "turn.completed"].includes(String(event.type))) {
+      model = publicModelId(event.model) ?? model;
+    }
     if (event.type === "thread.started") {
       parsedNativeSessionId = nativeSessionId(event.thread_id);
     }
@@ -3072,6 +3190,7 @@ function parseCodexResult(
       const item = event.item as Record<string, unknown>;
       if (item.type === "agent_message" && typeof item.text === "string") {
         lastText = item.text;
+        model = publicModelId(item.model) ?? model;
       }
     }
     if (
@@ -3109,6 +3228,7 @@ function parseCodexResult(
   return {
     text: text.trim(),
     usage,
+    ...(model ? { model } : {}),
     nativeSessionId: parsedNativeSessionId,
   };
 }

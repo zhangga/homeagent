@@ -19,7 +19,7 @@ export type RunEventKind =
 export type RunEventVisibility = "public" | "operator";
 export type RunEventPhase = "queue" | "prepare" | "provider" | "tool" | "answer" | "delivery";
 export type RunEventStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled" | "timed_out";
-export type PublicToolKind = "command" | "file-change" | "mcp" | "web-search";
+export type PublicToolKind = "command" | "file-read" | "file-change" | "mcp" | "web-search" | "other";
 export type PublicToolStatus = "running" | "completed" | "failed" | "unknown";
 
 export interface PublicLarkExecutionEvidence {
@@ -59,7 +59,9 @@ export type NewRunEvent = Omit<RunEvent, "schemaVersion" | "seq"> & {
 };
 
 export interface ProviderProgressEvent {
-  kind: "phase" | "tool" | "assistant_delta" | "assistant_snapshot";
+  /** Concrete model id explicitly reported by the Provider for this call. */
+  model?: string;
+  kind: "phase" | "tool" | "assistant_delta" | "assistant_snapshot" | "reasoning_summary";
   at: number;
   title: string;
   detail?: string;
@@ -67,4 +69,11 @@ export interface ProviderProgressEvent {
   visibility?: RunEventVisibility;
   phase?: RunEventPhase;
   tool?: PublicRunTool;
+}
+
+/** Model metadata is displayable only as a bounded identifier, never diagnostics. */
+export function publicModelId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const model = value.trim();
+  return /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,199}$/u.test(model) ? model : undefined;
 }

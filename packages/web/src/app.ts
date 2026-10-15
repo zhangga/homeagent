@@ -833,6 +833,7 @@ export function createWebApp(opts: WebOptions): Hono {
     saveSettings({
       feishuBotName: identity.botName,
       feishuBotOpenId: identity.botOpenId,
+      feishuAppId: status.appId,
       feishuConnectionDisabledAppId: "",
     });
     return true;
@@ -941,7 +942,8 @@ export function createWebApp(opts: WebOptions): Hono {
     const identity = verifiedBotIdentity(lark);
     if (
       identity
-      && (before.feishuBotName !== identity.botName || before.feishuBotOpenId !== identity.botOpenId)
+      && (before.feishuBotName !== identity.botName || before.feishuBotOpenId !== identity.botOpenId
+        || before.feishuAppId !== lark.appId)
     ) {
       persistVerifiedBot(lark);
       lark = await getLarkStatus();

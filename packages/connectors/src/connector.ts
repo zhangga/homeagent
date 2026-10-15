@@ -77,6 +77,7 @@ export interface LiveReplyStep {
   seq: number;
   title: string;
   status?: string;
+  kind?: "status" | "commentary" | "summary" | "tool";
 }
 
 export interface LiveReplySnapshot {

@@ -6,6 +6,7 @@ import {
   type JSONOptions,
 } from "@homeagent/llm";
 import type { LlmClient } from "./llm.ts";
+import type { ProviderProgressEvent } from "@homeagent/shared";
 import {
   isAggregatedRunUsage,
   observeLlmUsage,
@@ -13,6 +14,42 @@ import {
 } from "./usage.ts";
 
 describe("run usage aggregation", () => {
+  test("publishes answer summaries but keeps routing summaries and structured JSON private", async () => {
+    const seen: ProviderProgressEvent[] = [];
+    const client: LlmClient = {
+      async complete() { return { text: "", model: "fake" }; },
+      async completeJSON<T>(options: JSONOptions<T>) {
+        await options.onProgress?.({ kind: "reasoning_summary", at: 100, title: "思考摘要", phase: "provider", delta: options.publicReasoningSummary ? "正在核对回答依据。" : "PRIVATE_ROUTING_SUMMARY" });
+        await options.onProgress?.({ kind: "assistant_snapshot", at: 101, title: "结构化结果", delta: "PRIVATE_JSON" });
+        throw new Error("test completion");
+      },
+    };
+    const observed = observeLlmUsage(client, () => {}, undefined, event => { seen.push(event); });
+    await expect(observed.completeJSON({ schema: {}, prompt: "route" })).rejects.toThrow("test completion");
+    await expect(observed.completeJSON({ schema: {}, prompt: "answer", publicReasoningSummary: true })).rejects.toThrow("test completion");
+    expect(seen.map(event => event.delta)).toEqual(["正在核对回答依据。"]);
+  });
+  test("publishes public completion notes but suppresses internal structured routing text", async () => {
+    const seen: ProviderProgressEvent[] = [];
+    const emit = async (options: { onProgress?: (event: ProviderProgressEvent) => void | Promise<void> }, text: string) => {
+      await options.onProgress?.({ kind: "assistant_snapshot", at: 100, title: "公开说明", delta: text });
+      await options.onProgress?.({ kind: "phase", at: 101, title: "Provider 执行完成", phase: "provider" });
+    };
+    const client: LlmClient = {
+      async complete(options) {
+        await emit(options, "先核对构建状态");
+        return { text: "完成", model: "fake" };
+      },
+      async completeJSON<T>(options: JSONOptions<T>) {
+        await emit(options, "PRIVATE_ROUTING_JSON");
+        throw new Error("routing stopped");
+      },
+    };
+    const observed = observeLlmUsage(client, () => {}, undefined, event => { seen.push(event); });
+    await observed.complete({ prompt: "answer" });
+    await expect(observed.completeJSON({ prompt: "route", schema: {} })).rejects.toThrow("routing stopped");
+    expect(seen.map(event => event.delta ?? event.title)).toEqual(["先核对构建状态", "Provider 执行完成", "Provider 执行完成"]);
+  });
   test("keeps partial token and cost coverage explicit", () => {
     const accumulator = new RunUsageAccumulator();
     accumulator.record({

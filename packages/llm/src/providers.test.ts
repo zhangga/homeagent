@@ -11,14 +11,16 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
-import { providerPreparationFailure, ProviderPreparationError } from "./provider-preparation.ts";
+import { providerPreparationFailure, ProviderPreparationError, SKILL_STAGING_MAX_BYTES } from "./provider-preparation.ts";
 import type { ProviderExecutionEvidence } from "./execution-evidence.ts";
 import {
   codexProgressEventFromLine,
+  createClaudeProgressParser,
   codexReasoningEffortsForModel,
   curatedProviderModels,
   detectProviders,
@@ -40,7 +42,51 @@ const READ_ONLY_EXECUTION = {
   skills: [],
 };
 
-test("maps Codex JSONL to safe live progress and drops reasoning", () => {
+test("passes only the HomeAgent-selected Lark profile into provider tools", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ha-provider-lark-profile-"));
+  const previousBin = process.env.HOMEAGENT_TRAE_BIN;
+  const previousProfile = process.env.LARKSUITE_CLI_PROFILE;
+  try {
+    process.env.HOMEAGENT_TRAE_BIN = writeEnvironmentReportingProvider(directory);
+    process.env.LARKSUITE_CLI_PROFILE = "cli_daily_avatar";
+    const output = await runProviderDetailed("trae-cli", {
+      prompt: "read weekly sources", execution: READ_ONLY_EXECUTION, larkProfile: "cli_homeagent",
+    }, 5_000);
+    expect(JSON.parse(output.text).LARKSUITE_CLI_PROFILE).toBe("cli_homeagent");
+    const unconfigured = await runProviderDetailed("trae-cli", {
+      prompt: "read weekly sources", execution: READ_ONLY_EXECUTION,
+    }, 5_000);
+    expect(JSON.parse(unconfigured.text).LARKSUITE_CLI_PROFILE).toBe("");
+    expect(process.env.LARKSUITE_CLI_PROFILE).toBe("cli_daily_avatar");
+  } finally {
+    if (previousBin === undefined) delete process.env.HOMEAGENT_TRAE_BIN;
+    else process.env.HOMEAGENT_TRAE_BIN = previousBin;
+    if (previousProfile === undefined) delete process.env.LARKSUITE_CLI_PROFILE;
+    else process.env.LARKSUITE_CLI_PROFILE = previousProfile;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Codex explicitly retains the selected Lark profile in its shell environment policy", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ha-codex-lark-profile-"));
+  const previousBin = process.env.HOMEAGENT_CODEX_BIN;
+  try {
+    process.env.HOMEAGENT_CODEX_BIN = writeArgAndStdinReportingCodexProvider(directory);
+    const output = await runProviderDetailed("codex", {
+      prompt: "summarize weekly documents", execution: READ_ONLY_EXECUTION, larkProfile: "cli_homeagent",
+    }, 5_000);
+    const report = JSON.parse(output.text) as { args: string[] };
+    expect(report.args).toContain('shell_environment_policy.set.LARKSUITE_CLI_PROFILE="cli_homeagent"');
+    const allowed = report.args.find(arg => arg.startsWith("shell_environment_policy.include_only="))!;
+    expect(JSON.parse(allowed.slice(allowed.indexOf("=") + 1))).toContain("LARKSUITE_CLI_PROFILE");
+  } finally {
+    if (previousBin === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+    else process.env.HOMEAGENT_CODEX_BIN = previousBin;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("maps Codex JSONL to safe live progress", () => {
   expect(codexProgressEventFromLine(JSON.stringify({
     type: "item.completed",
     item: { type: "agent_message", text: "阶段结果" },
@@ -54,8 +100,188 @@ test("maps Codex JSONL to safe live progress and drops reasoning", () => {
     tool: { type: "web-search", status: "running" },
   });
   expect(codexProgressEventFromLine(JSON.stringify({
-    type: "item.completed", item: { type: "reasoning", text: "hidden chain" },
+    type: "item.completed", item: { type: "reasoning_raw_content", text: "hidden chain" },
   }), 125)).toBeUndefined();
+});
+
+test("forwards the Codex SDK reasoning summary even when no tool is called", () => {
+  const progress = codexProgressEventFromLine(JSON.stringify({
+    type: "item.completed", item: { id: "summary_1", type: "reasoning", text: "先核对会话返回的模型信息，再说明能够确认的范围。" },
+  }), 123);
+  expect(progress).toEqual({
+    kind: "reasoning_summary", at: 123, title: "思考摘要", phase: "provider", visibility: "public",
+    delta: "先核对会话返回的模型信息，再说明能够确认的范围。",
+  });
+  expect(codexProgressEventFromLine(JSON.stringify({
+    type: "item.completed", item: { type: "reasoning", text: "摘".repeat(4_001), encrypted_content: "PRIVATE_ENCRYPTED" },
+  }))?.delta).toBe("摘".repeat(4_000));
+  for (const item of [
+    { type: "reasoning", text: " ", encrypted_content: "PRIVATE_ENCRYPTED" },
+    { type: "reasoning", content: [{ type: "reasoning_text", text: "PRIVATE_RAW" }] },
+    { type: "reasoning", summary: [{ type: "summary_text", text: "different protocol" }] },
+  ]) expect(codexProgressEventFromLine(JSON.stringify({ type: "item.completed", item }))).toBeUndefined();
+});
+
+test("Codex streams reasoning summaries separately from the final answer", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ha-codex-summary-stream-"));
+  const previous = process.env.HOMEAGENT_CODEX_BIN;
+  const progress: Array<{ kind: string; delta?: string }> = [];
+  try {
+    process.env.HOMEAGENT_CODEX_BIN = writeStaticProvider(directory, [
+      { type: "item.completed", item: { id: "summary", type: "reasoning", text: "先确认会话元数据。" } },
+      { type: "item.completed", item: { id: "answer", type: "agent_message", text: "未返回具体型号。" } },
+      { type: "turn.completed", usage: { input_tokens: 10, output_tokens: 2 } },
+    ].map(event => JSON.stringify(event)).join("\n"));
+    const output = await runProviderDetailed("codex", {
+      prompt: "现在使用的模型是什么", execution: READ_ONLY_EXECUTION,
+      onProgress: event => { progress.push(event); },
+    }, 5_000);
+    expect(progress.filter(event => event.delta).map(event => [event.kind, event.delta])).toEqual([
+      ["reasoning_summary", "先确认会话元数据。"], ["assistant_snapshot", "未返回具体型号。"],
+    ]);
+    expect(output.text).toBe("未返回具体型号。");
+    expect(output.usage?.outputTokens).toBe(2);
+  } finally {
+    if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN; else process.env.HOMEAGENT_CODEX_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Claude progress preserves public text/tool order and omits private blocks", () => {
+  const parse = createClaudeProgressParser();
+  const progress = parse(JSON.stringify({ type: "assistant", message: { content: [
+    { type: "thinking", thinking: "PRIVATE_THINKING" },
+    { type: "redacted_thinking", data: "PRIVATE_REDACTED" },
+    { type: "text", text: "先核对构建状态，再更新环境。" },
+    { type: "tool_use", id: "tool1", name: "Bash", input: { command: "PRIVATE_COMMAND" } },
+    { type: "tool_use", id: "tool2", name: "Read", input: { file_path: "PRIVATE_PATH" } },
+  ] } }), 123);
+  expect(progress.map(event => event.kind)).toEqual(["assistant_snapshot", "tool", "tool"]);
+  expect(progress[0]?.delta).toBe("先核对构建状态，再更新环境。");
+  expect(progress[1]?.tool).toEqual({ type: "command", status: "running" });
+  const completed = parse(JSON.stringify({ type: "user", message: { content: [
+    { type: "tool_result", tool_use_id: "tool2", content: "PRIVATE_FILE_CONTENT" },
+    { type: "tool_result", tool_use_id: "tool1", is_error: true, content: "PRIVATE_DIAGNOSTIC" },
+  ] } }), 124);
+  expect(completed.map(event => event.tool)).toEqual([
+    { type: "file-read", status: "completed" }, { type: "command", status: "failed" },
+  ]);
+  expect(JSON.stringify([...progress, ...completed])).not.toContain("PRIVATE_");
+  expect(parse(JSON.stringify({ type: "system", subtype: "init", cwd: "PRIVATE_PATH" }))).toEqual([]);
+  expect(parse(JSON.stringify({ type: "assistant", parent_tool_use_id: "subagent", message: { content: [{ type: "text", text: "PRIVATE_CHILD" }] } }))).toEqual([]);
+  expect(parse("invalid json")).toEqual([]);
+  expect(parse("x".repeat(1_048_577))).toEqual([]);
+});
+
+test("Claude preserves an explicit root-session model without guessing from multi-model usage", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ha-claude-model-metadata-"));
+  const previous = process.env.HOMEAGENT_CLAUDE_BIN;
+  try {
+    for (const sample of [
+      { events: [], result: { modelUsage: { "claude-sonnet-4-6": {} } }, expected: "claude-sonnet-4-6" },
+      { events: [], result: { modelUsage: { "claude-sonnet-4-6": {}, "claude-haiku-4-5": {} } }, expected: undefined },
+      { events: [
+        { type: "system", subtype: "init", model: "claude-sonnet-4-6" },
+        { type: "assistant", message: { model: "claude-opus-4-8", content: [{ type: "text", text: "answer" }] } },
+        { type: "assistant", parent_tool_use_id: "child", message: { model: "claude-haiku-4-5" } },
+      ], result: {}, expected: "claude-opus-4-8" },
+      { events: [], result: { model: "PRIVATE_DIAGNOSTIC\nnot a model" }, expected: undefined },
+    ]) {
+      const stdout = [...sample.events, { type: "result", subtype: "success", result: "answer", ...sample.result }].map(event => JSON.stringify(event)).join("\n");
+      process.env.HOMEAGENT_CLAUDE_BIN = writeStaticProvider(directory, stdout);
+      const output = await runProviderDetailed("claude", { prompt: "answer", model: "sonnet" }, 5_000);
+      expect(output.model).toBe(sample.expected);
+      expect(output.text).toBe("answer");
+    }
+  } finally {
+    if (previous === undefined) delete process.env.HOMEAGENT_CLAUDE_BIN; else process.env.HOMEAGENT_CLAUDE_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Codex uses only explicit model metadata and preserves an unknown CLI default", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ha-codex-model-metadata-"));
+  const previous = process.env.HOMEAGENT_CODEX_BIN;
+  try {
+    for (const model of ["gpt-5.6-sol", undefined, "x".repeat(201)]) {
+      process.env.HOMEAGENT_CODEX_BIN = writeStaticProvider(directory, [
+        { type: "turn.started", model },
+        { type: "item.completed", item: { type: "reasoning", model: "PRIVATE_REASONING_MODEL", text: "hidden" } },
+        { type: "item.completed", item: { type: "agent_message", text: "answer" } },
+        { type: "turn.completed", usage: { input_tokens: 10, output_tokens: 2 } },
+      ].map(event => JSON.stringify(event)).join("\n"));
+      const output = await runProviderDetailed("codex", { prompt: "answer", execution: READ_ONLY_EXECUTION }, 5_000);
+      expect(output.model).toBe(model === "gpt-5.6-sol" ? model : undefined);
+      expect(output.text).toBe("answer");
+    }
+  } finally {
+    if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN; else process.env.HOMEAGENT_CODEX_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Claude streams progress before exit, preserves final usage, and requests stream-json", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ha-claude-stream-"));
+  const previous = process.env.HOMEAGENT_CLAUDE_BIN;
+  const proceed = join(directory, "proceed");
+  const updates: string[] = [];
+  try {
+    const bin = writeStaticProvider(directory, "");
+    writeFileSync(join(directory, "provider.js"), [
+      'const fs = require("node:fs");',
+      'process.stdout.write(JSON.stringify({type:"assistant",message:{content:[{type:"text",text:"正在核对构建"}]}}) + "\\n");',
+      'const timer = setInterval(() => {',
+      `  if (!fs.existsSync(${JSON.stringify(proceed)})) return;`,
+      '  clearInterval(timer);',
+      '  process.stdout.write(JSON.stringify({type:"result",subtype:"success",result:JSON.stringify(process.argv.slice(2)),total_cost_usd:0.012,usage:{input_tokens:12,output_tokens:8}}) + "\\n");',
+      '}, 10);',
+    ].join("\n"));
+    process.env.HOMEAGENT_CLAUDE_BIN = bin;
+    const output = await runProviderDetailed("claude", {
+      prompt: "PRIVATE_PROMPT",
+      onProgress: event => { updates.push(event.delta ?? event.title); writeFileSync(proceed, "ok"); },
+    }, 5_000);
+    expect(updates).toEqual(["正在核对构建"]);
+    const args: string[] = JSON.parse(output.text);
+    expect(args).toContain("stream-json");
+    expect(args).toContain("--verbose");
+    expect(args).not.toContain("PRIVATE_PROMPT");
+    expect(output.usage).toEqual({ inputTokens: 12, outputTokens: 8, costUsd: 0.012, costBasis: "reported", source: "claude-json" });
+  } finally {
+    if (previous === undefined) delete process.env.HOMEAGENT_CLAUDE_BIN; else process.env.HOMEAGENT_CLAUDE_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Claude stream failures retain usage and observer errors cannot swallow the answer", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ha-claude-stream-failure-"));
+  const previous = process.env.HOMEAGENT_CLAUDE_BIN;
+  const message = JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "公开进度" }] } });
+  try {
+    process.env.HOMEAGENT_CLAUDE_BIN = writeStaticProvider(directory, message + "\n" + JSON.stringify({
+      type: "result", subtype: "success", result: "最终回答", usage: { output_tokens: 8 },
+    }));
+    const output = await runProviderDetailed("claude", { prompt: "answer", onProgress: () => { throw new Error("observer failed"); } }, 5_000);
+    expect(output.text).toBe("最终回答");
+    process.env.HOMEAGENT_CLAUDE_BIN = writeStaticProvider(directory, message + "\n" + JSON.stringify({
+      type: "result", subtype: "error_during_execution", is_error: true, usage: { output_tokens: 5 },
+    }));
+    try {
+      await runProviderDetailed("claude", { prompt: "answer", onProgress: () => {} }, 5_000);
+      throw new Error("expected failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ProviderRunError);
+      expect((error as ProviderRunError).usage?.outputTokens).toBe(5);
+    }
+    process.env.HOMEAGENT_CLAUDE_BIN = writeStaticProvider(directory, message);
+    await expect(runProviderDetailed("claude", { prompt: "answer", onProgress: () => {} }, 5_000)).rejects.toThrow("did not return a final result");
+    const privateStream = JSON.stringify({ type: "assistant", message: { content: [{ type: "thinking", thinking: "PRIVATE_THINKING" }] } });
+    process.env.HOMEAGENT_CLAUDE_BIN = writeStaticProvider(directory, privateStream, "failed-stream", 1);
+    await expect(runProviderDetailed("claude", { prompt: "answer", onProgress: () => {} }, 5_000)).rejects.toThrow("provider claude exited 1: stream execution failed");
+  } finally {
+    if (previous === undefined) delete process.env.HOMEAGENT_CLAUDE_BIN; else process.env.HOMEAGENT_CLAUDE_BIN = previous;
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 test.each([[73, "codex-home-readable"], [74, "allowed-path-unreadable"], [75, "protected-root-readable"]] as const)(
   "native preflight preserves the precise failed filesystem check (%s)", async (code, reason) => {
@@ -255,7 +481,72 @@ test("keeps the isolated Codex cache when the ambient copy is unusable", () => {
   }
 });
 
-test("stages the complete frozen catalog beyond the single-bundle byte limit", async () => {
+test("stages a Skill with 55 MiB of installed dependencies without dropping them", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-codex-skill-dependencies-")));
+  const previous = process.env.HOMEAGENT_CODEX_BIN;
+  const skillDirectory = join(root, "skill");
+  const dependencies = join(skillDirectory, "scripts", "node_modules", "fixture");
+  const workdir = join(root, "workdir");
+  const dataRoot = join(root, "data");
+  const stagedBefore = stagedCodexSkillDirectories();
+  try {
+    mkdirSync(dependencies, { recursive: true });
+    mkdirSync(workdir);
+    mkdirSync(dataRoot);
+    const skillFile = join(skillDirectory, "SKILL.md");
+    writeFileSync(skillFile, "# Installed Skill\n");
+    const dependency = Buffer.alloc(55 * 1024 * 1024, 7);
+    writeFileSync(join(dependencies, "runtime.bin"), dependency);
+    const bundleHash = hashProviderSkillBundle(skillFile);
+    process.env.HOMEAGENT_CODEX_BIN = writeArgAndStdinReportingCodexProvider(root);
+    let inspected = false;
+    const output = await runProviderDetailed("codex", {
+      prompt: "use installed dependencies", protectedDataRoot: dataRoot,
+      execution: { permission: "read-only", workdir, skills: ["installed"], skillMode: "all" },
+      skillInputs: [{ name: "installed", directory: skillDirectory, skillFile, bundleHash }],
+      acquireExecutionPermit: () => {
+        const staged = stagedCodexSkillDirectories().filter(name => !stagedBefore.includes(name));
+        expect(staged).toHaveLength(1);
+        const stagedDirectory = join(realpathSync(tmpdir()), staged[0]!, "skill-0000");
+        expect(readFileSync(join(stagedDirectory, "scripts", "node_modules", "fixture", "runtime.bin")))
+          .toEqual(dependency);
+        expect(hashProviderSkillBundle(join(stagedDirectory, "SKILL.md"))).toBe(bundleHash);
+        inspected = true;
+        return { register: () => () => {}, release: () => {} };
+      },
+    }, 5000);
+    expect(inspected).toBe(true);
+    expect(JSON.parse(output.text).prompt).toContain("- installed: ");
+    expect(stagedCodexSkillDirectories()).toEqual(stagedBefore);
+  } finally {
+    if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+    else process.env.HOMEAGENT_CODEX_BIN = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a single Skill remains bounded by the catalog staging byte budget", () => {
+  const root = mkdtempSync(join(tmpdir(), "ha-skill-byte-boundary-"));
+  try {
+    const skillFile = join(root, "SKILL.md");
+    const metadata = "# Skill\n";
+    writeFileSync(skillFile, metadata);
+    const payload = join(root, "payload.bin");
+    writeFileSync(payload, "");
+    truncateSync(payload, SKILL_STAGING_MAX_BYTES + 1);
+    expect(() => hashProviderSkillBundle(skillFile)).toThrow("Skill bundle is too large");
+
+    // Exercise the inclusive boundary without allocating another large bundle.
+    truncateSync(payload, 1024 - Buffer.byteLength(metadata));
+    expect(hashProviderSkillBundle(skillFile, 50_000, 1024)).toMatch(/^[a-f0-9]{64}$/u);
+    truncateSync(payload, 1025 - Buffer.byteLength(metadata));
+    expect(() => hashProviderSkillBundle(skillFile, 50_000, 1024)).toThrow("Skill bundle is too large");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("stages the complete frozen catalog beyond 16 MiB", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-codex-skill-budget-")));
   const providerDirectory = join(root, "provider");
   const dataRoot = join(root, "data");
@@ -264,14 +555,14 @@ test("stages the complete frozen catalog beyond the single-bundle byte limit", a
   mkdirSync(dataRoot, { recursive: true });
   mkdirSync(workdir, { recursive: true });
 
-  // The whole catalog has its own aggregate budget, not one bundle's limit.
+  // Catalog staging must retain both complete bundles.
   const names = ["fits-first", "over-budget"];
   const skillInputs = names.map((name) => {
     const directory = join(root, "skills", name);
     mkdirSync(directory, { recursive: true });
     const skillFile = join(directory, "SKILL.md");
     writeFileSync(skillFile, `# ${name}\n`, "utf8");
-    // 9 MiB each: together they exceed the single-bundle 16 MiB ceiling.
+    // 9 MiB each: together they exceed the former single-bundle ceiling.
     writeFileSync(join(directory, "payload.bin"), Buffer.alloc(9 * 1024 * 1024, 1));
     return { name, directory, skillFile, bundleHash: hashProviderSkillBundle(skillFile) };
   });

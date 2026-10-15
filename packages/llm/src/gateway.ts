@@ -251,6 +251,8 @@ export async function complete(opts: CompleteOptions): Promise<CompleteResult> {
 }
 
 export interface JSONOptions<_T> extends CompleteOptions {
+  /** Answer synthesis may publish Provider summaries; routing/classification may not. */
+  publicReasoningSummary?: boolean;
   /** JSON schema for the structured result (Anthropic input_schema shape) */
   schema: Record<string, unknown>;
   /** validate + narrow the raw parsed object; throw to reject */

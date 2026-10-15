@@ -72,8 +72,9 @@ export function providerPreparationFailure(error: unknown): ProviderPreparationF
     ? structuredClone(error.evidence) : undefined;
 }
 
-// The complete catalog has a separate aggregate ceiling from each 16 MiB bundle.
-// Capture/verify one bundle at a time; fail the whole invocation at capacity.
+// A bundle, including installed dependencies, may use this byte budget.
+// Capture/verify one bundle at a time; the complete catalog shares the same
+// aggregate ceiling and fails the whole invocation at capacity.
 export const SKILL_STAGING_MAX_BYTES = 128 * 1024 * 1024;
 export const SKILL_STAGING_MAX_ENTRIES = 200_000;
 export class SkillStagingBudget {
