@@ -9,6 +9,8 @@ const testDataDir = mkdtempSync(join(tmpdir(), "homeagent-bun-test-"));
 // pinned to the same per-process directory as a safe fallback.
 process.env.HOMEAGENT_DATA_DIR = testDataDir;
 process.env.HOMEBRAIN_DATA_DIR = testDataDir;
+// Model inheritance must never depend on the developer's personal Codex config.
+process.env.CODEX_HOME = join(testDataDir, "console-codex");
 
 process.once("exit", () => {
   rmSync(testDataDir, { recursive: true, force: true });

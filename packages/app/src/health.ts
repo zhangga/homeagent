@@ -222,14 +222,14 @@ export function createSystemHealthReporter(
         status: locallyDisabled
           ? "degraded"
           : connector.ready
-            ? "ok"
+            ? pendingConsumers.length > 0 ? "degraded" : "ok"
             : failedConsumers.length > 0
               ? "down"
               : "degraded",
         summary: locallyDisabled
           ? "飞书连接已在 HomeAgent 中停用"
           : connector.ready
-            ? "飞书事件消费者已就绪"
+            ? pendingConsumers.length > 0 ? "飞书消息监听已就绪；卡片回调监听未就绪" : "飞书事件消费者已就绪"
             : `未就绪：${pendingConsumers.map((consumer) => consumer.key).join("、") || "尚未启动"}`,
         details: { ...connector, ...(locallyDisabled ? { locallyDisabled: true } : {}) },
       };

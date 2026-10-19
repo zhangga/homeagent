@@ -58,7 +58,19 @@ export interface BotAddedEvent {
   createdAt: number;
 }
 
-export type InboundEvent = InboundMessage | BotAddedEvent;
+/** A verified transport callback, kept out of message capture and model prompts. */
+export interface CardActionEvent {
+  kind: "card_action";
+  eventId: string;
+  chatId: string;
+  messageId: string;
+  operatorId: string;
+  actionTag: string;
+  actionValue: Record<string, unknown>;
+  createdAt: number;
+}
+
+export type InboundEvent = InboundMessage | BotAddedEvent | CardActionEvent;
 
 /** How the orchestrator asks a connector to send a reply. */
 export interface OutboundReply {
@@ -153,6 +165,10 @@ export interface Connector {
   finalizeLiveReply?(handle: LiveReplyHandle, snapshot: LiveReplySnapshot): Promise<void>;
   /** send a standalone message to a chat (e.g. group-added notice) */
   notice(chatId: string, markdown: string, opts?: NoticeOptions): Promise<void>;
+  /** Standalone interactive notification; transports without cards keep text notices. */
+  noticeCard?(chatId: string, card: Record<string, unknown>, opts?: NoticeOptions): Promise<void>;
+  /** Replace a card already sent by this application. */
+  updateCard?(messageId: string, card: Record<string, unknown>): Promise<void>;
   /** add a platform-native reaction while a response is being prepared */
   addReaction?(messageId: string, emojiType: string): Promise<string | undefined>;
   /** remove a previously-added platform-native reaction */

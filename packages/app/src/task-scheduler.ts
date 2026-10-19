@@ -120,7 +120,7 @@ export function formatTaskApprovalNotification(run: TaskRun): string {
     `🔐 任务「${run.taskName}」等待高权限审批`,
     "",
     `权限：${permission}`,
-    `审批截止：${new Date(approval.expiresAt).toLocaleString("zh-CN", { hour12: false })}`,
+    `审批截止：${new Date(approval.expiresAt).toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" })}`,
     `Run：${run.id}`,
     "请前往 HomeAgent 管理后台查看冻结执行计划并作出决定。",
   ].join("\n");

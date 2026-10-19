@@ -37,6 +37,7 @@ export const HOMEAGENT_FEISHU_ADDONS: AppAddons = {
       tenant: ["im.message.receive_v1", "im.chat.member.bot.added_v1"],
     },
   },
+  callbacks: { items: ["card.action.trigger"] },
 };
 
 export interface LarkAppRegistrationInput {

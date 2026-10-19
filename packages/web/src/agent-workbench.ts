@@ -378,7 +378,7 @@ function providerRecovery(
   };
 }
 
-export const AGENT_DEFAULT_MODEL_HELP = "未指定模型时，同 Provider 优先继承 HomeAgent「设置」中的全局模型；全局未指定或 Provider 不同时，由 CLI 自身选择默认模型。这里不会读取其他应用或终端会话当前选中的模型。";
+export const AGENT_DEFAULT_MODEL_HELP = "未指定模型时，同 Provider 优先继承 HomeAgent「设置」中的全局模型；Codex 随后继承本机 config.toml 中保存的模型，未保存时由 CLI 自身选择。推理强度留空时继承该文件的 model_reasoning_effort。每个新运行重新读取，进行中的运行和重试保留冻结配置；终端单次会话的临时选择不会同步。";
 
 export function agentDefaultModelLabel(
   provider: string,
@@ -386,7 +386,7 @@ export function agentDefaultModelLabel(
 ): string {
   return provider === defaults.provider && defaults.model
     ? `继承 HomeAgent 全局：${defaults.model}`
-    : "由 CLI 自身选择默认模型";
+    : provider === "codex" ? "继承本机 Codex CLI 模型" : "由 CLI 自身选择默认模型";
 }
 
 function effectiveModel(

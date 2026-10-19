@@ -101,6 +101,29 @@ describe("system health reporter", () => {
     engine.close();
   });
 
+  test("card callback failure is visible without blocking ordinary message readiness", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-card-callback-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }), runProvider: async () => "ok" });
+    try {
+      const report = createSystemHealthReporter({ engine,
+        connectorHealth: () => ({ name: "feishu", ready: true, consumers: [
+          { key: "im.message.receive_v1", state: "ready", attempts: 0 },
+          { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
+          { key: "card.action.trigger", state: "failed", attempts: 5 },
+        ] }),
+        dreamSchedulerHealth: () => loopHealth, taskSchedulerHealth: () => loopHealth,
+        requiredProviderIds: () => ["codex"],
+        detectProviders: async () => [{ id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" }],
+      });
+      const snapshot = await report();
+      expect(snapshot.ready).toBe(true);
+      expect(snapshot.components.feishu).toEqual(expect.objectContaining({ status: "degraded",
+        summary: "飞书消息监听已就绪；卡片回调监听未就绪" }));
+      expect(JSON.stringify(snapshot.components.feishu?.details)).toContain("card.action.trigger");
+    } finally { engine.close(); }
+  });
+
   test("manual foreground runtime is visible but does not make readiness fail", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hb-health-service-"));
     dirs.push(dir);

@@ -23,6 +23,11 @@ Agent revision、Instruction、Provider、Model、Permission、Workdir 或 Skill
 projection，也不进入 `homeagent.space` 归档，因为 Provider 的本机状态不可移植，归档恢复后的下一轮
 会重新开始。
 
+Codex 的模型设置在新 Run 创建时按 Agent 显式模型、同 Provider 的 HomeAgent 全局模型、本机用户
+`config.toml` 中保存的模型依次解析；推理强度优先使用 Agent 显式值，否则读取同文件的
+`model_reasoning_effort`。只读取这两个有界字段，其余用户配置继续被屏蔽。继承结果写入现有冻结执行
+计划，不增加持久化格式；本机配置变化只影响新 Run，恢复和重试继续使用原计划，也由兼容摘要区分不同模型设置。
+
 同一群话题可能由多人参与，因此绑定原生会话的回答只读取对应 Team Space，不能把任一发送者的 Personal
 Space 内容写入共享 Provider 历史。消息撤回、Space 删除或其他会使历史内容失去授权的治理操作必须废弃
 相关路由；这只阻止 HomeAgent 再次引用该会话，Provider 自己在机器账户下保留的数据仍由对应 CLI 管理。
@@ -70,7 +75,9 @@ Chat Run 的实时展示以本机 `runs/chat-events/<runId>.jsonl` 为权威事�
 公开事件只包含生命周期、阶段、公开工具类型/状态、回答增量与投递状态，不记录模型 reasoning/thinking、
 完整命令、工具输出、文件路径或凭据。最终回答仍以 ChatRun.output 为校准源。
 Provider 明确返回的模型 ID 可作为有界阶段元数据进入事件流；回答顶部的“本次模型”区分实际返回型号、冻结配置与未返回具体型号的 CLI 默认。
-该标注随现有 ChatRun.output 一同保存，重试投递不按当前设置重算，也不改写 Run/执行计划中冻结的 model；不新增持久化 schema 或 Provider 会话映射。
+Codex 回答还显示冻结的 reasoningEffort，标注为“推理等级（本次运行配置）”；未指定时明确为 CLI 默认且未确认具体等级。
+这些标注随现有 ChatRun.output 一同保存，重试投递不按当前设置重算，也不改写 Run/执行计划中冻结的 model 或 reasoningEffort；不新增持久化 schema 或 Provider 会话映射。
+固定问候、收录确认等未调用模型的 Chat Run 也通过同一输出与投递路径保存标注，明确区分“未调用（固定回复）”和该 Run 冻结的 Agent 配置，不产生额外 Provider 调用。
 
 飞书实时过程是同一事件流的可失败投影：Connector 先创建 CardKit Card 2.0 实体并回复到原话题，随后以
 Bot 身份按序、合并和节流地更新同一实体；运行态开启 streaming mode，终态关闭。过程卡展示公开步骤、
@@ -86,7 +93,15 @@ Codex 与 Claude 的公开 assistant 文本也作为过程说明保留；最终�
 可选 cardId、revision 与 lastAppliedSeq，旧 ChatRun 记录缺失 cardId 仍可按旧 message patch 路径收尾；
 该字段不参与 Provider 原生会话提交条件。只有最终回答成功投递且 `delivery.status=sent` 持久化后，Provider
 child 才能成为下一轮 parent。管理后台默认仅本机可达，因此未配置受认证的公开 HTTPS 地址时，过程卡不生成
-详情跳转；当前也不暴露未经验证的卡片 callback 取消/重试入口。
+详情跳转；过程卡的取消/重试继续由管理后台处理。
+
+Task 审批卡片是已有 Task Run 冻结计划与审批状态的投影，不增加持久化格式或执行授权来源。
+独立的 `card.action.trigger` 消费者只保留有界操作值、事件/会话/消息/操作者 ID，丢弃回调 token 和卡片正文，
+经 Orchestrator 确定性分流，不写 Raw、不调用模型。审批绑定 Run、申请时间、当前 Space/会话与已有通知尝试；
+群任务复用群主/管理员规则，个人任务只允许空间本人。异步角色查询前后均检查当前应用和群绑定，
+Core 先持久化 `feishu:<open_id>` 的批准/拒绝决定，再沿原冻结计划执行并复验 Workdir、Skill 和本机完全访问确认。
+重复点击、重启后点击、卡片更新失败均读取已有审批结果，不重放任务；卡片失败不能撤销已经落盘的决定。
+卡片回调消费者不参与普通消息 readiness，状态仍在运行诊断中显示；开放平台必须单独配置长连接回调。
 ## Provider execution evidence
 
 Chat Run 可在本机 `config/chat-runs.json` 附带有界、脱敏的 Provider 工具执行证据；这不是 Raw、

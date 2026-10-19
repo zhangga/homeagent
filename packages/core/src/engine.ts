@@ -30,7 +30,6 @@ import {
   AI_QUEUE_TIMEOUT_MS,
   AI_ROUTING_MAX_TOKENS,
   Serializer,
-  canonicalModelId,
   config,
   logger,
 } from "@homeagent/shared";
@@ -39,7 +38,7 @@ import {
   ProviderPreparationError,
   validateCodexFullAccessWorkdir,
   isCliProvider,
-  isCodexReasoningEffortSupported,
+  resolveCodexModelSettings,
   isProviderTimeoutError,
   preflightProviderNativeSession as preflightLocalProviderNativeSession,
   runProviderDetailed as runLocalProvider,
@@ -3293,15 +3292,9 @@ export class KnowledgeEngine implements Knowledge {
       ? cfg.defaultModel
       : "";
     const selectedModel = agent?.model || inheritedModel || undefined;
-    const model = selectedProvider === "codex" && selectedModel
-      ? canonicalModelId(selectedModel)
-      : selectedModel;
-    const reasoningEffort =
-      selectedProvider === "codex"
-      && agent?.reasoningEffort
-      && isCodexReasoningEffortSupported(model, agent.reasoningEffort)
-        ? agent.reasoningEffort
-        : undefined;
+    const { model, reasoningEffort } = selectedProvider === "codex"
+      ? resolveCodexModelSettings({ model: selectedModel, reasoningEffort: agent?.reasoningEffort || undefined })
+      : { model: selectedModel, reasoningEffort: undefined };
     const skills = skillsForProviderExecution(
       skillScope === "all"
         ? this.skillCatalog.resolveAll(resolutionProvider)
@@ -3686,15 +3679,9 @@ export class KnowledgeEngine implements Knowledge {
       ? cfg.defaultModel
       : "";
     const selectedModel = agent?.model || inheritedModel || undefined;
-    const model = provider === "codex" && selectedModel
-      ? canonicalModelId(selectedModel)
-      : selectedModel;
-    const reasoningEffort =
-      provider === "codex" &&
-      agent?.reasoningEffort &&
-      isCodexReasoningEffortSupported(model, agent.reasoningEffort)
-        ? agent.reasoningEffort
-        : undefined;
+    const { model, reasoningEffort } = provider === "codex"
+      ? resolveCodexModelSettings({ model: selectedModel, reasoningEffort: agent?.reasoningEffort || undefined })
+      : { model: selectedModel, reasoningEffort: undefined };
     if (!isCliProvider(provider)) throw new NoProviderError(space);
     return makeCliClient(
       provider as ProviderId,

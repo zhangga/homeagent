@@ -26,7 +26,10 @@ Bun workspaces monorepo，依赖严格单向：`web/app → orchestrator → cor
 
 机器人问答回复顶部会显示“本次模型”：优先使用 Provider 明确返回的型号；未返回时显示该 Run
 冻结的模型并标注“本次运行配置”，两者都没有时明确显示“CLI 默认（未返回具体型号）”，不根据本机其他会话猜测。
-模型说明与原回答一同保存，投递重试或重启后仍使用原回答中的型号；固定指令直接返回的静态回复不附此标注。
+Codex 回答同时显示“推理等级”，取自该 Run 冻结的配置（含从本机 Codex CLI 继承的值），并标注“本次运行配置”；
+未指定等级时显示“CLI 默认（未确认具体等级）”，不根据模型名称猜测。模型与推理等级说明和原回答一同保存，
+投递重试或重启后仍使用原回答中的标注。`hi` 问候、确认收录等固定回复也显示该次 Agent 的模型和推理配置，
+同时明确标注“未调用（固定回复）”，不会把配置值冒充实际调用；不为显示标注额外调用模型。
 
 每个 Chat Run 的排队、开始、Provider 阶段、公开工具状态、回答增量、投递状态和终态都会按序追加到
 `data/runs/chat-events/<runId>.jsonl`。该 journal 是 Web 与飞书展示的共同实时数据源；不保存或展示模型
@@ -50,7 +53,7 @@ Claude 保留公开 assistant 文本。没有返回摘要或进度时如实提�
 消息 ID 和最后应用序号保存在 Chat Run delivery 元数据中；创建或更新失败会写入 operator 事件并自动回退到
 最终 Markdown 回复。只有最终回答成功投递并持久化为 `delivery.status=sent` 后，才提交 Provider 原生话题
 会话。卡片默认不放管理页跳转，因为后台默认仅监听本机回环地址；部署方提供经过认证的可访问 HTTPS 地址后，
-才应向卡片传入详情 URL。当前未开放取消/重试卡片回调，相关操作继续在管理后台执行。
+才应向卡片传入详情 URL。过程卡的取消/重试仍在管理后台执行；任务高权限审批通知另有「通过审批 / 拒绝」按钮。
 ### 双层空间模型
 
 - `personal/<open_id>`：每人一个（私聊知识）
@@ -188,7 +191,7 @@ HomeAgent 应用本体通过对应 Mac 架构的 DMG 安装；机器上的 Agent
    向导会先展示默认位置，也允许选择一个不存在或为空的绝对路径；确认后通过安全重启切换，再继续后续设置。
 2. 在这台机器上安装至少一个受支持的 Agent CLI（`codex` 或 `claude`），确保 HomeAgent 后台服务的
    `PATH` 可以解析它。Claude 使用机器上的常规登录；Codex 会先初始化独立状态目录，并在其中安全导入
-   当前控制台 `CODEX_HOME/auth.json` 的登录缓存。只导入该认证文件，不继承控制台的配置、规则、Plugins、
+   当前控制台 `CODEX_HOME/auth.json` 的登录缓存。只导入该认证文件；模型与推理强度可按下文规则单独继承，不继承其余配置、规则、Plugins、
    Skills、原生会话或其他状态；找不到有效缓存时才由向导发起一次官方设备授权。导入和后续刷新都只写入
    `<dataDir>/provider-state/codex/auth.json`，源文件不会被修改或链接。
    如需把这份隔离状态放到其他位置，可显式设置 `HOMEAGENT_CODEX_HOME`。HomeAgent 不下载 Provider、不把
@@ -406,7 +409,8 @@ Task 后的提炼使用独立无工具调用，不继承完全访问。完全访
 - **Agents**（三栏工作台）：左侧选择 Agent，中间编辑配置，右侧查看真实的 CLI 状态、当前空间/飞书群绑定和该 Agent 最近处理的 Chat / 研究任务运行。Chat 记录会固定归属到实际处理它的 Agent，并可从 Recent runs 进入对应的原始消息详情。支持新建 / 删除，以及配置 **名称、Provider、Instruction（人格，会注入到回答）、Model、推理强度、Visibility、Permission、Workdir**；旧版 Pinned Skill 绑定会保留兼容，但不再限制运行时能力。编辑先保存为草稿，显式发布后才影响未来运行，发布历史不可变并支持通过新版本回滚，避免在途运行被原地改写。
   - 桌面端保持三栏并可拖拽或用方向键调整栏宽；窄屏把右侧信息收进详情抽屉，手机端在 Agent 列表和详情之间切换。页面不显示 HomeAgent 没有实现的 Mew Device、Repository、Environment、Concurrency 或独立 Chats 模块。
   - **Provider = 本机已安装的 agent CLI**（`claude` / `codex` / `trae-cli`）。所有 LLM 工作都通过当前空间配置的本机 CLI 子进程执行，homeagent 不直连网络 API。普通聊天和研究任务使用绑定 Agent 的 Permission / Workdir，并显式传入全部兼容 Skill；提炼和后台学习继续使用受限 no-tools 调用。Codex 的飞书群话题会使用 Provider 原生会话保持 Agent 问答上下文；Claude 及其他调用仍是一次性的，TRAE 当前仍只用于显式任务。后台会探测本机 CLI 的安装和可运行状态。
-  - **默认模型来源**：Agent 的 Model 留空时，同 Provider 优先继承 HomeAgent「设置」中的全局模型，选项直接显示“继承 HomeAgent 全局：模型名”；全局未指定或 Provider 不同时，显示“由 CLI 自身选择默认模型”。这里不会读取 Codex App 或终端会话当前选中的模型；Codex 仍使用独立状态目录并忽略用户配置。切换 Provider 时，选项文案同步更新。
+  - **默认模型来源**：Agent 的 Model 留空时，同 Provider 优先继承 HomeAgent「设置」中的全局模型，选项显示“继承 HomeAgent 全局：模型名”；Codex 随后继承运行 HomeAgent 的本机用户 `CODEX_HOME/config.toml`（未设置 `CODEX_HOME` 时为 `~/.codex/config.toml`）中保存的 `model`，选项显示“继承本机 Codex CLI 模型”。其他 CLI 使用自身默认模型。Codex 每个新运行都会重新读取，因此本地保存新模型后无需更新 HomeAgent 下拉目录或重启服务；终端单次调用的 `--model`、`--profile` 或未保存的临时选择不会同步。
+    HomeAgent 只提取 `model` 和 `model_reasoning_effort`，不会复制整份配置，也不会继承权限、规则、Hooks、Plugins、MCP 或其他会话；Codex 仍使用独立状态目录并忽略用户配置。文件不存在、无法读取或格式无效时沿用 CLI 自身默认值。解析后的模型与推理强度会在 Chat / Task Run 创建时冻结并保存，进行中的运行、排队恢复和重试不会改用后来修改的本机配置。
   - **不可用时可就地恢复**：Agent 详情右侧会显示恢复卡片。Codex 账号连接异常时，“恢复 Codex”会先尝试复用本机控制台登录，仍不可用则进入官方授权。默认检测只检查命令、身份和原生命令支持，不自动执行沙箱探针。隔离模式可显式点击“检测隔离能力”；仅明确报告 elevated 后端未就绪时提供 Windows 系统授权入口，通过后显示“机器隔离探测已通过”，不等于实际 Agent/模型调用已验证。完全访问页只重新检测 CLI 连接，不发起沙箱设置或受限探针。CLI 缺失时保留同机检查命令和设置入口。
   - **Skills 自动加载**：飞书群绑定团队空间，空间再绑定 Team Agent；个人空间绑定 Personal Agent。每次普通聊天或任务启动时，HomeAgent 都会扫描当前 Provider 可用的本机 Skill 目录，把完整兼容目录交给 Agent，再由 Agent 按当前请求加载相关 Skill，无需逐个固定。旧 Agent 的 Pinned Skill 仅作为兼容配置保留，不再形成能力白名单。
     普通聊天要求查询或整理外部来源时，回答阶段会指示 Agent 先使用相关 Skill 获取证据，即使命中了只记录请求或缺口的知识页，也不能把它当作已经完成查询。没有知识页支撑的工具答案直接返回，不额外启动一次通用回答。该行为仍取决于本轮冻结 Skill、实际工具权限与来源账号授权；本机完全访问不代表已获跨 Space 查询授权，工具不可用时须说明实际阻碍。明确要求仅依据知识库的查询不启用这项补查指引。
@@ -433,7 +437,7 @@ Task 后的提炼使用独立无工具调用，不继承完全访问。完全访
   - **当前全量模式边界**：普通聊天和研究任务都会冻结全部兼容 Skill 的名称、来源与完整目录摘要，并在调用 Provider 前重新扫描有效目录、散列完整 Skill bundle。Codex 随后把匹配内容复制到调用私有副本、对副本重算同一摘要，只授权该副本；原 Skill 目录不进入 prompt 或 permission profile。只要 `SKILL.md`、资源文件、目录路径、Skill 增删或同名来源优先级与冻结证据不一致，本次运行就会 fail-closed，Provider 不会被调用；需要按当前目录重新发起一次运行。提炼和后台学习不执行本机 Skill。
   - **图片输入的安全边界**：Codex 普通 Chat（包括飞书话题中的当前 turn）支持原生图片参数（每次最多 4 张）；其他不支持图片输入的 Provider 会明确失败，不会假装已经看过图片。
   - **Model 随 Provider 变化**：切 Provider 时 Model 下拉自动换成该 provider 的维护清单（CLI 无“列模型”接口）；Codex 当前提供 `gpt-6-astra / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna / gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex-spark`。其中 `gpt-5.6-sol` 是 GPT-5.6 Sol 的完整模型 ID；HomeAgent 日常问答优先选择较快、成本更低的 `gpt-5.6-luna`，复杂研究可选择 `gpt-5.6-terra` 或 `gpt-5.6-sol`。
-  - **推理强度按 Agent 配置**：Codex Agent 可选择继承默认值，或从当前模型支持的档位中选择；GPT-6 Astra（`gpt-6-astra`）支持 `low / medium / high / xhigh / max / ultra`（按 Codex 模型目录），不支持 `none`；GPT-5.6 系列支持 `none / low / medium / high / xhigh / max`，旧模型不会显示不支持的档位。此配置用于普通 Chat 和显式 Codex 任务；其他 Provider 暂不传递。
+  - **推理强度按 Agent 配置**：Codex Agent 可选择“继承本机 Codex CLI 推理强度”，跟随上述文件中的 `model_reasoning_effort`；也可从当前模型支持的档位中明确选择，覆盖本机默认值。新模型即使尚未列入 HomeAgent 的下拉目录，也可通过本机配置继承模型及推理强度。GPT-6 Astra（`gpt-6-astra`）支持 `low / medium / high / xhigh / max / ultra`（按 Codex 模型目录），不支持 `none`；GPT-5.6 系列支持 `none / low / medium / high / xhigh / max`，旧模型不会显示不支持的档位。此配置用于 Codex Chat、Task 及后台无工具调用；其他 Provider 不传递。
   - **Visibility 会限制空间绑定**：Team Agent 只能绑定群空间；Personal Agent 只能绑定个人空间。群设置只展示 Team Agent，个人空间详情页只展示 Personal Agent，后端也会拒绝类型不匹配的绑定。已有不兼容绑定时不能直接切换 Visibility，必须先解除绑定；显式删除 Agent 则会先一次性清除所有绑定，让这些空间回退到默认 AI。
   - **Chat / 任务权限会真实映射到 CLI 沙箱**：`read-only` 开启只读工具并禁止写入，`write` 以 Workdir 为工作根目录并启用 Provider 的工作区写入模式，`full` 会绕过 Provider 沙箱。`write/full` 必须配置存在的 Workdir；高权限任务仍需持久化人工审批。Codex 的旧或未确认 `full` 不可执行；开发中的显式本机完全访问另需发布确认及逐进程授权，不能被描述为已隔离。未配置 Workdir 的只读话题使用本轮专用空目录，不会回退到 HomeAgent 当前工作目录。话题 Workdir 与 HomeAgent 数据目录任一方向重叠仍拒绝；在完全访问模式下，这项检查只是防误操作，不能限制 Provider 读取其他目录。
 - **Skills**（能力清单）：只读展示 `~/.agents/skills` 中的共享 Skills、同名冲突和无效配置；运行时还会合并当前 Provider 的原生 Skill 目录。普通聊天和任务自动获得有效的完整目录，不需要在 Agent 上逐个分配。支持本地搜索、状态筛选和手动刷新；安装与更新仍由本机 CLI/Skill 管理工具负责。
@@ -441,6 +445,8 @@ Task 后的提炼使用独立无工具调用，不继承完全访问。完全访
   - 字段：名称、目标空间、研究主题、周期（每小时 / 每天几点 / 每周星期几几点）、最长运行时间、启用开关、推送开关、完成后立即提炼开关。
   - **定时**（TaskScheduler，每任务独立周期，启动即 catch-up）+ **后台「立即运行」**。每次启动会立即生成持久化运行编号，并冻结当时的 Agent 发布版本、Instruction、Provider、Model、Permission、Workdir 与完整兼容 Skill 目录证据；之后即使空间重新绑定、Agent 发布新版本或本机 Skill 变化，当次计划也不会被替换。任务详情页可查看状态、触发来源、耗时、用量/成本覆盖、完整输出或错误，并可重试失败、取消或超时的运行；Agent 工作台按准确归属展示最近记录。
   - `write/full` 运行先进入持久化人工审批，页面展示真正被冻结的主题、权限、Workdir、Provider、Model、Agent 版本和计划摘要；审批 24 小时过期，批准、拒绝、过期、通知尝试均留审计。`read-only` 保持直接排队；两者都使用冻结计划，执行前仍重新核验 Workdir。
+  - 飞书审批通知使用交互卡片，展示本次冻结的主题预览、权限、工作目录、Provider / 模型、推理等级和北京时间截止时间，提供「通过审批 / 拒绝」按钮。群任务沿用群主/管理员权限，个人任务仅本人可审批；决定先持久化再执行，重复点击、重启后点击或卡片更新失败不会重复执行。过期或已处理的卡片在点击后显示当前结果并移除按钮；管理后台仍可审批。Codex 本机完全访问发布确认和每次任务审批仍各自有效。
+    一键创建新机器人时会申请 `card.action.trigger` 回调；已有机器人升级后须在飞书开放平台当前应用的「事件与回调 → 回调配置」中启用长连接接收该回调，无需公开回调 URL。HomeAgent 重启后独立监听卡片操作，普通消息监听不受影响；回调监听失败会显示降级。「消费者就绪」只表示本机连接已建立，不能代替开放平台回调配置和真实点击验证。不支持卡片的 Connector 沿用文字通知；此前已发出的文字消息不会自动变成卡片。
   - 同一任务只允许一个活动运行；后台、定时调度和飞书命令共享互斥保护，不会重复执行。任务默认和最低运行上限为 360 分钟，可配置至 1440 分钟；后台可取消活动运行，超时或取消都会等待本机 CLI 退出或达到安全上限后再释放并发位。排队项在重启后按冻结计划恢复；已经运行的项会标记为失败，不会拿当前 Agent 配置偷偷续跑。
   - 仅定时触发、`read-only`、尚未产生输出且属于可重试 Provider 故障的运行会在 60 秒后自动再尝试一次；这是创建一条关联的新运行，不是进程 checkpoint。工作续作的 Task Run 成功只会提交带“结果 / 检查 / 证据”的验收候选；自动验收还要求冻结权限为 `read-only`、Raw 已落盘、输出未截断，并收到严格 JSON 执行报告（`outcome=completed`、无 blocker、全部检查通过）。普通文本或畸形报告统一停在人工验收，结构化 `blocked` 结果则保留动作边界并形成 blocker；`write/full/unknown` 必须人工接受后才记录动作边界 checkpoint。手动重试、禁用任务、取消或高权限运行都会终结/替代等待中的自动重试，避免重复执行。
   - Provider 报告的 token 与成本会按调用聚合到 Chat / Task / 质量 trace；无法从 CLI 获得的字段保持“未知”，不会伪装成 0。每日成本参考线只用于观察，超出参考线或成本未知都不会暂停、降级或拒绝 Provider 调用；系统仍会展示已知成本、未知成本调用与记账覆盖率。
@@ -494,7 +500,7 @@ Task 后的提炼使用独立无工具调用，不继承完全访问。完全访
 - **Bot 停用与更换**：在 HomeAgent 中停用 Bot 只关闭本机事件消费和发送，不删除 `lark-cli` 系统钥匙串凭据，
   也不撤销读取飞书文档所用的用户授权。重新启用或更换 Bot 后必须重启 HomeAgent；旧 App 的群绑定会显示为
   “需要重连”，不会被新旧运行实例混用。对外共享状态也按 App ID 独立记录。
-- **运行状态**：集中展示后台托管方式、PID、启动时间、两条飞书事件消费者的详细状态、必需 CLI、知识存储、任务、提醒、学习、Dream Cycle、Wiki Maintenance 与六个调度器；同时展示 AI 回答延迟、失败/超时、Agent 知识反馈待处理数、主动参与结果、事件队列积压，以及最近一次 Dream 追赶的批次数、已处理 Raw、剩余积压和是否达到单轮上限。积压仍在安全追赶时整体标为 degraded 但不阻断 readiness；维护检查发现知识问题或报告被截断时也采用同一服务降级语义。调度器本身未启动或最近失败仍会让 readiness 失败。LaunchAgent 托管时可从页面安全重启。
+- **运行状态**：集中展示后台托管方式、PID、启动时间、两条必需飞书消息事件消费者及独立卡片回调消费者的详细状态、必需 CLI、知识存储、任务、提醒、学习、Dream Cycle、Wiki Maintenance 与六个调度器；同时展示 AI 回答延迟、失败/超时、Agent 知识反馈待处理数、主动参与结果、事件队列积压，以及最近一次 Dream 追赶的批次数、已处理 Raw、剩余积压和是否达到单轮上限。积压仍在安全追赶时整体标为 degraded 但不阻断 readiness；维护检查发现知识问题或报告被截断时也采用同一服务降级语义。调度器本身未启动或最近失败仍会让 readiness 失败。LaunchAgent 托管时可从页面安全重启。
 - **工作上下文**：为每个空间维护目标、Brief、Runbook、当前进展、阻塞项与下一步；新 Raw、Chat Run、Task Run 和由 Raw 生成的 Wiki 页会自动关联到当前工作项，并投影为 `work/<id>/{brief.md,runbook.md,status.json}`。可手动执行下一动作，也可对单个工作项显式开启自动续作；每轮最多领取一个动作，复用 Task Run 的冻结计划、权限审批、通知、超时与一次安全重试。Task Run 成功后先进入动作验收门：后台展示结构化结果、确定性检查和 Run/Raw 证据，只有验收通过才消费当前首个下一步并记录 checkpoint；驳回会保留动作边界和证据、形成可见 blocker，并允许从同一动作重试。计划改变时可显式放弃受阻动作并清除其系统 blocker，再继续新的首个动作。待验收期间自动续作暂停；重启只恢复尚未执行的排队动作，绝不重放已中断的运行中动作。
 - **数据治理**：按空间导出 `homeagent.space v20` JSON 完整备份（知识页及系统生成的分层地图、原始记录及其动作验收准入状态、按 SHA-256 校验的完整原文件、工作上下文、续作动作/checkpoint/验收审计/策略及其证据关联、人工治理审计、本地 Agent 知识消费反馈及处置记录、撤回标记、任务及 Chat 运行历史、冻结执行计划、Agent 发布历史、审批/重试/通知/用量审计、Skill 证据、相关质量 trace 与封闭的重评记录、提醒、学习计划、主题路线、多来源材料及课程历史、Wiki Maintenance 最近摘要、空间元数据），兼容恢复 v1–v20 备份；WorkAction 输出在验收前保持 `held`、接受后才进入待提炼队列，驳回/取消/失败后永久 `excluded`。v20 保留 Agent 执行模式意图，不携带本机完全访问确认；恢复后须在本机重新确认。旧版缺失的高权限审批与执行计划会 fail-closed，legacy Skill 不会被静默绑定到错误来源；升级时会重新派生 WorkAction Raw 状态并清理引用未准入来源的旧 Wiki 页。导出、恢复和删除会阻止仍在运行、等待审批/验收/重试或正在外发的工作，恢复会校验 WorkItem、WorkAction、Task Run、验收证据、Raw 准入、原文件摘要与 checkpoint 的双向关联，避免删除后继续副作用、恢复后重复执行、污染知识、丢失原文件或重复通知。
 - **设置**：**默认 Provider + 默认 Model**（群未指定 Agent 时用它）、聊天最长回答时间（默认和最低 360 分钟，可设至 1440 分钟）、每日成本参考线（只观察，不阻断）、提炼时刻、原始消息保留周期、端口，以及安全的数据目录迁移与可选 Git 初始化。最长回答时间会冻结到新建 Chat Run，旧的短时限配置在加载时提升到 360 分钟；进行中的回答仍可随时取消。本机其他 Agent 可通过独立 MCP/JSON 接口渐进复用已提炼知识；可选反馈凭据只允许写入治理反馈队列，不授予 Raw/Wiki/管理权限，也不触发 Provider。

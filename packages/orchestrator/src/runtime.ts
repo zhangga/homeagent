@@ -55,6 +55,7 @@ import {
 } from "@homeagent/core";
 import type {
   Connector,
+  CardActionEvent,
   DownloadedAttachment,
   InboundEvent,
   InboundMessage,
@@ -264,6 +265,8 @@ function discloseUnavailableVision(text: string): string {
 }
 
 export interface RuntimeOptions {
+  /** Deterministic application callback; card actions never enter knowledge capture or the model. */
+  onCardAction?: (event: CardActionEvent) => void | Promise<void>;
   engine: KnowledgeEngine;
   connector: Connector;
   /**
@@ -291,6 +294,7 @@ export interface RuntimeOptions {
 }
 
 export class Orchestrator {
+  private onCardAction?: RuntimeOptions["onCardAction"];
   private engine: KnowledgeEngine;
   private connector: Connector;
   private activeFeishuAppId?: string;
@@ -338,6 +342,7 @@ export class Orchestrator {
   private recentAnswerOutcomes: AnswerOutcome[] = [];
 
   constructor(opts: RuntimeOptions) {
+    this.onCardAction = opts.onCardAction;
     this.engine = opts.engine;
     this.connector = opts.connector;
     this.activeFeishuAppId = opts.activeFeishuAppId;
@@ -473,7 +478,7 @@ export class Orchestrator {
   /** Process one event. Exposed for tests; connectors call it via start(). */
   enqueue(event: InboundEvent): Promise<void> {
     this.eventMetrics.total += 1;
-    const key = event.kind === "message" ? `chat:${event.chatId}` : "main";
+    const key = event.kind === "message" || event.kind === "card_action" ? `chat:${event.chatId}` : "main";
     const pending = this.serializer.run(key, async () => {
       const startedAt = Date.now();
       try {
@@ -659,6 +664,7 @@ export class Orchestrator {
     }
     let durableMutationMayHaveCommitted = false;
     try {
+      if (event.kind === "card_action") return await this.onCardAction?.(event);
       if (event.kind === "bot_added") {
         return await this.groupOnboarding.handleBotAdded(event);
       }
@@ -1504,13 +1510,16 @@ export class Orchestrator {
     runId: string,
     markdown: string,
   ): Promise<void> {
+    const run = this.engine.chatRuns.get(runId);
+    if (!run) return;
+    const text = withReplyModel(markdown, run, undefined, "static");
     const succeeded = this.engine.chatRuns.succeed(runId, {
       finishedAt: Date.now(),
-      output: markdown,
+      output: text,
     });
     if (!succeeded) return;
-    this.recordRunEvent({ runId, at: succeeded.finishedAt ?? Date.now(), kind: "run.succeeded", visibility: "public", phase: "answer", status: "succeeded", title: "执行完成", delta: markdown });
-    await this.send(msg, markdown, runId);
+    this.recordRunEvent({ runId, at: succeeded.finishedAt ?? Date.now(), kind: "run.succeeded", visibility: "public", phase: "answer", status: "succeeded", title: "执行完成", delta: text });
+    await this.send(msg, text, runId);
   }
 
   private recordRunEvent(event: import("@homeagent/shared").NewRunEvent): void {

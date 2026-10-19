@@ -22,7 +22,7 @@ describe("Agent workbench view", () => {
     for (const sample of [
       { provider: "codex" as const, globalModel: "gpt-5.6-sol", label: "继承 HomeAgent 全局：gpt-5.6-sol" },
       { provider: "claude" as const, globalModel: "gpt-5.6-sol", label: "由 CLI 自身选择默认模型" },
-      { provider: "codex" as const, globalModel: "", label: "由 CLI 自身选择默认模型" },
+      { provider: "codex" as const, globalModel: "", label: "继承本机 Codex CLI 模型" },
     ]) {
       const agent = { ...selected, provider: sample.provider, model: "", reasoningEffort: "" as const };
       const view = buildAgentWorkbench({ agents: mode === "edit" ? [agent] : [], mode,
@@ -39,7 +39,9 @@ describe("Agent workbench view", () => {
       const select = body.match(/<select\s[^>]*id="agent-model"[\s\S]*?<\/select>/u)?.[0];
       expect(select).toContain(`selected>${sample.label}</option>`);
       expect(select).toContain('aria-describedby="agent-model-help"');
-      expect(body).toContain("这里不会读取其他应用或终端会话当前选中的模型。");
+      expect(body).toContain("Codex 随后继承本机 config.toml 中保存的模型");
+      expect(body).toContain("继承本机 Codex CLI 推理强度");
+      expect(body).toContain("进行中的运行和重试保留冻结配置");
       expect(body).not.toContain(">使用默认模型<");
     }
   });

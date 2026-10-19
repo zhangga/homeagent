@@ -143,7 +143,8 @@ arm64 和 Intel 架构至少各完成一次；测试机不得依赖仓库 checko
    单个 Skill 连同已安装依赖超过 16 MiB、但未超过 128 MiB / 50,000 条目时仍须完整加载、冻结并验证依赖；整个目录未超过 128 MiB / 200,000 条目时，实际副本数量必须与冻结目录一致。超过总预算应整轮失败、清理副本、保留有界准备失败证据，不得静默删减。原生权限中的共同 Skill 读取根必须只覆盖本轮已验证副本，不得覆盖 live Skill 根或整个临时目录。普通测试会话不应反复追加无关 Skill 告警；明确点名的不可用 Skill 应说明已识别的失败原因。
    Claude 仍必须保持一次性隔离调用。
    Provider 安装、登录和升级由机器所有者管理，HomeAgent 不得下载或替换该程序。
-6. 创建或连接飞书机器人，确认两个事件消费者就绪。
+6. 创建或连接飞书机器人，确认两个必需消息事件消费者就绪；检查独立 `card.action.trigger` 消费者状态。
+   在飞书开放平台当前应用的「事件与回调 → 回调配置」启用长连接卡片回调；本机消费者 ready 不能证明平台已配置，必须真实点击验证。
 7. 加入测试群，确认机器人只登记待确认并发送一次提示；由群主或管理员发送“@HomeAgent 启用群聊”，
    再发送真实消息完成首次知识收录并记下原始记录 ID。
 8. 在同一空间创建一个禁用的研究任务、一个未来提醒和一个学习计划，记下各自名称或 ID。
@@ -490,8 +491,9 @@ metadata，不得包含消息正文、Instruction、Prompt、凭据或完整模�
 
 1. 在一次性测试 Workdir 上发布 `write` Agent，并创建开启飞书通知的测试任务。由群主或管理员从飞书立即运行，确认 Run 进入
    `awaiting_approval`，审批前没有 Provider 启动时间、输出、原始材料或 Workdir 变更，审批通知只出现一次。
-2. 保持待审批状态重启 HomeAgent；确认 Run 仍等待原冻结计划、没有重复审批通知。随后从后台批准，确认只执行一次并只产生一份
-   原始材料/完成通知。另建一条 Run 执行“拒绝”，确认 Provider 调用仍为 0。
+2. 保持待审批状态重启 HomeAgent；确认 Run 仍等待原冻结计划、没有重复审批通知。随后由群主或管理员点击飞书卡片「通过审批」，
+   确认决定人记录为实际 `feishu:<open_id>`、按钮消失、只执行一次并只产生一份原始材料/完成通知。
+   重复点击或重启后点击旧卡片不能重放。另建 Run 点击「拒绝」，确认 Provider 调用仍为 0；后台原审批路径也须可用。
 3. 另建一条审批 Run，在受控网络中断下让第一次审批通知投递失败，再恢复网络等待调度器重试；确认通知审计至少两次尝试、
    飞书最终只有一条包含该 Run ID 的审批消息。随后批准并等待 Run 成功，把它作为 `--approval-idempotency-run-id`；无法安全制造
    真实投递故障时，本项记为未覆盖，不得直接修改通知审计。
@@ -499,8 +501,11 @@ metadata，不得包含消息正文、Instruction、Prompt、凭据或完整模�
    无 Provider 输出、文件副作用或重复通知。`full` 绕过 Provider 沙箱，灰度中不得批准，只验收等待与过期。
 5. 核对每条 Run 的申请时间、24 小时截止时间、决定人/过期 actor、通知尝试和冻结计划；审批后若 Workdir 已移动或被替换，
    必须在 Provider 启动前 fail-closed。
+6. 在隔离测试环境覆盖普通群成员、错误群/申请时间、个人空间非本人及绑定停用，均不能批准。
+   通知已送达但回执失败仍可点击；卡片更新失败后须反馈已持久化结果，重试不得重复执行；审批落盘失败不得启动 Provider。
 
-自动验收以 `task-runs.test.ts`、`task-scheduler.test.ts`、`engine.test.ts` 和 `app.test.ts` 中的审批、过期、重启及通知去重用例为准。
+自动验收以 `feishu-task-approvals.test.ts`、`feishu-card-action.test.ts`、`feishu-task-approval-card.test.ts`、`feishu.test.ts`、
+`runtime.test.ts` 及原有 `task-runs.test.ts`、`task-scheduler.test.ts`、`engine.test.ts`、`app.test.ts` 中的审批、过期、重启及通知去重用例为准。
 
 #### `readonly_task_retry`：定时只读任务自动重试
 

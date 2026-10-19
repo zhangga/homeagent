@@ -92,6 +92,56 @@ afterEach(async () => {
 });
 
 describe("FeishuConnector daemon (fake spawn)", () => {
+  test("receives approval callbacks on an independent ready-gated stream without blocking messages", async () => {
+    const spawner = new FakeSpawner();
+    const events: InboundEvent[] = [];
+    connector = new FeishuConnector({ profile: "cli_homeagent", cardActions: true, spawner, runCommand: async () => "{}" });
+    await connector.start(event => { events.push(event); });
+    const message = await spawner.waitForProc("im.message.receive_v1");
+    const added = await spawner.waitForProc("im.chat.member.bot.added_v1");
+    const card = await spawner.waitForProc("card.action.trigger");
+    message.emitStderr("[event] ready event_key=im.message.receive_v1");
+    added.emitStderr("[event] ready event_key=im.chat.member.bot.added_v1");
+    card.emitStdout(JSON.stringify({ type: "card.action.trigger", event_id: "evt_approval", chat_id: "oc_team",
+      message_id: "om_approval", operator_id: "ou_owner", timestamp: "100", action_tag: "button",
+      action_value: '{"action":"homeagent.task-approval"}', token: "PRIVATE_TOKEN" }));
+    await Bun.sleep(20);
+    expect(connector.health().ready).toBe(true);
+    expect(events).toHaveLength(0);
+    card.emitStderr("[event] ready event_key=card.action.trigger");
+    await Bun.sleep(20);
+    expect(events).toEqual([expect.objectContaining({ kind: "card_action", operatorId: "ou_owner", messageId: "om_approval" })]);
+    expect(JSON.stringify(events)).not.toContain("PRIVATE_TOKEN");
+    expect(spawner.procs).toHaveLength(3);
+    for (const spawned of spawner.procs) expect(spawned.cmd.slice(0, 3)).toEqual(["lark-cli", "--profile", "cli_homeagent"]);
+  });
+
+  test("sends and replaces approval cards through stdin while preserving delivery idempotency", async () => {
+    const calls: { command: string[]; stdin?: string }[] = [];
+    connector = new FeishuConnector({ profile: "cli_homeagent", runCommand: async (command, opts) => {
+      calls.push({ command, stdin: opts?.stdin }); return '{"ok":true,"data":{}}';
+    } });
+    const card = { schema: "2.0", body: { elements: [{ tag: "markdown", content: "PRIVATE_TASK_TOPIC" }] } };
+    await connector.noticeCard("oc_team", card, { idempotencyKey: "ha-appr-same-run" });
+    await connector.noticeCard("oc_team", card, { idempotencyKey: "ha-appr-same-run" });
+    await connector.updateCard("om_approval", card);
+    for (const call of calls) {
+      expect(call.command.join(" ")).not.toContain("PRIVATE_TASK_TOPIC");
+      expect(call.command.slice(0, 3)).toEqual(["lark-cli", "--profile", "cli_homeagent"]);
+      expect(call.stdin).toContain("PRIVATE_TASK_TOPIC");
+    }
+    expect(calls[0]?.command).toEqual(calls[1]?.command);
+    expect(calls[0]?.command).toContain("ha-appr-same-run");
+    expect(calls[0]?.command.slice(-3)).toEqual(["--json", "--idempotency-key", "ha-appr-same-run"]);
+    expect(JSON.parse(calls[2]!.stdin!).content).toBe(JSON.stringify(card));
+  });
+
+  test.each(["invalid json", '{"ok":false,"error":{"message":"PRIVATE_PROVIDER_DIAGNOSTIC"}}'])("approval card errors are fixed and retryable: %s", async response => {
+    connector = new FeishuConnector({ runCommand: async () => response });
+    await expect(connector.noticeCard("oc_team", {})).rejects.toThrow("Feishu approval card delivery failed");
+    await expect(connector.updateCard("om_approval", {})).rejects.toThrow("Feishu approval card update failed");
+  });
+
   test("pins event consumers, delivery and user document reads to the HomeAgent profile", async () => {
     const spawner = new FakeSpawner();
     const commands: string[][] = [];

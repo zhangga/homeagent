@@ -5,7 +5,7 @@ import {
 } from "./lark-app-registration.ts";
 
 describe("HomeAgent Feishu app registration", () => {
-  test("requests every runtime permission and event during initial creation", () => {
+  test("requests every runtime permission, message event and approval callback during initial creation", () => {
     expect(HOMEAGENT_FEISHU_ADDONS).toEqual({
       preset: true,
       scopes: {
@@ -32,6 +32,7 @@ describe("HomeAgent Feishu app registration", () => {
           tenant: ["im.message.receive_v1", "im.chat.member.bot.added_v1"],
         },
       },
+      callbacks: { items: ["card.action.trigger"] },
     });
   });
 

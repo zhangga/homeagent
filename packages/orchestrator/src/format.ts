@@ -6,11 +6,13 @@
  */
 import type { AskResult, SkillWarningView } from "@homeagent/shared";
 import { publicModelId } from "@homeagent/shared";
+import { CODEX_REASONING_EFFORTS } from "@homeagent/llm";
 
 export function withReplyModel(
   markdown: string,
-  run: { provider?: string; model?: string },
+  run: { provider?: string; model?: string; reasoningEffort?: string },
   reportedModel?: string,
+  replyKind: "model" | "static" = "model",
 ): string {
   const provider = { codex: "Codex", claude: "Claude Code", "trae-cli": "TRAE CLI", gateway: "LLM 网关" }[run.provider ?? ""] ?? "CLI";
   const actual = publicModelId(reportedModel);
@@ -18,7 +20,15 @@ export function withReplyModel(
   const model = actual ? `\`${actual}\`（Provider 返回）`
     : configured ? `\`${configured}\`（本次运行配置）`
     : "CLI 默认（未返回具体型号）";
-  return `> 本次模型：${provider} · ${model}\n\n${markdown}`;
+  const caption = replyKind === "static"
+    ? `未调用（固定回复）；Agent 配置：${provider} · ${configured ? `\`${configured}\`（本次运行配置）` : "CLI 默认"}`
+    : `${provider} · ${model}`;
+  const effort = CODEX_REASONING_EFFORTS.find(value => value === run.reasoningEffort);
+  const reasoning = run.provider === "codex"
+    ? `\n> 推理等级：${effort ? `\`${effort}\`（本次运行配置${replyKind === "static" ? "，未调用" : ""}）`
+      : replyKind === "static" ? "CLI 默认（本次未调用）" : "CLI 默认（未确认具体等级）"}`
+    : "";
+  return `> 本次模型：${caption}${reasoning}\n\n${markdown}`;
 }
 
 function plainWarningText(value: string, maxLength: number): string {

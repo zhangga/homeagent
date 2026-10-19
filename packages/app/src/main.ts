@@ -37,13 +37,13 @@ import { createWebApp, FeishuIntegrationService } from "@homeagent/web";
 import { Scheduler } from "./scheduler.ts";
 import { MaintenanceScheduler } from "./maintenance-scheduler.ts";
 import {
-  formatTaskApprovalNotification,
   formatTaskRunNotification,
   TaskScheduler,
 } from "./task-scheduler.ts";
 import { LearningScheduler, learningNotification } from "./learning-scheduler.ts";
 import { ReminderScheduler } from "./reminder-scheduler.ts";
 import { WorkContinuationScheduler } from "./work-continuation-scheduler.ts";
+import { FeishuTaskApprovals } from "./feishu-task-approvals.ts";
 import { createSystemHealthReporter } from "./health.ts";
 import {
   homeAgentFeishuAvatarPath,
@@ -196,7 +196,7 @@ async function run(
   feishuProfile = feishuStartup.appId;
 
   // 1. feishu connector + orchestrator
-  const connector = new FeishuConnector({ larkBin: runtimePaths.larkBin, profile: feishuProfile });
+  const connector = new FeishuConnector({ larkBin: runtimePaths.larkBin, profile: feishuProfile, cardActions: true });
   const byteTechArticleFetcher = new ByteTechArticleFetcher({
     bin: brandedEnv(process.env, "BYTEDCLI_BIN"),
   });
@@ -206,6 +206,7 @@ async function run(
   const orchestrator = new Orchestrator({
     engine,
     connector,
+    onCardAction: event => taskApprovals.handle(event),
     activeFeishuAppId:
       feishuStartup.status.state === "ready" && feishuStartup.status.verified
         ? feishuStartup.status.appId
@@ -218,26 +219,10 @@ async function run(
   });
   let feishuOutboundEnabled = feishuStartup.consumersEnabled;
   let feishuLocallyDisabled = feishuStartup.locallyDisabled;
-  if (feishuStartup.consumersEnabled) {
-    await orchestrator.start();
-    log.info("orchestrator live; listening for feishu events", {
-      migratedBindings: feishuStartup.migrated,
-    });
-  } else {
-    log.info("feishu event consumers not started", {
-      reason: feishuStartup.locallyDisabled
-        ? "locally_disabled"
-        : feishuStartup.status.state,
-      migratedBindings: feishuStartup.migrated,
-    });
-  }
-
-  const sendFeishuNotice = async (
+  const assertFeishuDeliveryAllowed = (
     space: string | undefined,
     chatId: string,
-    text: string,
-    idempotencyKey?: string,
-  ): Promise<void> => {
+  ): void => {
     if (!feishuOutboundEnabled) {
       throw new Error("Feishu delivery is disabled until restart");
     }
@@ -254,6 +239,14 @@ async function run(
     ) {
       throw new Error(`Feishu group is not connected: ${space}`);
     }
+  };
+  const sendFeishuNotice = async (
+    space: string | undefined,
+    chatId: string,
+    text: string,
+    idempotencyKey?: string,
+  ): Promise<void> => {
+    assertFeishuDeliveryAllowed(space, chatId);
     await connector.notice(chatId, text, { idempotencyKey });
   };
 
@@ -270,16 +263,19 @@ async function run(
     );
   };
 
-  const notifyTaskApproval = async (run: TaskRun, deliveryKey: string) => {
-    const chatId = engine.registry.get(run.space)?.chatId;
-    if (!chatId) throw new Error(`task space has no bound Feishu chat: ${run.space}`);
-    await sendFeishuNotice(
-      run.space,
-      chatId,
-      formatTaskApprovalNotification(run),
-      deliveryKey,
-    );
-  };
+  const taskApprovals = new FeishuTaskApprovals({ engine, connector,
+    assertDeliveryAllowed: assertFeishuDeliveryAllowed, notifyCompleted: notifyTaskDone });
+  const notifyTaskApproval = (run: TaskRun, deliveryKey: string) => taskApprovals.notify(run, deliveryKey);
+
+  if (feishuStartup.consumersEnabled) {
+    await orchestrator.start();
+    log.info("orchestrator live; listening for feishu events", { migratedBindings: feishuStartup.migrated });
+  } else {
+    log.info("feishu event consumers not started", {
+      reason: feishuStartup.locallyDisabled ? "locally_disabled" : feishuStartup.status.state,
+      migratedBindings: feishuStartup.migrated,
+    });
+  }
 
   for (const resumed of engine.resumeQueuedTaskRuns()) {
     void resumed.completion.then(async (report) => {

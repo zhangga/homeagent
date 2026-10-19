@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProviderRunError, ProviderPreparationError, codexProgressEventFromLine, type JSONOptions } from "@homeagent/llm";
@@ -188,6 +188,67 @@ afterEach(async () => {
 });
 
 describe("orchestrator trunk (cli connector, no feishu)", () => {
+  test("card callbacks are dispatched once without message capture or model invocation", async () => {
+    const actions: string[] = [];
+    orch = new Orchestrator({ engine, connector, llm: fake, onCardAction: event => { actions.push(event.operatorId); } });
+    await orch.start();
+    const event = { kind: "card_action" as const, eventId: "evt_approval_callback", chatId: "oc_team",
+      messageId: "om_approval", operatorId: "ou_owner", actionTag: "button", createdAt: Date.now(),
+      actionValue: { action: "homeagent.task-approval", runId: "run_test", requestedAt: 100, decision: "approve" } };
+    await orch.enqueue(event);
+    await orch.enqueue(event);
+    expect(actions).toEqual(["ou_owner"]);
+    expect(fake.calls).toHaveLength(0);
+    expect(engine.chatRuns.list()).toHaveLength(0);
+    expect(engine.registry.has("team/oc_team")).toBe(false);
+  });
+  test.each(["p2p", "group"] as const)("hi fixed replies show model metadata without invoking a Provider: %s", async (chatType) => {
+    const space: SpaceId = chatType === "p2p" ? "personal/ou_me" : "team/oc_team";
+    engine.ensureSpace(space);
+    const agent = engine.agents.create({ name: "问候标注助手", provider: "codex", model: "gpt-6-astra",
+      reasoningEffort: "xhigh", visibility: chatType === "p2p" ? "Personal" : "Team" });
+    engine.updateSpaceMeta(space, { agentId: agent.id });
+    await orch.start();
+    if (chatType === "p2p") await connector.sendP2P("hi");
+    else await connector.sendGroup("@HomeAgent hi", true);
+    expect(connector.sent).toHaveLength(1);
+    const reply = connector.sent[0]!.markdown;
+    expect(reply).toContain("本次模型：未调用（固定回复）");
+    expect(reply).toContain("Agent 配置：Codex · `gpt-6-astra`（本次运行配置）");
+    expect(reply).toContain("推理等级：`xhigh`（本次运行配置，未调用）");
+    expect(reply).toContain("👋 我在。有需要随时问我，或把要记住的事告诉我。");
+    expect(fake.calls).toHaveLength(0);
+    const run = engine.chatRuns.list(space)[0]!;
+    expect(run.output).toBe(reply);
+    expect(engine.runEvents.list(run.id).find(event => event.kind === "run.succeeded")?.delta).toBe(reply);
+  });
+
+  test("fixed reply metadata survives a delivery failure, Agent changes, and restart", async () => {
+    engine.ensureSpace("personal/ou_me");
+    const agent = engine.agents.create({ name: "固定回复快照", provider: "codex", model: "gpt-6-astra",
+      reasoningEffort: "xhigh", visibility: "Personal" });
+    engine.updateSpaceMeta("personal/ou_me", { agentId: agent.id });
+    connector.reply = async () => { throw new Error("delivery unavailable"); };
+    await orch.start();
+    await expect(connector.sendP2P("hi")).rejects.toThrow("delivery unavailable");
+    const run = engine.chatRuns.list("personal/ou_me")[0]!;
+    expect(run.output).toContain("本次模型：未调用（固定回复）");
+    expect(run.output).toContain("推理等级：`xhigh`（本次运行配置，未调用）");
+    engine.agents.update(agent.id, { model: "gpt-5.6-sol", reasoningEffort: "low" });
+    await orch.stop();
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
+    connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
+    orch = new Orchestrator({ engine, connector, llm: fake });
+    await orch.start();
+    await orch.retryChatRun(run.id);
+    expect(connector.sent).toHaveLength(1);
+    expect(connector.sent[0]?.markdown).toBe(run.output);
+    expect(connector.sent[0]?.markdown.split("本次模型：")).toHaveLength(2);
+    expect(connector.sent[0]?.markdown.split("推理等级：")).toHaveLength(2);
+    expect(fake.calls).toHaveLength(0);
+  });
+
   test.each(["p2p", "group"] as const)("unrelated conversations omit catalog warnings while explicitly requested Skills retain them: %s", async (chatType) => {
     engine.askWithExecutionPlan = async () => ({
       answer: "测试回复。", source: "general", context: "agent-workdir", citations: [],
@@ -207,23 +268,32 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(run.output).toBe(connector.sent[2]?.markdown);
   });
 
-  test("a reported session model survives delivery failure, configuration changes, and restart", async () => {
+  test.each([
+    { provider: "claude" as const, model: "sonnet", reasoningEffort: undefined,
+      reportedModel: "claude-sonnet-4-6", nextModel: "opus", nextEffort: undefined,
+      caption: "> 本次模型：Claude Code · `claude-sonnet-4-6`（Provider 返回）" },
+    { provider: "codex" as const, model: "gpt-5.6-sol", reasoningEffort: "high",
+      reportedModel: "gpt-6.1-sol", nextModel: "gpt-6-astra", nextEffort: "ultra",
+      caption: "> 本次模型：Codex · `gpt-6.1-sol`（Provider 返回）\n> 推理等级：`high`（本次运行配置）" },
+  ])("session metadata survives delivery failure, configuration changes, and restart: $provider", async (sample) => {
     engine.ensureSpace("personal/ou_me");
-    const agent = engine.agents.create({ name: "模型来源助手", provider: "claude", model: "sonnet", visibility: "Personal" });
+    const agent = engine.agents.create({ name: "模型来源助手", provider: sample.provider,
+      model: sample.model, reasoningEffort: sample.reasoningEffort, visibility: "Personal" });
     engine.updateSpaceMeta("personal/ou_me", { agentId: agent.id });
     let answers = 0;
     engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
       answers++;
-      await opts?.onProgress?.({ kind: "phase", at: 100, phase: "provider", title: "会话模型已确认", model: "claude-sonnet-4-6" });
+      await opts?.onProgress?.({ kind: "phase", at: 100, phase: "provider", title: "会话模型已确认", model: sample.reportedModel });
       return { answer: "这次使用了 Provider 返回的型号。", source: "general", context: "agent-workdir", citations: [] };
     };
     connector.reply = async () => { throw new Error("delivery unavailable"); };
     await orch.start();
     await expect(connector.sendP2P("请回答并显示模型")).rejects.toThrow("delivery unavailable");
     const run = engine.chatRuns.list("personal/ou_me")[0]!;
-    expect(run.output).toBe("> 本次模型：Claude Code · `claude-sonnet-4-6`（Provider 返回）\n\n这次使用了 Provider 返回的型号。");
-    expect(run.model).toBe("sonnet");
-    engine.agents.update(agent.id, { model: "opus" });
+    expect(run.output).toBe(`${sample.caption}\n\n这次使用了 Provider 返回的型号。`);
+    expect(run.model).toBe(sample.model);
+    expect(run.reasoningEffort).toBe(sample.reasoningEffort);
+    engine.agents.update(agent.id, { model: sample.nextModel, reasoningEffort: sample.nextEffort });
     await orch.stop();
     engine.close();
     engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
@@ -234,8 +304,43 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(connector.sent).toHaveLength(1);
     expect(connector.sent[0]?.markdown).toBe(run.output);
     expect(connector.sent[0]?.markdown.split("本次模型：")).toHaveLength(2);
+    if (sample.reasoningEffort) expect(connector.sent[0]?.markdown.split("推理等级：")).toHaveLength(2);
     expect(engine.chatRuns.get(run.id)?.delivery.status).toBe("sent");
     expect(answers).toBe(1);
+  });
+
+  test.each(["p2p", "group"] as const)("completed Codex replies display inherited model and reasoning from the current Run: %s", async (chatType) => {
+    const previousHome = process.env.CODEX_HOME;
+    const consoleHome = join(dir, "console-codex");
+    mkdirSync(consoleHome);
+    const localConfig = join(consoleHome, "config.toml");
+    writeFileSync(localConfig, 'model = "gpt-6.1-sol"\nmodel_reasoning_effort = "xhigh"');
+    process.env.CODEX_HOME = consoleHome;
+    try {
+      const space: SpaceId = chatType === "p2p" ? "personal/ou_me" : "team/oc_team";
+      engine.ensureSpace(space);
+      const agent = engine.agents.create({ name: "继承标注助手", provider: "codex", permission: "read-only",
+        visibility: chatType === "p2p" ? "Personal" : "Team" });
+      engine.updateSpaceMeta(space, { agentId: agent.id });
+      engine.askWithExecutionPlan = async (_spaces, _question, plan, _evidence, opts) => {
+        expect(plan.model).toBe("gpt-6.1-sol");
+        expect(plan.reasoningEffort).toBe("xhigh");
+        writeFileSync(localConfig, 'model = "gpt-6-astra"\nmodel_reasoning_effort = "low"');
+        return { answer: "本次会话已完成。", source: "general", context: "agent-workdir", citations: [],
+          ...(opts?.nativeSession ? { nativeSessionId: "00000000-0000-4000-8000-000000000101" } : {}) };
+      };
+      await orch.start();
+      if (chatType === "p2p") await connector.sendP2P("请回答并展示本次模型和推理等级");
+      else await connector.sendGroup("@HomeAgent 请回答并展示本次模型和推理等级", true);
+      expect(connector.sent).toHaveLength(1);
+      const run = engine.chatRuns.list(space)[0]!;
+      expect(connector.sent[0]?.markdown).toBe("> 本次模型：Codex · `gpt-6.1-sol`（本次运行配置）\n> 推理等级：`xhigh`（本次运行配置）\n\n本次会话已完成。");
+      expect(run.output).toBe(connector.sent[0]?.markdown);
+      expect(engine.agentRunExecutionSnapshot(space)).toEqual(expect.objectContaining({ model: "gpt-6-astra", reasoningEffort: "low" }));
+    } finally {
+      if (previousHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousHome;
+    }
   });
   test("projects one Chat Run onto a progress card and still sends the final reply", async () => {
     const created: LiveReplySnapshot[] = [];

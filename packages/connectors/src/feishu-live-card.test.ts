@@ -138,9 +138,9 @@ test("retains failed tool progress and explicitly bounds a large combined card",
   expect(Buffer.byteLength(card, "utf8")).toBeLessThanOrEqual(30 * 1024);
 });
 
-test("keeps the model caption in the snapshot answer without repeating it in the process card", () => {
+test.each(["", "> 推理等级：`xhigh`（本次运行配置）\n"])("keeps model/reasoning captions in the answer without repeating them in the process card: %s", reasoningCaption => {
   const answer = "完成更新。";
-  const output = `> 本次模型：Codex · \`gpt-5.6-sol\`（本次运行配置）\n\n${answer}`;
+  const output = `> 本次模型：Codex · \`gpt-5.6-sol\`（本次运行配置）\n${reasoningCaption}\n${answer}`;
   const snapshot = liveReplySnapshot("chat_run_card", [
     event(1, "assistant.snapshot", { delta: "先检查，再更新。" }),
     event(2, "tool.completed", { tool: { type: "command", status: "completed" } }),

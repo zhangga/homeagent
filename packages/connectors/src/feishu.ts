@@ -4,6 +4,7 @@
  *   - spawns `event consume im.message.receive_v1 --as bot` and
  *     `event consume im.chat.member.bot.added_v1 --as bot`, each as a long-lived
  *     subprocess;
+ *   - optionally consumes `card.action.trigger` for deterministic card actions;
  *   - blocks on stderr until the `[event] ready` marker before trusting stdout
  *     (lark-event subprocess contract);
  *   - parses NDJSON stdout, normalizes to InboundEvents, forwards to the handler;
@@ -34,6 +35,7 @@ import type {
 import { buildLiveReplyCard } from "./feishu-live-card.ts";
 import {
   normalizeBotAdded,
+  normalizeCardAction,
   normalizeMessage,
   parseMessageResources,
   type FeishuIdentity,
@@ -44,6 +46,7 @@ const log = logger.child("feishu");
 
 const MESSAGE_KEY = "im.message.receive_v1";
 const BOT_ADDED_KEY = "im.chat.member.bot.added_v1";
+const CARD_ACTION_KEY = "card.action.trigger";
 const READY_RE = /\[event\]\s+ready\b/;
 const MAX_REPLY_CONTEXT_CHARS = 20_000;
 const MAX_REPLY_IDEMPOTENCY_IDENTITY_CHARS = 512;
@@ -140,6 +143,8 @@ export interface FeishuConnectorOptions {
   larkBin?: string;
   profile?: string;
   identity?: FeishuIdentity;
+  /** Independent callback stream for applications that handle interactive cards. */
+  cardActions?: boolean;
   /** injected for tests; defaults to Bun.spawn */
   spawner?: ProcSpawner;
   /** base backoff ms for restart (doubles up to a cap) */
@@ -271,6 +276,7 @@ export class FeishuConnector implements Connector {
   private runCommand: RunCommand;
   private handler?: (event: InboundEvent) => void | Promise<void>;
   private consumers: Consumer[] = [];
+  private cardActions: boolean;
   private stopping = false;
 
   constructor(opts: FeishuConnectorOptions = {}) {
@@ -283,6 +289,7 @@ export class FeishuConnector implements Connector {
       botOpenId: config().feishuBotOpenId,
     };
     this.spawner = opts.spawner ?? bunSpawner;
+    this.cardActions = opts.cardActions === true;
     this.backoffBaseMs = opts.backoffBaseMs ?? 1000;
     this.backoffMaxMs = opts.backoffMaxMs ?? 60_000;
     this.maxNeverReady = opts.maxNeverReady ?? 5;
@@ -298,6 +305,7 @@ export class FeishuConnector implements Connector {
     this.consumers = [
       { key: MESSAGE_KEY, stopped: false, attempts: 0, neverReady: 0, state: "starting" },
       { key: BOT_ADDED_KEY, stopped: false, attempts: 0, neverReady: 0, state: "starting" },
+      ...(this.cardActions ? [{ key: CARD_ACTION_KEY, stopped: false, attempts: 0, neverReady: 0, state: "starting" as const }] : []),
     ];
     // Launch each consumer loop; do not await (they run for the connector's life).
     for (const c of this.consumers) void this.runConsumer(c);
@@ -326,7 +334,8 @@ export class FeishuConnector implements Connector {
       .filter((at): at is number => at !== undefined);
     return {
       name: this.name,
-      ready: consumers.length > 0 && consumers.every((consumer) => consumer.state === "ready"),
+      ready: consumers.length > 0 && consumers.filter(consumer => consumer.key !== CARD_ACTION_KEY)
+        .every((consumer) => consumer.state === "ready"),
       lastEventAt: eventTimes.length > 0 ? Math.max(...eventTimes) : undefined,
       consumers,
     };
@@ -453,7 +462,7 @@ export class FeishuConnector implements Connector {
           continue;
         }
         const event =
-          c.key === MESSAGE_KEY
+          c.key === CARD_ACTION_KEY ? normalizeCardAction(obj) : c.key === MESSAGE_KEY
             ? normalizeMessage(obj, this.identity)
             : normalizeBotAdded(obj);
         if (!event) continue;
@@ -620,6 +629,30 @@ export class FeishuConnector implements Connector {
       log.error("notice failed", { err: String(err) });
       throw err;
     }
+  }
+
+  async noticeCard(chatId: string, card: Record<string, unknown>, opts: NoticeOptions = {}): Promise<void> {
+    const content = JSON.stringify(card);
+    if (Buffer.byteLength(content, "utf8") > 30 * 1024) throw new Error("Feishu card exceeds message size limit");
+    const cmd = [this.larkBin, "im", "+messages-send", "--as", "bot", "--chat-id", chatId,
+      "--msg-type", "interactive", "--content", "-", "--json"];
+    if (opts.idempotencyKey) cmd.push("--idempotency-key", opts.idempotencyKey.slice(0, 50));
+    try {
+      const response = parseFeishuJson(await this.runCommand(cmd, { stdin: content }), "Feishu approval card");
+      if (jsonRecord(response)?.ok === false) throw new Error("card rejected");
+    }
+    catch { throw new Error("Feishu approval card delivery failed"); }
+  }
+
+  async updateCard(messageId: string, card: Record<string, unknown>): Promise<void> {
+    if (!/^om_[a-zA-Z0-9_-]{1,256}$/u.test(messageId)) throw new Error("Invalid Feishu card message id");
+    const content = JSON.stringify(card);
+    if (Buffer.byteLength(content, "utf8") > 30 * 1024) throw new Error("Feishu card exceeds message size limit");
+    try {
+      const response = parseFeishuJson(await this.runCommand([this.larkBin, "im", "messages", "patch", "--as", "bot",
+        "--message-id", messageId, "--data", "-", "--json"], { stdin: JSON.stringify({ content }) }), "Feishu approval card update");
+      if (jsonRecord(response)?.ok === false) throw new Error("card update rejected");
+    } catch { throw new Error("Feishu approval card update failed"); }
   }
 
   async addReaction(messageId: string, emojiType: string): Promise<string | undefined> {

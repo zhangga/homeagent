@@ -1087,7 +1087,7 @@ export function agentsView(
     reasoning.disabled = prov.value !== 'codex';
     reasoning.innerHTML = '';
     var inherited = document.createElement('option');
-    inherited.value = ''; inherited.textContent = '默认（继承 Codex 配置）';
+    inherited.value = ''; inherited.textContent = '继承本机 Codex CLI 推理强度';
     reasoning.appendChild(inherited);
     if (reasoning.disabled) return;
     var list = model.value === '' ? (REASONING[''] || []) : (REASONING[model.value] || []);
@@ -1161,7 +1161,7 @@ export function agentsView(
             <div class="field">
               <label>推理强度 <span class="hint">仅 Codex；档位随模型变化，级别越高通常越慢</span></label>
               <select name="reasoningEffort" id="agent-reasoning-effort" ${providerVal === "codex" ? "" : "disabled"}>
-                <option value="" ${reasoningEffortVal === "" ? "selected" : ""}>默认（继承 Codex 配置）</option>
+                <option value="" ${reasoningEffortVal === "" ? "selected" : ""}>继承本机 Codex CLI 推理强度</option>
                 ${initialReasoningEfforts.map(
                   (effort) => html`<option value="${effort}" ${effort === reasoningEffortVal ? "selected" : ""}>${reasoningEffortLabels[effort] ?? effort}</option>`,
                 )}
@@ -3585,7 +3585,7 @@ export function settingsView(
             <select name="defaultModel" id="default-model"
               aria-describedby="${describedBy("defaultModel", "default-model-help", "default-model-error")}"
               aria-invalid="${errors.defaultModel ? "true" : "false"}">${modelOpts}</select>
-            <p class="field-help" id="default-model-help">随 Provider 变化；留空时使用该 CLI 自身的默认模型。</p>
+            <p class="field-help" id="default-model-help">随 Provider 变化；Codex 留空时继承本机 config.toml 中保存的模型，其他 CLI 使用自身默认模型。</p>
             ${errorMessage("defaultModel", "default-model-error")}
           </div>
         </div>

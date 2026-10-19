@@ -1328,7 +1328,7 @@ export function agentWorkbenchView(
                 aria-invalid="${reasoningAttrs.invalid}"
                 aria-describedby="${reasoningAttrs.describedBy}"
               >
-                <option value="" ${values.reasoningEffort === "" ? "selected" : ""}>继承 Codex 默认配置</option>
+                <option value="" ${values.reasoningEffort === "" ? "selected" : ""}>继承本机 Codex CLI 推理强度</option>
                 ${reasoningOptions}
               </select>
               ${errorFor(view.errors, "reasoningEffort")}
@@ -1632,7 +1632,7 @@ export function agentWorkbenchView(
               aria-invalid="${reasoningAttrs.invalid}"
               aria-describedby="${reasoningAttrs.describedBy}"
             >
-              <option value="" ${values.reasoningEffort === "" ? "selected" : ""}>继承 Codex 默认配置</option>
+              <option value="" ${values.reasoningEffort === "" ? "selected" : ""}>继承本机 Codex CLI 推理强度</option>
               ${reasoningOptions}
             </select>
             ${errorFor(view.errors, "reasoningEffort")}
@@ -1981,7 +1981,7 @@ export function agentWorkbenchView(
     reasoning.replaceChildren();
     var inherited = document.createElement('option');
     inherited.value = '';
-    inherited.textContent = '继承 Codex 默认配置';
+    inherited.textContent = '继承本机 Codex CLI 推理强度';
     reasoning.appendChild(inherited);
     if (reasoning.disabled) return;
     (REASONING[model.value] || []).forEach(function (effort) {

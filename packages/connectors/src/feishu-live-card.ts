@@ -76,7 +76,7 @@ export function liveReplySnapshot(
   if (answer) {
     const lastMessage = steps.findLastIndex(step => step.kind === "commentary");
     const message = steps[lastMessage]?.title;
-    const body = bound(answer.replace(/^> 本次模型：[^\n]{1,300}\n\n/u, ""), 4_000);
+    const body = bound(answer.replace(/^> 本次模型：[^\n]{1,300}\n(?:> 推理等级：[^\n]{1,300}\n)?\n/u, ""), 4_000);
     if (message && body && !steps.slice(lastMessage + 1).some(step => step.kind === "tool")
       && (body.startsWith(message) || message.startsWith(body))) steps.splice(lastMessage, 1);
   }

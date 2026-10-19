@@ -21,7 +21,7 @@
  * them we fall back to "any mention present" so the bot is not permanently mute.
  */
 import type { Attachment } from "@homeagent/shared";
-import type { BotAddedEvent, InboundMessage } from "./connector.ts";
+import type { BotAddedEvent, CardActionEvent, InboundMessage } from "./connector.ts";
 import { normalizeByteTechArticleUrl } from "./source-links.ts";
 
 export interface FeishuIdentity {
@@ -37,6 +37,27 @@ interface MentionEntry {
 
 function asString(v: unknown): string | undefined {
   return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/** lark-cli renders card.action.trigger at the top level. Never retain its token/card body. */
+export function normalizeCardAction(obj: Record<string, unknown>): CardActionEvent | null {
+  if (obj.type !== "card.action.trigger" || obj.action_tag !== "button") return null;
+  const eventId = asString(obj.event_id);
+  const chatId = asString(obj.chat_id);
+  const messageId = asString(obj.message_id);
+  const operatorId = asString(obj.operator_id);
+  if (!eventId || eventId.length > 256 || !chatId || !/^oc_[a-zA-Z0-9_-]{1,256}$/u.test(chatId)
+    || !messageId || !/^om_[a-zA-Z0-9_-]{1,256}$/u.test(messageId)
+    || !operatorId || !/^ou_[a-zA-Z0-9_-]{1,256}$/u.test(operatorId)
+    || typeof obj.action_value !== "string" || obj.action_value.length > 2048) return null;
+  let actionValue: unknown;
+  try { actionValue = JSON.parse(obj.action_value); } catch { return null; }
+  if (!actionValue || typeof actionValue !== "object" || Array.isArray(actionValue)
+    || Object.keys(actionValue).length > 16) return null;
+  const createdAt = Number(obj.timestamp);
+  if (!Number.isSafeInteger(createdAt) || createdAt < 0) return null;
+  return { kind: "card_action", eventId, chatId, messageId, operatorId, actionTag: "button",
+    actionValue: Object.fromEntries(Object.entries(actionValue)), createdAt };
 }
 
 export interface FeishuMessageResource {
