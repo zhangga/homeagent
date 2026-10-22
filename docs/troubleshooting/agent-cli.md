@@ -52,6 +52,16 @@ live Skill 目录不会进入 prompt/profile，fork 也会忽略历史 turn 中�
 `AGENTS.md` 注入或改成继承用户规则；这会改变安全契约。版本不匹配时升级受支持 CLI，或在代码和相邻
 provider 测试中显式完成兼容改动。
 
+普通 Codex Chat/Task 调用显式设置 `web_search="live"`，无需 `research` 标记或先加载研究技能；
+提炼、后台学习等无执行配置的调用仍设置 `web_search="disabled"`。原生搜索是托管工具，
+不使用本地命令的网络通道，话题沙箱的 `network.enabled=false` 不会关闭它。若回复称没有搜索工具，
+先检查运行版本及实际启动参数，不能把本地命令联网被拒绝等同于原生搜索不可用。
+命令工具禁止登录 Shell（`allow_login_shell=false`）；显式 `login=true` 会被 CLI 拒绝，应改用
+`login=false` 或省略该字段后重试读取本轮映射中的 Skill。自动选用的技能读取失败可以说明后使用
+原生搜索等可用工具；用户明确指定的技能仍须报告依赖步骤受阻，不能声称已经加载。
+参数语义见 [OpenAI 网页搜索文档](https://learn.chatgpt.com/docs/web-search)和
+[Codex 配置参考](https://developers.openai.com/codex/config-reference/)。
+
 HomeAgent 的 Codex setup、能力探测和实际运行共同使用 `<dataDir>/provider-state/codex`。启动时会初始化该独立目录；
 若当前控制台 `CODEX_HOME/auth.json` 是有效的普通文件，HomeAgent 会以有界读取、JSON 校验、同目录临时文件和原子发布
 把登录缓存导入独立目录。源文件不会被修改或链接，控制台的配置、规则、Plugins、Skills、原生会话及其他状态也不会被继承。

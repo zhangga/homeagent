@@ -29,6 +29,7 @@ import {
   AI_OPERATION_TIMEOUT_MS,
   AI_QUEUE_TIMEOUT_MS,
   AI_ROUTING_MAX_TOKENS,
+  splitMaterialText,
   Serializer,
   config,
   logger,
@@ -79,6 +80,7 @@ import { SpaceRegistry } from "./registry.ts";
 import { normalizeSearchLimit } from "./sqlite.ts";
 import type { RawSourceCapture, RawSourceDownload } from "./raw-source-files.ts";
 import { chatRawEntryUpdatedAt, chatRawImportId, createChatRawCapture, formatChatRawImportReceipt, isChatRawScopeSkip, parseChatRawImport, readChatRawCapture, resolveChatRawImportRequest, type ChatRawImportReceipt } from "./chat-raw-import.ts";
+import { createDocumentCapture, readDocumentCapture, resolveDocumentImportRequest } from "./chat-document-import.ts";
 import { ChatSourceProgressStore, chatSourceProgressInstruction } from "./chat-source-progress.ts";
 import { assertLocalStatePath } from "./durable-file.ts";
 import { FeishuGroupBindingStore } from "./feishu-bindings.ts";
@@ -6785,6 +6787,88 @@ export class KnowledgeEngine implements Knowledge {
           });
         } catch {
           return `原始记录入库未完成：已确认新增 ${receipt.imported} 条；其余未确认。请检查交接文件、来源群范围、大小/格式和当前授权后重新请求。已落盘记录保留，重试按消息去重；未下载附件，未推进增量起点。`;
+        }
+      },
+    };
+  }
+
+  /** Agent-fetched documents use the same host-owned handoff as other Chat sources. */
+  prepareChatDocumentImport(runId: string): { instruction: string; finish(signal?: AbortSignal): Promise<string> } | undefined {
+    const run = this.chatRuns.get(runId);
+    if (!run || run.inputTruncated) return undefined;
+    const urls = resolveDocumentImportRequest(this.chatRuns.topicInputsThroughRun(runId));
+    if (!urls.length) return undefined;
+    const plan = run.executionPlan;
+    const denied = {
+      instruction: "本轮文档原文不能自动入库：需要当前 Agent 已有可写权限与有效 Workdir。只能报告实际抓取或本地保存结果，不能声称已入库。",
+      finish: async () => "文档原文入库未完成：当前 Run 没有有效的可写 Workdir 或执行授权。",
+    };
+    if (!isResolvedExecutionPlan(plan) || plan.resolutionError || !plan.workdir
+      || !["write", "full"].includes(plan.execution?.permission ?? "") || !this.registry.has(run.space)) return denied;
+    const store = this.registry.store(run.space);
+    // Already synchronized Feishu/ByteTech documents retain their existing path.
+    const synchronized = run.messageId && run.chatId ? store.index().findRawsByMessageId(run.messageId, run.chatId) : [];
+    const pendingUrls = urls.filter(url => !synchronized.some(raw => raw.source === "doc" && !raw.id.startsWith("doc-import-")
+      && raw.content.startsWith(`# 来源资料：${url}\n`)));
+    if (!pendingUrls.length) return undefined;
+    const initialMeta = this.registry.get(run.space);
+    const initialBinding = this.feishuBindings.getBySpace(run.space);
+    const validate = (signal?: AbortSignal) => {
+      const current = this.chatRuns.get(runId);
+      const meta = this.registry.get(run.space);
+      const binding = this.feishuBindings.getBySpace(run.space);
+      if (signal?.aborted || current?.status !== "running" || !meta
+        || meta.agentBindingEpoch !== initialMeta?.agentBindingEpoch
+        || this.localExecutionPlanError(run.space, run.agentId, plan, "chat")
+        || (run.space.startsWith("team/") && (run.space !== `team/${run.chatId}` || binding?.state !== "active"
+          || !binding.boundAppId || binding.executionScopeEpoch !== initialBinding?.executionScopeEpoch))
+        || (run.messageId && run.chatId && store.index().getMessageRetraction(run.chatId, run.messageId))) {
+        throw new Error("Document capture authorization expired");
+      }
+      this.validateNativeSessionFilesystemContract(plan.execution, plan.workdir);
+    };
+    try { validate(); } catch { return denied; }
+    const capture = createDocumentCapture(plan.workdir, pendingUrls);
+    return {
+      instruction: capture.instruction,
+      finish: async signal => {
+        let imported = 0, duplicates = 0;
+        try {
+          return await this.serializer.run(run.space, async () => {
+            validate(signal);
+            const documents = readDocumentCapture(capture);
+            validate(signal);
+            const createdAt = Date.now();
+            const day = new Date(createdAt).toISOString().slice(0, 10).split("-");
+            assertLocalStatePath(this.dataDir, join(store.root, ".index.db"));
+            assertLocalStatePath(this.dataDir, join(store.root, "raw", "records", day[0]!, day[1]!, `${day[2]}.jsonl`));
+            // Prepare every digest/path before any source or journal mutation.
+            const prepared = documents.map(doc => ({ ...doc, files: doc.files.map(file => {
+              const digest = createHash("sha256").update(file.bytes).digest("hex");
+              assertLocalStatePath(this.dataDir, store.rawSourceFiles.pathFor(digest));
+              return { ...file, digest };
+            }) }));
+            for (const doc of prepared) for (const file of doc.files) store.rawSourceFiles.write(file.bytes, file.digest);
+            for (const doc of prepared) {
+              const attachments = doc.files.map(file => ({ kind: file.kind, name: file.path, ref: file.path,
+                sourceDigest: file.digest, sourceSizeBytes: file.bytes.byteLength }));
+              const parts = splitMaterialText(doc.content);
+              for (const [part, body] of parts.entries()) {
+                const content = `# 来源资料：${doc.url}\n\n<!-- ${JSON.stringify({ format: "homeagent.document-source", version: 1,
+                  capture: "agent-submitted", title: doc.title, complete: doc.complete, part: part + 1, parts: parts.length })} -->\n\n${body}`;
+                const id = `doc-import-${createHash("sha256").update(JSON.stringify([
+                  run.space, run.messageId ?? run.id, content, attachments,
+                ])).digest("hex")}`;
+                if (store.index().captureImportedRaw(id, { space: run.space, source: "doc", content, attachments,
+                  createdAt, chatId: run.chatId, messageId: run.messageId, author: run.author, agentId: run.agentId })) imported++;
+                else duplicates++;
+              }
+            }
+            const incomplete = documents.length !== pendingUrls.length || documents.some(doc => !doc.complete);
+            return `文档原文入库：新增 ${imported} 条，重复跳过 ${duplicates} 条；已保存 ${prepared.reduce((sum, doc) => sum + doc.files.length, 0)} 份原文文件、配图或附件。${incomplete ? "来源交接不完整，缺失部分仍需补录。" : "已保存本轮交接的全部正文与文件，来源完整性为 Agent 声明。"}知识页将在后续提炼中生成。`;
+          });
+        } catch {
+          return `文档原文入库未完成：已确认新增 ${imported} 条、重复 ${duplicates} 条；其余未确认。请检查本轮资料交接、文件大小/格式和当前授权后重试。已落盘资料保留，重试按来源内容去重；本地文件保存不等于入库。`;
         }
       },
     };

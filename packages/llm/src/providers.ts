@@ -1316,7 +1316,10 @@ const KNOWN: CliSpec[] = [
         "-c",
         'developer_instructions=""',
         "-c",
-        'web_search="disabled"',
+        // Hosted search is independent of sandboxed command networking. Chat
+        // and Task calls can research current information without widening it;
+        // background completions still receive no web tool.
+        `web_search="${execution ? "live" : "disabled"}"`,
       ];
       args.push(...codexSkillIsolationOverrides());
       const policy = resolveCodexExecutionPolicy(execution, isCodexTopicCall({ nativeSession, nativeTopic, nativeSessionIsolation }));
@@ -2590,6 +2593,14 @@ function injectProviderSkills(id: ProviderId, input: RunInput): RunInput {
   ) {
     throw new Error("provider Codex Skill inputs do not match frozen evidence");
   }
+  if (id === "codex" && prepared.execution) {
+    prepared.prompt = [
+      "本轮已启用原生实时网页搜索；涉及最新新闻等时效性信息时，使用该工具核实并提供来源，不要仅凭已有知识回答。用户未明确指定技能时，无需先加载研究或新闻技能即可搜索。",
+      "本轮禁止登录 Shell；调用命令工具时设置 login=false（或省略 login），不要请求 login=true。若因登录 Shell 参数被拒绝，改用 login=false 重试；这不代表映射内的技能文件不可读。",
+      "",
+      prepared.prompt,
+    ].join("\n");
+  }
   // Native Skill invocation requires an execution grant. Background no-tools
   // completions keep evidence in the Run trace but do not ask the CLI to load
   // a local Skill.
@@ -2605,7 +2616,9 @@ function injectProviderSkills(id: ProviderId, input: RunInput): RunInput {
         "以下是本轮唯一有效的技能映射；忽略会话历史中的旧技能路径。使用某个技能前，必须先读取下列映射中的 SKILL.md；只可从对应目录读取技能资源，禁止搜索、发现或加载其他技能。",
         "技能文档若用 ../<技能名>/SKILL.md 引用另一个技能，必须按该名称在本轮映射中解析，不能假设副本目录仍是原来的相邻布局。依赖未列入映射时报告缺失，不读取原始目录或自行安装。",
         ...skillInputs.map((skill) => `- ${skill.name}: ${JSON.stringify(skill.skillFile)}`),
-        "如果任一所需技能或资源不可读取，停止执行并明确报告，不要假装已经使用。",
+        prepared.execution.skillMode === "all"
+          ? "自动选用的技能或资源不可读取时，说明情况并继续使用本轮可用工具完成请求，不要假装已经使用该技能；若用户明确指定该技能，停止依赖它的步骤并明确报告。"
+          : "如果任一所需技能或资源不可读取，停止执行并明确报告，不要假装已经使用。",
         "",
         prepared.prompt,
       ].join("\n"),

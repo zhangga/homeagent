@@ -42,6 +42,127 @@ const READ_ONLY_EXECUTION = {
   skills: [],
 };
 
+test.each(["read-only", "write"] as const)("ordinary Codex news questions have live search without a research-only flag: %s", async permission => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "ha-codex-news-")));
+  const previousBin = process.env.HOMEAGENT_CODEX_BIN;
+  try {
+    process.env.HOMEAGENT_CODEX_BIN = writeArgAndStdinReportingCodexProvider(directory);
+    const output = await runProviderDetailed("codex", {
+      prompt: "最近AI界有什么新的重大的新闻吗",
+      execution: { permission, skills: [] },
+    }, 5_000);
+    const observed = JSON.parse(output.text) as { args: string[]; prompt: string };
+    expect(observed.args).toContain('web_search="live"');
+    expect(observed.args).not.toContain('web_search="disabled"');
+    expect(observed.args).toContain(permission === "write" ? "workspace-write" : "read-only");
+    expect(observed.args).toContain("allow_login_shell=false");
+    expect(observed.prompt).toContain("login=false");
+    expect(observed.prompt).toContain("原生实时网页搜索");
+    expect(observed.prompt).toContain("无需先加载研究或新闻技能");
+  } finally {
+    if (previousBin === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+    else process.env.HOMEAGENT_CODEX_BIN = previousBin;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("background Codex completions keep native search disabled", async () => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "ha-codex-background-search-")));
+  const previousBin = process.env.HOMEAGENT_CODEX_BIN;
+  try {
+    process.env.HOMEAGENT_CODEX_BIN = writeArgAndStdinReportingCodexProvider(directory);
+    const output = await runProviderDetailed("codex", { prompt: "提炼已提供的材料" }, 5_000);
+    const observed = JSON.parse(output.text) as { args: string[]; prompt: string };
+    expect(observed.args).toContain('web_search="disabled"');
+    expect(observed.args).not.toContain("--search");
+    expect(observed.prompt).toBe("提炼已提供的材料");
+  } finally {
+    if (previousBin === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+    else process.env.HOMEAGENT_CODEX_BIN = previousBin;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test.each(["routing", "start", "fork"] as const)("Codex topic news keeps live search and frozen Skill read access: %s", async mode => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "ha-codex-topic-news-")));
+  const previousBin = process.env.HOMEAGENT_CODEX_BIN;
+  const previousHome = process.env.HOMEAGENT_CODEX_HOME;
+  try {
+    const workdir = join(directory, "workdir");
+    const dataRoot = join(directory, "data");
+    const skillDirectory = join(directory, "research");
+    for (const path of [workdir, dataRoot, skillDirectory]) mkdirSync(path);
+    const skillFile = join(skillDirectory, "SKILL.md");
+    writeFileSync(skillFile, "# Research\n");
+    process.env.HOMEAGENT_CODEX_BIN = writeArgAndStdinReportingCodexProvider(directory);
+    process.env.HOMEAGENT_CODEX_HOME = join(directory, "codex-home");
+    const output = await runProviderDetailed("codex", {
+      prompt: "最近AI界有什么新的重大的新闻吗",
+      protectedDataRoot: dataRoot,
+      nativeTopic: true,
+      nativeSession: mode === "routing" ? undefined : mode === "start" ? { mode: "start" }
+        : { mode: "fork", id: "11111111-2222-4333-8444-555555555555" },
+      execution: { permission: "read-only", workdir, skills: ["research"], skillMode: "all" },
+      skillInputs: [{ name: "research", directory: skillDirectory, skillFile, bundleHash: hashProviderSkillBundle(skillFile) }],
+    }, 5_000);
+    const observed = JSON.parse(output.text) as { args: string[]; prompt: string };
+    expect(observed.args).toContain('web_search="live"');
+    expect(observed.args).not.toContain("--sandbox");
+    expect(observed.args.includes("--ephemeral")).toBe(mode === "routing");
+    expect(observed.args.includes("fork")).toBe(mode === "fork");
+    const profile = observed.args.find(arg => arg.startsWith("permissions="))!;
+    expect(profile).toContain('":root"="deny"');
+    expect(profile).toContain("network={enabled=false}");
+    const line = observed.prompt.split("\n").find(item => item.startsWith("- research: "))!;
+    const stagedFile = JSON.parse(line.slice("- research: ".length)) as string;
+    const stagedRoot = resolve(stagedFile, "..", "..");
+    expect(profile).toContain(`${JSON.stringify(stagedRoot)}="read"`);
+    expect(profile).not.toContain(JSON.stringify(skillDirectory));
+    expect(existsSync(stagedFile)).toBe(false);
+  } finally {
+    if (previousBin === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+    else process.env.HOMEAGENT_CODEX_BIN = previousBin;
+    if (previousHome === undefined) delete process.env.HOMEAGENT_CODEX_HOME;
+    else process.env.HOMEAGENT_CODEX_HOME = previousHome;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test.each(["all", undefined] as const)("Codex distinguishes optional catalog Skills from required Skills: %s", async skillMode => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "ha-codex-news-skill-")));
+  const previousBin = process.env.HOMEAGENT_CODEX_BIN;
+  try {
+    const skillDirectory = join(directory, "research");
+    mkdirSync(skillDirectory);
+    const skillFile = join(skillDirectory, "SKILL.md");
+    writeFileSync(skillFile, "# Research\n");
+    process.env.HOMEAGENT_CODEX_BIN = writeArgAndStdinReportingCodexProvider(directory);
+    const output = await runProviderDetailed("codex", {
+      prompt: "最近AI界有什么新的重大的新闻吗",
+      execution: { ...READ_ONLY_EXECUTION, skills: ["research"], skillMode },
+      skillInputs: [{ name: "research", directory: skillDirectory, skillFile, bundleHash: hashProviderSkillBundle(skillFile) }],
+    }, 5_000);
+    const observed = JSON.parse(output.text) as { args: string[]; prompt: string };
+    expect(observed.args).toContain('web_search="live"');
+    expect(observed.prompt).toContain("- research: ");
+    expect(observed.prompt).toContain("homeagent-codex-skills-");
+    if (skillMode === "all") {
+      expect(observed.prompt).toContain("自动选用的技能或资源不可读取时");
+      expect(observed.prompt).toContain("继续使用本轮可用工具完成请求");
+      expect(observed.prompt).toContain("用户明确指定");
+      expect(observed.prompt).not.toContain("如果任一所需技能或资源不可读取，停止执行");
+    } else {
+      expect(observed.prompt).toContain("如果任一所需技能或资源不可读取，停止执行");
+      expect(observed.prompt).not.toContain("继续使用本轮可用工具完成请求");
+    }
+    expect(observed.prompt).not.toContain(skillDirectory);
+  } finally {
+    if (previousBin === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
+    else process.env.HOMEAGENT_CODEX_BIN = previousBin;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("passes only the HomeAgent-selected Lark profile into provider tools", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ha-provider-lark-profile-"));
   const previousBin = process.env.HOMEAGENT_TRAE_BIN;
@@ -910,6 +1031,7 @@ test("explicit full topic start, fork and routing do not invoke a failing Window
         acquireExecutionPermit: () => ({ register: () => () => {}, release: () => {} }),
       }, 5000);
       expect(result.text).toContain("--sandbox danger-full-access");
+      expect(result.text).toContain('web_search="live"');
       expect(result.text).toContain('cli_auth_credentials_store="keyring"');
       expect(result.text).not.toContain("permissions=");
       expect(result.text).toContain("--strict-config --ignore-user-config --ignore-rules --json");
@@ -3279,11 +3401,13 @@ describe("provider detection", () => {
       if (process.platform !== "win32") chmodSync(bin, 0o755);
       process.env.HOMEAGENT_CODEX_BIN = bin;
 
-      expect(await runProvider(
+      const output = await runProvider(
         "codex",
         { prompt, execution: READ_ONLY_EXECUTION },
         500,
-      )).toBe(prompt);
+      );
+      expect(output.endsWith(`\n\n${prompt}`)).toBe(true);
+      expect(output).toContain("login=false");
     } finally {
       if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
       else process.env.HOMEAGENT_CODEX_BIN = previous;

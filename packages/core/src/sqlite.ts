@@ -455,7 +455,9 @@ export class SpaceIndex {
 
   /** Idempotent source snapshot capture; repair only the rebuildable projection on retry. */
   captureImportedRaw(id: string, entry: RawEntry): boolean {
-    if (!/^chat-import-[a-f0-9]{64}$/.test(id) || entry.source !== "manual" || entry.workActionId || entry.admission) {
+    const chatImport = /^chat-import-[a-f0-9]{64}$/.test(id) && entry.source === "manual";
+    const documentImport = /^doc-import-[a-f0-9]{64}$/.test(id) && entry.source === "doc";
+    if ((!chatImport && !documentImport) || entry.workActionId || entry.admission) {
       throw new Error("Invalid imported Raw capture");
     }
     // The journal may already have committed when a previous projection write failed.
@@ -466,6 +468,10 @@ export class SpaceIndex {
       }
       if (chatRawEntryUpdatedAt(entry) !== undefined && chatRawVersionContent(existing) !== chatRawVersionContent(entry)) {
         throw new Error("Imported Raw version conflict");
+      }
+      const documentFiles = (raw: RawEntry) => raw.attachments?.map(file => [file.kind, file.ref, file.name, file.sourceDigest, file.sourceSizeBytes]);
+      if (documentImport && (existing.content !== entry.content || JSON.stringify(documentFiles(existing)) !== JSON.stringify(documentFiles(entry)))) {
+        throw new Error("Imported document content conflict");
       }
       if (!this.getRaw(id)) this.insertRawProjection(existing);
       return false;

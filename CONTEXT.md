@@ -81,13 +81,16 @@ Codex 回答还显示冻结的 reasoningEffort，标注为“推理等级（本�
 
 飞书实时过程是同一事件流的可失败投影：Connector 先创建 CardKit Card 2.0 实体并回复到原话题，随后以
 Bot 身份按序、合并和节流地更新同一实体；运行态开启 streaming mode，终态关闭。过程卡展示公开步骤、
-阶段性说明和工具调用计数，按事件顺序交错排列，默认展开、终态仍可手动折叠；不展示隐藏推理、完整命令或工具输出。
+阶段性说明和工具调用计数，按事件顺序交错排列，默认展开、终态仍可手动折叠，箭头紧随状态标题。
+连续工具事件在卡片中合并为默认收起的累计调用记录，开始/结束配对不重复计数，展开后保留原工具类型与状态，
+失败在收起的记录上仍有明确提示；journal 不因展示分组而合并事件。不展示隐藏推理、完整命令或工具输出。
 Codex exec `reasoning.text` 是 Provider 明确返回的公开推理摘要，以 transient `reasoning_summary` 事件接入，
 在 journal 中复用 `assistant.snapshot`、`phase=provider` 和“思考摘要”标题，不增加持久化格式。
 Codex 与 Claude 的公开 assistant 文本也作为过程说明保留；最终回答通过 Run 成功事件校准去重，
 只在独立 Markdown 回复展示，过程卡不重复回答。内部路由/分类的摘要和结构化文本不外发；
 回答合成以 `publicReasoningSummary` 显式开放摘要，仍不公开其 JSON。缺少摘要时如实提示，不伪造过程。
-卡片超出平台 30 KiB 限制时明确标记省略数量，本机 journal 不因卡片裁剪而删除历史。管理后台通过同一 journal 展示可展开时间线。
+卡片超出平台 30 KiB 或 200 个组件限制时明确标记省略数量，截取最近完整步骤后仍保留真实累计调用数；
+本机 journal 不因卡片裁剪而删除历史。管理后台通过同一 journal 展示可展开时间线。
 过程卡与最终 Markdown 回答是两个独立投影；
 过程投影失败会记录 operator 事件并回退，但不能吞掉最终回答。`delivery.liveReply` 保存 provider、messageId、
 可选 cardId、revision 与 lastAppliedSeq，旧 ChatRun 记录缺失 cardId 仍可按旧 message patch 路径收尾；
@@ -122,6 +125,16 @@ Chat 文件新写入 v8，读取 v1–v8；Task 文件新写入 v13，读取 v2�
 准入状态、提炼状态及 Agent 处理信息，是知识页 provenance 的根。
 
 ## Raw journal
+
+显式要求记录网页/文档完整内容的 Chat Run 可在冻结的可写 Workdir 中提交本轮专用的
+`homeagent-document-raw-<随机 ID>.json` 清单。来源 URL 只从当前或同话题已保存的用户请求确定，
+正文、图片及原网页等原件在写入前整批校验；HomeAgent 复验运行状态、Space 绑定、Workdir 与执行授权，
+再将正文以现有 `source=doc` 保存到该 Run 的唯一 Space，长正文复用 200,000 字符分段，原文件按 SHA-256 保存。
+正文的 `homeagent.document-source` v1 注释标记 Agent 来源声明、标题、完整性和分段顺序，不是独立验证网页的证明。
+`doc-import-<摘要>` Raw ID 绑定 Space、请求消息、正文与原件版本，沿用 journal 先提交、SQLite projection 后提交的恢复路径；
+同一份交接重试修复投影而不重复 Raw。未完整提交的持久化失败保留已落盘资料，并返回确认计数；不自动重放已停止的 Provider。
+清单不改变 Raw journal、原文件与 Knowledge page 的所有权，也不新增运行持久化格式或 Space 归档版本。
+最终回复中的文档入库回执由后台在 Raw 落盘后生成；本地归档与知识页提炼分别报告，未入库不能以文件保存成功代替。
 
 显式要求保存飞书群聊天原文的 Chat Run 可在冻结的可写 Workdir 中生成 `homeagent-chat-raw-<随机 ID>.json`
 交接文件。Core 只接受仍在运行、授权和发起请求群绑定均有效的 Team Space 交接；按完整 schema 和有界文件验证后，

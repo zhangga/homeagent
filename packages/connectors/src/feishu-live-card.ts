@@ -3,6 +3,7 @@ import type { LiveReplySnapshot, LiveReplyStep } from "./connector.ts";
 
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
 const MAX_CARD_BYTES = 30 * 1024;
+const MAX_CARD_ELEMENTS = 200;
 const TOOL_LABELS = {
   command: "命令执行", "file-read": "读取文件", "file-change": "修改文件",
   mcp: "外部工具", "web-search": "网络查询", other: "工具调用",
@@ -13,6 +14,20 @@ function bound(value: string | undefined, limit: number): string {
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, "")
     .trim()
     .slice(0, limit);
+}
+
+function countToolCall(runningTools: Map<string, number>, type: string, started: boolean): number {
+  const running = runningTools.get(type) ?? 0;
+  if (started) {
+    runningTools.set(type, running + 1);
+    return 1;
+  }
+  if (running > 0) {
+    runningTools.set(type, running - 1);
+    return 0;
+  }
+  // Some providers report only the completed event for a tool.
+  return 1;
 }
 
 export function liveReplySnapshot(
@@ -57,17 +72,9 @@ export function liveReplySnapshot(
     deltaStep = undefined;
     if (event.kind === "tool.started" || event.kind === "tool.completed") {
       const type = event.tool?.type ?? "other";
-      const running = runningTools.get(type) ?? 0;
-      if (event.kind === "tool.started") {
-        toolCallCount++;
-        runningTools.set(type, running + 1);
-      } else if (running > 0) {
-        runningTools.set(type, running - 1);
-      } else {
-        // Some providers report only the completed event for a tool.
-        toolCallCount++;
-      }
-      steps.push({ seq: event.seq, title: TOOL_LABELS[type], kind: "tool", status: event.tool?.status });
+      const started = event.kind === "tool.started";
+      toolCallCount += countToolCall(runningTools, type, started);
+      steps.push({ seq: event.seq, title: TOOL_LABELS[type], kind: "tool", status: started ? "running" : event.tool?.status ?? "unknown" });
     } else if (!event.kind.startsWith("delivery.") && event.kind !== "run.succeeded") {
       steps.push({ seq: event.seq, title: bound(event.title, 120), kind: "status", status: event.status });
     }
@@ -97,23 +104,85 @@ export function liveReplySnapshot(
   };
 }
 
+interface ProcessRow {
+  content: string;
+  toolCallCount?: number;
+  running?: boolean;
+  failed?: boolean;
+}
+
+function processRows(steps: LiveReplyStep[]): ProcessRow[] {
+  const statuses: Record<string, string> = { running: "执行中", completed: "已完成", failed: "失败", unknown: "已结束" };
+  const runningTools = new Map<string, number>();
+  let toolCallCount = 0;
+  return steps.map(step => {
+    const title = bound(step.title, step.kind === "commentary" || step.kind === "summary" ? 4_000 : 120);
+    if (step.kind !== "tool") {
+      return { content: step.kind === "commentary" || step.kind === "summary" ? title : `> ${title}` };
+    }
+    toolCallCount += countToolCall(runningTools, title, step.status === "running");
+    return {
+      content: `${step.status === "failed" ? "✗" : step.status === "running" ? "◷" : "✓"} ${title} · ${statuses[step.status ?? "unknown"] ?? "已结束"}`,
+      toolCallCount,
+      running: [...runningTools.values()].some(count => count > 0),
+      failed: step.status === "failed",
+    };
+  });
+}
+
+function processElements(rows: ProcessRow[]): Record<string, unknown>[] {
+  const elements: Record<string, unknown>[] = [];
+  let tools: ProcessRow[] = [];
+  const flushTools = () => {
+    const last = tools.at(-1);
+    if (!last) return;
+    const failed = tools.some(row => row.failed);
+    const status = `${last.running ? " · 执行中" : ""}${failed ? " · 包含失败" : ""}`;
+    elements.push({
+      tag: "collapsible_panel", expanded: false, padding: "0px", vertical_spacing: "4px",
+      header: {
+        title: { tag: "markdown", content: `<font color='${failed ? "red" : "grey"}'>已调用 ${last.toolCallCount} 次工具${status}</font>` },
+        width: "auto", icon_position: "follow_text", padding: "0px",
+      },
+      elements: [{ tag: "markdown", content: tools.map(row => row.content).join("\n"), text_size: "notation" }],
+    });
+    tools = [];
+  };
+  for (const row of rows) {
+    if (row.toolCallCount !== undefined) tools.push(row);
+    else {
+      flushTools();
+      elements.push({ tag: "markdown", content: row.content, text_size: "normal" });
+    }
+  }
+  flushTools();
+  return elements;
+}
+
+function cardElementCount(value: unknown): number {
+  if (!value || typeof value !== "object") return 0;
+  return ("tag" in value ? 1 : 0) + Object.values(value).reduce<number>((sum, item) => sum + cardElementCount(item), 0);
+}
+
+function omissionNotice(count: number): Record<string, unknown> {
+  return { tag: "markdown", content: `较早的 ${count} 条过程记录未在卡片内展开，可在管理后台查看。`, text_size: "notation" };
+}
+
 export function buildLiveReplyCard(snapshot: LiveReplySnapshot): Record<string, unknown> {
   const labels: Record<LiveReplySnapshot["state"], string> = {
     queued: "排队中", running: "执行中", waiting: "等待处理", succeeded: "已完成",
     failed: "执行失败", cancelled: "已取消", timed_out: "已超时",
   };
   const stateTitle = snapshot.state === "succeeded" ? "任务已完成" : labels[snapshot.state];
-  const toolCount = snapshot.toolCallCount > 0 ? ` · 已调用 ${snapshot.toolCallCount} 次工具` : "";
-  const processContent: Record<string, unknown> = { tag: "markdown", content: "", text_size: "normal" };
-  const elements: Record<string, unknown>[] = [
-    {
-      tag: "collapsible_panel",
-      expanded: true,
-      header: { title: { tag: "plain_text", content: `${stateTitle}${toolCount}` } },
-      padding: "4px", vertical_spacing: "8px",
-      elements: [processContent],
+  const processPanel: Record<string, unknown> = {
+    tag: "collapsible_panel", expanded: true, padding: "0px", vertical_spacing: "8px",
+    header: {
+      title: { tag: "plain_text", content: stateTitle },
+      width: "auto", icon_position: "follow_text", padding: "0px",
     },
-  ];
+    elements: [],
+  };
+  const elements: Record<string, unknown>[] = [processPanel];
   if (snapshot.detailUrl) {
     elements.push({
       tag: "button", type: "primary_filled", width: "fill", text: { tag: "plain_text", content: "查看详细执行" },
@@ -136,28 +205,25 @@ export function buildLiveReplyCard(snapshot: LiveReplySnapshot): Record<string, 
     },
     body: { direction: "vertical", padding: "12px", vertical_spacing: "8px", elements },
   };
-  // CardKit rejects payloads over 30 KiB. Keep recent complete entries and make
-  // any omitted history explicit; the durable journal retains the full timeline.
-  const budget = Math.max(0, MAX_CARD_BYTES - Buffer.byteLength(JSON.stringify(card), "utf8") - 512);
-  const rows: string[] = [];
-  let usedBytes = 0;
-  const statuses: Record<string, string> = { running: "执行中", completed: "已完成", failed: "失败", unknown: "已结束" };
   // Lifecycle labels are useful while waiting, but must not obscure the actual
   // summaries and tool activity once a successful turn has completed.
   const processSteps = snapshot.state === "succeeded"
     ? snapshot.steps.filter(step => step.kind !== "status") : snapshot.steps;
-  for (const step of [...processSteps].reverse()) {
-    const row = step.kind === "commentary" || step.kind === "summary" ? bound(step.title, 4_000)
-      : step.kind === "tool" ? `> ${step.status === "failed" ? "✗" : step.status === "running" ? "◷" : "✓"} ${bound(step.title, 120)} · ${statuses[step.status ?? "unknown"] ?? "已结束"}`
-      : `> ${bound(step.title, 120)}`;
-    const bytes = Buffer.byteLength(JSON.stringify(row), "utf8") + 4;
-    if (usedBytes + bytes > budget) break;
-    rows.unshift(row);
-    usedBytes += bytes;
-  }
-  const omitted = processSteps.length - rows.length;
   const empty = isLiveReplyTerminal(snapshot) ? "本次调用未返回可展示的过程摘要。" : "正在准备执行…";
-  processContent.content = `${omitted ? `较早的 ${omitted} 条过程记录未在卡片内展开，可在管理后台查看。\n\n` : ""}${rows.join("\n\n") || (omitted ? "" : empty)}`;
+  const rows = processRows(processSteps);
+  let retained: Record<string, unknown>[] = rows.length
+    ? [omissionNotice(rows.length)] : [{ tag: "markdown", content: empty, text_size: "normal" }];
+  processPanel.elements = retained;
+  // Apply both platform limits to the complete payload, including nested panels
+  // and the omission notice. Count totals before trimming a suffix of the journal.
+  for (let index = rows.length - 1; index >= 0; index--) {
+    const candidate = processElements(rows.slice(index));
+    if (index > 0) candidate.unshift(omissionNotice(index));
+    processPanel.elements = candidate;
+    if (Buffer.byteLength(JSON.stringify(card), "utf8") > MAX_CARD_BYTES || cardElementCount(card) > MAX_CARD_ELEMENTS) break;
+    retained = candidate;
+  }
+  processPanel.elements = retained;
   return card;
 }
 

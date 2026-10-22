@@ -166,3 +166,93 @@ test("explains an absent summary without inventing a process or showing a zero-t
   expect(card).not.toContain("已调用 0 次工具");
   expect(card).not.toContain("简短回答");
 });
+
+function processPanel(snapshot: ReturnType<typeof liveReplySnapshot>) {
+  const card = buildLiveReplyCard(snapshot);
+  return (card.body as { elements: Array<{
+    tag: string;
+    expanded: boolean;
+    header: { title: { content: string }; width?: string; icon_position?: string };
+    elements: Array<{ tag: string; content?: string; expanded?: boolean; header?: { title: { content: string } } }>;
+  }> }).elements[0]!;
+}
+
+test("renders Mew-style progress paragraphs with compact expandable tool activity", () => {
+  const snapshot = liveReplySnapshot("chat_run_card", [
+    event(1, "assistant.snapshot", { delta: "先检查环境和创建参数。" }),
+    event(2, "tool.started", { tool: { type: "file-read", status: "running" } }),
+    event(3, "tool.completed", { tool: { type: "file-read", status: "completed" } }),
+    event(4, "tool.started", { tool: { type: "command", status: "running" } }),
+    event(5, "tool.completed", { tool: { type: "command", status: "completed" } }),
+    event(6, "assistant.snapshot", { delta: "环境可用，继续验证连接。" }),
+    event(7, "tool.completed", { tool: { type: "web-search", status: "completed" } }),
+    event(8, "run.succeeded", { delta: "已创建并验证。" }),
+  ]);
+  const panel = processPanel(snapshot);
+  expect(panel.header.title.content).toBe("任务已完成");
+  expect(panel.header.width).toBe("auto");
+  expect(panel.header.icon_position).toBe("follow_text");
+  expect(panel.expanded).toBeTrue();
+  expect(panel.elements.map(element => element.tag)).toEqual([
+    "markdown", "collapsible_panel", "markdown", "collapsible_panel",
+  ]);
+  expect(panel.elements[0]?.content).toBe("先检查环境和创建参数。");
+  expect(panel.elements[1]?.expanded).toBeFalse();
+  expect(panel.elements[1]?.header?.title.content).toContain("已调用 2 次工具");
+  expect(panel.elements[2]?.content).toBe("环境可用，继续验证连接。");
+  expect(panel.elements[3]?.header?.title.content).toContain("已调用 3 次工具");
+  expect(JSON.stringify(panel.elements[1])).toContain("读取文件");
+  expect(JSON.stringify(panel.elements[1])).toContain("命令执行");
+  expect(JSON.stringify(panel)).not.toContain("已创建并验证。");
+});
+
+test("does not double-count tools that finish after an intervening progress paragraph", () => {
+  const panel = processPanel(liveReplySnapshot("chat_run_card", [
+    event(1, "tool.started", { tool: { type: "command", status: "running" } }),
+    event(2, "tool.started", { tool: { type: "command", status: "running" } }),
+    event(3, "assistant.snapshot", { delta: "等待两项检查完成。" }),
+    event(4, "tool.completed", { tool: { type: "command", status: "completed" } }),
+    event(5, "tool.completed", { tool: { type: "command", status: "failed" } }),
+    event(6, "run.failed", { title: "检查失败", status: "failed" }),
+  ]));
+  const groups = panel.elements.filter(element => element.tag === "collapsible_panel");
+  expect(groups).toHaveLength(2);
+  expect(groups[0]?.header?.title.content).toContain("已调用 2 次工具");
+  expect(groups[0]?.header?.title.content).toContain("执行中");
+  expect(groups[1]?.header?.title.content).toContain("已调用 2 次工具");
+  expect(groups[1]?.header?.title.content).toContain("失败");
+  expect(groups[1]?.header?.title.content).not.toContain("执行中");
+  expect(JSON.stringify(panel)).toContain("检查失败");
+});
+
+function cardElementCount(value: unknown): number {
+  if (!value || typeof value !== "object") return 0;
+  return ("tag" in value ? 1 : 0) + Object.values(value).reduce<number>((sum, item) => sum + cardElementCount(item), 0);
+}
+
+test("bounds a long compact timeline by the platform element limit as well as bytes", () => {
+  const history: RunEvent[] = [];
+  for (let index = 0; index < 100; index++) {
+    history.push(event(history.length + 1, "assistant.snapshot", { delta: `步骤 ${index}。` }));
+    history.push(event(history.length + 1, "tool.completed", { tool: { type: "command", status: "completed" } }));
+  }
+  history.push(event(history.length + 1, "run.succeeded", { delta: "结束。" }));
+  const card = buildLiveReplyCard(liveReplySnapshot("chat_run_card", history));
+  expect(cardElementCount(card)).toBeLessThanOrEqual(200);
+  expect(Buffer.byteLength(JSON.stringify(card), "utf8")).toBeLessThanOrEqual(30 * 1024);
+  expect(JSON.stringify(card)).toContain("较早的");
+  expect(JSON.stringify(card)).toContain("步骤 99。");
+  expect(JSON.stringify(card)).toContain("已调用 100 次工具");
+});
+
+test("retains recent tool details and the true total when a single group exceeds the card budget", () => {
+  const history = Array.from({ length: 1_000 }, (_, index) => event(index + 1, "tool.completed", {
+    tool: { type: index === 999 ? "web-search" : "command", status: "completed" },
+  }));
+  history.push(event(1_001, "run.succeeded", { delta: "结束。" }));
+  const card = buildLiveReplyCard(liveReplySnapshot("chat_run_card", history));
+  expect(Buffer.byteLength(JSON.stringify(card), "utf8")).toBeLessThanOrEqual(30 * 1024);
+  expect(JSON.stringify(card)).toContain("较早的");
+  expect(JSON.stringify(card)).toContain("网络查询");
+  expect(JSON.stringify(card)).toContain("已调用 1000 次工具");
+});

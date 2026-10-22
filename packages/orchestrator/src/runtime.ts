@@ -1694,6 +1694,8 @@ export class Orchestrator {
       let context: ConversationContext = { text: userText, images: [] };
       let failureTrace: AskFailureTrace | undefined;
       const rawImport = this.engine.prepareChatRawImport(runId);
+      const documentImport = this.engine.prepareChatDocumentImport(runId);
+      const captureInstruction = [rawImport?.instruction, documentImport?.instruction].filter(Boolean).join("\n\n");
       let reportedModel: string | undefined;
       let res;
       try {
@@ -1742,7 +1744,7 @@ export class Orchestrator {
                 tool: progress.tool,
               });
             },
-            ...(rawImport ? { sourceCaptureInstruction: rawImport.instruction } : {}),
+            ...(captureInstruction ? { sourceCaptureInstruction: captureInstruction } : {}),
           },
           run.agentId,
         );
@@ -1805,6 +1807,7 @@ export class Orchestrator {
       // gentle nudge to feed knowledge.
       let text = formatAnswer(res, userText);
       if (rawImport) text += `\n\n${await rawImport.finish(signal)}`;
+      if (documentImport) text += `\n\n${await documentImport.finish(signal)}`;
       if (
         res.source === "general"
         && !res.context
