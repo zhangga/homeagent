@@ -1,17 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { DownloadedAttachment } from "@homeagent/connectors";
-
-const TEXT_EXTENSIONS = new Set([
-  ".txt",
-  ".md",
-  ".markdown",
-  ".csv",
-  ".json",
-  ".log",
-]);
-const MAX_OUTPUT_CHARS = 200_000;
+import { extractMaterialText, isExtractableMaterial, MAX_MATERIAL_BYTES, MAX_MATERIAL_EXPANDED_BYTES } from "@homeagent/shared";
 const NATIVE_TIMEOUT_MS = 60_000;
 
 export interface NativeResult {
@@ -50,10 +41,9 @@ export async function extractAttachmentText(
 ): Promise<string | null> {
   try {
     const extension = extname(input.attachment.name ?? "").toLowerCase();
-    if (input.attachment.kind === "file" && TEXT_EXTENSIONS.has(extension)) {
+    if (input.attachment.kind === "file" && isExtractableMaterial(input.attachment.name ?? "")) {
       const bytes = readFileSync(input.localPath);
-      const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes).trim();
-      return decoded ? decoded.slice(0, MAX_OUTPUT_CHARS) : null;
+      return extractMaterialText(input.attachment.name!, bytes);
     }
 
     const mode = input.attachment.kind === "image"
@@ -66,9 +56,31 @@ export async function extractAttachmentText(
     const result = await runNative(mode, input.localPath);
     if (result.code !== 0) return null;
     const text = result.stdout.trim();
-    return text ? text.slice(0, MAX_OUTPUT_CHARS) : null;
+    if (Buffer.byteLength(text) > MAX_MATERIAL_EXPANDED_BYTES) return null;
+    return text || null;
   } catch {
     return null;
+  }
+}
+
+/** Web uploads use the identical parser/native adapter without crossing package dependencies. */
+export async function extractUploadedMaterialText(
+  name: string,
+  bytes: Uint8Array,
+  runNative: NativeExtractor = defaultNativeExtractor,
+): Promise<string | null> {
+  if (bytes.byteLength > MAX_MATERIAL_BYTES) throw new Error("单个文件不能超过 20 MiB");
+  if (isExtractableMaterial(name)) return extractMaterialText(name, bytes);
+  const extension = extname(name).toLowerCase();
+  const kind = extension === ".pdf" ? "pdf" : /\.(?:png|jpe?g|webp|gif|tiff?|bmp)$/u.test(extension) ? "image" : undefined;
+  if (!kind) return null;
+  const directory = mkdtempSync(join(tmpdir(), "homeagent-material-"));
+  try {
+    const localPath = join(directory, `source${extension}`);
+    writeFileSync(localPath, bytes, { mode: 0o600 });
+    return await extractAttachmentText({ attachment: { kind, name, ref: "upload" }, localPath, sizeBytes: bytes.byteLength, cleanup() {} }, runNative);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 }
 

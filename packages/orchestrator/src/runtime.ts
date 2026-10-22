@@ -62,6 +62,7 @@ import type {
   LiveReplyHandle,
 } from "@homeagent/connectors";
 import { extractAttachmentText } from "./attachment-extractor.ts";
+import { splitMaterialText } from "@homeagent/shared";
 import { isLiveReplyTerminal, liveReplySnapshot } from "@homeagent/connectors";
 import { attribute } from "./attribution.ts";
 import { gate } from "./gateway.ts";
@@ -864,6 +865,7 @@ export class Orchestrator {
             chatId: msg.chatId,
             messageId: msg.messageId,
             content: msg.text,
+            createdAt: msg.createdAt,
           });
           markDurableMutation();
         }
@@ -1708,6 +1710,10 @@ export class Orchestrator {
           executionPlan,
           run.skillEvidence,
           {
+            retrievalQuestion: userText,
+            referenceTime: run.rawId
+              ? this.engine.registry.store(writeSpace).index().getRaw(run.rawId)?.createdAt ?? run.startedAt
+              : run.startedAt,
             images: context.images.map((image) => ({ path: image.localPath })),
             fallbackContext: context.sourceContext ? "message-source" : undefined,
             signal,
@@ -2243,10 +2249,11 @@ export class Orchestrator {
             err: String(err),
           });
         }
-        const content = extracted?.trim()
-          ? `# 附件：${name}\n\n${extracted.trim()}`
-          : `# 附件：${name}\n\n原文件已完整保存，可从原始记录详情下载。`;
-        await this.engine.rememberFile(
+        const parts = extracted?.trim() ? splitMaterialText(extracted.trim()) : [];
+        const contents = parts.length > 0
+          ? parts.map((part, index) => `# 附件：${name}\n\n${parts.length > 1 ? `正文分段：${index + 1}/${parts.length}\n\n` : ""}${part}`)
+          : [`# 附件：${name}\n\n未提取到可供提炼的正文；原文件已完整保存，可从原始记录详情下载。`];
+        for (const content of contents) await this.engine.rememberFile(
           {
             space: writeSpace,
             source: "message",

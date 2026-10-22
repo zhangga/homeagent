@@ -188,6 +188,20 @@ afterEach(async () => {
 });
 
 describe("orchestrator trunk (cli connector, no feishu)", () => {
+  test("relative retrieval dates use the original message time rather than the later execution time", async () => {
+    const originalTime = Date.parse("2026-10-18T12:00:00+08:00");
+    let referenceTime: number | undefined;
+    engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
+      referenceTime = opts?.referenceTime;
+      return { answer: "查到已入库原文。", source: "knowledge", citations: [] };
+    };
+    await orch.start();
+    await connector.inject({ kind: "message", eventId: "relative-raw-time", chatType: "group", chatId: "oc_team", senderId: "ou_me",
+      text: "在知识库找一下上周小王说过的发布结论", messageId: "om_relative_raw", mentionsBot: true, createdAt: originalTime });
+    expect(referenceTime).toBe(originalTime);
+    expect(engine.registry.store("team/oc_team").index().findRawsByMessageId("om_relative_raw", "oc_team")[0]?.createdAt).toBe(originalTime);
+    expect(connector.sent.at(-1)?.markdown).toContain("查到已入库原文");
+  });
   test("card callbacks are dispatched once without message capture or model invocation", async () => {
     const actions: string[] = [];
     orch = new Orchestrator({ engine, connector, llm: fake, onCardAction: event => { actions.push(event.operatorId); } });
@@ -4767,6 +4781,30 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(existsSync(stored!.path)).toBe(false);
   });
 
+  test("long attachment segments retain full content, shared originals, and message retraction", async () => {
+    const path = join(dir, "long.txt");
+    const original = `${"A".repeat(199_999)}😀${"B".repeat(200_000)}TAIL_MARKER`;
+    writeFileSync(path, original);
+    let cleaned = 0;
+    orch = new Orchestrator({ engine, connector, llm: fake,
+      attachmentDownloader: async () => [{ attachment: { kind: "file", ref: "long", name: "long.txt" }, localPath: path,
+        sizeBytes: Buffer.byteLength(original), cleanup() { cleaned += 1; } }],
+    });
+    await orch.start();
+    await connector.inject({ kind: "message", eventId: "long-file", chatType: "group", chatId: "oc_team", senderId: "ou_me",
+      text: "[文件] long.txt", messageId: "om_long_file", messageType: "file", mentionsBot: false, createdAt: Date.now() });
+    const raw = engine.registry.store("team/oc_team").index().listRaw({}).filter(raw => raw.attachments?.[0]?.sourceDigest);
+    expect(raw).toHaveLength(3);
+    raw.sort((a, b) => Number(a.content.match(/正文分段：(\d+)/u)?.[1]) - Number(b.content.match(/正文分段：(\d+)/u)?.[1]));
+    expect(raw.map(raw => raw.content.split("\n\n").slice(2).join("\n\n")).join("")).toBe(original);
+    expect(new Set(raw.map(raw => raw.attachments![0]!.sourceDigest)).size).toBe(1);
+    for (const part of raw) expect(await Bun.file(engine.getRawSource("team/oc_team", part.id, 0)!.path).text()).toBe(original);
+    expect(cleaned).toBe(1);
+    (connector as CliConnector & Connector).resolveReplyTarget = async () => ({ messageId: "om_long_file", senderId: "ou_me" });
+    await connector.sendGroup("@小强Bot 别记这条", true);
+    expect(engine.registry.store("team/oc_team").index().listRaw({}).filter(raw => raw.messageId === "om_long_file")).toHaveLength(0);
+  });
+
   test("an explicit reply request preserves the original file from the replied message", async () => {
     const attachmentDir = mkdtempSync(join(tmpdir(), "hb-runtime-reply-file-"));
     const localPath = join(attachmentDir, "resource.bin");
@@ -4898,7 +4936,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       expect.objectContaining({
         source: "message",
         messageId: "om_extraction_failure",
-        content: "# 附件：broken.txt\n\n原文件已完整保存，可从原始记录详情下载。",
+        content: "# 附件：broken.txt\n\n未提取到可供提炼的正文；原文件已完整保存，可从原始记录详情下载。",
         attachments: [expect.objectContaining({ sourceDigest: expect.any(String) })],
       }),
     ]));

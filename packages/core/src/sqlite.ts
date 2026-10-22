@@ -23,14 +23,26 @@ import type {
   RawAdmission,
   RawEntry,
   RawRecord,
+  RawSource,
   SpaceId,
 } from "@homeagent/shared";
 import type { MessageRetractionRecord } from "./governance.ts";
 import { RawJournal } from "./raw-journal.ts";
-import { chatRawEntryUpdatedAt, chatRawVersionContent } from "./chat-raw-import.ts";
+import { chatRawEntryUpdatedAt, chatRawSourceName, chatRawVersionContent, normalizedRawSourceName } from "./chat-raw-import.ts";
 import { toMatchQuery, toSearchText } from "./tokenize.ts";
 
 export const MAX_SEARCH_RESULTS = 100;
+
+export interface RawSearchFilters {
+  /** Inclusive creation time and exclusive upper bound, in epoch milliseconds. */
+  from?: number;
+  to?: number;
+  author?: string;
+  chatId?: string;
+  chatName?: string;
+  source?: RawSource;
+  fileName?: string;
+}
 
 export function normalizeSearchLimit(limit: number): number {
   if (!Number.isSafeInteger(limit) || limit <= 0) return 0;
@@ -139,6 +151,15 @@ export class SpaceIndex {
          CHECK(admission IN ('ready', 'held', 'excluded'))`,
       );
     }
+    if (!rawColumns.some(column => column.name === "source_chat_name")) {
+      this.db.transaction(() => {
+        this.db.run("ALTER TABLE raw ADD COLUMN source_chat_name TEXT NOT NULL DEFAULT ''");
+        const statement = this.db.prepare("UPDATE raw SET source_chat_name = ? WHERE id = ?");
+        try {
+          for (const raw of this.listRaw()) statement.run(normalizedRawSourceName(chatRawSourceName(raw) ?? ""), raw.id);
+        } finally { statement.finalize(); }
+      })();
+    }
     this.db.run(`
       CREATE TABLE IF NOT EXISTS message_retractions (
         chat_id TEXT NOT NULL,
@@ -200,8 +221,8 @@ export class SpaceIndex {
     this.db.transaction(() => {
     this.db
       .query(
-        `INSERT INTO raw (id, space, source, work_item_id, work_action_id, agent_id, agent_handled, agent_response, agent_responded_at, author, chat_id, message_id, content, attachments_json, created, ingested, admission)
-         VALUES ($id, $space, $source, $workItem, $workAction, $agent, $handled, $response, $respondedAt, $author, $chat, $msg, $content, $att, $created, $ingested, $admission)`,
+        `INSERT INTO raw (id, space, source, work_item_id, work_action_id, agent_id, agent_handled, agent_response, agent_responded_at, author, chat_id, source_chat_name, message_id, content, attachments_json, created, ingested, admission)
+         VALUES ($id, $space, $source, $workItem, $workAction, $agent, $handled, $response, $respondedAt, $author, $chat, $chatName, $msg, $content, $att, $created, $ingested, $admission)`,
       )
       .run({
         $id: record.id,
@@ -215,6 +236,7 @@ export class SpaceIndex {
         $respondedAt: record.agentRespondedAt ?? null,
         $author: record.author ?? null,
         $chat: record.chatId ?? null,
+        $chatName: normalizedRawSourceName(chatRawSourceName(record) ?? ""),
         $msg: record.messageId ?? null,
         $content: record.content,
         $att: JSON.stringify(record.attachments ?? []),
@@ -369,16 +391,37 @@ export class SpaceIndex {
   // ---- raw -----------------------------------------------------------------
 
   /** FTS projection of admitted Raw, including records not yet distilled into pages. */
-  searchRaw(query: string, limit = 20): RawRecord[] {
+  searchRaw(query: string, limit = 20, filters: RawSearchFilters = {}): RawRecord[] {
     const safeLimit = normalizeSearchLimit(limit);
     const match = toMatchQuery(query.slice(0, 4000));
-    if (!safeLimit || !match) return [];
-    const statement = this.db.prepare(`SELECT r.* FROM raw_fts f JOIN raw r ON r.id = f.id
-      WHERE raw_fts MATCH ? AND r.admission = 'ready'
-        AND NOT EXISTS (SELECT 1 FROM message_retractions m WHERE m.chat_id = r.chat_id AND m.message_id = r.message_id)
-      ORDER BY bm25(raw_fts), r.created DESC, r.id LIMIT ?`);
+    if (!safeLimit || (!match && query.trim().length > 0)) return [];
+    const predicates = ["r.admission = 'ready'", "NOT EXISTS (SELECT 1 FROM message_retractions m WHERE m.chat_id = r.chat_id AND m.message_id = r.message_id)"];
+    const bindings: Array<string | number> = [];
+    if (match) { predicates.unshift("raw_fts MATCH ?"); bindings.push(match); }
+    for (const [key, operator] of [["from", ">="], ["to", "<"]] as const) {
+      const value = filters[key];
+      if (value === undefined) continue;
+      if (!Number.isSafeInteger(value)) throw new Error("Invalid Raw search filters");
+      predicates.push(`r.created ${operator} ?`);
+      bindings.push(value);
+    }
+    if (filters.from !== undefined && filters.to !== undefined && filters.from >= filters.to) throw new Error("Invalid Raw search filters");
+    for (const [key, column, maximum] of [["author", "r.author", 512], ["chatId", "r.chat_id", 256], ["chatName", "r.source_chat_name", 256], ["source", "r.source", 16], ["fileName", "", 255]] as const) {
+      const value = filters[key];
+      if (value === undefined) continue;
+      if (typeof value !== "string" || !value.trim() || value.length > maximum) throw new Error("Invalid Raw search filters");
+      if (key === "source" && !["message", "doc", "manual", "task", "learning"].includes(value)) throw new Error("Invalid Raw search filters");
+      predicates.push(key === "fileName"
+        ? "EXISTS (SELECT 1 FROM json_each(r.attachments_json) a WHERE json_extract(a.value, '$.name') = ?)"
+        : `${column} = ?`);
+      bindings.push(key === "chatName" ? normalizedRawSourceName(value) : value);
+    }
+    if (!match && bindings.length === 0) return [];
+    const statement = this.db.prepare(`SELECT r.* FROM ${match ? "raw_fts f JOIN raw r ON r.id = f.id" : "raw r"}
+      WHERE ${predicates.join(" AND ")}
+      ORDER BY ${match ? "bm25(raw_fts), " : ""}r.created DESC, r.id LIMIT ?`);
     try {
-      const rows = statement.all(match, safeLimit) as Record<string, unknown>[];
+      const rows = statement.all(...bindings, safeLimit) as Record<string, unknown>[];
       return rows.map(rowToRaw);
     } finally { statement.finalize(); }
   }

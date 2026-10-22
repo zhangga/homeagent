@@ -101,8 +101,8 @@ export function requestsChatRawImport(text: string): boolean {
 
 /** A lookup of stored evidence is not a new external-source capture. */
 export function requestsStoredRawQuery(text: string): boolean {
-  return /\bRaw\b|原文|原始记录/iu.test(text)
-    && /查询|检索|查找|查阅|核验|摘录|给出|提供/iu.test(text)
+  return /\bRaw\b|原文|原话|原始记录|原始消息|聊天记录|说过|说的|发过|发的/iu.test(text)
+    && /查询|检索|查找|查阅|查一下|找一下|找出|核验|摘录|给出|提供/iu.test(text)
     && /已(?:经)?(?:入库|收录|保存)|知识库|\bRaw\s*ID\b/iu.test(text);
 }
 
@@ -277,6 +277,21 @@ export function chatRawEntryUpdatedAt(entry: RawEntry): number | undefined {
 export function isChatSourceSnapshot(raw: RawRecord): boolean {
   return raw.source === "manual" && /^chat-import-[a-f0-9]{64}$/.test(raw.id)
     && raw.content.startsWith("<!-- HomeAgent: Agent 查询所得来源快照；附件仅为引用 -->\n");
+}
+
+/** Derived display metadata; never infer a source group from message prose. */
+export function chatRawSourceName(raw: RawRecord): string | undefined {
+  if (!isChatSourceSnapshot(raw)) return undefined;
+  try {
+    const metadata: unknown = JSON.parse(raw.content.split("\n", 2)[1]!);
+    if (metadata && typeof metadata === "object" && "format" in metadata && metadata.format === "homeagent.chat-source"
+      && "chatName" in metadata && typeof metadata.chatName === "string" && metadata.chatName.length <= 256) return metadata.chatName;
+  } catch { /* Invalid metadata is not a verified source name. */ }
+  return undefined;
+}
+
+export function normalizedRawSourceName(name: string): string {
+  return name.normalize("NFKC").replace(/\s+/gu, "").toLowerCase();
 }
 
 /** Coverage, display names and links can change between queries without editing the message. */

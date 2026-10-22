@@ -1,12 +1,13 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { deflateSync } from "node:zlib";
 import type { DownloadedAttachment } from "@homeagent/connectors";
 import {
   createNativeExtractor,
   extractAttachmentText,
+  extractUploadedMaterialText,
   runBoundedProcess,
   type DeadlineFactory,
   type NativeExtractor,
@@ -23,12 +24,12 @@ test("runBoundedProcess cancels its deadline after a fast successful command", a
   });
 
   expect(
-    await runBoundedProcess(["/usr/bin/true"], 200, 100, deadlineFactory),
+    await runBoundedProcess([process.execPath, "-e", "void 0"], 200, 100, deadlineFactory),
   ).toEqual({ code: 0, stdout: "", stderr: "" });
   expect(cancellations).toBe(1);
 });
 
-test("runBoundedProcess escalates from SIGTERM and returns within a fixed bound", async () => {
+test.skipIf(process.platform === "win32")("runBoundedProcess escalates from SIGTERM and returns within a fixed bound", async () => {
   const startedAt = Date.now();
   const result = await runBoundedProcess(
     ["/bin/sh", "-c", "trap '' TERM; exec /bin/sleep 30"],
@@ -61,7 +62,7 @@ test("bundled native extraction executes the precompiled Resources helper direct
   expect(calls).toEqual([
     {
       command: [
-        "/Applications/HomeAgent.app/Contents/Resources/bin/attachment-extract",
+        resolve("/Applications/HomeAgent.app/Contents/Resources/bin/attachment-extract"),
         "image",
         "/tmp/scan.png",
       ],
@@ -83,7 +84,7 @@ test("bundled native extraction recognizes the separately embedded Bun runtime",
 
   await extractor("pdf", "/tmp/brief.pdf");
   expect(commands[0]?.[0]).toBe(
-    "/Applications/HomeAgent.app/Contents/Resources/bin/attachment-extract",
+    resolve("/Applications/HomeAgent.app/Contents/Resources/bin/attachment-extract"),
   );
   expect(commands.some((command) => command.includes("swiftc"))).toBeFalse();
 });
@@ -136,7 +137,7 @@ test("source native extraction retains temporary Swift compilation", async () =>
     "-module-cache-path",
     expect.stringContaining("homeagent-native-extract-"),
   ]);
-  expect(commands[1]?.[0]?.endsWith("/attachment-extract")).toBeTrue();
+  expect(commands[1]?.[0]?.endsWith(`${sep}attachment-extract`)).toBeTrue();
   expect(commands[1]?.slice(1)).toEqual(["pdf", "/tmp/brief.pdf"]);
 });
 
@@ -183,7 +184,7 @@ macOSOnly("Swift attachment helper limits", () => {
     expect(result.stderr).toContain("40 million pixel limit");
   });
 
-  test("caps cumulative PDF output at 200,000 characters inside the helper", async () => {
+  test("extracts PDF text past 200,000 characters inside the helper", async () => {
     const pdfPath = join(helperDirectory, "large-text.pdf");
     writeFileSync(pdfPath, minimalPdf("A".repeat(210_000)));
 
@@ -191,7 +192,15 @@ macOSOnly("Swift attachment helper limits", () => {
 
     expect(result.code).toBe(0);
     expect(result.stdout.startsWith("AAAA")).toBe(true);
-    expect(result.stdout.length).toBe(200_000);
+    expect(result.stdout.replace(/\s/gu, "").length).toBe(210_000);
+  });
+
+  test("extracts PDF text beyond page 50", async () => {
+    const pdfPath = join(helperDirectory, "many-pages.pdf");
+    writeFileSync(pdfPath, minimalPdf("PAGE_MARKER", 55));
+    const result = await runBoundedProcess([helperBinary, "pdf", pdfPath], 5_000);
+    expect(result.code).toBe(0);
+    expect(result.stdout.match(/PAGE_MARKER/gu)).toHaveLength(55);
   });
 });
 
@@ -277,7 +286,7 @@ describe("extractAttachmentText", () => {
     expect(await extractAttachmentText(attachment("broken.pdf", "pdf"), failed)).toBeNull();
   });
 
-  test("bounds native output to 200,000 characters", async () => {
+  test("keeps native output past 200,000 characters", async () => {
     const native: NativeExtractor = async () => ({
       code: 0,
       stdout: `${"识".repeat(200_001)}\n`,
@@ -285,7 +294,31 @@ describe("extractAttachmentText", () => {
     });
 
     const text = await extractAttachmentText(attachment("large.png", "image"), native);
-    expect(text).toBe("识".repeat(200_000));
+    expect(text).toBe("识".repeat(200_001));
+  });
+
+  test("keeps text attachments past 200,000 characters", async () => {
+    const input = attachment("messages.jsonl");
+    const content = `${"甲".repeat(200_001)}TAIL_MARKER`;
+    writeFileSync(input.localPath, content);
+    expect(await extractAttachmentText(input)).toBe(content);
+  });
+
+  test("uploaded PDFs and images use native extraction and clean up temporary files", async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const paths: string[] = [];
+    const native: NativeExtractor = async (mode, path) => {
+      paths.push(path);
+      expect(new Uint8Array(readFileSync(path))).toEqual(bytes);
+      return { code: 0, stdout: `${mode}正文${"甲".repeat(200_001)}TAIL_MARKER`, stderr: "" };
+    };
+    for (const name of ["../../report.pdf", "scan.png"]) {
+      expect(await extractUploadedMaterialText(name, bytes, native)).toContain("TAIL_MARKER");
+    }
+    expect(paths.every(path => !existsSync(path))).toBeTrue();
+    const failed: NativeExtractor = async (_mode, path) => { paths.push(path); throw new Error("failure"); };
+    expect(await extractUploadedMaterialText("bad.pdf", bytes, failed)).toBeNull();
+    expect(paths.every(path => !existsSync(path))).toBeTrue();
   });
 
   test("returns null for unsupported audio", async () => {
@@ -357,7 +390,7 @@ function concatenateBytes(parts: Uint8Array[]): Uint8Array {
   return output;
 }
 
-function minimalPdf(text: string): string {
+function minimalPdf(text: string, pageCount = 1): string {
   const textRuns = text.match(/.{1,1000}/g) ?? [];
   const content = [
     "BT",
@@ -368,11 +401,12 @@ function minimalPdf(text: string): string {
   ].join("\n");
   const objects = [
     "<< /Type /Catalog /Pages 2 0 R >>",
-    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    `<< /Type /Pages /Kids [3 0 R ${Array.from({ length: pageCount - 1 }, (_, index) => `${index + 6} 0 R`).join(" ")}] /Count ${pageCount} >>`,
     "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20000 10000] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
     `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
     "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
   ];
+  for (let i = 1; i < pageCount; i += 1) objects.push(objects[2]!);
   let pdf = "%PDF-1.4\n";
   const offsets = [0];
   for (const [index, object] of objects.entries()) {

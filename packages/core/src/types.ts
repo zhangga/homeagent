@@ -29,6 +29,10 @@ export interface DreamOptions {
 }
 
 export interface AskOptions {
+  /** Current user request before host-attached reply/source context; only this text may set retrieval filters. */
+  retrievalQuestion?: string;
+  /** Host-owned request time for relative retrieval dates; queued work retains the original reference. */
+  referenceTime?: number;
   /** Host-provided handoff instructions for a scoped, writable Chat Run. */
   sourceCaptureInstruction?: string;
   onExecutionEvidence?: import("@homeagent/llm").RunInput["onExecutionEvidence"];

@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SpaceIndex } from "./sqlite.ts";
+import { chatRawImportId, parseChatRawImport } from "./chat-raw-import.ts";
 
 const space = "team/oc_search" as const;
 const roots: string[] = [];
@@ -61,5 +62,59 @@ test("retention counts only deleted Raw and removes its FTS entry in the same op
     expect(index.deleteExpiredRawMessages(200)).toBe(1);
     expect(index.searchRaw("长帧")).toEqual([]);
     expect(index.countRaw()).toBe(0);
+  } finally { index.close(); }
+});
+
+test("Raw filters run before limiting candidates, including metadata-only file queries", () => {
+  const { db } = fixture(); const index = new SpaceIndex(db);
+  try {
+    const wanted = index.insertRaw({ space, source: "message", author: "小王", chatId: "oc_source", content: "发布结论：已验收", createdAt: 200,
+      attachments: [{ kind: "file", ref: "file_report", name: "发布说明.md" }] });
+    index.insertRaw({ space, source: "message", author: "小王", chatId: "oc_source", content: "发布结论：旧消息", createdAt: 199 });
+    index.insertRaw({ space, source: "message", author: "小王", chatId: "oc_source", content: "发布结论：区间之外", createdAt: 300 });
+    for (let i = 0; i < 30; i++) index.insertRaw({ space, source: "manual", author: "其他人", chatId: "oc_other", content: "发布结论 发布结论", createdAt: 250 });
+    expect(index.searchRaw("发布结论", 1, { from: 200, to: 300, author: "小王", chatId: "oc_source", source: "message" }).map(raw => raw.id)).toEqual([wanted]);
+    expect(index.searchRaw("", 20, { fileName: "发布说明.md" }).map(raw => raw.id)).toEqual([wanted]);
+    expect(index.searchRaw("", 20, { author: "小王", from: 200, to: 300 }).map(raw => raw.id)).toEqual([wanted]);
+    expect(index.searchRaw("", 20)).toEqual([]);
+    expect(index.searchRaw("!!!", 20, { author: "小王" })).toEqual([]);
+    expect(index.searchRaw("发布结论", 20, { author: "小王' OR 1=1 --" })).toEqual([]);
+    expect(() => index.searchRaw("发布", 20, { author: "a".repeat(513) })).toThrow("Invalid Raw search filters");
+    expect(index.searchRaw("发布", 20, { author: "a".repeat(512) })).toEqual([]);
+    expect(() => index.searchRaw("发布", 20, { from: NaN })).toThrow("Invalid Raw search filters");
+    expect(() => index.searchRaw("发布", 20, { from: 300, to: 200 })).toThrow("Invalid Raw search filters");
+  } finally { index.close(); }
+});
+
+test("source-name projection backfills legacy databases and rebuilds from the Raw journal", () => {
+  const { db, rawDir } = fixture();
+  let index = new SpaceIndex(db, { rawDir, space });
+  const parsed = parseChatRawImport(JSON.stringify({ version: 1, chatId: "oc_source", chatName: "ＰＳＴ 专项", startAt: 100, endAt: 300,
+    mainComplete: true, threadsComplete: true, olderThreadsScanned: true, failedMessageIds: [],
+    messages: [{ messageId: "om_source", createdAt: 200, text: "发布结论：来自指定群" }] }), space, "oc_search", { requestedName: "PST专项" });
+  const id = chatRawImportId(space, "oc_source", "om_source");
+  index.captureImportedRaw(id, parsed.entries[0]!);
+  index.insertRaw({ space, source: "manual", content: "发布结论：正文提到了 PST 专项，但它不是来源群。" });
+  expect(index.searchRaw("发布结论", 20, { chatName: "pst专项" }).map(raw => raw.id)).toEqual([id]);
+  index.close();
+  const legacy = new Database(db); legacy.run("ALTER TABLE raw DROP COLUMN source_chat_name"); legacy.close();
+  index = new SpaceIndex(db);
+  expect(index.searchRaw("发布结论", 20, { chatName: "PST 专项" }).map(raw => raw.id)).toEqual([id]);
+  index.close();
+  for (const suffix of ["", "-wal", "-shm"]) rmSync(db + suffix, { force: true });
+  index = new SpaceIndex(db, { rawDir, space });
+  try { expect(index.searchRaw("", 20, { chatName: "ＰＳＴ专项" }).map(raw => raw.id)).toEqual([id]); } finally { index.close(); }
+});
+
+test("metadata-only Raw searches still exclude held, rejected and retracted evidence", () => {
+  const { db } = fixture(); const index = new SpaceIndex(db);
+  try {
+    index.insertRaw({ space, source: "task", author: "小王", admission: "held", workActionId: "held", content: "发布结论：未验收" });
+    const rejected = index.insertRaw({ space, source: "task", author: "小王", admission: "held", workActionId: "rejected", content: "发布结论：已驳回" });
+    index.excludeRawAdmission(rejected, "rejected");
+    index.insertRaw({ space, source: "message", author: "小王", chatId: "oc_source", messageId: "om_retracted", content: "发布结论：已撤回" });
+    index.recordMessageRetraction({ chatId: "oc_source", messageId: "om_retracted", originalAuthor: "小王", retractedBy: "小王" });
+    expect(index.searchRaw("", 20, { author: "小王" })).toEqual([]);
+    expect(index.searchRaw("发布结论", 20, { author: "小王" })).toEqual([]);
   } finally { index.close(); }
 });

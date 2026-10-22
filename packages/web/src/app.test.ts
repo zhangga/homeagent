@@ -21,7 +21,7 @@ import {
 import { createWebApp } from "./app.ts";
 import { FeishuIntegrationService } from "./feishu-integration-service.ts";
 import type { LarkSetupPort } from "./integrations.ts";
-import { zipFixture } from "./local-materials.fixture.ts";
+import { zipFixture } from "../../../test-support/zip.ts";
 
 let dir: string;
 let engine: KnowledgeEngine;
@@ -2435,7 +2435,7 @@ describe("management backend (read-write)", () => {
     expect((await download.arrayBuffer()).byteLength).toBe(0);
   });
 
-  test("keeps the exact original file when extracted text is bounded", async () => {
+  test("keeps every standalone text segment and the exact original file after reopen", async () => {
     const original = `${"甲".repeat(200_000)}TAIL_MARKER`;
     const form = new FormData();
     form.set(
@@ -2450,17 +2450,80 @@ describe("management backend (read-write)", () => {
       { method: "POST", body: form },
     );
 
-    const detail = await app.request(imported.headers.get("location") ?? "");
-    const body = await detail.text();
-    expect(body).toContain("正文超过限制，仅保留前 200000 个字符");
-    expect(body).not.toContain("TAIL_MARKER");
-    expect(body).toContain("下载原文件");
+    expect(decodeURIComponent(imported.headers.get("location")!)).toContain("资料已导入，等待提炼");
+    expect(decodeURIComponent(imported.headers.get("location")!)).toContain("完整分为 2 段");
+    const parts = engine.registry.store(SPACE).index().listRaw({}).filter(raw => raw.source === "manual");
+    expect(parts).toHaveLength(2);
+    expect(parts.some(raw => raw.content.includes("TAIL_MARKER"))).toBeTrue();
+    expect(parts.map(raw => raw.attachments?.[0]?.sourceDigest)).toEqual([parts[0]!.attachments![0]!.sourceDigest, parts[0]!.attachments![0]!.sourceDigest]);
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
+    app = createWebApp({ engine });
+    expect(engine.registry.store(SPACE).index().searchRaw("TAIL_MARKER")).toHaveLength(1);
+    for (const part of parts) {
+      const download = await app.request(`/spaces/${encodeURIComponent(SPACE)}/raw/${part.id}/attachments/0`);
+      expect(download.status).toBe(200);
+      expect(download.headers.get("content-disposition")).toContain("long-notes.md");
+      expect(await download.text()).toBe(original);
+    }
+  });
 
-    const location = new URL(imported.headers.get("location") ?? "", "http://localhost");
-    const download = await app.request(`${location.pathname}/attachments/0`);
-    expect(download.status).toBe(200);
-    expect(download.headers.get("content-disposition")).toContain("long-notes.md");
-    expect(await download.text()).toBe(original);
+  test("standalone long material reaches Dream planning and generation through its middle and tail", async () => {
+    const markers = ["BEGIN_MARKER", "MIDDLE_MARKER", "TAIL_MARKER"];
+    const original = `${markers[0]}${"A".repeat(100_000)}${markers[1]}${"B".repeat(110_000)}${markers[2]}`;
+    const planned = new Set<string>();
+    const generated = new Set<string>();
+    fake.onJSON(opts => {
+      expect(opts.prompt).not.toContain("一条原始消息");
+      const prompt = opts.prompt ?? "";
+      const planning = prompt.includes("## 待提炼的原始条目");
+      for (const marker of markers) if (prompt.includes(marker)) (planning ? planned : generated).add(marker);
+      if (planning) return {
+        operations: [{ type: "source", name: "complete-material", title: "完整资料", rawIds: [...new Set([...prompt.matchAll(/<entry id="([^"]+)"/gu)].map(match => match[1]!))] }],
+        skippedRawIds: [],
+      };
+      return { title: "完整资料", summary: "完整提炼", aliases: [], tags: [], links: [], content: [...generated].join("\n") };
+    });
+    const form = new FormData();
+    form.set("material", new File([original], "complete.txt"));
+    form.set("distillNow", "on");
+    const response = await app.request(`/spaces/${encodeURIComponent(SPACE)}/materials`, { method: "POST", body: form });
+    expect(decodeURIComponent(response.headers.get("location")!)).toContain("资料已导入并完成提炼");
+    expect([...planned]).toEqual(markers);
+    expect([...generated]).toEqual(markers);
+    const page = await engine.getPage(SPACE, "sources/complete-material");
+    expect(page?.sources).toHaveLength(2);
+    expect(page?.content).toContain("TAIL_MARKER");
+    expect(engine.registry.store(SPACE).index().listRaw({ onlyPending: true }).map(raw => raw.content)).toEqual(["一条原始消息"]);
+  });
+
+  test("web PDF uploads use the injected native parser and keep all extracted segments", async () => {
+    let calls = 0;
+    const bytes = new Uint8Array([37, 80, 68, 70]);
+    app = createWebApp({ engine, materialTextExtractor: async (name, input) => {
+      calls += 1;
+      expect(name).toBe("paper.pdf");
+      expect(input).toEqual(bytes);
+      return `${"A".repeat(200_001)}PDF_LAST_PAGE`;
+    } });
+    const form = new FormData();
+    form.set("material", new File([bytes], "paper.pdf"));
+    const response = await app.request(`/spaces/${encodeURIComponent(SPACE)}/materials`, { method: "POST", body: form });
+    expect(response.status).toBe(302);
+    expect(calls).toBe(1);
+    const raws = engine.registry.store(SPACE).index().listRaw({}).filter(raw => raw.source === "manual");
+    expect(raws).toHaveLength(2);
+    expect(raws.some(raw => raw.content.includes("PDF_LAST_PAGE"))).toBeTrue();
+    expect(new Uint8Array(await (await app.request(`/spaces/${encodeURIComponent(SPACE)}/raw/${raws[1]!.id}/attachments/0`)).arrayBuffer())).toEqual(bytes);
+  });
+
+  test("counts files rather than long-text segments in a mixed upload", async () => {
+    const form = new FormData();
+    form.append("material", new File(["A".repeat(200_001)], "long.txt"));
+    form.append("material", new File(["short"], "short.txt"));
+    const response = await app.request(`/spaces/${encodeURIComponent(SPACE)}/materials`, { method: "POST", body: form });
+    expect(decodeURIComponent(response.headers.get("location")!)).toContain("已导入 2 份资料");
+    expect(engine.registry.store(SPACE).index().listRaw({}).filter(raw => raw.source === "manual")).toHaveLength(3);
   });
 
   test("rejects more than 20 local materials in one request", async () => {

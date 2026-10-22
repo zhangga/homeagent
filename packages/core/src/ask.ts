@@ -43,6 +43,8 @@ const MAX_MAP_NODES_VISITED = 256;
 
 export interface AskDeps {
   client?: LlmClient;
+  /** Deterministic reference clock for relative Raw-query dates. */
+  now?: () => number;
   /** Supplied by the execution context, never inferred from the user's request. */
   toolExecution?: boolean;
   onRetrieval?: (evidence: AskRetrievalEvidence) => void;
@@ -639,7 +641,7 @@ export async function ask(
   deps: AskDeps = {},
 ): Promise<AskResult> {
   const client = deps.client ?? gatewayClient;
-  if (requestsStoredRawQuery(question)) return askStoredRaw(stores, question, client, opts);
+  if (requestsStoredRawQuery(question)) return askStoredRaw(stores, question, client, opts, opts.referenceTime ?? deps.now?.() ?? Date.now());
   const toolExecution = deps.toolExecution === true && !opts.knowledgeOnly;
   const maxPages = opts.maxPages ?? DEFAULT_MAX_PAGES;
   const model = opts.model ?? config().model;

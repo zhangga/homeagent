@@ -1,17 +1,6 @@
 import { createHash } from "node:crypto";
 import { extname } from "node:path";
-import { readZipDirectory } from "./local-material-zip.ts";
-
-const TEXT_EXTENSIONS = new Set([
-  ".txt",
-  ".md",
-  ".markdown",
-  ".csv",
-  ".json",
-  ".jsonl",
-  ".ndjson",
-  ".log",
-]);
+import { extractMaterialText, isExtractableMaterial, readZipDirectory, splitMaterialText, type MaterialTextExtractor } from "@homeagent/shared";
 const MAX_BYTES = 20 * 1024 * 1024;
 const MAX_CHARACTERS = 200_000;
 const MAX_FILES = 20;
@@ -28,11 +17,12 @@ export interface PreparedLocalMaterial {
   bytes: Uint8Array;
   content: string | null;
   truncated: boolean;
+  textPart?: { index: number; total: number };
   archive?: { name: string; path: string; part: number; parts: number };
 }
 
 /** Validate every upload before returning any material, preventing partial input batches. */
-export async function prepareLocalMaterials(input: unknown): Promise<PreparedLocalMaterial[]> {
+export async function prepareLocalMaterials(input: unknown, extractText: MaterialTextExtractor = extractMaterialText): Promise<PreparedLocalMaterial[]> {
   const candidates = Array.isArray(input) ? input : [input];
   if (
     candidates.length === 0
@@ -53,8 +43,9 @@ export async function prepareLocalMaterials(input: unknown): Promise<PreparedLoc
 
     const bytes = new Uint8Array(await upload.arrayBuffer());
     if (bytes.byteLength > MAX_BYTES) throw new Error("单个文件不能超过 20 MiB");
-    const material = prepareMaterial(name, bytes);
-    materials.push(material);
+    const prepared = await prepareMaterial(name, bytes, extractText);
+    const material = prepared[0]!;
+    materials.push(...prepared);
     if (extension !== ".zip") continue;
 
     const notes: string[] = [];
@@ -71,7 +62,7 @@ export async function prepareLocalMaterials(input: unknown): Promise<PreparedLoc
     try {
       const entries = readZipDirectory(bytes, MAX_BYTES);
       for (const entry of entries) {
-        if (!TEXT_EXTENSIONS.has(extname(entry.path).toLowerCase())) {
+        if (!isExtractableMaterial(entry.path) && !/\.(?:pdf|png|jpe?g|webp|gif|tiff?|bmp)$/iu.test(entry.path)) {
           skippedFiles += 1;
           note(`- ${safeArchivePath(entry.path)}：未识别文本格式，原内容保留在 ZIP 中。`);
           continue;
@@ -82,24 +73,20 @@ export async function prepareLocalMaterials(input: unknown): Promise<PreparedLoc
           }
           const expanded = entry.read();
           remainingExpandedBytes -= expanded.length;
-          const decoded = decodeText(expanded);
-          if (!decoded) {
+          const member = await prepareMaterial(safeUploadName(entry.path), expanded, extractText);
+          if (!member[0]?.content) {
             skippedFiles += 1;
-            note(`- ${safeArchivePath(entry.path)}：正文为空或不是 UTF-8 文本。`);
+            note(`- ${safeArchivePath(entry.path)}：正文为空或不是 UTF-8 文本，或当前环境无法解析此格式。`);
             continue;
           }
-          const member = prepareMaterial(safeUploadName(entry.path), expanded);
-          const chunks = splitText(decoded);
-          for (const [index, content] of chunks.entries()) {
+          for (const [index, part] of member.entries()) {
             materials.push({
-              ...member,
-              content,
-              truncated: false,
-              archive: { name, path: safeArchivePath(entry.path), part: index + 1, parts: chunks.length },
+              ...part,
+              archive: { name, path: safeArchivePath(entry.path), part: index + 1, parts: member.length },
             });
           }
           extractedFiles += 1;
-          rawParts += chunks.length;
+          rawParts += member.length;
         } catch (error) {
           skippedFiles += 1;
           note(`- ${safeArchivePath(entry.path)}：${error instanceof Error ? error.message : "ZIP 条目读取失败"}`);
@@ -129,6 +116,7 @@ export function localMaterialRawContent(material: PreparedLocalMaterial): string
       `正文分段：${material.archive.part}/${material.archive.parts}`,
       "",
     ] : []),
+    ...(!material.archive && material.textPart ? [`正文分段：${material.textPart.index}/${material.textPart.total}`, ""] : []),
     ...(material.truncated
       ? ["正文超过限制，仅保留前 200000 个字符。", ""]
       : []),
@@ -136,42 +124,19 @@ export function localMaterialRawContent(material: PreparedLocalMaterial): string
   ].join("\n");
 }
 
-function decodeText(bytes: Uint8Array): string | null {
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes).trim() || null;
-  } catch {
-    return null;
-  }
-}
-
-function prepareMaterial(name: string, bytes: Uint8Array): PreparedLocalMaterial {
-  const decoded = TEXT_EXTENSIONS.has(extname(name).toLowerCase()) ? decodeText(bytes) : null;
-  return {
-    name,
-    digest: createHash("sha256").update(bytes).digest("hex"),
-    bytes,
-    content: decoded?.slice(0, MAX_CHARACTERS) ?? null,
-    truncated: decoded !== null && decoded.length > MAX_CHARACTERS,
-  };
+async function prepareMaterial(name: string, bytes: Uint8Array, extractText: MaterialTextExtractor): Promise<PreparedLocalMaterial[]> {
+  let decoded: string | null = null;
+  try { decoded = (await extractText(name, bytes))?.trim() || null; } catch { /* Preserve unsupported or damaged originals. */ }
+  const chunks = decoded ? splitMaterialText(decoded) : [null];
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  return chunks.map((content, index) => ({
+    name, digest, bytes, content, truncated: false,
+    ...(chunks.length > 1 ? { textPart: { index: index + 1, total: chunks.length } } : {}),
+  }));
 }
 
 function safeArchivePath(path: string): string {
   return path.replace(/[\u0000-\u001f\u007f]/gu, " ");
-}
-
-function splitText(text: string): string[] {
-  const chunks: string[] = [];
-  for (let start = 0; start < text.length;) {
-    let end = Math.min(start + MAX_CHARACTERS, text.length);
-    if (end < text.length) {
-      const newline = text.lastIndexOf("\n", end - 1);
-      if (newline > start + MAX_CHARACTERS / 2) end = newline + 1;
-      else if (text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) end -= 1;
-    }
-    chunks.push(text.slice(start, end));
-    start = end;
-  }
-  return chunks;
 }
 
 function isLocalMaterialUpload(value: unknown): value is LocalMaterialUpload {

@@ -43,16 +43,17 @@ test("reports queued work, blocked model calls, every fragment and terminal coun
   const analysisRelease = gate();
   const generationEntered = gate();
   const generationRelease = gate();
-  let calls = 0;
+  let analyses = 0;
+  let generations = 0;
   const fragments: number[] = [];
   const client: LlmClient = {
     complete: (opts) => fake.complete(opts),
     async completeJSON(opts) {
-      calls += 1;
-      if (calls === 1) { analysisEntered.resolve(); await analysisRelease.promise; }
-      if (calls === 2) { generationEntered.resolve(); await generationRelease.promise; }
+      const planning = opts.prompt?.includes("## 待提炼的原始条目") === true;
+      if (planning && ++analyses === 1) { analysisEntered.resolve(); await analysisRelease.promise; }
+      if (!planning && ++generations === 1) { generationEntered.resolve(); await generationRelease.promise; }
       const chunk = engine.listDreamRuns().find((run) => run.status === "running")?.chunk;
-      if (chunk) fragments.push(chunk.index);
+      if (chunk && !planning) fragments.push(chunk.index);
       return fake.completeJSON(opts);
     },
   };
@@ -60,7 +61,7 @@ test("reports queued work, blocked model calls, every fragment and terminal coun
   const rawId = await engine.rememberFile({
     space: SPACE, source: "manual", content: `PRIVATE_BODY_${"甲".repeat(100_000)}`,
   }, { attachment: { kind: "file", ref: "test", name: "长资料.jsonl" }, bytes: new TextEncoder().encode("original") });
-  fake.queueJSON({ operations: [{ type: "concept", name: "release", title: "发布约定", rawIds: [rawId] }], skippedRawIds: [] });
+  for (let i = 0; i < 3; i += 1) fake.queueJSON({ operations: [{ type: "concept", name: "release", title: "发布约定", rawIds: [rawId] }], skippedRawIds: [] });
   for (let i = 0; i < 3; i += 1) fake.queueJSON({ title: "发布约定", summary: "summary", content: "正文", links: [] });
   const first = engine.runDreamCycle(SPACE, { trigger: "import", batch: { index: 1, total: 2 } });
   await analysisEntered.promise;

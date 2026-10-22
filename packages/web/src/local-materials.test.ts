@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { localMaterialRawContent, prepareLocalMaterials } from "./local-materials.ts";
-import { zipFixture } from "./local-materials.fixture.ts";
+import { zipFixture } from "../../../test-support/zip.ts";
 
 function uploadZip(entries: Parameters<typeof zipFixture>[0], name = "资料.ZIP") {
   return new File([zipFixture(entries, "中文备注")], name);
@@ -98,15 +98,23 @@ describe("ZIP local materials", () => {
     expect(materials[0]?.content).toContain("nested.zip");
   });
 
-  test("keeps normal text imports unchanged and recognizes standalone JSONL", async () => {
+  test("splits standalone long text completely and recognizes standalone JSONL", async () => {
+    const original = `${"甲".repeat(199_999)}😀\n${"乙".repeat(200_000)}TAIL_MARKER`;
     const materials = await prepareLocalMaterials([
-      new File(["甲".repeat(200_001)], "normal.md"),
+      new File([original], "normal.md"),
       new File(['{"content":"消息"}'], "messages.jsonl"),
     ]);
-    expect(materials[0]?.truncated).toBeTrue();
-    expect(materials[0]?.content).toHaveLength(200_000);
-    expect(materials[1]?.content).toContain("消息");
-    expect(materials[1]?.archive).toBeUndefined();
+    const parts = materials.filter(material => material.name === "normal.md");
+    expect(parts).toHaveLength(3);
+    expect(parts.map(part => part.content).join("")).toBe(original);
+    for (const part of parts) {
+      expect(part.content!.length).toBeLessThanOrEqual(200_000);
+      expect(part.content!.isWellFormed()).toBeTrue();
+      expect(part.bytes).toEqual(new TextEncoder().encode(original));
+      expect(part.truncated).toBeFalse();
+    }
+    expect(materials.at(-1)?.content).toContain("消息");
+    expect(materials.at(-1)?.archive).toBeUndefined();
   });
 
   test("accepts a text member exactly at the existing 20 MiB source boundary", async () => {
@@ -115,6 +123,17 @@ describe("ZIP local materials", () => {
     expect(materials[0]?.content).toContain("1 个文本文件");
     expect(materials.slice(1).map((part) => part.content).join("")).toBe(original);
     expect(materials[1]?.bytes.byteLength).toBe(20 * 1024 * 1024);
+  });
+
+  test("extracts Office text both standalone and inside ZIP while preserving the exact Office file", async () => {
+    const original = zipFixture([{ name: "word/document.xml", content: `<w:document><w:p><w:r><w:t>${"A".repeat(200_001)}WORD_TAIL</w:t></w:r></w:p></w:document>` }]);
+    for (const file of [new File([original], "report.docx"), uploadZip([{ name: "folder/report.docx", content: original }])]) {
+      const materials = await prepareLocalMaterials(file);
+      const parts = materials.filter(material => material.name === "report.docx");
+      expect(parts).toHaveLength(2);
+      expect(parts.map(part => part.content).join("")).toBe(`${"A".repeat(200_001)}WORD_TAIL`);
+      expect(parts.every(part => Buffer.from(part.bytes).equals(Buffer.from(original)))).toBeTrue();
+    }
   });
 
   test("bounds total expanded bytes across uploads using the existing 400 MiB request budget", async () => {

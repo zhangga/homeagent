@@ -162,6 +162,8 @@ async function readBoundedRequestBody(request: Request, maximumBytes: number): P
 
 export interface WebOptions {
   engine: KnowledgeEngine;
+  /** Production supplies the same native PDF/image extractor as inbound attachments. */
+  materialTextExtractor?: import("@homeagent/shared").MaterialTextExtractor;
   /** Fixed local HomeAgent avatar file; request data never selects this path. */
   brandAvatarPath?: string;
   /** protects all management routes; liveness/readiness probes remain public */
@@ -1521,7 +1523,7 @@ export function createWebApp(opts: WebOptions): Hono {
     const body = await c.req.parseBody({ all: true });
     let materials;
     try {
-      materials = await prepareLocalMaterials(body.material);
+      materials = await prepareLocalMaterials(body.material, opts.materialTextExtractor);
     } catch (error) {
       const reason = error instanceof Error ? error.message : "无法读取资料文件";
       return c.redirect(
@@ -1547,7 +1549,7 @@ export function createWebApp(opts: WebOptions): Hono {
         },
       ));
     }
-    const uploadCount = materials.filter((material) => !material.archive).length;
+    const uploadCount = materials.filter((material) => !material.archive && (!material.textPart || material.textPart.index === 1)).length;
     const label = uploadCount === 1 ? "资料" : `${uploadCount} 份资料`;
     let message = uploadCount === 1
       ? "资料已导入，等待提炼"
@@ -1579,6 +1581,10 @@ export function createWebApp(opts: WebOptions): Hono {
       .filter((material) => !material.archive && material.name.toLowerCase().endsWith(".zip"))
       .map((material) => material.content?.split("\n")[0]);
     if (archiveMessages.length > 0) message += `；${archiveMessages.join("；")}`;
+    const textParts = materials.filter(material => !material.archive && material.textPart).length;
+    if (textParts > 0) message += `；长资料已完整分为 ${textParts} 段正文`;
+    const unreadable = materials.filter(material => !material.archive && material.content === null).length;
+    if (unreadable > 0) message += `；${unreadable} 份资料未提取到正文，原文件已完整保存`;
     const destination = rawIds.length === 1
       ? `/spaces/${encodeURIComponent(space)}/raw/${encodeURIComponent(rawIds[0]!)}`
       : `/spaces/${encodeURIComponent(space)}`;

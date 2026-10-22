@@ -5,7 +5,8 @@ import PDFKit
 import Vision
 
 let maxImagePixels = 40_000_000
-let maxOutputCharacters = 200_000
+let maxOutputBytes = 400 * 1024 * 1024
+enum ExtractionError: Error { case outputTooLarge }
 
 let arguments = CommandLine.arguments
 guard arguments.count == 3 else {
@@ -28,24 +29,20 @@ guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
 }
 let url = URL(fileURLWithPath: path)
 
-@discardableResult
-func appendBounded(
+func appendComplete(
     _ value: String,
     separator: String,
     to output: inout String,
     remaining: inout Int
-) -> Bool {
-    guard remaining > 0 else { return false }
+) throws {
     if !output.isEmpty && !separator.isEmpty {
-        let boundedSeparator = String(separator.prefix(remaining))
-        output.append(boundedSeparator)
-        remaining -= boundedSeparator.count
+        guard separator.utf8.count <= remaining else { throw ExtractionError.outputTooLarge }
+        output.append(separator)
+        remaining -= separator.utf8.count
     }
-    guard remaining > 0 else { return false }
-    let boundedValue = String(value.prefix(remaining))
-    output.append(boundedValue)
-    remaining -= boundedValue.count
-    return remaining > 0
+    guard value.utf8.count <= remaining else { throw ExtractionError.outputTooLarge }
+    output.append(value)
+    remaining -= value.utf8.count
 }
 
 func writeOutput(_ output: String) {
@@ -61,12 +58,10 @@ func recognize(_ image: CGImage) throws -> String {
     request.usesLanguageCorrection = true
     try VNImageRequestHandler(cgImage: image).perform([request])
     var output = ""
-    var remaining = maxOutputCharacters
+    var remaining = maxOutputBytes
     for result in request.results ?? [] {
         guard let text = result.topCandidates(1).first?.string, !text.isEmpty else { continue }
-        if !appendBounded(text, separator: "\n", to: &output, remaining: &remaining) {
-            break
-        }
+        try appendComplete(text, separator: "\n", to: &output, remaining: &remaining)
     }
     return output
 }
@@ -101,14 +96,12 @@ do {
             exit(3)
         }
         var output = ""
-        var remaining = maxOutputCharacters
-        for index in 0..<min(document.pageCount, 50) {
+        var remaining = maxOutputBytes
+        for index in 0..<document.pageCount {
             guard let page = document.page(at: index) else { continue }
             if let text = page.string,
                !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                if !appendBounded(text, separator: "\n\n", to: &output, remaining: &remaining) {
-                    break
-                }
+                try appendComplete(text, separator: "\n\n", to: &output, remaining: &remaining)
             }
         }
         writeOutput(output)

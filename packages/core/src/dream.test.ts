@@ -233,12 +233,49 @@ describe("runDreamCycle", () => {
       .filter((call) => call.kind === "json")
       .map((call) => call.opts.prompt ?? "");
     const generationPrompts = prompts.filter((prompt) => prompt.includes("## 相关原始来源"));
+    const planningPrompts = prompts.filter((prompt) => prompt.includes("## 待提炼的原始条目"));
     expect(report.pagesWritten).toBe(1);
     expect(generationPrompts.length).toBeGreaterThan(1);
     expect(prompts.every((prompt) => prompt.length <= 100_000)).toBe(true);
     for (const marker of markers) {
       expect(generationPrompts.some((prompt) => prompt.includes(marker))).toBe(true);
+      expect(planningPrompts.some((prompt) => prompt.includes(marker))).toBe(true);
     }
+  });
+
+  test("a useful middle fragment is not skipped when other fragments are noise", async () => {
+    const id = seedRaw(`${"A".repeat(48_000)}MIDDLE_ONLY_FACT${"B".repeat(48_000)}`);
+    const fake = new FakeLlm();
+    fake.onJSON(opts => {
+      if (opts.prompt?.includes("## 待提炼的原始条目")) return opts.prompt.includes("MIDDLE_ONLY_FACT")
+        ? { operations: [{ type: "concept", name: "middle", title: "中间事实", rawIds: [id] }], skippedRawIds: [] }
+        : { operations: [], skippedRawIds: [id] };
+      return { title: "中间事实", summary: "中间事实", content: "MIDDLE_ONLY_FACT", links: [] };
+    });
+    const report = await runDreamCycle(store, {}, { client: fake });
+    expect(report.skipped).toBe(0);
+    expect(report.pagesWritten).toBe(1);
+    expect(store.index().getPage("concepts/middle")?.sources).toEqual([id]);
+    expect(store.index().countRaw(true)).toBe(0);
+  });
+
+  test("failed later planning fragments leave all source material pending for retry", async () => {
+    const id = seedRaw("A".repeat(100_000));
+    const fake = new FakeLlm();
+    let calls = 0;
+    fake.onJSON(() => {
+      if (++calls > 1) throw new Error("later planning failed");
+      return { operations: [], skippedRawIds: [id] };
+    });
+    const report = await runDreamCycle(store, {}, { client: fake });
+    expect(report.pagesWritten).toBe(0);
+    expect(report.errors).toHaveLength(1);
+    expect(store.index().countRaw(true)).toBe(1);
+    expect(report.processedRawIds).toEqual([]);
+    const retry = new FakeLlm();
+    retry.onJSON(() => ({ operations: [], skippedRawIds: [id] }));
+    expect((await runDreamCycle(store, {}, { client: retry })).skipped).toBe(1);
+    expect(store.index().countRaw(true)).toBe(0);
   });
 
   test("distills through the real Codex CLI adapter final-artifact seam", async () => {

@@ -118,30 +118,17 @@ function validateAnalyze(raw: unknown): AnalyzeResult {
   return { operations, skippedRawIds: (o.skippedRawIds as unknown[]).map(String) };
 }
 
-function planningExcerpt(content: string, maxCharacters: number): string {
-  if (content.length <= maxCharacters) return content;
-  const marker = "\n…[仅规划阶段截取；生成阶段会处理完整来源]…\n";
-  const available = Math.max(0, maxCharacters - marker.length);
-  const head = Math.ceil(available / 2);
-  const tail = Math.floor(available / 2);
-  return `${content.slice(0, head)}${marker}${content.slice(content.length - tail)}`;
-}
-
-function analyzePrompt(store: SpaceStore, batch: RawRecord[]): string {
+function analyzePrompt(store: SpaceStore, batch: SourceFragment[]): string {
   const index = store
     .index()
     .listPages()
     .filter(isKnowledgeContentRef)
     .map((r) => `- ${r.slug} (${r.type})：${r.title}｜${r.summary}`)
     .join("\n");
-  const perEntryBudget = Math.max(
-    64,
-    Math.floor(MAX_ANALYZE_SOURCE_CHARACTERS / Math.max(1, batch.length)),
-  );
   const entries = batch
-    .map((r) => {
+    .map(({ raw: r, content, part, totalParts }) => {
       const meta = [r.source, r.author ? `by ${r.author}` : ""].filter(Boolean).join(" ");
-      return `<entry id="${r.id}" ${meta ? `meta="${meta}"` : ""}>\n${planningExcerpt(r.content, perEntryBudget)}\n</entry>`;
+      return `<entry id="${r.id}"${totalParts > 1 ? ` part="${part}/${totalParts}"` : ""} ${meta ? `meta="${meta}"` : ""}>\n${content}\n</entry>`;
     })
     .join("\n\n");
   return [
@@ -163,6 +150,7 @@ function analyzePrompt(store: SpaceStore, batch: RawRecord[]): string {
     "- 纯寒暄、无信息量的噪声条目，放入 skippedRawIds，不要建页。",
     "- 值得沉淀的，规划成对页面的 create/update 操作；若与现有页相关请复用其 name/slug 以更新。",
     "- 每个操作的 rawIds 必须来自上面条目的真实 id。",
+    "- 带 part 的条目是完整来源的一段；仅规划本段实际出现的知识，后续会合并同一知识页的计划。",
   ].join("\n");
 }
 
@@ -171,18 +159,43 @@ async function analyze(
   store: SpaceStore,
   batch: RawRecord[],
   model: string | undefined,
+  onProgress?: (progress: DreamProgress) => void,
+  signal?: AbortSignal,
 ): Promise<AnalyzeResult> {
-  const { value } = await client.completeJSON<AnalyzeResult>({
-    model,
-    system: "你严格按 schema 输出结构化结果，不要输出多余文本。",
-    prompt: analyzePrompt(store, batch),
-    schema: ANALYZE_SCHEMA as unknown as Record<string, unknown>,
-    validate: validateAnalyze,
-    maxTokens: AI_ROUTING_MAX_TOKENS,
-    purpose: "distill",
-    space: store.space,
-  });
-  return value;
+  const groups = groupSourceFragments(splitSourceFragments(batch, MAX_ANALYZE_SOURCE_CHARACTERS));
+  const operations = new Map<string, PlannedOp>();
+  const skipped = new Map<string, number>();
+  const appearances = new Map<string, number>();
+  for (const [index, group] of groups.entries()) {
+    if (signal?.aborted) throw signal.reason ?? new Error("distillation cancelled");
+    const ids = new Set(group.map(fragment => fragment.raw.id));
+    for (const id of ids) appearances.set(id, (appearances.get(id) ?? 0) + 1);
+    onProgress?.({ stage: "analyzing", rawCount: batch.length, sources: dreamSourceRefs(group.map(fragment => fragment.raw)),
+      sourceCount: batch.length, chunk: { index: index + 1, total: groups.length } });
+    const { value } = await client.completeJSON<AnalyzeResult>({
+      model,
+      system: "你严格按 schema 输出结构化结果，不要输出多余文本。",
+      prompt: analyzePrompt(store, group),
+      schema: ANALYZE_SCHEMA as unknown as Record<string, unknown>,
+      validate: validateAnalyze,
+      maxTokens: AI_ROUTING_MAX_TOKENS,
+      purpose: "distill",
+      space: store.space,
+    });
+    for (const op of value.operations) {
+      const rawIds = [...new Set(op.rawIds.filter(id => ids.has(id)))];
+      if (rawIds.length === 0) continue;
+      const key = canonicalSlug(op.type, op.name);
+      const previous = operations.get(key);
+      operations.set(key, previous
+        ? { ...previous, rawIds: [...new Set([...previous.rawIds, ...rawIds])] }
+        : { ...op, rawIds });
+    }
+    for (const id of new Set(value.skippedRawIds.filter(id => ids.has(id)))) skipped.set(id, (skipped.get(id) ?? 0) + 1);
+  }
+  const used = new Set([...operations.values()].flatMap(op => op.rawIds));
+  return { operations: [...operations.values()], skippedRawIds: batch
+    .filter(raw => !used.has(raw.id) && skipped.get(raw.id) === appearances.get(raw.id)).map(raw => raw.id) };
 }
 
 // ---- step 2: generate ------------------------------------------------------
@@ -256,17 +269,21 @@ interface SourceFragment {
   totalParts: number;
 }
 
-function splitSourceFragments(sources: RawRecord[]): SourceFragment[] {
+function splitSourceFragments(sources: RawRecord[], characters = MAX_GENERATE_SOURCE_CHARACTERS): SourceFragment[] {
   return sources.flatMap((raw) => {
-    const totalParts = Math.max(1, Math.ceil(raw.content.length / MAX_GENERATE_SOURCE_CHARACTERS));
-    return Array.from({ length: totalParts }, (_, index) => ({
+    const chunks: string[] = [];
+    for (let start = 0; start < raw.content.length;) {
+      let end = Math.min(start + characters, raw.content.length);
+      if (end < raw.content.length && raw.content.charCodeAt(end - 1) >= 0xd800 && raw.content.charCodeAt(end - 1) <= 0xdbff) end -= 1;
+      chunks.push(raw.content.slice(start, end));
+      start = end;
+    }
+    if (chunks.length === 0) chunks.push("");
+    return chunks.map((content, index) => ({
       raw,
-      content: raw.content.slice(
-        index * MAX_GENERATE_SOURCE_CHARACTERS,
-        (index + 1) * MAX_GENERATE_SOURCE_CHARACTERS,
-      ),
+      content,
       part: index + 1,
-      totalParts,
+      totalParts: chunks.length,
     }));
   });
 }
@@ -761,7 +778,7 @@ export async function runDreamCycle(
     throwIfAborted();
     deps.onProgress?.({ stage: "analyzing", rawCount: batch.length,
       sources: dreamSourceRefs(batch), sourceCount: batch.length });
-    plan = await analyze(client, store, batch, model);
+    plan = await analyze(client, store, batch, model, deps.onProgress, opts.signal);
     throwIfAborted();
   } catch (err) {
     throwIfAborted();

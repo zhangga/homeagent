@@ -59,7 +59,7 @@ export function readZipDirectory(input: Uint8Array, maxEntryBytes: number): ZipM
           throw new Error("ZIP 条目路径无效或为符号链接");
         }
         if (flags & 1) throw new Error("ZIP 条目已加密，无法读取正文");
-        if (size > maxEntryBytes) throw new Error("ZIP 内单个文件超过 20 MiB，原内容保留在压缩包中");
+        if (size > maxEntryBytes) throw new Error(`ZIP 内单个文件超过 ${Math.floor(maxEntryBytes / 1024 / 1024)} MiB，原内容保留在压缩包中`);
         if (method !== 0 && method !== 8) throw new Error("ZIP 条目压缩方式不受支持");
         if (localOffset + 30 > directoryStart || bytes.readUInt32LE(localOffset) !== 0x04034b50
           || bytes.readUInt16LE(localOffset + 6) !== flags

@@ -299,7 +299,7 @@ export function spaceDetailView(
           <label for="local-material-${enc}">资料文件</label>
           <input class="material-file-input" id="local-material-${enc}" name="material" type="file"
             multiple required />
-          <p class="field-help">可一次选择最多 20 份任意类型文件；单个文件不超过 20 MiB。原文件都会完整保存，可从 Raw 详情页下载；能识别的文本才会进入提炼。</p>
+          <p class="field-help">可一次选择最多 20 份任意类型文件；单个文件不超过 20 MiB。支持文本、Word（DOCX）、Excel（XLSX）、PowerPoint（PPTX）和 ZIP；macOS 另支持 PDF 文本层与图片文字。长正文会完整分段提炼，原文件可从 Raw 详情页下载；无法解析的资料会明确提示。</p>
           <p class="field-help">ZIP 会自动展开其中的 UTF-8 文本（TXT、Markdown、CSV、JSON、JSONL、LOG），保留内部路径，长文本分段提炼。未识别或无法解压的文件会在压缩包原始条目中说明，原 ZIP 仍可下载。</p>
         </div>
         <div class="material-import-actions">

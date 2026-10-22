@@ -32,6 +32,7 @@ import {
   Orchestrator,
   createNativeExtractor,
   extractAttachmentText,
+  extractUploadedMaterialText,
 } from "@homeagent/orchestrator";
 import { createWebApp, FeishuIntegrationService } from "@homeagent/web";
 import { Scheduler } from "./scheduler.ts";
@@ -345,6 +346,7 @@ async function run(
   });
   const app = createWebApp({
     engine,
+    materialTextExtractor: (name, bytes) => extractUploadedMaterialText(name, bytes, nativeAttachmentExtractor),
     brandAvatarPath: homeAgentFeishuAvatarPath(runtimePaths),
     adminToken: cfg.webAdminToken,
     agentReadToken: cfg.agentReadToken,
