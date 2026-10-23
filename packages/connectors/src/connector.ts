@@ -90,6 +90,8 @@ export interface LiveReplyStep {
   title: string;
   status?: string;
   kind?: "status" | "commentary" | "summary" | "tool";
+  /** Factual outcome derived only from public structured tool metadata. */
+  result?: string;
 }
 
 export interface LiveReplySnapshot {

@@ -31,6 +31,35 @@ function completedWorkActionOutput(result: string): string {
   });
 }
 
+test("archives preserve previously offered Codex none and current Ultra across restore and restart", async () => {
+  for (const model of ["gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+    const source = new KnowledgeEngine({ dataDir: tempDir("ha-codex-catalog-source-") });
+    let archive: SpaceArchive;
+    try {
+      source.ensureSpace(SPACE, { chatId: "oc_governance" });
+      const agent = source.agents.create({ name: "模型兼容", provider: "codex", model,
+        reasoningEffort: model.endsWith("luna") ? "max" : "ultra" });
+      source.registry.updateMeta(SPACE, { agentId: agent.id });
+      archive = await source.exportSpace(SPACE);
+    } finally { source.close(); }
+    if (model.startsWith("gpt-5.6-")) {
+      archive.agent!.reasoningEffort = "none";
+      for (const revision of archive.agentRevisions) revision.snapshot.reasoningEffort = "none";
+    }
+    const parsed = parseSpaceArchive(archive);
+    expect(parsed.agent).toEqual(archive.agent);
+    expect(parsed.agentRevisions).toEqual(archive.agentRevisions);
+    const targetDir = tempDir("ha-codex-catalog-restored-");
+    const target = new KnowledgeEngine({ dataDir: targetDir });
+    try { await target.restoreSpace(parsed); } finally { target.close(); }
+    const reopened = new KnowledgeEngine({ dataDir: targetDir });
+    try {
+      expect(reopened.agentForSpace(SPACE)).toEqual(archive.agent);
+      expect(reopened.agents.listRevisions(archive.agent!.id)).toEqual(archive.agentRevisions);
+    } finally { reopened.close(); }
+  }
+});
+
 function persistArchiveFixture(dataDir: string, version: number, archive: unknown): unknown {
   const path = join(dataDir, `candidate-space-v${version}.json`);
   writeFileSync(path, `${JSON.stringify(archive, null, 2)}\n`, "utf8");

@@ -27,6 +27,8 @@ import {
   ensureProviderCodexHome,
   hashProviderSkillBundle,
   isCliProvider,
+  isCodexReasoningEffortSupported,
+  isPersistedCodexReasoningEffortSupported,
   isProviderNativeSessionParentMissingError,
   prepareProviderCodexHome,
   providerFailureDetail,
@@ -1227,7 +1229,7 @@ function writeArgAndStdinReportingCodexProvider(
   writeFileSync(
     script,
     [
-      'const { appendFileSync } = require("node:fs");',
+      'const { appendFileSync, existsSync } = require("node:fs");',
       "const args = process.argv.slice(2);",
       `appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");`,
       "if (args.length === 1 && args[0] === '--version') process.stdout.write('codex-cli 0.152.1\\n');",
@@ -1239,7 +1241,7 @@ function writeArgAndStdinReportingCodexProvider(
       '  process.stdin.setEncoding("utf8");',
       "  process.stdin.on('data', (chunk) => { prompt += chunk; });",
       "  process.stdin.on('end', () => {",
-      "    const text = JSON.stringify({ args, prompt });",
+      "    const text = JSON.stringify({ args, prompt, cwd: process.cwd(), agentContextVisible: existsSync('AGENT_CONTEXT.md') });",
       "    process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' }) + '\\n');",
       "    process.stdout.write(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text } }) + '\\n');",
       "    process.stdout.write(JSON.stringify({ type: 'turn.completed' }));",
@@ -1617,17 +1619,19 @@ function codexMcpListArgs(workdir?: string): string[] {
 
 describe("Codex model capabilities", () => {
   test("reasoning effort choices follow the selected model", () => {
-    expect(codexReasoningEffortsForModel("gpt-6-astra")).toEqual([
-      "low", "medium", "high", "xhigh", "max", "ultra",
-    ]);
-    expect(codexReasoningEffortsForModel("gpt-5.6-sol")).toEqual([
-      "none",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max",
-    ]);
+    for (const model of ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra"]) {
+      expect(codexReasoningEffortsForModel(model)).toEqual([
+        "low", "medium", "high", "xhigh", "max", "ultra",
+      ]);
+      expect(isCodexReasoningEffortSupported(model, "none")).toBe(false);
+    }
+    for (const model of ["gpt-6-luna", "gpt-5.6-luna"]) {
+      expect(codexReasoningEffortsForModel(model)).toEqual([
+        "low", "medium", "high", "xhigh", "max",
+      ]);
+      expect(isCodexReasoningEffortSupported(model, "none")).toBe(false);
+      expect(isCodexReasoningEffortSupported(model, "ultra")).toBe(false);
+    }
     expect(codexReasoningEffortsForModel("gpt-5.5")).toEqual([
       "none",
       "low",
@@ -1644,6 +1648,16 @@ describe("Codex model capabilities", () => {
     expect(codexReasoningEffortsForModel("custom-codex-model")).toEqual([]);
     expect(codexReasoningEffortsForModel("gpt-5.6-custom")).toEqual([]);
     expect(codexReasoningEffortsForModel()).toEqual([]);
+  });
+
+  test("legacy none remains readable only for models that previously offered it", () => {
+    for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+      expect(isPersistedCodexReasoningEffortSupported(model, "none")).toBe(true);
+      expect(isPersistedCodexReasoningEffortSupported(model, "extreme")).toBe(false);
+    }
+    expect(isPersistedCodexReasoningEffortSupported("gpt-6.1-sol", "none")).toBe(false);
+    expect(isPersistedCodexReasoningEffortSupported("gpt-6-luna", "ultra")).toBe(false);
+    expect(isPersistedCodexReasoningEffortSupported("custom-codex-model", "none")).toBe(false);
   });
 });
 
@@ -3300,20 +3314,11 @@ describe("provider detection", () => {
   test("Codex ordinary calls run as ephemeral read-only completions without native Skills", async () => {
     const previous = process.env.HOMEAGENT_CODEX_BIN;
     const directory = mkdtempSync(join(tmpdir(), "ha-codex-no-tools-"));
-    const bin = join(directory, process.platform === "win32" ? "codex.cmd" : "codex");
     const workdir = join(directory, "agent-workdir");
     try {
       mkdirSync(workdir);
       writeFileSync(join(workdir, "AGENT_CONTEXT.md"), "agent context", "utf8");
-      writeFileSync(
-        bin,
-        process.platform === "win32"
-          ? '@echo off\r\nnode -e "console.log(require(\'fs\').existsSync(\'AGENT_CONTEXT.md\')?\'AGENT_WORKDIR_VISIBLE\':\'AGENT_WORKDIR_MISSING\')"\r\necho %*\r\nnode -e "let s=\'\';process.stdin.setEncoding(\'utf8\');process.stdin.on(\'data\',d=>s+=d);process.stdin.on(\'end\',()=>process.stdout.write(s))"\r\n'
-          : '#!/bin/sh\nnode -e "console.log(require(\'fs\').existsSync(\'AGENT_CONTEXT.md\')?\'AGENT_WORKDIR_VISIBLE\':\'AGENT_WORKDIR_MISSING\')"\nprintf "%s\\n" "$*"\ncat\n',
-        "utf8",
-      );
-      if (process.platform !== "win32") chmodSync(bin, 0o755);
-      process.env.HOMEAGENT_CODEX_BIN = bin;
+      process.env.HOMEAGENT_CODEX_BIN = writeArgAndStdinReportingCodexProvider(directory, "codex");
 
       const output = await runProvider("codex", {
         prompt: "answer the question",
@@ -3321,16 +3326,18 @@ describe("provider detection", () => {
         workdir,
       }, 500);
 
-      expect(output).toContain("exec --ephemeral --strict-config --ignore-user-config --ignore-rules");
-      expect(output).toContain("approval_policy");
-      expect(output).toContain("never");
-      expect(output).toContain(
-        "--json --sandbox read-only --skip-git-repo-check -- -",
-      );
-      expect(output).toContain("answer the question");
-      expect(output).toContain("AGENT_WORKDIR_VISIBLE");
-      expect(output).not.toContain("AGENT_WORKDIR_MISSING");
-      expect(output).not.toContain("/review");
+      const observed = JSON.parse(output) as {
+        args: string[]; prompt: string; cwd: string; agentContextVisible: boolean;
+      };
+      expect(observed.args).toContain('approval_policy="never"');
+      expect(observed.args.slice(observed.args.indexOf("exec"))).toEqual([
+        "exec", "--ephemeral", "--strict-config", "--ignore-user-config", "--ignore-rules",
+        "--json", "--sandbox", "read-only", "--skip-git-repo-check", "--", "-",
+      ]);
+      expect(observed.prompt).toContain("answer the question");
+      expect(observed.cwd).toBe(realpathSync(workdir));
+      expect(observed.agentContextVisible).toBe(true);
+      expect(observed.prompt).not.toContain("/review");
     } finally {
       if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
       else process.env.HOMEAGENT_CODEX_BIN = previous;
@@ -3361,23 +3368,25 @@ describe("provider detection", () => {
   test("passes visual inputs to Codex as native image attachments", async () => {
     const previous = process.env.HOMEAGENT_CODEX_BIN;
     const directory = mkdtempSync(join(tmpdir(), "ha-provider-argv-"));
+    const imagePath = join(directory, "晚餐 photo.png");
     try {
-      process.env.HOMEAGENT_CODEX_BIN = writeArgEchoProvider(directory);
+      process.env.HOMEAGENT_CODEX_BIN = writeArgAndStdinReportingCodexProvider(directory);
 
       const output = await runProvider(
         "codex",
         {
           prompt: "分析这顿晚餐",
-          images: [{ path: "/tmp/dinner.png" }],
+          images: [{ path: imagePath }],
           execution: READ_ONLY_EXECUTION,
         },
         500,
       );
-      expect(output).toContain('cli_auth_credentials_store=\\"file\\"');
-      expect(output).toContain(
-        "exec --ephemeral --strict-config --ignore-user-config --ignore-rules --json --sandbox read-only",
-      );
-      expect(output).toContain("--image /tmp/dinner.png -- -");
+      const { args } = JSON.parse(output) as { args: string[] };
+      expect(args).toContain('cli_auth_credentials_store="file"');
+      expect(args.slice(args.indexOf("exec"))).toEqual([
+        "exec", "--ephemeral", "--strict-config", "--ignore-user-config", "--ignore-rules",
+        "--json", "--sandbox", "read-only", "--skip-git-repo-check", "--image", imagePath, "--", "-",
+      ]);
     } finally {
       if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
       else process.env.HOMEAGENT_CODEX_BIN = previous;
@@ -3502,7 +3511,7 @@ describe("provider detection", () => {
     const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
     const directory = mkdtempSync(join(tmpdir(), "ha-provider-overrides-"));
     try {
-      const bin = writeArgEchoProvider(directory);
+      const bin = writeArgAndStdinReportingCodexProvider(directory);
       for (const key of keys) process.env[key] = bin;
 
       const detected = await detectProviders(500, { codexNativeIsolation: true });
@@ -3516,25 +3525,34 @@ describe("provider detection", () => {
         { prompt: "hello", execution: READ_ONLY_EXECUTION },
         500,
       );
-      expect(defaultRun).toContain('cli_auth_credentials_store=\\"file\\"');
-      expect(defaultRun).toContain(
-        "exec --ephemeral --strict-config --ignore-user-config --ignore-rules --json --sandbox read-only --skip-git-repo-check -- -",
-      );
+      const defaultArgs = (JSON.parse(defaultRun) as { args: string[] }).args;
+      expect(defaultArgs).toContain('cli_auth_credentials_store="file"');
+      expect(defaultArgs.slice(defaultArgs.indexOf("exec"))).toEqual([
+        "exec", "--ephemeral", "--strict-config", "--ignore-user-config", "--ignore-rules",
+        "--json", "--sandbox", "read-only", "--skip-git-repo-check", "--", "-",
+      ]);
 
       for (const [model, reasoningEffort] of [
         ["gpt-5.6-sol", "high"],
         ["gpt-6-astra", "ultra"],
+        ["gpt-6.1-sol", "ultra"],
+        ["gpt-6-sol", "ultra"],
+        ["gpt-6-luna", "max"],
+        ["gpt-5.6-sol", "ultra"],
+        ["gpt-5.6-terra", "ultra"],
+        ["gpt-5.6-luna", "max"],
       ] as const) {
         const configuredRun = await runProvider(
           "codex",
           { prompt: "hello", model, reasoningEffort, execution: READ_ONLY_EXECUTION },
           500,
         );
-        expect(configuredRun).toContain("model_reasoning_effort");
-        expect(configuredRun).toContain(reasoningEffort);
-        expect(configuredRun).toContain(
-          `exec --ephemeral --strict-config --ignore-user-config --ignore-rules --json --sandbox read-only --skip-git-repo-check -m ${model} -- -`,
-        );
+        const args = (JSON.parse(configuredRun) as { args: string[] }).args;
+        expect(args).toContain(`model_reasoning_effort="${reasoningEffort}"`);
+        expect(args.slice(args.indexOf("exec"))).toEqual([
+          "exec", "--ephemeral", "--strict-config", "--ignore-user-config", "--ignore-rules",
+          "--json", "--sandbox", "read-only", "--skip-git-repo-check", "-m", model, "--", "-",
+        ]);
       }
     } finally {
       for (const key of keys) {
@@ -4285,16 +4303,17 @@ describe("provider detection", () => {
     const directory = mkdtempSync(join(tmpdir(), "ha-provider-legacy-"));
     try {
       delete process.env.HOMEAGENT_CODEX_BIN;
-      process.env.HOMEBRAIN_CODEX_BIN = writeArgEchoProvider(directory);
+      process.env.HOMEBRAIN_CODEX_BIN = writeArgAndStdinReportingCodexProvider(directory);
 
       const detected = await detectProviders(500, { codexNativeIsolation: true });
       expect(detected.find((provider) => provider.id === "codex")?.bin)
         .toBe(process.env.HOMEBRAIN_CODEX_BIN);
-      expect(await runProvider(
+      const output = await runProvider(
         "codex",
         { prompt: "legacy", execution: READ_ONLY_EXECUTION },
         500,
-      )).toContain('cli_auth_credentials_store=\\"file\\"');
+      );
+      expect((JSON.parse(output) as { args: string[] }).args).toContain('cli_auth_credentials_store="file"');
     } finally {
       if (canonical === undefined) delete process.env.HOMEAGENT_CODEX_BIN;
       else process.env.HOMEAGENT_CODEX_BIN = canonical;
@@ -4608,14 +4627,15 @@ describe("provider detection", () => {
     // no "gateway" key — providers are CLIs only
     expect(m.gateway).toBeUndefined();
     expect(m["trae-cli"]).toContain("openrouter-3o");
-    expect(m.codex?.slice(0, 4)).toEqual([
+    expect(m.codex).toEqual([
+      "gpt-6.1-sol",
       "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
     ]);
-    expect(m.codex).toContain("gpt-5.5");
-    expect(m.codex).toContain("gpt-5.3-codex-spark");
     expect(m.claude?.length).toBeGreaterThan(0);
     // provider lists are not all identical
     expect(m.claude).not.toEqual(m["trae-cli"]);

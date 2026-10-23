@@ -84,6 +84,11 @@ Bot 身份按序、合并和节流地更新同一实体；运行态开启 stream
 阶段性说明和工具调用计数，按事件顺序交错排列，默认展开、终态仍可手动折叠，箭头紧随状态标题。
 连续工具事件在卡片中合并为默认收起的累计调用记录，开始/结束配对不重复计数，展开后保留原工具类型与状态，
 失败在收起的记录上仍有明确提示；journal 不因展示分组而合并事件。不展示隐藏推理、完整命令或工具输出。
+工具型回答要求 Agent 在实际取得结果后及时发送公开阶段说明。结构化回答通过本轮显式开启的 `publicAssistantProgress`
+接收以内部标记“执行进展：”开头的独立 assistant 消息，移除标记后沿现有 `assistant.snapshot` 保存；
+内部路由未开启该通道，最终 JSON、未标记的结构化文本及隐藏推理仍被过滤。内部路由的 Provider 阶段仅供 operator 查看。
+过程卡还从已有公开飞书工具元数据派生查询数量、分页和失败说明，不读取或持久化工具输出正文；
+`LiveReplyStep.result` 只是卡片投影字段，不新增 journal 格式或知识来源。结果正文与工具计数分开展示，连续工具记录的明细合并同次调用的开始/结束状态。
 Codex exec `reasoning.text` 是 Provider 明确返回的公开推理摘要，以 transient `reasoning_summary` 事件接入，
 在 journal 中复用 `assistant.snapshot`、`phase=provider` 和“思考摘要”标题，不增加持久化格式。
 Codex 与 Claude 的公开 assistant 文本也作为过程说明保留；最终回答通过 Run 成功事件校准去重，

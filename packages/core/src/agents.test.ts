@@ -644,8 +644,44 @@ describe("AgentStore", () => {
     }));
     expect(store.update(agent.id, { reasoningEffort: "none" })?.reasoningEffort).toBe("");
     expect(store.update(agent.id, { reasoningEffort: "ultra" })?.reasoningEffort).toBe("ultra");
-    expect(store.update(agent.id, { model: "gpt-5.6-sol" })?.reasoningEffort).toBe("");
+    expect(store.update(agent.id, { model: "gpt-5.6-sol" })?.reasoningEffort).toBe("ultra");
+    expect(store.update(agent.id, { model: "gpt-6-luna" })?.reasoningEffort).toBe("");
   });
+
+  test.each([
+    ["gpt-6.1-sol", "ultra"], ["gpt-6-sol", "ultra"], ["gpt-6-luna", "max"],
+    ["gpt-5.6-sol", "ultra"], ["gpt-5.6-terra", "ultra"], ["gpt-5.6-luna", "max"],
+  ] as const)("current Codex selection survives publication and reload: %s %s", (model, reasoningEffort) => {
+    const store = new AgentStore(dir);
+    const agent = store.create({ name: "当前模型", provider: "codex", model, reasoningEffort });
+    expect(agent.reasoningEffort).toBe(reasoningEffort);
+    expect(new AgentStore(dir).get(agent.id)).toEqual(agent);
+    expect(store.update(agent.id, { reasoningEffort: "none" })?.reasoningEffort).toBe("");
+    expect(new AgentStore(dir).listRevisions(agent.id).at(-1)?.snapshot.reasoningEffort).toBe(reasoningEffort);
+  });
+
+  test.each(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])(
+    "previously saved none survives reload, migration and later revisions: %s", (model) => {
+      const store = new AgentStore(dir);
+      const created = store.create({ name: "旧配置", provider: "codex", model, reasoningEffort: "high" });
+      const agent = { ...created, reasoningEffort: "none" as const };
+      const revisions = store.listRevisions(agent.id).map(revision => ({
+        ...revision, snapshot: { ...revision.snapshot, reasoningEffort: "none" as const },
+      }));
+      const path = join(dir, "config", "agents.json");
+      writeFileSync(path, JSON.stringify({ version: 5, agents: { [agent.id]: agent },
+        revisions: { [agent.id]: revisions }, localExecutionGrants: {} }));
+      const reopened = new AgentStore(dir);
+      expect(reopened.get(agent.id)).toEqual(agent);
+      expect(reopened.listRevisions(agent.id)).toEqual(revisions);
+      reopened.update(agent.id, { reasoningEffort: "high" });
+      expect(new AgentStore(dir).listRevisions(agent.id).at(-1)?.snapshot.reasoningEffort).toBe("none");
+
+      writeFileSync(path, JSON.stringify({ version: 2, agents: { [agent.id]: agent } }));
+      expect(new AgentStore(dir).get(agent.id)?.reasoningEffort).toBe("none");
+      expect(new AgentStore(dir).listRevisions(agent.id)[0]?.snapshot.reasoningEffort).toBe("none");
+    },
+  );
 
   test("task-execution fields: defaults, safe parsing, and update", () => {
     const store = new AgentStore(dir);

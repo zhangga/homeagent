@@ -1,4 +1,4 @@
-import type { RunEvent } from "@homeagent/shared";
+import type { PublicRunTool, RunEvent } from "@homeagent/shared";
 import type { LiveReplySnapshot, LiveReplyStep } from "./connector.ts";
 
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
@@ -28,6 +28,24 @@ function countToolCall(runningTools: Map<string, number>, type: string, started:
   }
   // Some providers report only the completed event for a tool.
   return 1;
+}
+
+function toolResult(tool: PublicRunTool | undefined): string | undefined {
+  const evidence = tool?.lark;
+  if (!evidence || tool?.status === "running") return undefined;
+  const label = new Map([
+    ["chat-list", "群列表查询"], ["chat-search", "群搜索"], ["chat-messages-list", "群消息查询"],
+    ["messages-search", "消息搜索"], ["messages-mget", "消息读取"], ["threads-messages-list", "话题消息查询"],
+    ["auth-status", "飞书授权状态查询"],
+  ]).get(evidence.operation);
+  if (!label) return undefined;
+  if (tool?.status === "failed" || evidence.ok === false) return `${label}未成功，尚未取得可核验结果。`;
+  if (evidence.ok !== true) return undefined;
+  const count = evidence.count;
+  if (typeof count === "number" && Number.isSafeInteger(count) && count >= 0 && count <= 1_000_000) {
+    return `${label}返回 ${count} 条结果${evidence.hasMore === true ? "，仍有后续分页" : ""}。`;
+  }
+  return `${label}已返回${evidence.hasMore === true ? "，仍有后续分页" : ""}。`;
 }
 
 export function liveReplySnapshot(
@@ -62,7 +80,7 @@ export function liveReplySnapshot(
         continue;
       }
       const previous = steps.at(-1);
-      const kind = event.phase === "provider" ? "summary" : "commentary";
+      const kind = event.phase === "provider" || event.title === "执行进展" ? "summary" : "commentary";
       if (previous?.kind === kind && previous.title === text) continue;
       const step: LiveReplyStep = { seq: event.seq, title: text, kind };
       steps.push(step);
@@ -74,7 +92,11 @@ export function liveReplySnapshot(
       const type = event.tool?.type ?? "other";
       const started = event.kind === "tool.started";
       toolCallCount += countToolCall(runningTools, type, started);
-      steps.push({ seq: event.seq, title: TOOL_LABELS[type], kind: "tool", status: started ? "running" : event.tool?.status ?? "unknown" });
+      const result = started ? undefined : toolResult(event.tool);
+      steps.push({ seq: event.seq, title: TOOL_LABELS[type], kind: "tool",
+        status: started ? "running" : event.tool?.lark?.ok === false ? "failed" : event.tool?.status ?? "unknown",
+        ...(result ? { result } : {}),
+      });
     } else if (!event.kind.startsWith("delivery.") && event.kind !== "run.succeeded") {
       steps.push({ seq: event.seq, title: bound(event.title, 120), kind: "status", status: event.status });
     }
@@ -109,6 +131,9 @@ interface ProcessRow {
   toolCallCount?: number;
   running?: boolean;
   failed?: boolean;
+  result?: string;
+  toolLabel?: string;
+  toolRunning?: boolean;
 }
 
 function processRows(steps: LiveReplyStep[]): ProcessRow[] {
@@ -126,6 +151,9 @@ function processRows(steps: LiveReplyStep[]): ProcessRow[] {
       toolCallCount,
       running: [...runningTools.values()].some(count => count > 0),
       failed: step.status === "failed",
+      result: bound(step.result, 4_000) || undefined,
+      toolLabel: title,
+      toolRunning: step.status === "running",
     };
   });
 }
@@ -138,13 +166,28 @@ function processElements(rows: ProcessRow[]): Record<string, unknown>[] {
     if (!last) return;
     const failed = tools.some(row => row.failed);
     const status = `${last.running ? " · 执行中" : ""}${failed ? " · 包含失败" : ""}`;
+    const results = tools.flatMap(row => row.result ? [row.result] : []);
+    if (results.length) elements.push({ tag: "markdown", content: results.join("\n\n"), text_size: "normal" });
+    // Show the latest state once per invocation instead of a start/end transcript.
+    const details: ProcessRow[] = [];
+    const pending = new Map<string, number[]>();
+    for (const row of tools) {
+      const key = row.toolLabel ?? "";
+      const positions = pending.get(key) ?? [];
+      const position = row.toolRunning ? undefined : positions.shift();
+      if (position === undefined) {
+        if (row.toolRunning) positions.push(details.length);
+        details.push(row);
+      } else details[position] = row;
+      pending.set(key, positions);
+    }
     elements.push({
       tag: "collapsible_panel", expanded: false, padding: "0px", vertical_spacing: "4px",
       header: {
         title: { tag: "markdown", content: `<font color='${failed ? "red" : "grey"}'>已调用 ${last.toolCallCount} 次工具${status}</font>` },
         width: "auto", icon_position: "follow_text", padding: "0px",
       },
-      elements: [{ tag: "markdown", content: tools.map(row => row.content).join("\n"), text_size: "notation" }],
+      elements: [{ tag: "markdown", content: details.map(row => row.content).join("\n"), text_size: "notation" }],
     });
     tools = [];
   };
@@ -207,8 +250,9 @@ export function buildLiveReplyCard(snapshot: LiveReplySnapshot): Record<string, 
   };
   // Lifecycle labels are useful while waiting, but must not obscure the actual
   // summaries and tool activity once a successful turn has completed.
-  const processSteps = snapshot.state === "succeeded"
-    ? snapshot.steps.filter(step => step.kind !== "status") : snapshot.steps;
+  const hasActivity = snapshot.steps.some(step => step.kind === "commentary" || step.kind === "summary" || step.kind === "tool");
+  const processSteps = snapshot.steps.filter(step => step.kind !== "status"
+    || (snapshot.state !== "succeeded" && (!hasActivity || ["failed", "cancelled", "timed_out"].includes(step.status ?? ""))));
   const empty = isLiveReplyTerminal(snapshot) ? "本次调用未返回可展示的过程摘要。" : "正在准备执行…";
   const rows = processRows(processSteps);
   let retained: Record<string, unknown>[] = rows.length

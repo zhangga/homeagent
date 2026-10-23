@@ -764,6 +764,8 @@ describe("ask pipeline", () => {
     expect(routing?.opts.nativeSession).toBeUndefined();
     expect(String(routing?.opts.prompt)).not.toContain("先使用本轮已提供的相关 Skill");
     expect(String(routing?.opts.prompt)).not.toContain("host-scoped-raw-capture-instruction");
+    expect((routing?.opts as JSONOptions<unknown>).publicAssistantProgress).toBeUndefined();
+    expect((final?.opts as JSONOptions<unknown>).publicAssistantProgress).toBe(true);
     expect(String(final?.opts.prompt)).toContain("host-scoped-raw-capture-instruction");
     expect(final?.opts.nativeSession).toEqual(native ? { mode: "start" } : undefined);
     expect(String(final?.opts.prompt)).toContain("先使用本轮已提供的相关 Skill");
@@ -771,6 +773,8 @@ describe("ask pipeline", () => {
     expect(String(final?.opts.prompt)).toContain("lark-im");
     expect(String(final?.opts.prompt)).toContain("只有 HomeAgent 入库接口确认成功");
     expect(String(final?.opts.prompt)).toContain("核对分页、时间范围和截断状态");
+    expect(String(final?.opts.prompt)).toContain("每完成一个有意义的执行阶段");
+    expect(String(final?.opts.prompt)).toContain("已取得的结果");
     expect(String(final?.opts.prompt)).not.toContain("只依据上面页面作答");
     expect(String(final?.opts.system)).not.toContain("只依据给定材料");
     expect(res.answer).toBe("已查询该群最近一周记录；原文尚未入库。");
@@ -794,6 +798,7 @@ describe("ask pipeline", () => {
       expect(system).toContain("完成可用的取数步骤前，不要直接要求用户导出或粘贴记录");
       expect(system).toContain("跨 Space 授权不明确时先澄清");
       expect(system).toContain("HomeAgent 已明确同步本轮来源正文时");
+      expect(system).toContain("每完成一个有意义的执行阶段");
       if (fallbackContext === "agent-workdir") {
         expect(system).toContain("用户需要外部来源时按相关 Skill 取数");
       }

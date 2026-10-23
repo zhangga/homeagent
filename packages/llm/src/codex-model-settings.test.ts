@@ -64,6 +64,19 @@ test("missing, malformed and non-file config preserve the CLI default path", () 
   expect(readLocalCodexModelSettings({}, root)).toEqual({});
 });
 
+test("current model defaults retain newly supported effort and filter unsupported choices", () => {
+  for (const model of ["gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra"]) {
+    writeFileSync(join(home, "config.toml"), `model = "${model}"\nmodel_reasoning_effort = "ultra"`);
+    expect(resolveCodexModelSettings({}, readLocalCodexModelSettings({}, root)))
+      .toEqual({ model, reasoningEffort: "ultra" });
+    expect(resolveCodexModelSettings({ model }, { reasoningEffort: "none" }).reasoningEffort).toBeUndefined();
+  }
+  expect(resolveCodexModelSettings({ model: "gpt-6-luna" }, { reasoningEffort: "max" }))
+    .toEqual({ model: "gpt-6-luna", reasoningEffort: "max" });
+  expect(resolveCodexModelSettings({ model: "gpt-6-luna" }, { reasoningEffort: "ultra" }).reasoningEffort)
+    .toBeUndefined();
+});
+
 test("bounds config bytes and model identifiers and accepts only supported effort names", () => {
   const path = join(home, "config.toml");
   const prefix = `model = "${"m".repeat(200)}"\nmodel_reasoning_effort = "xhigh"\n#`;

@@ -8,12 +8,13 @@ import type {
   SpaceMeta,
   TaskRun,
 } from "@homeagent/core";
-import type { DetectedProvider } from "@homeagent/llm";
+import { curatedProviderModels, type DetectedProvider } from "@homeagent/llm";
 import {
   buildAgentWorkbench,
   agentInputForEditor,
   editorValuesFor,
   generatedAgentName,
+  reasoningEffortsForEditor,
   validateAgentEditor,
   type AgentEditorValues,
 } from "./agent-workbench.ts";
@@ -497,6 +498,37 @@ describe("Agent workbench presenter", () => {
 });
 
 describe("Agent editor validation", () => {
+  test.each([
+    ["gpt-6.1-sol", "ultra"], ["gpt-6-astra", "ultra"], ["gpt-6-sol", "ultra"],
+    ["gpt-6-luna", "max"], ["gpt-5.6-sol", "ultra"], ["gpt-5.6-terra", "ultra"],
+    ["gpt-5.6-luna", "max"],
+  ])("accepts current Codex options for explicit and inherited models: %s %s", (model, effort) => {
+    const defaults = { provider: "codex", model };
+    const values = { ...editorValuesFor(agent, providers, defaults), model, reasoningEffort: effort };
+    const context = { providers, models: curatedProviderModels(), defaults };
+    expect(validateAgentEditor(values, context).ok).toBe(true);
+    expect(validateAgentEditor({ ...values, model: "" }, context).ok).toBe(true);
+    expect(reasoningEffortsForEditor(values, defaults)).toContain(effort);
+    expect(reasoningEffortsForEditor({ ...values, model: "" }, defaults)).toContain(effort);
+    expect(validateAgentEditor({ ...values, reasoningEffort: "none" }, context).errors.reasoningEffort)
+      .toBeDefined();
+    if (model.endsWith("luna")) {
+      expect(validateAgentEditor({ ...values, reasoningEffort: "ultra" }, context).errors.reasoningEffort)
+        .toBeDefined();
+    }
+  });
+
+  test("retired models remain editable on existing Agents but are absent from new selections", () => {
+    const defaults = { provider: "codex", model: "gpt-6.1-sol" };
+    for (const model of ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"]) {
+      const current = { ...agent, model };
+      const values = editorValuesFor(current, providers, defaults);
+      const context = { providers, models: curatedProviderModels(), defaults };
+      expect(validateAgentEditor(values, context).errors.model).toBeDefined();
+      expect(validateAgentEditor(values, { ...context, current }).ok).toBe(true);
+    }
+  });
+
   test("returns field-level errors for unsafe or incompatible values", () => {
     const values: AgentEditorValues = {
       name: "",

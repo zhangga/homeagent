@@ -84,7 +84,7 @@ beforeEach(async () => {
     ],
     providerModels: async () => ({
       claude: ["sonnet", "opus"],
-      codex: ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"],
+      codex: ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"],
       "trae-cli": ["openrouter-3o"],
     }),
   });
@@ -2689,6 +2689,12 @@ describe("management backend (read-write)", () => {
   test.each([
     ["gpt-5.6-sol", "high"],
     ["gpt-6-astra", "ultra"],
+    ["gpt-6.1-sol", "ultra"],
+    ["gpt-6-sol", "ultra"],
+    ["gpt-6-luna", "max"],
+    ["gpt-5.6-sol", "ultra"],
+    ["gpt-5.6-terra", "ultra"],
+    ["gpt-5.6-luna", "max"],
   ] as const)(
     "creating a Codex agent persists model %s and reasoning %s",
     async (model, reasoningEffort) => {

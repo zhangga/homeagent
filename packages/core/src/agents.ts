@@ -39,6 +39,7 @@ import {
   DEFAULT_CLI_PROVIDER,
   isCliProvider,
   isCodexReasoningEffortSupported,
+  isPersistedCodexReasoningEffortSupported,
   normalizeProviderSkills,
   isCodexExecutionMode,
   validateCodexFullAccessWorkdir,
@@ -206,11 +207,12 @@ function normalizeVisibility(raw?: unknown): AgentVisibility {
 }
 
 /** Normalize a Codex reasoning level; unknown/empty => inherit the CLI default. */
-function normalizeReasoningEffort(raw: string | undefined, model: string): CodexReasoningEffort | "" {
+function normalizeReasoningEffort(raw: string | undefined, model: string, persisted = false): CodexReasoningEffort | "" {
   const value = raw?.trim() as CodexReasoningEffort | undefined;
   if (!value) return "";
   if (!model) return CODEX_REASONING_EFFORTS.includes(value) ? value : "";
-  return isCodexReasoningEffortSupported(model, value) ? value : "";
+  const supported = persisted ? isPersistedCodexReasoningEffortSupported : isCodexReasoningEffortSupported;
+  return supported(model, value) ? value : "";
 }
 
 /** Store the explicit GPT-5.6 Sol id instead of its shorter routing alias. */
@@ -320,7 +322,7 @@ function isCurrentAgentRecord(value: unknown, id: string): value is Agent {
     && typeof candidate.provider === "string"
     && isCliProvider(candidate.provider)
     && typeof candidate.reasoningEffort === "string"
-    && normalizeReasoningEffort(candidate.reasoningEffort, candidate.model)
+    && normalizeReasoningEffort(candidate.reasoningEffort, candidate.model, true)
       === candidate.reasoningEffort
     && typeof candidate.visibility === "string"
     && AGENT_VISIBILITIES.includes(candidate.visibility as AgentVisibility)
@@ -398,7 +400,7 @@ function normalizeAgentForPersistence(agent: Agent): Agent {
     ...agent,
     name: agent.name.trim() || DEFAULT_AGENT_NAME,
     model,
-    reasoningEffort: normalizeReasoningEffort(agent.reasoningEffort, model),
+    reasoningEffort: normalizeReasoningEffort(agent.reasoningEffort, model, true),
     provider: normalizeProvider(agent.provider),
     visibility: normalizeVisibility(agent.visibility),
     workdir: agent.workdir?.trim() || undefined,
@@ -874,7 +876,7 @@ export class AgentStore {
       }
       if (JSON.stringify(skills) !== JSON.stringify(a.skills)) migrated = true;
       a.skills = skills;
-      const reasoningEffort = normalizeReasoningEffort(a.reasoningEffort, a.model);
+      const reasoningEffort = normalizeReasoningEffort(a.reasoningEffort, a.model, true);
       if (reasoningEffort !== a.reasoningEffort) migrated = true;
       a.reasoningEffort = reasoningEffort;
       const persisted = normalizeAgentForPersistence(a);

@@ -34,6 +34,7 @@ import {
 } from "@homeagent/llm";
 import { logger, publicModelId } from "@homeagent/shared";
 import type { LlmClient } from "./llm.ts";
+import { PUBLIC_PROGRESS_PREFIX } from "./public-progress.ts";
 
 const log = logger.child("cli-client");
 
@@ -176,10 +177,12 @@ export function extractJson(raw: string): unknown {
   }
 }
 
-function jsonInstruction(schema: Record<string, unknown>): string {
+function jsonInstruction(schema: Record<string, unknown>, publicProgress = false): string {
   return [
     "",
-    "严格要求：只输出一个 JSON，对应下面的 JSON Schema，不要输出任何解释、前后缀或 Markdown 代码块标记。",
+    publicProgress
+      ? `执行期间可用独立 assistant 消息发送以“${PUBLIC_PROGRESS_PREFIX}”开头的公开阶段结果；最终结果严格要求只输出一个 JSON，对应下面的 JSON Schema，不要给最终 JSON 添加解释、前后缀或 Markdown 代码块标记。`
+      : "严格要求：只输出一个 JSON，对应下面的 JSON Schema，不要输出任何解释、前后缀或 Markdown 代码块标记。",
     "## JSON Schema",
     JSON.stringify(schema),
   ].join("\n");
@@ -288,7 +291,7 @@ export function makeCliClient(
       const structuredPrompt = withSystem(opts.system, base);
       const prompt = provider === "codex"
         ? structuredPrompt
-        : structuredPrompt + jsonInstruction(opts.schema);
+        : structuredPrompt + jsonInstruction(opts.schema, opts.publicAssistantProgress === true);
       const purpose = opts.purpose ?? "other";
       const started = Date.now();
       let result: CompleteResult | undefined;

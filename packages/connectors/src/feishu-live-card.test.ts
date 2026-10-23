@@ -256,3 +256,50 @@ test("retains recent tool details and the true total when a single group exceeds
   expect(JSON.stringify(card)).toContain("网络查询");
   expect(JSON.stringify(card)).toContain("已调用 1000 次工具");
 });
+
+test("shows verified execution results above compact tool details while running", () => {
+  const snapshot = liveReplySnapshot("chat_run_card", [
+    event(1, "run.queued", { title: "请求已进入队列" }),
+    event(2, "run.started", { title: "开始执行" }),
+    event(3, "phase.completed", { title: "Provider 执行完成" }),
+    event(4, "assistant.snapshot", { delta: "已确认目标群，开始读取消息。" }),
+    event(5, "tool.started", { tool: { type: "command", status: "running" } }),
+    event(6, "tool.completed", { tool: { type: "command", status: "completed", exitCode: 0,
+      lark: { operation: "chat-messages-list", requestedIdentity: "user", ok: true, count: 28, hasMore: true } } }),
+    event(7, "assistant.snapshot", { delta: "已取得本页 28 条消息，还需要继续翻页。" }),
+  ]);
+  const panel = processPanel(snapshot);
+  expect(panel.elements.some(element => element.tag === "markdown" && element.content?.includes("群消息查询返回 28 条结果，仍有后续分页"))).toBe(true);
+  expect(panel.elements.some(element => element.tag === "markdown" && element.content?.includes("已取得本页 28 条消息"))).toBe(true);
+  expect(JSON.stringify(panel)).not.toContain("请求已进入队列");
+  expect(JSON.stringify(panel)).not.toContain("Provider 执行完成");
+  const details = panel.elements.find(element => element.tag === "collapsible_panel");
+  expect(JSON.stringify(details)).not.toContain("◷ 命令执行");
+  expect(JSON.stringify(details)).toContain("✓ 命令执行");
+  expect(snapshot.toolCallCount).toBe(1);
+});
+
+test("zero results and failed queries stay factual without revealing raw output or claiming success", () => {
+  const snapshot = liveReplySnapshot("chat_run_card", [
+    event(1, "tool.completed", { tool: { type: "command", status: "completed",
+      lark: { operation: "chat-search", requestedIdentity: "user", ok: true, count: 0 } } }),
+    event(2, "tool.completed", { tool: { type: "command", status: "failed", exitCode: 1,
+      lark: { operation: "messages-search", requestedIdentity: "user", ok: false, count: 10 } } }),
+  ]);
+  const card = JSON.stringify(buildLiveReplyCard(snapshot));
+  expect(card).toContain("群搜索返回 0 条结果");
+  expect(card).toContain("消息搜索未成功");
+  expect(card).not.toContain("返回 10 条结果");
+});
+
+test("an explicit execution update remains visible when the final answer starts with the same result", () => {
+  const snapshot = liveReplySnapshot("chat_run_card", [
+    event(1, "assistant.snapshot", { title: "执行进展", phase: "answer", delta: "已核对 28 条记录。" }),
+    event(2, "assistant.snapshot", { phase: "answer", delta: "已核对 28 条记录。负责人是 Alice。" }),
+    event(3, "run.succeeded", { delta: "已核对 28 条记录。负责人是 Alice。" }),
+  ]);
+  expect(snapshot.commentary).toEqual(["已核对 28 条记录。"]);
+  const card = JSON.stringify(buildLiveReplyCard(snapshot));
+  expect(card).toContain("已核对 28 条记录。");
+  expect(card).not.toContain("负责人是 Alice。");
+});

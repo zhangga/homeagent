@@ -43,6 +43,18 @@ describe("extractJson", () => {
 });
 
 describe("makeCliClient", () => {
+  test("public stage updates do not conflict with the final JSON instruction", async () => {
+    const prompts: string[] = [];
+    const cli = makeCliClient("claude", undefined, testAccountingDataDir, async (_provider, input) => {
+      prompts.push(input.prompt); return '{"ok":true}';
+    });
+    await cli.completeJSON({ schema: {}, prompt: "routing" });
+    await cli.completeJSON({ schema: {}, prompt: "answer", publicAssistantProgress: true });
+    expect(prompts[0]).toContain("严格要求：只输出一个 JSON");
+    expect(prompts[0]).not.toContain("公开阶段结果");
+    expect(prompts[1]).toContain("公开阶段结果");
+    expect(prompts[1]).toContain("最终结果严格要求只输出一个 JSON");
+  });
   test("reports only Provider-returned model ids for text and structured calls", async () => {
     const seen: string[] = [];
     const client = makeCliClient("claude", "sonnet", testAccountingDataDir, async () => ({

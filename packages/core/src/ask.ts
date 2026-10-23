@@ -33,6 +33,7 @@ import { isKnowledgeContentRef } from "./digest.ts";
 import { buildKnowledgePageTrace } from "./traceability.ts";
 import { requestsStoredRawQuery } from "./chat-raw-import.ts";
 import { askStoredRaw } from "./ask-raw.ts";
+import { PUBLIC_PROGRESS_PREFIX } from "./public-progress.ts";
 
 const log = logger.child("ask");
 
@@ -398,6 +399,8 @@ interface SynthesisKnowledgePage {
 }
 
 const TOOL_EVIDENCE_INSTRUCTIONS = [
+  `首次执行工具前，用一句公开进度说明准备做什么；每完成一个有意义的执行阶段，立即发送面向用户的公开 assistant/commentary 消息，说明已取得的结果、已核验的事实或遇到的阻碍，以及下一步。阶段消息以“${PUBLIC_PROGRESS_PREFIX}”开头，后台会去掉此前缀后展示；不要等全部工作结束才一次性汇报，也不要逐条重复工具开始/结束。`,
+  "公开执行进展必须依据已经返回的工具结果，保留数量、关键结论和覆盖缺口；未核验的内容不能写成成功。不要公开隐藏思维过程、完整命令、工具输出正文、凭据或原始诊断。最终答案仍单独返回；结构化回答的 JSON 只在最终结果通道输出，不放进进度消息。",
   "用户要求查询、拉取或整理外部来源（例如飞书群近期聊天记录）时，先使用本轮已提供的相关 Skill 和工具获取证据，再回答；知识库页面只是已有背景，命中页面不代表完成取数。",
   "先读取本轮冻结映射中的相关 SKILL.md 并遵循它；飞书群消息优先检查 lark-im 及其依赖。只使用本轮实际可用的能力，不自行发现其他 Skill 或扩大权限。",
   "知识库缺少原文不等于无法获取原文；完成可用的取数步骤前，不要直接要求用户导出或粘贴记录。所需能力缺失、身份无权访问或工具失败时，明确说明已尝试的步骤和实际阻碍，不猜测权限或编造结果。",
@@ -504,6 +507,7 @@ async function synthesize(
     images,
     schema: SYNTH_SCHEMA as unknown as Record<string, unknown>,
     publicReasoningSummary: true,
+    ...(toolExecution ? { publicAssistantProgress: true } : {}),
     validate: validateSynth,
     maxTokens: AI_GENERATION_MAX_TOKENS,
     purpose: "ask",

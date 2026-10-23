@@ -96,11 +96,11 @@ export class ProviderRunError extends Error {
 export const CODEX_REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type CodexReasoningEffort = (typeof CODEX_REASONING_EFFORTS)[number];
 
-const ASTRA_REASONING_EFFORTS: readonly CodexReasoningEffort[] = [
+const ULTRA_REASONING_EFFORTS: readonly CodexReasoningEffort[] = [
   "low", "medium", "high", "xhigh", "max", "ultra",
 ];
-const GPT_56_REASONING_EFFORTS: readonly CodexReasoningEffort[] = [
-  "none", "low", "medium", "high", "xhigh", "max",
+const LUNA_REASONING_EFFORTS: readonly CodexReasoningEffort[] = [
+  "low", "medium", "high", "xhigh", "max",
 ];
 
 const STANDARD_REASONING_EFFORTS: readonly CodexReasoningEffort[] = [
@@ -121,9 +121,12 @@ const LEGACY_CODEX_REASONING_EFFORTS: readonly CodexReasoningEffort[] = [
 export function codexReasoningEffortsForModel(
   model?: string,
 ): readonly CodexReasoningEffort[] {
-  if (model === "gpt-6-astra") return ASTRA_REASONING_EFFORTS;
-  if (model === "gpt-5.6-sol" || model === "gpt-5.6-terra" || model === "gpt-5.6-luna") {
-    return GPT_56_REASONING_EFFORTS;
+  if (model === "gpt-6.1-sol" || model === "gpt-6-astra" || model === "gpt-6-sol"
+    || model === "gpt-5.6-sol" || model === "gpt-5.6-terra") {
+    return ULTRA_REASONING_EFFORTS;
+  }
+  if (model === "gpt-6-luna" || model === "gpt-5.6-luna") {
+    return LUNA_REASONING_EFFORTS;
   }
   if (model === "gpt-5.5" || model === "gpt-5.4" || model === "gpt-5.4-mini") {
     return STANDARD_REASONING_EFFORTS;
@@ -137,6 +140,16 @@ export function isCodexReasoningEffortSupported(
   effort: string,
 ): effort is CodexReasoningEffort {
   return codexReasoningEffortsForModel(model).includes(effort as CodexReasoningEffort);
+}
+
+/** Catalog updates must not invalidate immutable Agent revisions or archives. */
+export function isPersistedCodexReasoningEffortSupported(
+  model: string | undefined,
+  effort: string,
+): effort is CodexReasoningEffort {
+  return isCodexReasoningEffortSupported(model, effort)
+    || (effort === "none"
+      && (model === "gpt-5.6-sol" || model === "gpt-5.6-terra" || model === "gpt-5.6-luna"));
 }
 
 /**
@@ -1240,16 +1253,16 @@ const KNOWN: CliSpec[] = [
     bin: "codex",
     envBin: "CODEX_BIN",
     versionArgs: ["--version"],
-    // Curated from OpenAI's current model catalog (CLIs expose no list command).
+    // Picker-visible catalog verified with Codex CLI 0.163.0 on 2026-10-23.
+    // Retired model capabilities above remain readable for existing history.
     models: [
+      "gpt-6.1-sol",
       "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
-      "gpt-5.5",
-      "gpt-5.4",
-      "gpt-5.4-mini",
-      "gpt-5.3-codex-spark",
     ],
     buildRun: ({
       model,

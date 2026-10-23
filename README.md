@@ -46,6 +46,11 @@ streaming mode。卡片采用简洁的“任务已完成／执行中”过程记
 包含失败时在收起的记录上明确提示。没有调用时不显示“0 次工具”。Codex exec 的 `reasoning.text` 是官方 SDK 定义的
 [公开推理摘要](https://github.com/openai/codex/blob/main/sdk/typescript/src/items.ts)，按“思考摘要”接入；
 Claude 保留公开 assistant 文本。没有返回摘要或进度时如实提示，不补写虚构过程。
+工具执行前会要求 Agent 说明目标，每完成有意义的阶段及时报告已取得的结果、关键结论、缺口和下一步。
+即使命中知识库、最终回答使用结构化 JSON，这些明确标记为公开的执行进展也会实时展示；内部路由及最终 JSON 不进入过程卡。
+已识别的飞书查询还会直接展示结构化结果，如“群消息查询返回 28 条结果，仍有后续分页”或“群搜索返回 0 条结果”，
+不把一页返回成功当作全部取齐。结果说明直接显示在卡片正文，累计工具次数与合并后的最新状态明细可展开查看；
+连续工具记录中的开始/结束不再各占一行。已有执行内容后隐藏排队、Provider 完成等重复阶段标签，失败提示保留。
 摘要从升级后的新 Run 开始采集；旧 Run 中此前被过滤的摘要无法补回。
 最终回答（含本次模型）只在独立 Markdown 回复中完整展示，过程卡不重复回答。
 内部结构化路由的文本和摘要、回答合成的结构化 JSON、隐藏 reasoning/thinking 不进入过程展示；
@@ -449,8 +454,8 @@ Task 后的提炼使用独立无工具调用，不继承完全访问。完全访
     聊天回复只追加当前请求明确点名的不可用 Skill 告警，避免全量目录中的无关问题在每轮回复刷屏；跳过证据仍保留在 Run 中供管理后台查看。体积、文件数量、链接和读取期间内容变化等已识别原因分别显示，不再一律归为“配置无效”。
   - **当前全量模式边界**：普通聊天和研究任务都会冻结全部兼容 Skill 的名称、来源与完整目录摘要，并在调用 Provider 前重新扫描有效目录、散列完整 Skill bundle。Codex 随后把匹配内容复制到调用私有副本、对副本重算同一摘要，只授权该副本；原 Skill 目录不进入 prompt 或 permission profile。只要 `SKILL.md`、资源文件、目录路径、Skill 增删或同名来源优先级与冻结证据不一致，本次运行就会 fail-closed，Provider 不会被调用；需要按当前目录重新发起一次运行。提炼和后台学习不执行本机 Skill。
   - **图片输入的安全边界**：Codex 普通 Chat（包括飞书话题中的当前 turn）支持原生图片参数（每次最多 4 张）；其他不支持图片输入的 Provider 会明确失败，不会假装已经看过图片。
-  - **Model 随 Provider 变化**：切 Provider 时 Model 下拉自动换成该 provider 的维护清单（CLI 无“列模型”接口）；Codex 当前提供 `gpt-6-astra / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna / gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex-spark`。其中 `gpt-5.6-sol` 是 GPT-5.6 Sol 的完整模型 ID；HomeAgent 日常问答优先选择较快、成本更低的 `gpt-5.6-luna`，复杂研究可选择 `gpt-5.6-terra` 或 `gpt-5.6-sol`。
-  - **推理强度按 Agent 配置**：Codex Agent 可选择“继承本机 Codex CLI 推理强度”，跟随上述文件中的 `model_reasoning_effort`；也可从当前模型支持的档位中明确选择，覆盖本机默认值。新模型即使尚未列入 HomeAgent 的下拉目录，也可通过本机配置继承模型及推理强度。GPT-6 Astra（`gpt-6-astra`）支持 `low / medium / high / xhigh / max / ultra`（按 Codex 模型目录），不支持 `none`；GPT-5.6 系列支持 `none / low / medium / high / xhigh / max`，旧模型不会显示不支持的档位。此配置用于 Codex Chat、Task 及后台无工具调用；其他 Provider 不传递。
+  - **Model 随 Provider 变化**：切 Provider 时 Model 下拉自动换成该 Provider 的维护清单。Codex 清单按 2026-10-23 的 CLI `0.163.0` 模型目录核对，提供 `gpt-6.1-sol / gpt-6-astra / gpt-6-sol / gpt-6-luna / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna`；实际可用性取决于账号与客户端。按[官方模型说明](https://learn.chatgpt.com/docs/models)，日常问答可选择 `gpt-6-luna`，复杂研究可选择 `gpt-6.1-sol` 或 `gpt-6-astra`。已退役的 `gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex-spark` 不再出现在新建选项中；已有 Agent 和历史运行保留原模型，不自动改写。
+  - **推理强度按 Agent 配置**：Codex Agent 可选择“继承本机 Codex CLI 推理强度”，跟随上述文件中的 `model_reasoning_effort`；也可从当前模型支持的档位中明确选择，覆盖本机默认值。新模型即使尚未列入 HomeAgent 的下拉目录，也可通过本机配置继承模型及推理强度。GPT-6.1 Sol、GPT-6 Astra、GPT-6 Sol、GPT-5.6 Sol/Terra 支持 `low / medium / high / xhigh / max / ultra`；GPT-6 Luna、GPT-5.6 Luna 支持 `low / medium / high / xhigh / max`。当前模型均不再提供 `none`；旧版本保存的 Agent revision、Run 和空间归档仍可读取原值。此配置用于 Codex Chat、Task 及后台无工具调用；其他 Provider 不传递。
   - **Visibility 会限制空间绑定**：Team Agent 只能绑定群空间；Personal Agent 只能绑定个人空间。群设置只展示 Team Agent，个人空间详情页只展示 Personal Agent，后端也会拒绝类型不匹配的绑定。已有不兼容绑定时不能直接切换 Visibility，必须先解除绑定；显式删除 Agent 则会先一次性清除所有绑定，让这些空间回退到默认 AI。
   - **Chat / 任务权限会真实映射到 CLI 沙箱**：`read-only` 开启只读工具并禁止写入，`write` 以 Workdir 为工作根目录并启用 Provider 的工作区写入模式，`full` 会绕过 Provider 沙箱。`write/full` 必须配置存在的 Workdir；高权限任务仍需持久化人工审批。Codex 的旧或未确认 `full` 不可执行；开发中的显式本机完全访问另需发布确认及逐进程授权，不能被描述为已隔离。未配置 Workdir 的只读话题使用本轮专用空目录，不会回退到 HomeAgent 当前工作目录。话题 Workdir 与 HomeAgent 数据目录任一方向重叠仍拒绝；在完全访问模式下，这项检查只是防误操作，不能限制 Provider 读取其他目录。
 - **Skills**（能力清单）：只读展示 `~/.agents/skills` 中的共享 Skills、同名冲突和无效配置；运行时还会合并当前 Provider 的原生 Skill 目录。普通聊天和任务自动获得有效的完整目录，不需要在 Agent 上逐个分配。支持本地搜索、状态筛选和手动刷新；安装与更新仍由本机 CLI/Skill 管理工具负责。

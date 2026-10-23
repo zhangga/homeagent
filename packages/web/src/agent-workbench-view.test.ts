@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Agent, AgentActivityRun } from "@homeagent/core";
+import { curatedProviderModels } from "@homeagent/llm";
 import { buildAgentWorkbench } from "./agent-workbench.ts";
 import { agentWorkbenchView } from "./agent-workbench-view.ts";
 
@@ -18,6 +19,29 @@ const selected: Agent = {
 };
 
 describe("Agent workbench view", () => {
+  test.each(["create", "edit"] as const)("%s shows current Codex model and reasoning choices", async (mode) => {
+    for (const model of curatedProviderModels().codex ?? []) {
+      const agent = { ...selected, model, reasoningEffort: "" as const };
+      const view = buildAgentWorkbench({ agents: mode === "edit" ? [agent] : [], mode,
+        selected: mode === "edit" ? agent : null,
+        providers: [{ id: "codex", name: "Codex", bin: "codex", available: true, detail: "0.163.0" }],
+        models: curatedProviderModels(), defaults: { provider: "codex", model }, bindings: [], runs: [],
+      });
+      const body = String(await agentWorkbenchView(view));
+      const models = body.match(/<select\s[^>]*id="agent-model"[\s\S]*?<\/select>/u)?.[0] ?? "";
+      const reasoning = body.match(/<select\s[^>]*id="agent-reasoning-effort"[\s\S]*?<\/select>/u)?.[0] ?? "";
+      for (const offered of curatedProviderModels().codex ?? []) {
+        expect(models).toContain(`value="${offered}"`);
+      }
+      expect(models).not.toMatch(/value="(?:gpt-5\.5|gpt-5\.4|gpt-5\.4-mini|gpt-5\.3-codex-spark)"/u);
+      expect(reasoning).toContain('value="max"');
+      expect(reasoning).not.toContain('value="none"');
+      expect(reasoning.includes('value="ultra"')).toBe(!model.endsWith("luna"));
+      expect(body).toContain('"gpt-6.1-sol":["low","medium","high","xhigh","max","ultra"]');
+      expect(body).toContain('"gpt-6-luna":["low","medium","high","xhigh","max"]');
+    }
+  });
+
   test.each(["create", "edit"] as const)("%s model selector names the actual default source", async (mode) => {
     for (const sample of [
       { provider: "codex" as const, globalModel: "gpt-5.6-sol", label: "继承 HomeAgent 全局：gpt-5.6-sol" },

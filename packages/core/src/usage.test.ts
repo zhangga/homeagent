@@ -14,6 +14,23 @@ import {
 } from "./usage.ts";
 
 describe("run usage aggregation", () => {
+  test("streams explicitly public execution updates during JSON synthesis without exposing JSON or routing text", async () => {
+    const seen: ProviderProgressEvent[] = [];
+    const client: LlmClient = {
+      async complete() { return { text: "", model: "fake" }; },
+      async completeJSON<T>(options: JSONOptions<T>) {
+        for (const text of ["执行进展：已取得 28 条消息，继续翻页。", '{"answer":"PRIVATE_FINAL_JSON"}', "执行进展：{\"answer\":\"PRIVATE_MARKED_JSON\"}", "PRIVATE_UNMARKED_TEXT"]) {
+          await options.onProgress?.({ kind: "assistant_snapshot", at: 100, title: "正在生成回答", phase: "answer", delta: text });
+        }
+        throw new Error("fixture completion");
+      },
+    };
+    const observed = observeLlmUsage(client, () => {}, undefined, event => { seen.push(event); });
+    await expect(observed.completeJSON({ schema: {}, prompt: "route" })).rejects.toThrow();
+    await expect(observed.completeJSON({ schema: {}, prompt: "answer", publicAssistantProgress: true })).rejects.toThrow();
+    expect(seen.map(event => event.delta)).toEqual(["已取得 28 条消息，继续翻页。"]);
+    expect(seen[0]?.title).toBe("执行进展");
+  });
   test("publishes answer summaries but keeps routing summaries and structured JSON private", async () => {
     const seen: ProviderProgressEvent[] = [];
     const client: LlmClient = {
@@ -49,6 +66,7 @@ describe("run usage aggregation", () => {
     await observed.complete({ prompt: "answer" });
     await expect(observed.completeJSON({ prompt: "route", schema: {} })).rejects.toThrow("routing stopped");
     expect(seen.map(event => event.delta ?? event.title)).toEqual(["先核对构建状态", "Provider 执行完成", "Provider 执行完成"]);
+    expect(seen.at(-1)?.visibility).toBe("operator");
   });
   test("keeps partial token and cost coverage explicit", () => {
     const accumulator = new RunUsageAccumulator();

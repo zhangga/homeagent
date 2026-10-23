@@ -457,6 +457,51 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(engine.runEvents.list(run.id).find(event => event.title === "思考摘要")?.delta)
       .toBe("需要依据会话返回的信息说明型号，无法确认时明确说明。");
   });
+  test("structured answer progress reaches the live card as execution results while final JSON stays private", async () => {
+    const finalized: LiveReplySnapshot[] = [];
+    const cliEngine = new KnowledgeEngine({ dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }),
+      runProvider: async (_provider, input) => {
+        const schema = JSON.stringify(input.outputSchema ?? {});
+        if (schema.includes("relevant")) {
+          await input.onProgress?.({ kind: "phase", at: 100, title: "Provider 执行完成", phase: "provider" });
+          return JSON.stringify({ relevant: true, slugs: ["entities/alice"] });
+        }
+        if (schema.includes("grounded")) {
+          expect(input.prompt).toContain("每完成一个有意义的执行阶段");
+          for (const item of [
+            { type: "agent_message", text: "执行进展：先核对负责人及相关记录。" },
+            { type: "command_execution", command: "lark-cli im +chat-messages-list --chat-id oc_fixture --as user --json",
+              exit_code: 0, status: "completed", aggregated_output: JSON.stringify({ ok: true,
+                data: { messages: Array.from({ length: 28 }, () => ({ text: "PRIVATE_SOURCE_BODY" })), has_more: false } }) },
+            { type: "agent_message", text: "执行进展：已核对 28 条记录，负责人为 Alice。" },
+            { type: "agent_message", text: '{"answer":"PRIVATE_STRUCTURED_PROGRESS"}' },
+          ]) {
+            const progress = codexProgressEventFromLine(JSON.stringify({ type: "item.completed", item }));
+            if (progress) await input.onProgress?.(progress);
+          }
+          return JSON.stringify({ answer: "后端由 [[entities/alice|Alice]] 负责。", grounded: true, usedSlugs: ["entities/alice"], gaps: [] });
+        }
+        return "ok";
+      } });
+    const runtime = makeCliOnlyRuntime(cliEngine, "personal/ou_me", { provider: "codex", permission: "read", workdir: dir });
+    await cliEngine.upsertPage("personal/ou_me", { slug: "entities/alice", type: "entity", title: "Alice", summary: "后端负责人",
+      aliases: [], tags: [], sources: [], links: [], content: "Alice 负责后端服务。", updatedAt: Date.now(), contentHash: "fixture" });
+    const live = runtime.connector as CliConnector & Connector;
+    live.createLiveReply = async (_out, snapshot) => ({ messageId: "om_result_progress", revision: snapshot.seq });
+    live.updateLiveReply = async (handle, snapshot) => ({ ...handle, revision: snapshot.seq });
+    live.finalizeLiveReply = async (_handle, snapshot) => { finalized.push(snapshot); };
+    await runtime.orchestrator.start();
+    await live.sendP2P("后端负责人是谁，请核对相关记录？");
+    expect(finalized).toHaveLength(1);
+    const card = JSON.stringify(buildLiveReplyCard(finalized[0]!));
+    expect(card).toContain("已核对 28 条记录，负责人为 Alice。");
+    expect(card).toContain("群消息查询返回 28 条结果");
+    expect(card).not.toContain("执行进展：");
+    expect(card).not.toContain("Provider 执行完成");
+    expect(card).not.toContain("PRIVATE_");
+    expect(live.sent).toHaveLength(1);
+    expect(live.sent[0]?.markdown).toContain("Alice");
+  });
   test("a new Chat Run is attached to the current work item", async () => {
     const workItem = engine.workItems.create({
       space: "team/oc_team",

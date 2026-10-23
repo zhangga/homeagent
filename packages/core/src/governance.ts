@@ -13,7 +13,7 @@ import {
   CODEX_REASONING_EFFORTS,
   isCliProvider,
   isCodexExecutionMode,
-  isCodexReasoningEffortSupported,
+  isPersistedCodexReasoningEffortSupported,
   normalizeProviderSkills,
 } from "@homeagent/llm";
 import type { Agent, AgentRevision, AgentSkillBinding } from "./agents.ts";
@@ -360,7 +360,7 @@ function reasoningEffort(value: unknown, model: string): Agent["reasoningEffort"
   if (value === undefined || value === "") return "";
   const effort = text(value, "agent.reasoningEffort") as Agent["reasoningEffort"];
   const valid = model
-    ? isCodexReasoningEffortSupported(model, effort)
+    ? isPersistedCodexReasoningEffortSupported(model, effort)
     : CODEX_REASONING_EFFORTS.includes(effort as (typeof CODEX_REASONING_EFFORTS)[number]);
   if (!valid) {
     throw new Error("agent.reasoningEffort is invalid");
