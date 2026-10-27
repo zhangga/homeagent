@@ -8,6 +8,7 @@ import {
   type AgentFieldErrors,
   type AgentWorkbenchView,
 } from "./agent-workbench.ts";
+import { agentActivityPanel } from "./agent-activity-view.ts";
 
 const STATUS_LABELS = {
   awaiting_approval: "待审批",
@@ -162,6 +163,7 @@ const AGENT_STYLE = `
     background:#aaa9a2;
   }
   .agent-status-mark.ready { background:#21845a; }
+  .agent-status-mark.queued { background:#b66d08; }
   .agent-status-mark.running {
     background:#b66d08;
     box-shadow:0 0 0 3px #f8e9cf;
@@ -176,6 +178,7 @@ const AGENT_STYLE = `
     white-space:nowrap;
   }
   .agent-list-meta span { overflow:hidden; text-overflow:ellipsis; }
+  .agent-list-item[data-agent-active="true"] [data-agent-status] { flex:0 0 auto; }
   .agent-list-meta span + span::before { content:"·"; margin-right:5px; color:#b1b1aa; }
   .agent-empty-list { padding:28px 18px; color:#85857f; font-size:13px; text-align:center; }
   .agent-resizer {
@@ -972,6 +975,96 @@ function scriptJson(value: unknown): string {
   return JSON.stringify(value).replaceAll("<", "\\u003c");
 }
 
+export function agentRecentRunsView(view: AgentWorkbenchView) {
+  if (!view.inspector || !view.selected) return html``;
+  return html`<section class="agent-recent-runs" aria-labelledby="agent-recent-runs-heading">
+        <div class="agent-runs-heading">
+          <h2 id="agent-recent-runs-heading">
+            Recent runs
+            <span class="agent-count">${view.inspector!.runTotal}</span>
+          </h2>
+        </div>
+        ${view.inspector!.runs.length > 0
+          ? html`
+            <div class="agent-run-list" aria-label="Recent runs">
+              ${view.inspector!.runs.map((run) => html`
+                <div class="agent-run-item ${run.status}">
+                  <a
+                    class="agent-run-link"
+                    href="${run.href}"
+                    aria-label="${STATUS_LABELS[run.status]}：${run.taskName}，${run.space}，${run.provider} / ${run.model}"
+                  >
+                    <span class="agent-run-icon" aria-hidden="true">
+                      ${run.status === "recorded"
+                        ? "◆"
+                        : run.status === "awaiting_approval"
+                        ? "?"
+                        : run.status === "succeeded"
+                        ? "✓"
+                        : run.status === "running" || run.status === "queued"
+                          ? "…"
+                          : run.status === "timed_out"
+                            ? "!"
+                            : run.status === "cancelled"
+                              ? "–"
+                              : "×"}
+                    </span>
+                    <span class="agent-run-copy">
+                      <span class="agent-run-primary">
+                        ${run.kind === "chat"
+                          ? html`Chat · ${run.topic}`
+                          : run.retryable && run.error
+                            ? run.error
+                            : run.taskName}
+                      </span>
+                      <span class="agent-run-secondary">
+                        <span class="agent-run-status-text">${STATUS_LABELS[run.status]}</span>
+                        ${run.kind === "chat" && run.deliveryStatus === "failed"
+                          ? " · 投递失败"
+                          : run.kind === "chat"
+                            && run.status === "succeeded"
+                            && run.deliveryStatus === "pending"
+                            ? " · 待投递"
+                            : ""}
+                        ${run.status === "queued"
+                          ? html` · 队列第 ${run.queuePosition ?? "—"} 位${
+                              run.queueReason ? ` · 等待 ${run.queueReason}` : ""
+                            }`
+                          : ""}
+                        · ${run.retryable && run.error ? html`${run.taskName} · ` : ""}
+                        ${run.space} · ${run.provider} / ${run.model}
+                      </span>
+                    </span>
+                    <time class="agent-run-time" datetime="${new Date(run.startedAt).toISOString()}">
+                      ${formatTime(run.startedAt)}
+                    </time>
+                    <span class="agent-run-open" aria-hidden="true">↗</span>
+                  </a>
+                  ${run.retryable ? html`
+                    <form method="post" action="${run.kind === "chat"
+                      ? `/chats/runs/${encodeURIComponent(run.id)}/retry`
+                      : `/tasks/runs/${encodeURIComponent(run.id)}/retry`}">
+                      <button
+                        type="submit"
+                        class="agent-run-retry"
+                        aria-label="${run.kind === "chat" ? "重试 Chat" : "重试任务"}：${run.taskName}"
+                      >重试</button>
+                    </form>
+                  ` : ""}
+                </div>
+              `)}
+            </div>
+          `
+          : html`<div class="agent-runs-empty">还没有由此 Agent 处理的 Chat 或研究任务</div>`}
+        ${view.inspector!.hasMoreRuns ? html`
+          <a
+            class="agent-load-more"
+            href="/agents/${encodeURIComponent(view.selected!.id)}?runs=${Math.min(100, view.inspector!.runLimit + 20)}"
+          >加载更多（${view.inspector!.runs.length} / ${view.inspector!.runTotal}）</a>
+        ` : ""}
+      </section>`;
+}
+
 export function agentWorkbenchView(
   view: AgentWorkbenchView,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
@@ -988,15 +1081,19 @@ export function agentWorkbenchView(
   const listItems = view.list.map((agent) => html`
     <a
       class="agent-list-item ${agent.selected ? "active" : ""}"
+      data-agent-id="${agent.id}"
+      data-agent-active="${agent.running || agent.queued}"
+      data-agent-idle-label="${agent.readinessLabel}"
+      data-agent-idle-state="${agent.readiness}"
       href="/agents/${encodeURIComponent(agent.id)}"
       aria-current="${agent.selected ? "page" : "false"}"
     >
       <div class="agent-list-name-row">
-        <span class="agent-status-mark ${agent.running ? "running" : agent.readiness}" aria-hidden="true"></span>
+        <span class="agent-status-mark ${agent.running ? "running" : agent.queued ? "queued" : agent.readiness}" aria-hidden="true"></span>
         <span class="agent-list-name">${agent.name}</span>
       </div>
       <div class="agent-list-meta">
-        <span>${agent.running ? "任务运行中" : agent.readinessLabel}</span>
+        <span data-agent-status>${agent.running ? "任务运行中" : agent.queued ? "任务排队中" : agent.readinessLabel}</span>
         <span>${agent.providerName}</span>
         <span>${agent.modelLabel}</span>
       </div>
@@ -1465,94 +1562,7 @@ export function agentWorkbenchView(
         </section>
       </form>
       ${skillSelector}
-      ${view.inspector ? html`
-      <section class="agent-recent-runs" aria-labelledby="agent-recent-runs-heading">
-        <div class="agent-runs-heading">
-          <h2 id="agent-recent-runs-heading">
-            Recent runs
-            <span class="agent-count">${view.inspector!.runTotal}</span>
-          </h2>
-        </div>
-        ${view.inspector!.runs.length > 0
-          ? html`
-            <div class="agent-run-list" aria-label="Recent runs">
-              ${view.inspector!.runs.map((run) => html`
-                <div class="agent-run-item ${run.status}">
-                  <a
-                    class="agent-run-link"
-                    href="${run.href}"
-                    aria-label="${STATUS_LABELS[run.status]}：${run.taskName}，${run.space}，${run.provider} / ${run.model}"
-                  >
-                    <span class="agent-run-icon" aria-hidden="true">
-                      ${run.status === "recorded"
-                        ? "◆"
-                        : run.status === "awaiting_approval"
-                        ? "?"
-                        : run.status === "succeeded"
-                        ? "✓"
-                        : run.status === "running" || run.status === "queued"
-                          ? "…"
-                          : run.status === "timed_out"
-                            ? "!"
-                            : run.status === "cancelled"
-                              ? "–"
-                              : "×"}
-                    </span>
-                    <span class="agent-run-copy">
-                      <span class="agent-run-primary">
-                        ${run.kind === "chat"
-                          ? html`Chat · ${run.topic}`
-                          : run.retryable && run.error
-                            ? run.error
-                            : run.taskName}
-                      </span>
-                      <span class="agent-run-secondary">
-                        <span class="agent-run-status-text">${STATUS_LABELS[run.status]}</span>
-                        ${run.kind === "chat" && run.deliveryStatus === "failed"
-                          ? " · 投递失败"
-                          : run.kind === "chat"
-                            && run.status === "succeeded"
-                            && run.deliveryStatus === "pending"
-                            ? " · 待投递"
-                            : ""}
-                        ${run.status === "queued"
-                          ? html` · 队列第 ${run.queuePosition ?? "—"} 位${
-                              run.queueReason ? ` · 等待 ${run.queueReason}` : ""
-                            }`
-                          : ""}
-                        · ${run.retryable && run.error ? html`${run.taskName} · ` : ""}
-                        ${run.space} · ${run.provider} / ${run.model}
-                      </span>
-                    </span>
-                    <time class="agent-run-time" datetime="${new Date(run.startedAt).toISOString()}">
-                      ${formatTime(run.startedAt)}
-                    </time>
-                    <span class="agent-run-open" aria-hidden="true">↗</span>
-                  </a>
-                  ${run.retryable ? html`
-                    <form method="post" action="${run.kind === "chat"
-                      ? `/chats/runs/${encodeURIComponent(run.id)}/retry`
-                      : `/tasks/runs/${encodeURIComponent(run.id)}/retry`}">
-                      <button
-                        type="submit"
-                        class="agent-run-retry"
-                        aria-label="${run.kind === "chat" ? "重试 Chat" : "重试任务"}：${run.taskName}"
-                      >重试</button>
-                    </form>
-                  ` : ""}
-                </div>
-              `)}
-            </div>
-          `
-          : html`<div class="agent-runs-empty">还没有由此 Agent 处理的 Chat 或研究任务</div>`}
-        ${view.inspector!.hasMoreRuns ? html`
-          <a
-            class="agent-load-more"
-            href="/agents/${encodeURIComponent(view.selected!.id)}?runs=${Math.min(100, view.inspector!.runLimit + 20)}"
-          >加载更多（${view.inspector!.runs.length} / ${view.inspector!.runTotal}）</a>
-        ` : ""}
-      </section>
-      ` : ""}
+      <div id="agent-recent-runs">${agentRecentRunsView(view)}</div>
     </div>
   ` : html`
     <div class="agent-empty-editor">
@@ -2278,7 +2288,11 @@ export function agentWorkbenchView(
           aria-valuenow="244"
         ></div>
       </aside>
-      <section class="agent-pane agent-editor-pane" data-pane="agent-editor">${editor}</section>
+      <section class="agent-pane agent-editor-pane" data-pane="agent-editor">
+        ${view.activity ? agentActivityPanel(view.activity, `/agents/activity${view.selected
+          ? `?agent=${encodeURIComponent(view.selected.id)}&runs=${view.inspector?.runLimit ?? 20}` : ""}`) : ""}
+        ${editor}
+      </section>
       ${view.mode === "create" ? "" : html`
         <aside class="agent-pane agent-inspector-pane" id="agent-inspector" data-pane="agent-inspector" aria-label="Agent 设置">
           ${inspector}

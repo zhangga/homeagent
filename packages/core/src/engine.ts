@@ -6792,25 +6792,54 @@ export class KnowledgeEngine implements Knowledge {
     };
   }
 
-  /** Agent-fetched documents use the same host-owned handoff as other Chat sources. */
+  /** Confirm host-synchronized sources before preparing an Agent file handoff. */
   prepareChatDocumentImport(runId: string): { instruction: string; finish(signal?: AbortSignal): Promise<string> } | undefined {
     const run = this.chatRuns.get(runId);
     if (!run || run.inputTruncated) return undefined;
     const urls = resolveDocumentImportRequest(this.chatRuns.topicInputsThroughRun(runId));
     if (!urls.length) return undefined;
     const plan = run.executionPlan;
+    // Connector synchronization is host-owned and precedes the model call. Its
+    // durable result does not depend on the model's permission to write files.
+    const synchronizedUrls = () => {
+      if (!this.registry.has(run.space) || !run.messageId || !run.chatId) return [];
+      const index = this.registry.store(run.space).index();
+      if (index.getMessageRetraction(run.chatId, run.messageId)) return [];
+      const raws = index.findRawsByMessageId(run.messageId, run.chatId);
+      return urls.filter(url => raws.some(raw => raw.source === "doc" && raw.admission === "ready"
+        && !raw.id.startsWith("doc-import-") && raw.content.startsWith(`# 来源资料：${url}\n`)));
+    };
+    const synchronized = synchronizedUrls();
+    const pendingUrls = urls.filter(url => !synchronized.includes(url));
+    const synchronizedReceipt = `文档原文入库：已确认同步 ${synchronized.length} 个来源的正文到当前 Space 的 Raw journal。仅确认已取得的正文，嵌入表格及图片、视频等媒体的完整性与原件归档需另行核验；知识页由后续提炼生成。`;
+    const withSynchronized = (pending?: { instruction: string; finish(signal?: AbortSignal): Promise<string> }) => {
+      if (!synchronized.length) return pending;
+      return {
+        instruction: [
+          "## 本轮后台文档收录状态",
+          synchronizedReceipt,
+          `已收录来源 URL：${JSON.stringify(synchronized)}。这是 HomeAgent 已落盘的结果，与 Agent 的只读权限及 Workdir 无关；直接使用已同步正文，不需要寻找保存入口、调用 Skill 或重复抓取这些来源，不要将其报告为尚未入库。`,
+          pending?.instruction,
+        ].filter(Boolean).join("\n"),
+        finish: async (signal?: AbortSignal) => {
+          const pendingReceipt = pending ? await pending.finish(signal) : undefined;
+          const current = synchronizedUrls();
+          const receipt = !signal?.aborted && this.chatRuns.get(runId)?.status === "running"
+            && synchronized.every(url => current.includes(url))
+            ? synchronizedReceipt
+            : "文档原文入库未完成：本轮已同步来源的可用状态发生变化，无法确认收录结果。";
+          return [receipt, pendingReceipt].filter(Boolean).join("\n\n");
+        },
+      };
+    };
+    if (!pendingUrls.length) return withSynchronized();
     const denied = {
-      instruction: "本轮文档原文不能自动入库：需要当前 Agent 已有可写权限与有效 Workdir。只能报告实际抓取或本地保存结果，不能声称已入库。",
-      finish: async () => "文档原文入库未完成：当前 Run 没有有效的可写 Workdir 或执行授权。",
+      instruction: `本轮尚未同步的来源 ${JSON.stringify(pendingUrls)} 不能通过文件交接自动入库：需要当前 Agent 已有可写权限与有效 Workdir。对这些来源只能报告实际抓取或本地保存结果，不能声称已入库；不影响后台已确认同步的其他来源。`,
+      finish: async () => `文档原文入库未完成：另有 ${pendingUrls.length} 个来源尚未同步，当前 Run 没有有效的可写 Workdir 或执行授权用于文件交接。`,
     };
     if (!isResolvedExecutionPlan(plan) || plan.resolutionError || !plan.workdir
-      || !["write", "full"].includes(plan.execution?.permission ?? "") || !this.registry.has(run.space)) return denied;
+      || !["write", "full"].includes(plan.execution?.permission ?? "") || !this.registry.has(run.space)) return withSynchronized(denied);
     const store = this.registry.store(run.space);
-    // Already synchronized Feishu/ByteTech documents retain their existing path.
-    const synchronized = run.messageId && run.chatId ? store.index().findRawsByMessageId(run.messageId, run.chatId) : [];
-    const pendingUrls = urls.filter(url => !synchronized.some(raw => raw.source === "doc" && !raw.id.startsWith("doc-import-")
-      && raw.content.startsWith(`# 来源资料：${url}\n`)));
-    if (!pendingUrls.length) return undefined;
     const initialMeta = this.registry.get(run.space);
     const initialBinding = this.feishuBindings.getBySpace(run.space);
     const validate = (signal?: AbortSignal) => {
@@ -6827,9 +6856,9 @@ export class KnowledgeEngine implements Knowledge {
       }
       this.validateNativeSessionFilesystemContract(plan.execution, plan.workdir);
     };
-    try { validate(); } catch { return denied; }
+    try { validate(); } catch { return withSynchronized(denied); }
     const capture = createDocumentCapture(plan.workdir, pendingUrls);
-    return {
+    return withSynchronized({
       instruction: capture.instruction,
       finish: async signal => {
         let imported = 0, duplicates = 0;
@@ -6871,7 +6900,7 @@ export class KnowledgeEngine implements Knowledge {
           return `文档原文入库未完成：已确认新增 ${imported} 条、重复 ${duplicates} 条；其余未确认。请检查本轮资料交接、文件大小/格式和当前授权后重试。已落盘资料保留，重试按来源内容去重；本地文件保存不等于入库。`;
         }
       },
-    };
+    });
   }
 
   /** Execute a durable Chat Run using only the configuration captured at enqueue time. */

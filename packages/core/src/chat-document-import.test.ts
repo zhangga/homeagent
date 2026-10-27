@@ -137,7 +137,57 @@ test("records incomplete capture honestly instead of claiming the whole source w
 test("already synchronized sources keep their original document ingestion path", async () => {
   const f = fixture();
   await f.engine.remember({ space, source: "doc", chatId: "oc_documents", messageId: "om_document", content: `# 来源资料：${url}\n\n已同步正文。` });
-  expect(f.engine.prepareChatDocumentImport(f.run.id)).toBeUndefined();
+  const synchronized = f.engine.prepareChatDocumentImport(f.run.id)!;
+  expect(synchronized.instruction).not.toContain("homeagent-document-raw-");
+  expect(await synchronized.finish()).toContain("文档原文入库：已确认同步 1 个来源");
+});
+
+test.each([false, true])("read-only synchronized receipts distinguish unsynchronized sources: mixed=%s", async mixed => {
+  const engine = new KnowledgeEngine({ dataDir: join(root, "data"), skillCatalog: new SkillCatalog({ roots: [] }) });
+  engines.push(engine);
+  const target = "personal/ou_fixture" as const;
+  const syncedUrl = "https://example.larkoffice.com/wiki/article";
+  engine.ensureSpace(target, { chatId: "oc_dm" });
+  const agent = engine.agents.create({ provider: "codex", permission: "read-only" });
+  engine.registry.updateMeta(target, { agentId: agent.id });
+  await engine.remember({ space: target, source: "doc", chatId: "oc_dm", messageId: "om_synced", content: `# 来源资料：${syncedUrl}\n\n已同步正文。` });
+  const run = engine.chatRuns.start({ space: target, chatId: "oc_dm", messageId: "om_synced", agentId: agent.id,
+    input: `记录下这个文章 ${syncedUrl}${mixed ? ` 和 ${url}` : ""}`, trigger: "message",
+    executionPlan: engine.agentRunExecutionSnapshot(target).executionPlan });
+  engine.chatRuns.begin(run.id);
+  const capture = engine.prepareChatDocumentImport(run.id)!;
+  expect(capture.instruction).toContain("与 Agent 的只读权限及 Workdir 无关");
+  expect(capture.instruction).not.toContain("homeagent-document-raw-");
+  const receipt = await capture.finish();
+  expect(receipt).toContain("已确认同步 1 个来源");
+  expect(receipt.includes("另有 1 个来源尚未同步")).toBe(mixed);
+  expect(await capture.finish()).toBe(receipt);
+  expect(engine.registry.store(target).index().listRaw({})).toHaveLength(1);
+});
+
+test("mixed synchronized and Agent-fetched documents preserve both ingestion paths", async () => {
+  const syncedUrl = "https://example.larkoffice.com/wiki/article";
+  const f = fixture(`记录这两篇文章 ${url} ${syncedUrl}`);
+  await f.engine.remember({ space, source: "doc", chatId: "oc_documents", messageId: "om_document", content: `# 来源资料：${syncedUrl}\n\n已同步正文。` });
+  const capture = f.engine.prepareChatDocumentImport(f.run.id)!;
+  const file = JSON.parse(capture.instruction.match(/写入 ("[^\n]+?")；/u)![1]!) as string;
+  f.manifest();
+  writeFileSync(file, readFileSync(f.file));
+  const receipt = await capture.finish();
+  expect(receipt).toContain("已确认同步 1 个来源");
+  expect(receipt).toContain("文档原文入库：新增 1 条");
+  expect(receipt).not.toContain("来源交接不完整");
+  expect(f.engine.registry.store(space).index().listRaw({})).toHaveLength(2);
+});
+
+test("a synchronized receipt is rechecked before delivery", async () => {
+  const f = fixture();
+  await f.engine.remember({ space, source: "doc", chatId: "oc_documents", messageId: "om_document", author: "ou_fixture", content: `# 来源资料：${url}\n\n已同步正文。` });
+  const capture = f.engine.prepareChatDocumentImport(f.run.id)!;
+  const result = await f.engine.retractMessage(space, { chatId: "oc_documents", messageId: "om_document", requestedBy: "ou_fixture", requesterIsAdmin: true });
+  expect(result.status).toBe("retracted");
+  expect(await capture.finish()).toContain("无法确认收录结果");
+  expect(await capture.finish()).not.toContain("已确认同步");
 });
 
 test("document Raw and original bytes round-trip through the existing Space archive schema", async () => {

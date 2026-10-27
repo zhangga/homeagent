@@ -27,6 +27,7 @@ import {
   type CodexWindowsSandboxSetupSession,
   type DetectedProvider,
 } from "@homeagent/llm";
+import type { AgentActivity } from "./agent-activity.ts";
 
 export type AgentWorkbenchMode = "empty" | "create" | "edit";
 
@@ -57,6 +58,7 @@ export interface AgentWorkbenchListItem {
   readiness: "ready" | "unavailable";
   readinessLabel: string;
   running: boolean;
+  queued: boolean;
   selected: boolean;
 }
 
@@ -139,6 +141,7 @@ export interface AgentRevisionView {
 }
 
 export interface AgentWorkbenchView {
+  activity?: AgentActivity;
   mode: AgentWorkbenchMode;
   list: AgentWorkbenchListItem[];
   selected: Agent | null;
@@ -210,6 +213,7 @@ export interface AgentSkillCatalogView {
 }
 
 export interface BuildAgentWorkbenchInput {
+  activity?: AgentActivity;
   agents: Agent[];
   mode: AgentWorkbenchMode;
   selected: Agent | null;
@@ -800,7 +804,8 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
       modelLabel: effectiveModel(agent, input.defaults),
       readiness: fullyAvailable ? "ready" as const : "unavailable" as const,
       readinessLabel: providerStatusLabel(provider, full),
-      running: runningAgentIds.has(agent.id),
+      running: input.activity?.agents.find((state) => state.id === agent.id)?.running ?? runningAgentIds.has(agent.id),
+      queued: input.activity?.agents.find((state) => state.id === agent.id)?.queued ?? false,
       selected: input.selected?.id === agent.id,
     };
   });
@@ -946,6 +951,7 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
   }
 
   return {
+    activity: input.activity,
     mode: input.mode,
     list,
     selected: input.selected,

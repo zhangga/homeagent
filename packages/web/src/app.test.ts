@@ -3121,6 +3121,91 @@ describe("management backend (read-write)", () => {
     expect(mobileListBody).toContain("选择一个 Agent");
   });
 
+  test("Agent activity includes unassigned private Chats and tracks named Chat and Task runs without model calls", async () => {
+    const selected = engine.agents.create({ name: "群聊助手", provider: "claude" });
+    const other = engine.agents.create({ name: "另一位助手", provider: "claude" });
+    const personal: SpaceId = "personal/ou_activity";
+    engine.ensureSpace(personal);
+    const unassigned = engine.chatRuns.start({
+      space: personal, input: "私聊任务 <script>private()</script>", trigger: "message", startedAt: 100,
+      provider: "claude", model: "sonnet",
+    });
+    engine.chatRuns.begin(unassigned.id, 101);
+    const named = engine.chatRuns.start({
+      space: SPACE, input: "另一个 Agent 的聊天", trigger: "message", startedAt: 200,
+      agentId: other.id, provider: "claude",
+    });
+    const task = engine.tasks.create({ name: "研究任务", space: SPACE, topic: "研究进展", distillOnRun: false })!;
+    const taskRun = engine.taskRuns.start({ task, trigger: "manual", agentId: selected.id, distill: false });
+    const calls = fake.calls.length;
+    const read = async () => {
+      const response = await app.request(`/agents/activity?agent=${encodeURIComponent(selected.id)}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      return response.json();
+    };
+    const initial = await read();
+    expect(initial).toHaveProperty("activeCount", 3);
+    for (const text of [`/chats/runs/${unassigned.id}`, "默认（全局）", personal, "另一位助手", `/tasks/runs/${taskRun.id}`]) {
+      expect(initial).toHaveProperty("overviewHtml", expect.stringContaining(text));
+    }
+    expect(initial).toHaveProperty("overviewHtml", expect.not.stringContaining("<script>private()</script>"));
+    expect(initial).toHaveProperty("recentHtml", expect.stringContaining(`/tasks/runs/${taskRun.id}`));
+    expect(initial).toHaveProperty("recentHtml", expect.not.stringContaining(unassigned.id));
+    expect(initial).toHaveProperty("recentHtml", expect.not.stringContaining(named.id));
+    expect(initial).toHaveProperty("agents", expect.arrayContaining([
+      expect.objectContaining({ id: selected.id, running: false, queued: true }),
+      expect.objectContaining({ id: other.id, running: false, queued: true }),
+    ]));
+
+    engine.chatRuns.begin(named.id, 201);
+    engine.taskRuns.begin(taskRun.id);
+    const running = await read();
+    expect(running).toHaveProperty("agents", expect.arrayContaining([
+      expect.objectContaining({ id: selected.id, running: true, queued: false }),
+      expect.objectContaining({ id: other.id, running: true, queued: false }),
+    ]));
+    const page = await (await app.request(`/agents/${selected.id}`)).text();
+    expect(page).toContain('id="agent-activity"');
+    expect(page).toContain('data-agent-activity-url=');
+    expect(page).toContain(`/chats/runs/${unassigned.id}`);
+    const otherItem = page.match(new RegExp(`data-agent-id="${other.id}"[\\s\\S]*?</a>`))?.[0];
+    expect(otherItem).toContain("任务运行中");
+
+    engine.chatRuns.succeed(unassigned.id, { output: "私聊已完成", finishedAt: 300 });
+    engine.chatRuns.succeed(named.id, { output: "聊天已完成", finishedAt: 301 });
+    engine.taskRuns.succeed(taskRun.id, { output: "研究已完成", finishedAt: Date.now() });
+    const completed = await read();
+    expect(completed).toHaveProperty("activeCount", 0);
+    expect(completed).toHaveProperty("summary", "当前没有运行或排队的任务");
+    expect(completed).toHaveProperty("overviewHtml", expect.stringContaining("默认 Agent 最近记录"));
+    expect(completed).toHaveProperty("overviewHtml", expect.stringContaining(`/chats/runs/${unassigned.id}`));
+    expect(completed).toHaveProperty("agents", [
+      { id: selected.id, running: false, queued: false }, { id: other.id, running: false, queued: false },
+    ]);
+    expect(engine.chatRuns.get(unassigned.id)?.agentId).toBeUndefined();
+    expect(fake.calls.length).toBe(calls);
+  });
+
+  test("Agent activity uses management authorization and works without configured Agents", async () => {
+    const run = engine.chatRuns.start({ space: SPACE, input: "默认任务", trigger: "message" });
+    const secured = createWebApp({ engine, adminToken: "activity-admin", agentReadToken: "activity-reader",
+      detectProviders: async () => { throw new Error("activity must not probe Providers"); },
+    });
+    expect((await secured.request("/agents/activity")).status).toBe(401);
+    expect((await secured.request("/agents/activity", { headers: { authorization: "Bearer activity-reader" } })).status).toBe(401);
+    const response = await secured.request("/agents/activity", { headers: { authorization: "Bearer activity-admin" } });
+    expect(response.status).toBe(200);
+    const activity = await response.json();
+    expect(activity).toHaveProperty("activeCount", 1);
+    expect(activity).toHaveProperty("overviewHtml", expect.stringContaining(`/chats/runs/${run.id}`));
+    expect(activity).toHaveProperty("recentHtml", null);
+    const page = await (await app.request("/agents")).text();
+    expect(page).toContain('id="agent-activity"');
+    expect(page).toContain(`/chats/runs/${run.id}`);
+    expect((await app.request("/agents/activity?agent=missing")).status).toBe(404);
+  });
+
   test("agent Recent runs includes durable Chat records attributed to that Agent", async () => {
     const selected = engine.agents.create({ name: "Chat Agent", provider: "claude" });
     engine.updateSpaceMeta(SPACE, { agentId: selected.id, name: "Product chat" });

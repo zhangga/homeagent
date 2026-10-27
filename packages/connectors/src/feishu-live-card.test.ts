@@ -177,6 +177,15 @@ function processPanel(snapshot: ReturnType<typeof liveReplySnapshot>) {
   }> }).elements[0]!;
 }
 
+test("a generated refusal does not claim that the user's task was completed", () => {
+  const snapshot = liveReplySnapshot("chat_run_card", [
+    event(1, "assistant.snapshot", { delta: "文章保存未完成。" }),
+    event(2, "run.succeeded", { delta: "文章保存未完成。" }),
+  ]);
+  expect(processPanel(snapshot).header.title.content).toBe("回复已生成");
+  expect(JSON.stringify(buildLiveReplyCard(snapshot))).not.toContain("任务已完成");
+});
+
 test("renders Mew-style progress paragraphs with compact expandable tool activity", () => {
   const snapshot = liveReplySnapshot("chat_run_card", [
     event(1, "assistant.snapshot", { delta: "先检查环境和创建参数。" }),
@@ -189,7 +198,7 @@ test("renders Mew-style progress paragraphs with compact expandable tool activit
     event(8, "run.succeeded", { delta: "已创建并验证。" }),
   ]);
   const panel = processPanel(snapshot);
-  expect(panel.header.title.content).toBe("任务已完成");
+  expect(panel.header.title.content).toBe("回复已生成");
   expect(panel.header.width).toBe("auto");
   expect(panel.header.icon_position).toBe("follow_text");
   expect(panel.expanded).toBeTrue();

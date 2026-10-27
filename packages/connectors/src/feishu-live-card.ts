@@ -213,10 +213,10 @@ function omissionNotice(count: number): Record<string, unknown> {
 
 export function buildLiveReplyCard(snapshot: LiveReplySnapshot): Record<string, unknown> {
   const labels: Record<LiveReplySnapshot["state"], string> = {
-    queued: "排队中", running: "执行中", waiting: "等待处理", succeeded: "已完成",
+    queued: "排队中", running: "执行中", waiting: "等待处理", succeeded: "回复已生成",
     failed: "执行失败", cancelled: "已取消", timed_out: "已超时",
   };
-  const stateTitle = snapshot.state === "succeeded" ? "任务已完成" : labels[snapshot.state];
+  const stateTitle = labels[snapshot.state];
   const processPanel: Record<string, unknown> = {
     tag: "collapsible_panel", expanded: true, padding: "0px", vertical_spacing: "8px",
     header: {

@@ -68,7 +68,9 @@ import {
   type WorkItemPhase,
 } from "@homeagent/core";
 import { layout } from "./layout.ts";
-import { agentWorkbenchView } from "./agent-workbench-view.ts";
+import { agentRecentRunsView, agentWorkbenchView } from "./agent-workbench-view.ts";
+import { buildAgentActivity } from "./agent-activity.ts";
+import { agentActivityOverview } from "./agent-activity-view.ts";
 import { localExecutionConfirmationUrl, localExecutionRunStatus, localExecutionWorkbenchState, registerAgentLocalExecutionRoutes } from "./agent-local-execution.ts";
 import { buildSkillInventory, skillInventoryView } from "./skill-inventory-view.ts";
 import {
@@ -743,6 +745,7 @@ export function createWebApp(opts: WebOptions): Hono {
       ? engine.listAgentActivityRuns(selected.id, 100)
       : [];
     return agentWorkbenchView(buildAgentWorkbench({
+      activity: buildAgentActivity(agents, engine.listTaskRuns(), engine.chatRuns.list()),
       agents,
       mode: input.mode,
       selected,
@@ -2058,6 +2061,31 @@ export function createWebApp(opts: WebOptions): Hono {
         "agents",
       ),
     );
+  });
+
+  app.get("/agents/activity", async (c) => {
+    c.header("cache-control", "no-store");
+    const agentId = c.req.query("agent");
+    const selected = agentId ? engine.agents.get(agentId) : undefined;
+    if (agentId && !selected) return c.notFound();
+    const agents = engine.agents.list();
+    const activity = buildAgentActivity(agents, engine.listTaskRuns(), engine.chatRuns.list());
+    let recentHtml: string | null = null;
+    if (selected) {
+      const cfg = config();
+      const activityRuns = engine.listAgentActivityRuns(selected.id, 100);
+      const view = buildAgentWorkbench({
+        agents, activity, mode: "edit", selected, providers: [], models: {},
+        defaults: { provider: cfg.defaultProvider, model: cfg.defaultModel },
+        bindings: [], runs: [], activityRuns, runTotal: activityRuns.length,
+        runLimit: agentRunLimit(c.req.query("runs")),
+      });
+      recentHtml = String(await agentRecentRunsView(view));
+    }
+    return c.json({
+      summary: activity.summary, activeCount: activity.activeCount, agents: activity.agents,
+      overviewHtml: String(await agentActivityOverview(activity)), recentHtml,
+    });
   });
 
   app.get("/agents/:id", async (c) => {
