@@ -2,6 +2,30 @@ import { expect, test } from "bun:test";
 import { formatAnswer, withReplyModel } from "./format.ts";
 import type { AskResult } from "@homeagent/shared";
 
+test("document coverage already explained in the answer is not repeated as a gap", () => {
+  const coverage = "嵌入表格及图片、视频原件的完整性与归档状态尚未核验";
+  const answer = `文章重点：先验证核心玩法，再制作正式资产。\n\n知识页待后续提炼；${coverage}。`;
+  expect(formatAnswer({ answer, source: "knowledge", citations: [], gaps: [`${coverage}。`] })).toBe(answer);
+});
+
+test("gap formatting deduplicates whitespace and Markdown while retaining distinct missing details", () => {
+  const result: AskResult = { answer: "**图片原件尚未归档**。", source: "knowledge", citations: [],
+    gaps: [" 图片原件尚未归档。 ", "视频缺少字幕", "视频缺少字幕。", "视频缺少音轨", "", "  "] };
+  expect(formatAnswer(result)).toBe("**图片原件尚未归档**。\n\n（尚缺：视频缺少字幕；视频缺少音轨）");
+  expect(result.gaps).toHaveLength(6);
+});
+
+test("a more specific missing detail is retained even when its topic is already mentioned", () => {
+  const result: AskResult = { answer: "表格完整性尚未核验。", source: "knowledge", citations: [],
+    gaps: ["第 3 张表格缺少性能数据"] };
+  expect(formatAnswer(result)).toContain("尚缺：第 3 张表格缺少性能数据");
+});
+
+test("a missing detail is not discarded just because it is quoted in a different claim", () => {
+  const result: AskResult = { answer: "不能确认是否缺少视频字幕。", source: "knowledge", citations: [], gaps: ["缺少视频字幕"] };
+  expect(formatAnswer(result)).toContain("尚缺：缺少视频字幕");
+});
+
 test("only surfaces catalog warnings for Skills named in the current request", () => {
   const result: AskResult = {
     answer: "已完成。", source: "general", citations: [],

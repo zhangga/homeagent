@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { MAX_MATERIAL_BYTES, MAX_MATERIAL_EXPANDED_BYTES, type Attachment } from "@homeagent/shared";
-import { MAX_CHAT_IMPORT_BYTES, MAX_CHAT_IMPORT_MESSAGES } from "./chat-raw-import.ts";
+import { MAX_MATERIAL_BYTES, MAX_MATERIAL_EXPANDED_BYTES, MAX_MATERIAL_FILES, type Attachment } from "@homeagent/shared";
+import { MAX_CHAT_IMPORT_BYTES } from "./chat-raw-import.ts";
 
 export interface DocumentCapture {
   file: string;
@@ -69,9 +69,10 @@ export function createDocumentCapture(workdir: string, urls: string[]): Document
     `把本轮真实取得的资料清单以 UTF-8 JSON 写入 ${JSON.stringify(file)}；正文用 contentPath 指向完整 UTF-8 Markdown/文本，不用摘要代替原文。`,
     '格式：{"version":1,"documents":[{"url":"用户给出的来源 URL","title":"实际标题","complete":true,"contentPath":"article.md","files":[{"path":"images/figure.png","kind":"image"},{"path":"original.html","kind":"file"},{"path":"archive.zip","kind":"file"}]}]}。files 可为空，正文文件自动保存，不需要重复列出。',
     "所有路径相对于冻结的 Workdir，也可使用其中的绝对路径。正文、HTML、图片、代码附件、ZIP 等实际文件都通过 files 交接；不要仅交接含链接的请求消息，也不要只交 ZIP 而不提供可检索正文。",
-    `沿用资料导入边界：单文件最多 ${MAX_MATERIAL_BYTES} 字节，总原件最多 ${MAX_MATERIAL_EXPANDED_BYTES} 字节；交接清单最多 ${MAX_CHAT_IMPORT_BYTES} 字节、${MAX_CHAT_IMPORT_MESSAGES} 个文件引用。长正文由后台完整分段，不截断。`,
+    `沿用资料导入边界：单文件最多 ${MAX_MATERIAL_BYTES} 字节，总原件最多 ${MAX_MATERIAL_EXPANDED_BYTES} 字节；交接清单最多 ${MAX_CHAT_IMPORT_BYTES} 字节、${MAX_MATERIAL_FILES} 个文件引用。长正文由后台完整分段，不截断。`,
     "跟随网页重定向时 url 仍填写用户给出的来源 URL，规范链接可保留在正文。未取得全文或有缺失图片时 complete=false，并在正文和回复中说明缺口；不要把登录页、错误页或摘要声明为完整正文。",
     "HomeAgent 会在回答生成后读取交接文件、把资料原件和原文写入当前 Space 的 Raw journal，并追加真实入库回执；知识页由后续 Dream cycle 生成。回答只能说明已提交待校验，不能预先声称 Raw 入库成功。",
+    "用户只要求记录时不展开文章摘要，最终回答只保留文章标题/链接和具体缺口；用户另有总结或分析要求时正常回答。保存结果由后台回执统一说明，相同缺口只说明一次，不自行追加“尚缺”尾注；结构化 gaps 只列正文尚未说明的缺口。",
     "无需寻找其他 HomeAgent 入库接口，也不要自行调用管理写接口或修改运行数据目录。只用本轮交接路径，不沿用历史路径；文件中不包含凭据或 Provider 诊断。",
   ].join("\n") };
 }
@@ -118,7 +119,7 @@ export function readDocumentCapture(capture: DocumentCapture): CapturedDocument[
     const title = string(doc.title, 500);
     if (typeof doc.complete !== "boolean" || !Array.isArray(doc.files)) invalid();
     fileCount += doc.files.length + 1;
-    if (fileCount > MAX_CHAT_IMPORT_MESSAGES) invalid();
+    if (fileCount > MAX_MATERIAL_FILES) invalid();
     const originals = [{ path: doc.contentPath, kind: "file" }, ...doc.files];
     const files: CapturedDocumentFile[] = [];
     const paths = new Set<string>();

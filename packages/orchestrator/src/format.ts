@@ -87,6 +87,14 @@ function citationEvidenceText(citation: AskResult["citations"][number]): string 
   return parts.length > 0 ? `（${parts.join(" · ")}）` : "";
 }
 
+function noticeKey(text: string): string {
+  return text.normalize("NFKC")
+    .replace(/^\s*(?:[-*+]\s+|\d+\.\s+)/u, "")
+    .replace(/\*\*([^*]+)\*\*|__([^_]+)__|`([^`\n]+)`/gu, (_match, bold: string | undefined, emphasis: string | undefined, code: string | undefined) => bold ?? emphasis ?? code ?? "")
+    .replace(/\s+/gu, "")
+    .replace(/[。.!！?？;；]+$/gu, "");
+}
+
 export function formatAnswer(res: AskResult, question?: string): string {
   const parts: string[] = [res.answer.trim()];
 
@@ -104,7 +112,17 @@ export function formatAnswer(res: AskResult, question?: string): string {
   }
 
   if (!res.context && res.gaps && res.gaps.length > 0) {
-    parts.push("", `（尚缺：${res.gaps.join("；")}）`);
+    // Compare complete statements so a shared topic or a different certainty
+    // level cannot silently remove a distinct missing detail.
+    const answer = new Set(res.answer.split(/[。；;！？!?\n]/u).map(noticeKey));
+    const seen = new Set<string>();
+    const gaps = res.gaps.filter(gap => {
+      const key = noticeKey(gap);
+      if (!key || seen.has(key) || answer.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).map(gap => gap.trim().replace(/[。.!！?？;；]+$/gu, ""));
+    if (gaps.length) parts.push("", `（尚缺：${gaps.join("；")}）`);
   }
 
   // Full-catalog admission records unrelated unavailable Skills too. Keep that

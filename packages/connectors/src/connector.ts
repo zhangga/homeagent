@@ -15,6 +15,14 @@ export interface DownloadedAttachment {
   cleanup(): void;
 }
 
+/** References without downloads remain visible as missing originals. */
+export interface FetchedDocument {
+  content: string;
+  images: Attachment[];
+  downloads: DownloadedAttachment[];
+  imageNotice?: string;
+}
+
 /** Where a message came from — drives the reply gateway (Q2). */
 export type ChatType = "p2p" | "group";
 

@@ -57,6 +57,7 @@ import type {
   Connector,
   CardActionEvent,
   DownloadedAttachment,
+  FetchedDocument,
   InboundEvent,
   InboundMessage,
   LiveReplyHandle,
@@ -283,7 +284,7 @@ export interface RuntimeOptions {
    * runtime fetches each as markdown and remembers it as a doc-sourced entry.
    * The feishu connector supplies this; the cli connector does not.
    */
-  docFetcher?: (urlOrToken: string) => Promise<string | null>;
+  docFetcher?: (urlOrToken: string) => Promise<string | FetchedDocument | null>;
   /** Optional direct-message attachment boundary; defaults to the connector capability. */
   attachmentDownloader?: (messageId: string) => Promise<DownloadedAttachment[]>;
   /** Optional local extraction boundary; defaults to the built-in extractor. */
@@ -313,7 +314,7 @@ export class Orchestrator {
   private liveReplyNextAt = new Map<string, number>();
   private liveReplyDirty = new Set<string>();
   private dedupSize: number;
-  private docFetcher?: (urlOrToken: string) => Promise<string | null>;
+  private docFetcher?: (urlOrToken: string) => Promise<string | FetchedDocument | null>;
   private attachmentDownloader?: (messageId: string) => Promise<DownloadedAttachment[]>;
   private attachmentExtractor: (attachment: DownloadedAttachment) => Promise<string | null>;
   private chatQueueTimeoutMs: number;
@@ -2199,18 +2200,25 @@ export class Orchestrator {
   ): Promise<SourceSyncResult> {
     let succeeded = 0;
     for (const link of msg.docLinks ?? []) {
+      let downloads: DownloadedAttachment[] = [];
       try {
-        const md = await this.docFetcher!(link);
+        const document = await this.docFetcher!(link);
+        if (!document) continue;
+        downloads = typeof document === "string" ? [] : document.downloads;
+        const md = typeof document === "string" ? document : document.content;
         if (!md || md.trim() === "") continue;
-        await this.engine.remember({
+        const savedRefs = new Set(downloads.map(download => download.attachment.ref));
+        const missingImages = typeof document === "string" ? [] : document.images.filter(image => !savedRefs.has(image.ref));
+        await this.engine.rememberFiles({
           space: writeSpace,
           source: "doc",
           author: msg.senderId,
           chatId: msg.chatId,
           messageId: msg.messageId,
-          content: `# 来源资料：${link}\n\n${md}`,
+          content: `# 来源资料：${link}\n\n${md}${typeof document !== "string" && document.imageNotice ? `\n\n配图归档：${document.imageNotice}` : ""}`,
           createdAt: msg.createdAt,
-        });
+          attachments: missingImages,
+        }, downloads.map(download => ({ attachment: download.attachment, localPath: download.localPath })));
         succeeded += 1;
         log.info("synced source into space", { space: writeSpace });
       } catch (err) {
@@ -2218,6 +2226,10 @@ export class Orchestrator {
           space: writeSpace,
           kind: chatRunError(err).kind,
         });
+      } finally {
+        for (const download of downloads) {
+          try { download.cleanup(); } catch { log.warn("document image cleanup failed"); }
+        }
       }
     }
     return {

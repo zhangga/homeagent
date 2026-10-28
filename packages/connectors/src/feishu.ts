@@ -14,9 +14,9 @@
  *   - adds/removes native message reactions via `im reactions`;
  *   - fetches docx links via `docs +fetch --as user` for doc sync (Q8).
  */
-import { config, logger } from "@homeagent/shared";
+import { config, logger, MAX_MATERIAL_BYTES, MAX_MATERIAL_EXPANDED_BYTES, MAX_MATERIAL_FILES } from "@homeagent/shared";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { formatFeishuLocalFileLinks } from "./feishu-markdown.ts";
@@ -25,6 +25,7 @@ import type {
   Connector,
   ConnectorHealth,
   DownloadedAttachment,
+  FetchedDocument,
   InboundEvent,
   NoticeOptions,
   OutboundReply,
@@ -33,6 +34,7 @@ import type {
   ReplyTarget,
 } from "./connector.ts";
 import { buildLiveReplyCard } from "./feishu-live-card.ts";
+import { documentBody, documentImages, imageFileName } from "./feishu-document.ts";
 import {
   normalizeBotAdded,
   normalizeCardAction,
@@ -866,6 +868,49 @@ export class FeishuConnector implements Connector {
 
   /** Fetch a docx/wiki link as markdown (user identity). Returns null on error. */
   async fetchDoc(docUrlOrToken: string): Promise<string | null> {
+    return (await this.fetchDocument(docUrlOrToken, false))?.content ?? null;
+  }
+
+  /** Preserve successful image downloads even when another image is unavailable. */
+  async fetchDocWithImages(docUrlOrToken: string): Promise<FetchedDocument | null> {
+    const document = await this.fetchDocument(docUrlOrToken, true);
+    if (!document) return null;
+    const images = documentImages(document.content, document.referenceMap);
+    if (images.length > MAX_MATERIAL_FILES) return { content: document.content, images: [], downloads: [],
+      imageNotice: `检测到 ${images.length} 个配图引用，超过现有单次 ${MAX_MATERIAL_FILES} 个文件引用预算；本轮仅保存正文，配图原件未保存。` };
+    const downloads: DownloadedAttachment[] = [];
+    let remaining = MAX_MATERIAL_EXPANDED_BYTES;
+    for (const image of images) {
+      if (!image.token || remaining <= 0) continue;
+      let directory: string | undefined;
+      try {
+        directory = realpathSync(mkdtempSync(join(tmpdir(), "homeagent-doc-image-")));
+        const downloadDirectory = directory;
+        const localPath = join(directory, "image.bin");
+        const maxBytes = Math.min(this.maxAttachmentBytes, MAX_MATERIAL_BYTES, remaining);
+        const result = jsonRecord(JSON.parse(await this.runCommand([
+          this.larkBin, "docs", "+media-download", "--token", image.token,
+          "--output", "image.bin", "--as", "user", "--json",
+        ], { cwd: directory, outputPath: localPath, maxOutputBytes: maxBytes })));
+        if (result?.ok === false || (typeof result?.code === "number" && result.code !== 0)) throw new Error("media unavailable");
+        const stat = lstatSync(localPath);
+        if (!stat.isFile() || stat.isSymbolicLink() || realpathSync(localPath) !== localPath
+          || stat.size <= 0 || stat.size > maxBytes) throw new Error("invalid media file");
+        remaining -= stat.size;
+        const header = new Uint8Array(await Bun.file(localPath).slice(0, 16).arrayBuffer());
+        downloads.push({ attachment: { ...image.attachment, name: imageFileName(image.attachment.name, header, downloads.length + 1) }, localPath, sizeBytes: stat.size,
+          cleanup: () => rmSync(downloadDirectory, { recursive: true, force: true }) });
+      } catch {
+        if (directory) {
+          try { rmSync(directory, { recursive: true, force: true }); } catch { log.warn("document image cleanup failed"); }
+        }
+        log.warn("document image unavailable");
+      }
+    }
+    return { content: document.content, images: images.map(image => image.attachment), downloads };
+  }
+
+  private async fetchDocument(docUrlOrToken: string, withReferences: boolean) {
     const cmd = [
       this.larkBin,
       "docs",
@@ -874,29 +919,16 @@ export class FeishuConnector implements Connector {
       docUrlOrToken,
       "--doc-format",
       "markdown",
+      ...(withReferences ? ["--detail", "full"] : []),
       "--as",
       "user",
       "--json",
     ];
     try {
       const out = await this.runCommand(cmd);
-      const parsed = jsonRecord(JSON.parse(out));
-      const data = jsonRecord(parsed?.data);
-      const document = jsonRecord(data?.document);
-      // Current docs +fetch wraps the body in data.document; retain the older
-      // envelopes without treating reference metadata as document text.
-      for (const content of [
-        document?.content,
-        parsed?.markdown,
-        parsed?.content,
-        data?.markdown,
-        data?.content,
-      ]) {
-        if (typeof content === "string" && content.trim()) return content;
-      }
-      return null;
-    } catch (err) {
-      log.warn("doc fetch failed", { doc: docUrlOrToken, err: String(err) });
+      return documentBody(JSON.parse(out));
+    } catch {
+      log.warn("doc fetch failed");
       return null;
     }
   }

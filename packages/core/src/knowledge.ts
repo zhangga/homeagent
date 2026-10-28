@@ -43,6 +43,7 @@ export interface Knowledge {
   remember(entry: RawEntry): Promise<string>;
   /** Capture Raw plus one exact immutable original file in the same Space. */
   rememberFile(entry: RawEntry, file: RawSourceCapture): Promise<string>;
+  rememberFiles(entry: RawEntry, files: readonly RawSourceCapture[]): Promise<string>;
   /** Resolve one stored original file through Raw provenance. */
   getRawSource(space: SpaceId, rawId: string, attachmentIndex: number): RawSourceDownload | null;
 

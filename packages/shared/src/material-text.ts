@@ -6,6 +6,8 @@ const TEXT_EXTENSIONS = new Set([".txt", ".md", ".markdown", ".csv", ".json", ".
 const OFFICE_EXTENSIONS = new Set([".docx", ".xlsx", ".pptx"]);
 export const MAX_MATERIAL_BYTES = 20 * 1024 * 1024;
 export const MAX_MATERIAL_EXPANDED_BYTES = MAX_MATERIAL_BYTES * 20;
+/** Matches the existing document handoff's maximum number of file references. */
+export const MAX_MATERIAL_FILES = 1000;
 export const MATERIAL_PART_CHARACTERS = 200_000;
 export type MaterialTextExtractor = (name: string, bytes: Uint8Array) => string | null | Promise<string | null>;
 

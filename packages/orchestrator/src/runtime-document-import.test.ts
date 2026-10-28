@@ -1,10 +1,59 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FakeLlm, KnowledgeEngine, SkillCatalog } from "@homeagent/core";
-import { CliConnector, type Connector } from "@homeagent/connectors";
+import { CliConnector, FeishuConnector, type Connector } from "@homeagent/connectors";
 import { Orchestrator } from "./runtime.ts";
+
+test.each([false, true])("a recorded Feishu article owns its downloaded images and reports missing originals once: partial=%s", async partial => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-synced-images-")));
+  const space = "personal/ou_fixture" as const;
+  const url = "https://example.larkoffice.com/wiki/game_workflow";
+  const content = '# AI 构建中小型游戏工作流\n<img ref="image_1"/>\n<img ref="image_2"/>\n末尾测试与迭代。';
+  const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const temporaryPaths: string[] = [];
+  const fetcher = new FeishuConnector({ runCommand: async (cmd, opts) => {
+    if (cmd.includes("+fetch")) return JSON.stringify({ ok: true, data: { document: { content,
+      reference_map: { image: { image_1: { token: "token_1" }, image_2: { token: "token_2" } } } } } });
+    temporaryPaths.push(opts!.cwd!);
+    if (partial && cmd.includes("token_2")) throw new Error("fixture media unavailable");
+    writeFileSync(join(opts!.cwd!, "image.bin"), bytes);
+    return JSON.stringify({ ok: true });
+  } });
+  const prompts: string[] = [];
+  const engine = new KnowledgeEngine({ dataDir: join(root, "data"), skillCatalog: new SkillCatalog({ roots: [] }),
+    runProvider: async (_provider, input) => { prompts.push(input.prompt); return `[AI 构建中小型游戏工作流](${url})`; } });
+  const transport = new CliConnector({ userId: "ou_fixture" });
+  const connector: Connector = { name: "feishu", start: handler => transport.start(handler), stop: () => transport.stop(),
+    reply: out => transport.reply(out), notice: (chat, text, options) => transport.notice(chat, text, options) };
+  const runtime = new Orchestrator({ engine, connector, docFetcher: link => fetcher.fetchDocWithImages(link) });
+  try {
+    engine.ensureSpace(space, { chatId: "oc_dm" });
+    const agent = engine.agents.create({ provider: "codex", visibility: "Personal", permission: "read-only" });
+    engine.registry.updateMeta(space, { agentId: agent.id });
+    await runtime.start();
+    await transport.inject({ kind: "message", eventId: "evt_images", chatType: "p2p", chatId: "oc_dm", senderId: "ou_fixture",
+      text: `[AI构建中小型游戏工作流](${url}) 记录下这个文章`, messageId: "om_images", docLinks: [url], mentionsBot: false, createdAt: 200 });
+    const docs = engine.registry.store(space).index().listRaw({}).filter(raw => raw.source === "doc");
+    expect(docs).toHaveLength(1);
+    expect(docs[0]?.content).toContain(content);
+    expect(docs[0]?.attachments).toHaveLength(2);
+    const originals = docs[0]!.attachments!.filter(attachment => attachment.sourceDigest);
+    expect(originals).toHaveLength(partial ? 1 : 2);
+    for (let i = 0; i < 2; i++) {
+      const source = engine.getRawSource(space, docs[0]!.id, i);
+      if (source) expect(new Uint8Array(readFileSync(source.path))).toEqual(bytes);
+    }
+    const reply = transport.sent[0]!.markdown;
+    expect(reply.match(/张配图原件/gu)).toHaveLength(1);
+    expect(reply).toContain(`已保存 ${partial ? 1 : 2} 张配图原件`);
+    expect(reply.match(/张配图未取得原件/gu) ?? []).toHaveLength(partial ? 1 : 0);
+    expect(prompts.join("\n")).toContain("配图原件的保存数量及未取得数量已由后台核实");
+    expect(temporaryPaths.every(path => !existsSync(path))).toBe(true);
+    expect(engine.registry.has("team/oc_dm")).toBe(false);
+  } finally { await runtime.stop(); engine.close(); rmSync(root, { recursive: true, force: true }); }
+});
 
 test("a read-only private Chat records a synchronized article without requiring a writable Workdir", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-synced-document-")));
@@ -15,7 +64,7 @@ test("a read-only private Chat records a synchronized article without requiring 
   const engine = new KnowledgeEngine({ dataDir: join(root, "data"), skillCatalog: new SkillCatalog({ roots: [] }),
     runProvider: async (_provider, input) => {
       prompts.push(input.prompt);
-      return "已收录本轮同步的文章正文，嵌入表格和媒体的覆盖情况需另行核验。";
+      return `[AI 构建中小型游戏工作流](${url})\n\n嵌入表格及图片、视频原件的完整性尚未核验。`;
     } });
   const transport = new CliConnector({ userId: "ou_fixture" });
   const connector: Connector = { name: "feishu", start: handler => transport.start(handler), stop: () => transport.stop(),
@@ -35,8 +84,11 @@ test("a read-only private Chat records a synchronized article without requiring 
     expect(fetched).toBe(1);
     expect(prompts.join("\n")).toContain(body);
     expect(prompts.join("\n")).not.toContain("需要当前 Agent 已有可写权限与有效 Workdir");
+    expect(prompts.join("\n")).toContain("保存结果由后台回执统一说明");
     expect(transport.sent[0]?.markdown).not.toContain("文档原文入库未完成");
     expect(transport.sent[0]?.markdown).toContain("文档原文入库：已确认同步 1 个来源");
+    expect(transport.sent[0]?.markdown?.match(/嵌入表格/gu)).toHaveLength(1);
+    expect(transport.sent[0]?.markdown?.match(/知识页/gu)).toHaveLength(1);
     expect(engine.chatRuns.list(space)[0]?.output).toBe(transport.sent[0]?.markdown);
     expect(engine.chatRuns.list(space)[0]?.delivery.status).toBe("sent");
     await runtime.stop();

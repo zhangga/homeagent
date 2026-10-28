@@ -214,7 +214,7 @@ async function run(
         : undefined,
     docFetcher: (link) => isByteTechArticleUrl(link)
       ? byteTechArticleFetcher.fetch(link)
-      : connector.fetchDoc(link),
+      : connector.fetchDocWithImages(link),
     attachmentExtractor: (attachment) =>
       extractAttachmentText(attachment, nativeAttachmentExtractor),
   });

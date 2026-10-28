@@ -29,6 +29,9 @@ import {
   AI_OPERATION_TIMEOUT_MS,
   AI_QUEUE_TIMEOUT_MS,
   AI_ROUTING_MAX_TOKENS,
+  MAX_MATERIAL_BYTES,
+  MAX_MATERIAL_EXPANDED_BYTES,
+  MAX_MATERIAL_FILES,
   splitMaterialText,
   Serializer,
   config,
@@ -79,6 +82,8 @@ import {
 import { SpaceRegistry } from "./registry.ts";
 import { normalizeSearchLimit } from "./sqlite.ts";
 import type { RawSourceCapture, RawSourceDownload } from "./raw-source-files.ts";
+import { readRawSourceBytes } from "./raw-source-files.ts";
+import { RawJournal } from "./raw-journal.ts";
 import { chatRawEntryUpdatedAt, chatRawImportId, createChatRawCapture, formatChatRawImportReceipt, isChatRawScopeSkip, parseChatRawImport, readChatRawCapture, resolveChatRawImportRequest, type ChatRawImportReceipt } from "./chat-raw-import.ts";
 import { createDocumentCapture, readDocumentCapture, resolveDocumentImportRequest } from "./chat-document-import.ts";
 import { ChatSourceProgressStore, chatSourceProgressInstruction } from "./chat-source-progress.ts";
@@ -3749,6 +3754,24 @@ export class KnowledgeEngine implements Knowledge {
     entry: RawEntry,
     file: RawSourceCapture,
   ): Promise<string> {
+    return this.rememberFiles(entry, [file]);
+  }
+
+  /** Commit one Raw with all of its originals, after validating the whole batch. */
+  async rememberFiles(entry: RawEntry, files: readonly RawSourceCapture[]): Promise<string> {
+    if (files.length + (entry.attachments?.length ?? 0) > MAX_MATERIAL_FILES) throw new Error("too many raw source files");
+    let inputBytes = 0;
+    for (const file of files) if ("bytes" in file) {
+      inputBytes += file.bytes.byteLength;
+      if (file.bytes.byteLength > MAX_MATERIAL_BYTES || inputBytes > MAX_MATERIAL_EXPANDED_BYTES) {
+        throw new Error("raw source byte budget exceeded");
+      }
+    }
+    entry = structuredClone(entry);
+    const captures = files.map((file): RawSourceCapture => {
+      return "bytes" in file ? { attachment: { ...file.attachment }, bytes: new Uint8Array(file.bytes) }
+        : { attachment: { ...file.attachment }, localPath: file.localPath };
+    });
     return this.serializer.run(entry.space, async () => {
       const store = this.registry.ensure(entry.space, { chatId: entry.chatId });
       if (
@@ -3758,26 +3781,36 @@ export class KnowledgeEngine implements Knowledge {
       ) {
         return `retracted:${entry.messageId}`;
       }
-      if (file.attachment.sourceDigest !== undefined) {
-        throw new Error("sourceDigest is assigned by HomeAgent storage");
-      }
-      const stored = "bytes" in file
-        ? store.rawSourceFiles.write(file.bytes)
-        : store.rawSourceFiles.writeFromPath(file.localPath);
+      let remaining = MAX_MATERIAL_EXPANDED_BYTES;
+      const prepared = captures.map(file => {
+        const attachment = file.attachment;
+        if (attachment.sourceDigest !== undefined || attachment.sourceSizeBytes !== undefined) {
+          throw new Error("sourceDigest is assigned by HomeAgent storage");
+        }
+        if (!attachment.ref || attachment.ref.length > 2048 || (attachment.name?.length ?? 0) > 500) {
+          throw new Error("invalid raw source reference");
+        }
+        const bytes = "bytes" in file ? file.bytes : readRawSourceBytes(file.localPath);
+        if (bytes.byteLength > MAX_MATERIAL_BYTES || bytes.byteLength > remaining) throw new Error("raw source byte budget exceeded");
+        remaining -= bytes.byteLength;
+        return { attachment, bytes };
+      });
+      const written = new Set<string>();
       try {
+        const attachments = prepared.map(file => {
+          const stored = store.rawSourceFiles.write(file.bytes);
+          written.add(stored.digest);
+          return { ...file.attachment, sourceDigest: stored.digest, sourceSizeBytes: stored.sizeBytes };
+        });
         return this.rememberSerialized({
           ...entry,
           attachments: [
             ...(entry.attachments ?? []).map((attachment) => ({ ...attachment })),
-            {
-              ...file.attachment,
-              sourceDigest: stored.digest,
-              sourceSizeBytes: stored.sizeBytes,
-            },
+            ...attachments,
           ],
         });
       } catch (error) {
-        this.removeUnreferencedRawSources(entry.space, new Set([stored.digest]));
+        this.removeUnreferencedRawSources(entry.space, written);
         throw error;
       }
     });
@@ -3808,7 +3841,9 @@ export class KnowledgeEngine implements Knowledge {
   private removeUnreferencedRawSources(space: SpaceId, candidates: ReadonlySet<string>): void {
     if (candidates.size === 0 || !this.registry.has(space)) return;
     const store = this.registry.store(space);
-    const referenced = new Set(store.index().listRaw({}).flatMap((entry) =>
+    // A journal commit may precede a failed SQLite projection write. Never
+    // remove originals already referenced by that authoritative commit.
+    const referenced = new Set(new RawJournal(join(store.root, "raw"), space).listRaw().flatMap((entry) =>
       (entry.attachments ?? []).flatMap((attachment) =>
         attachment.sourceDigest ? [attachment.sourceDigest] : []
       )
@@ -6811,7 +6846,16 @@ export class KnowledgeEngine implements Knowledge {
     };
     const synchronized = synchronizedUrls();
     const pendingUrls = urls.filter(url => !synchronized.includes(url));
-    const synchronizedReceipt = `文档原文入库：已确认同步 ${synchronized.length} 个来源的正文到当前 Space 的 Raw journal。仅确认已取得的正文，嵌入表格及图片、视频等媒体的完整性与原件归档需另行核验；知识页由后续提炼生成。`;
+    const synchronizedImages = synchronized.length
+      ? this.registry.store(run.space).index().findRawsByMessageId(run.messageId!, run.chatId!)
+        .filter(raw => raw.source === "doc" && raw.admission === "ready" && !raw.id.startsWith("doc-import-")
+          && synchronized.some(url => raw.content.startsWith(`# 来源资料：${url}\n`)))
+        .flatMap(raw => (raw.attachments ?? []).filter(attachment => attachment.kind === "image"))
+      : [];
+    const savedImages = synchronizedImages.filter(image => image.sourceDigest && image.sourceSizeBytes !== undefined).length;
+    const missingImages = synchronizedImages.length - savedImages;
+    const imageReceipt = [savedImages ? `已保存 ${savedImages} 张配图原件` : "", missingImages ? `${missingImages} 张配图未取得原件` : ""].filter(Boolean).join("；");
+    const synchronizedReceipt = `文档原文入库：已确认同步 ${synchronized.length} 个来源的正文。${imageReceipt ? `${imageReceipt}。` : ""}知识页待后续提炼。`;
     const withSynchronized = (pending?: { instruction: string; finish(signal?: AbortSignal): Promise<string> }) => {
       if (!synchronized.length) return pending;
       return {
@@ -6819,6 +6863,8 @@ export class KnowledgeEngine implements Knowledge {
           "## 本轮后台文档收录状态",
           synchronizedReceipt,
           `已收录来源 URL：${JSON.stringify(synchronized)}。这是 HomeAgent 已落盘的结果，与 Agent 的只读权限及 Workdir 无关；直接使用已同步正文，不需要寻找保存入口、调用 Skill 或重复抓取这些来源，不要将其报告为尚未入库。`,
+          "用户只要求记录时不展开文章摘要，最终回答只保留文章标题/链接和实际缺口；用户另有总结或分析要求时正常回答。保存结果由后台回执统一说明，不在正文重复保存结果或知识页提炼状态，也不要自行追加“尚缺”尾注。正文收录不证明嵌入表格或媒体原件完整，相关缺失或未核验情况简洁说明一次；结构化 gaps 只列正文尚未说明的缺口。",
+          imageReceipt ? "配图原件的保存数量及未取得数量已由后台核实，会在回执中统一说明，不在正文或 gaps 重复这些信息，也不要把已保存的配图说成尚未归档。图片文字识别、嵌入表格及视频的完整性须按实际证据判断。" : undefined,
           pending?.instruction,
         ].filter(Boolean).join("\n"),
         finish: async (signal?: AbortSignal) => {

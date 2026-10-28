@@ -46,6 +46,16 @@ function sameCanonicalPath(left: string, right: string): boolean {
     : left === right;
 }
 
+export function readRawSourceBytes(path: string): Uint8Array {
+  if (!sameCanonicalPath(realpathSync(path), resolve(path))) throw new Error("raw source path must not traverse a link");
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("raw source path must be a regular file");
+  if (stat.size > MAX_RAW_SOURCE_BYTES) throw new Error(`raw source exceeds ${MAX_RAW_SOURCE_BYTES} bytes`);
+  const bytes = readFileSync(path);
+  if (bytes.byteLength > MAX_RAW_SOURCE_BYTES) throw new Error(`raw source exceeds ${MAX_RAW_SOURCE_BYTES} bytes`);
+  return bytes;
+}
+
 /** Immutable, content-addressed original files owned by one Space. */
 export class RawSourceFileStore {
   constructor(readonly root: string) {}
@@ -109,17 +119,7 @@ export class RawSourceFileStore {
   }
 
   writeFromPath(path: string): StoredRawSourceFile {
-    if (!sameCanonicalPath(realpathSync(path), resolve(path))) {
-      throw new Error("raw source path must not traverse a link");
-    }
-    const stat = lstatSync(path);
-    if (!stat.isFile() || stat.isSymbolicLink()) {
-      throw new Error("raw source path must be a regular file");
-    }
-    if (stat.size > MAX_RAW_SOURCE_BYTES) {
-      throw new Error(`raw source exceeds ${MAX_RAW_SOURCE_BYTES} bytes`);
-    }
-    return this.write(readFileSync(path));
+    return this.write(readRawSourceBytes(path));
   }
 
   read(digest: string): StoredRawSourceFile {
