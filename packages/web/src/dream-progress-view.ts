@@ -3,7 +3,7 @@ import type { DreamRunSnapshot, DreamStage, DreamTrigger } from "@homeagent/core
 
 const STAGES: Record<DreamStage, string> = {
   queued: "等待执行", preparing: "准备资料与计划", analyzing: "分析资料，规划知识页",
-  generating: "生成与合并知识页", saving: "保存提炼结果", indexing: "更新知识地图与索引",
+  extracting: "提取分段知识", generating: "集中生成与合并知识页", saving: "保存提炼结果", indexing: "更新知识地图与索引",
 };
 const TRIGGERS: Record<DreamTrigger, string> = {
   manual: "手动提炼", scheduled: "自动提炼", import: "资料导入",
@@ -23,14 +23,11 @@ function time(at: number): string {
 }
 
 export function dreamRunsFragment(runs: DreamRunSnapshot[], now = Date.now()) {
-  const active = runs.filter((run) => run.finishedAt === undefined).length;
-  return html`<div class="dream-summary" data-dream-active="${active}">
-    <strong>${active > 0 ? `${active} 个任务正在运行或排队` : "当前没有正在执行的提炼任务"}</strong>
-    <span class="muted">${runs.length} 条运行记录 · 最近检查 ${time(now)}</span>
-  </div>
-  ${runs.length === 0 ? html`<div class="empty">提炼开始后会在这里显示阶段、来源和耗时。仅保留本次服务启动后的运行信息。</div>` : runs.map((run) => {
+  const current = runs.filter((run) => run.finishedAt === undefined);
+  const history = runs.filter((run) => run.finishedAt !== undefined);
+  const renderRun = (run: DreamRunSnapshot) => {
     const active = run.finishedAt === undefined;
-    const waiting = run.status === "running" && (run.stage === "analyzing" || run.stage === "generating");
+    const waiting = run.status === "running" && (run.stage === "analyzing" || run.stage === "extracting" || run.stage === "generating");
     const enc = encodeURIComponent(run.space);
     const status = { queued: "排队中", running: "运行中", completed: "已完成", failed: "未完成", cancelled: "已取消" }[run.status];
     const stage = active ? STAGES[run.stage] : status;
@@ -44,11 +41,11 @@ export function dreamRunsFragment(runs: DreamRunSnapshot[], now = Date.now()) {
         <span class="badge ${run.status === "failed" ? "down" : run.status === "completed" ? "ok" : "general"}">${status}</span>
       </header>
       <div class="dream-stage"><span class="dream-stage-mark" aria-hidden="true"></span><strong>${stage}</strong></div>
-      ${run.page ? html`<div class="dream-current">当前知识页：<strong>${run.page.title}</strong>
+      ${run.page ? html`<div class="dream-current">${active ? "当前知识页" : "最后处理的知识页"}：<strong>${run.page.title}</strong>
         <span class="muted">（第 ${run.page.index}${run.pagesTotal ? ` / ${run.pagesTotal}` : ""} 页）</span></div>` : ""}
       ${run.chunk ? html`<div class="dream-current">来源分段：第 <strong>${run.chunk.index} / ${run.chunk.total}</strong> 段
         <span class="muted"> · 分段结果会合并为完整知识页</span></div>` : ""}
-      ${waiting ? html`<p class="dream-wait">正在等待模型返回${run.stage === "analyzing" ? "分析计划" : "这一段的生成结果"}，包括 Provider 准备与自动重试。
+      ${waiting ? html`<p class="dream-wait">正在等待模型返回${run.stage === "analyzing" ? "分析计划" : run.stage === "extracting" ? "这一段的知识片段" : "完整知识页"}，包括 Provider 准备与自动重试。
         当前步骤已用 ${duration(now - run.stageStartedAt)}；模型返回前不会增加完成数量。</p>` : ""}
       ${run.status === "queued" ? html`<p class="dream-wait">正在等待本空间前面的写入或提炼工作完成。</p>` : ""}
       <dl class="dream-metrics">
@@ -69,7 +66,15 @@ export function dreamRunsFragment(runs: DreamRunSnapshot[], now = Date.now()) {
         ${(run.sourceCount ?? 0) > run.sources!.length ? html`<p class="muted">此处显示前 ${run.sources!.length} 条，可进入空间查看全部原始条目。</p>` : ""}
       </details>` : ""}
     </article>`;
-  })}`;
+  };
+  return html`<div class="dream-summary" data-dream-active="${current.length}">
+    <strong>${current.length > 0 ? `${current.length} 个任务正在运行或排队` : "当前没有正在执行的提炼任务"}</strong>
+    <span class="muted">${runs.length} 条运行记录 · 最近检查 ${time(now)}</span>
+  </div>
+  ${runs.length === 0 ? html`<div class="empty">提炼开始后会在这里显示阶段、来源和耗时。仅保留本次服务启动后的运行信息。</div>` : ""}
+  ${current.length > 0 ? html`<h3>当前提炼</h3>${current.map(renderRun)}` : ""}
+  ${history.length > 0 ? html`<details class="dream-history" data-dream-details="history">
+    <summary id="dream-history-title">历史运行记录（${history.length} 条）</summary>${history.map(renderRun)}</details>` : ""}`;
 }
 
 export function dreamRunsPanel(runs: DreamRunSnapshot[]) {
@@ -88,6 +93,7 @@ const DREAM_STYLE = `
   .dream-panel-head p { max-width:570px; margin:6px 0; }
   .dream-panel-head .btn { white-space:nowrap; }
   .dream-summary { display:flex; flex-wrap:wrap; gap:8px 20px; justify-content:space-between; padding:12px 0; }
+  .dream-history > summary { cursor:pointer; font-weight:600; padding:14px 0; }
   .dream-run { background:var(--card); border:1px solid var(--border); padding:20px; margin:0 0 14px; border-radius:10px; }
   .dream-active { border-left:4px solid var(--accent); padding-left:17px; }
   .dream-run-head { display:flex; justify-content:space-between; align-items:center; gap:12px; }

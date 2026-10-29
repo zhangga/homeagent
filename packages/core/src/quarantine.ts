@@ -4,14 +4,13 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
-  renameSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { SpaceStore } from "./space.ts";
 import type { QuarantinedDreamOperation, QuarantineRecord } from "./types.ts";
+import { writeAtomicStateFile } from "./durable-file.ts";
 
 export interface NewQuarantineRecord {
   slug: string;
@@ -24,6 +23,8 @@ export interface NewQuarantineRecord {
 const MAX_QUARANTINE_ERROR_CHARACTERS = 4_000;
 const MAX_QUARANTINE_RAW_IDS = 40;
 const MAX_QUARANTINE_IDENTIFIER_CHARACTERS = 240;
+// Covers the supported 400 MiB upload budget, including ASCII-only material.
+const MAX_QUARANTINE_SOURCE_FRAGMENTS = 10_000;
 
 function rawIds(value: unknown): string[] {
   return Array.isArray(value)
@@ -52,12 +53,31 @@ function operation(value: unknown): QuarantinedDreamOperation | undefined {
   ) return undefined;
   const plannedRawIds = rawIds(item.rawIds);
   if (plannedRawIds.length === 0) return undefined;
+  const sourceFragments: NonNullable<QuarantinedDreamOperation["sourceFragments"]> = [];
+  if (item.sourceFragments !== undefined) {
+    if (!Array.isArray(item.sourceFragments) || item.sourceFragments.length === 0
+      || item.sourceFragments.length > MAX_QUARANTINE_SOURCE_FRAGMENTS) return undefined;
+    for (const fragment of item.sourceFragments) {
+      if (!fragment || typeof fragment !== "object" || Array.isArray(fragment)) return undefined;
+      const ref = fragment as Record<string, unknown>;
+      if (typeof ref.rawId !== "string" || !plannedRawIds.includes(ref.rawId)
+        || typeof ref.start !== "number" || !Number.isSafeInteger(ref.start) || ref.start < 0
+        || typeof ref.end !== "number" || !Number.isSafeInteger(ref.end) || ref.end < ref.start || ref.end - ref.start > 48_000
+        || typeof ref.part !== "number" || !Number.isSafeInteger(ref.part) || ref.part < 1
+        || typeof ref.totalParts !== "number" || !Number.isSafeInteger(ref.totalParts) || ref.totalParts < ref.part
+        || typeof ref.contentHash !== "string" || !/^[a-f0-9]{64}$/u.test(ref.contentHash)) return undefined;
+      sourceFragments.push({ rawId: ref.rawId, start: ref.start, end: ref.end,
+        part: ref.part, totalParts: ref.totalParts, contentHash: ref.contentHash });
+    }
+    if (plannedRawIds.some(id => !sourceFragments.some(fragment => fragment.rawId === id))) return undefined;
+  }
   return {
     type: item.type as QuarantinedDreamOperation["type"],
     name: item.name.trim(),
     title: item.title.trim(),
     rawIds: plannedRawIds,
     basePageHash: item.basePageHash as string | null,
+    ...(item.sourceFragments === undefined ? {} : { sourceFragments }),
   };
 }
 
@@ -128,6 +148,9 @@ function parseRecord(store: SpaceStore, id: string, path: string): QuarantineRec
         ? legacyCreatedAt
         : fallbackCreatedAt;
     const frozenOperation = operation(value.operation);
+    if (value.operation !== undefined && !frozenOperation) {
+      return invalidRecord(store, id, createdAt, "冻结的提炼计划无效");
+    }
     return {
       id,
       space: store.space,
@@ -191,7 +214,6 @@ export function writeQuarantineRecord(
   if (!isSafeDirectory(store)) throw new Error("unsafe quarantine directory");
   const id = `quarantine-${randomUUID()}`;
   const path = pathFor(store, id)!;
-  const temporary = `${path}.${randomUUID()}.tmp`;
   const record: QuarantineRecord = {
     id,
     space: store.space,
@@ -201,8 +223,7 @@ export function writeQuarantineRecord(
     createdAt: input.createdAt,
     ...(frozenOperation ? { operation: frozenOperation } : {}),
   };
-  writeFileSync(temporary, `${JSON.stringify(record, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  renameSync(temporary, path);
+  writeAtomicStateFile(path, `${JSON.stringify(record, null, 2)}\n`);
   return record;
 }
 

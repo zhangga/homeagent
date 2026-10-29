@@ -891,6 +891,34 @@ describe("system health reporter", () => {
     engine.close();
   });
 
+  test("a recovering Dream shows its current run separately from its last completed failure", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-recovering-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }), runProvider: async () => "ok" });
+    const health = { ...loopHealth, running: true, lastStatus: "error" as "ok" | "error", lastFailureAt: 100, lastTickAt: 200 };
+    try {
+      const report = createSystemHealthReporter({
+        engine,
+        connectorHealth: () => ({ name: "feishu", ready: true, consumers: [] }),
+        dreamSchedulerHealth: () => health,
+        taskSchedulerHealth: () => loopHealth,
+        detectProviders: async () => [{ id: "codex", name: "Codex", bin: "codex", available: true, detail: "test" }],
+        requiredProviderIds: () => ["codex"],
+      });
+      const recovering = await report();
+      expect(recovering.components.dreamScheduler?.summary).toContain("运行中");
+      expect(recovering.components.dreamScheduler?.summary).toContain("上次完成失败");
+      expect(recovering.components.dreamScheduler?.details).toMatchObject({ running: true, lastStatus: "error", lastFailureAt: 100 });
+      expect(recovering.ready).toBe(false);
+      health.running = false;
+      health.lastStatus = "ok";
+      const recovered = await report();
+      expect(recovered.ready).toBe(true);
+      expect(recovered.components.dreamScheduler?.status).toBe("ok");
+      expect(recovered.components.dreamScheduler?.details?.lastFailureAt).toBe(100);
+    } finally { engine.close(); }
+  });
+
   test("a bounded Dream catch-up exposes remaining backlog without failing readiness", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hb-health-dream-backlog-"));
     dirs.push(dir);

@@ -35,3 +35,24 @@ test("terminal and empty states do not claim that a model is still running", asy
   expect(failed).not.toContain("正在等待模型返回");
   expect(String(await dreamRunsPanel([]))).toContain("仅保留本次服务启动后的运行信息");
 });
+
+test("keeps current execution separate from historical failures", async () => {
+  const body = String(await dreamRunsFragment([
+    { ...run, id: "dream_failed", status: "failed", finishedAt: 1000, errorCount: 1 }, run,
+  ], 122_000));
+  expect(body).toContain("当前提炼");
+  expect(body).toContain("历史运行记录");
+  expect(body.indexOf('data-dream-run="dream_test"')).toBeLessThan(body.indexOf("历史运行记录"));
+  expect(body.indexOf('data-dream-run="dream_failed"')).toBeGreaterThan(body.indexOf("历史运行记录"));
+});
+
+test("distinguishes independent extraction from the one-time page merge", async () => {
+  const extracting = String(await dreamRunsFragment([{ ...run, stage: "extracting" }], 122_000));
+  expect(extracting).toContain("提取分段知识");
+  expect(extracting).toContain("这一段的知识片段");
+  expect(extracting).not.toContain("正在等待模型返回完整知识页");
+  const merging = String(await dreamRunsFragment([{ ...run, stage: "generating", chunk: undefined }], 122_000));
+  expect(merging).toContain("集中生成与合并知识页");
+  expect(merging).toContain("正在等待模型返回完整知识页");
+  expect(merging).not.toContain("来源分段：第");
+});

@@ -7,9 +7,10 @@
  *     and a batch of pending raw entries, the LLM decides which entries are
  *     worth distilling and plans page operations (create/update). Pure noise is
  *     reported as skipped and never becomes a page (plan Q7).
- *   Step 2 (generate): for each planned page, the LLM writes the whole page
- *     (llm_wiki's whole-page paradigm — never fragments), given any existing
- *     page content to merge and the contributing raw entries.
+ *   Step 2 (generate): short inputs produce a page directly. Long inputs first
+ *     yield independent evidence notes, then merge into the existing page once.
+ *     Notes remain verbatim in source-detail sections; oversized merge inputs use
+ *     a reduced overview. Intermediate pages are never replayed.
  *
  * Robustness (plan R3): JSON mode via forced tool-use + schema validation +
  * retries + bad-page quarantine. Provenance: each page records the raw ids it
@@ -20,7 +21,7 @@
  * are refreshed and a log entry is appended.
  */
 import type { DreamReport, Page, RawRecord } from "@homeagent/shared";
-import { isChatSourceSnapshot } from "./chat-raw-import.ts";
+import { chatRawEntryUpdatedAt, isChatSourceSnapshot } from "./chat-raw-import.ts";
 import { dreamSourceRefs, type DreamProgress } from "./dream-progress.ts";
 import {
   AI_GENERATION_MAX_TOKENS,
@@ -57,6 +58,8 @@ interface PlannedOp {
   title: string;
   rawIds: string[];
   reason?: string;
+  /** Selected by the planner's input groups, never accepted from model output. */
+  sourceFragments?: SourceFragment[];
 }
 
 interface AnalyzeResult {
@@ -166,6 +169,7 @@ async function analyze(
   const operations = new Map<string, PlannedOp>();
   const skipped = new Map<string, number>();
   const appearances = new Map<string, number>();
+  const classified = new Map<string, number>();
   for (const [index, group] of groups.entries()) {
     if (signal?.aborted) throw signal.reason ?? new Error("distillation cancelled");
     const ids = new Set(group.map(fragment => fragment.raw.id));
@@ -187,13 +191,20 @@ async function analyze(
       if (rawIds.length === 0) continue;
       const key = canonicalSlug(op.type, op.name);
       const previous = operations.get(key);
+      const sourceFragments = group.filter(fragment => rawIds.includes(fragment.raw.id));
       operations.set(key, previous
-        ? { ...previous, rawIds: [...new Set([...previous.rawIds, ...rawIds])] }
-        : { ...op, rawIds });
+        ? { ...previous, rawIds: [...new Set([...previous.rawIds, ...rawIds])],
+          sourceFragments: [...new Set([...previous.sourceFragments!, ...sourceFragments])] }
+        : { ...op, rawIds, sourceFragments });
     }
     for (const id of new Set(value.skippedRawIds.filter(id => ids.has(id)))) skipped.set(id, (skipped.get(id) ?? 0) + 1);
+    const classifiedIds = new Set([...value.operations.flatMap(op => op.rawIds), ...value.skippedRawIds]);
+    for (const id of ids) if (classifiedIds.has(id)) classified.set(id, (classified.get(id) ?? 0) + 1);
   }
   const used = new Set([...operations.values()].flatMap(op => op.rawIds));
+  // Do not generate/consume a partial Raw while its other fragments are unclassified.
+  const incomplete = batch.filter(raw => used.has(raw.id) && classified.get(raw.id) !== appearances.get(raw.id));
+  if (incomplete.length > 0) throw new Error(`${incomplete.length} 条 Raw 仍有未分类的来源分段，保留待提炼`);
   return { operations: [...operations.values()], skippedRawIds: batch
     .filter(raw => !used.has(raw.id) && skipped.get(raw.id) === appearances.get(raw.id)).map(raw => raw.id) };
 }
@@ -267,21 +278,27 @@ interface SourceFragment {
   content: string;
   part: number;
   totalParts: number;
+  start: number;
+  end: number;
+}
+
+function splitText(content: string, characters = MAX_GENERATE_SOURCE_CHARACTERS): Array<{ content: string; start: number; end: number }> {
+  const chunks: Array<{ content: string; start: number; end: number }> = [];
+  for (let start = 0; start < content.length;) {
+    let end = Math.min(start + characters, content.length);
+    if (end < content.length && content.charCodeAt(end - 1) >= 0xd800 && content.charCodeAt(end - 1) <= 0xdbff) end -= 1;
+    chunks.push({ content: content.slice(start, end), start, end });
+    start = end;
+  }
+  return chunks.length > 0 ? chunks : [{ content: "", start: 0, end: 0 }];
 }
 
 function splitSourceFragments(sources: RawRecord[], characters = MAX_GENERATE_SOURCE_CHARACTERS): SourceFragment[] {
   return sources.flatMap((raw) => {
-    const chunks: string[] = [];
-    for (let start = 0; start < raw.content.length;) {
-      let end = Math.min(start + characters, raw.content.length);
-      if (end < raw.content.length && raw.content.charCodeAt(end - 1) >= 0xd800 && raw.content.charCodeAt(end - 1) <= 0xdbff) end -= 1;
-      chunks.push(raw.content.slice(start, end));
-      start = end;
-    }
-    if (chunks.length === 0) chunks.push("");
-    return chunks.map((content, index) => ({
+    const chunks = splitText(raw.content, characters);
+    return chunks.map((chunk, index) => ({
       raw,
-      content,
+      ...chunk,
       part: index + 1,
       totalParts: chunks.length,
     }));
@@ -314,8 +331,10 @@ function generatePrompt(
   slug: string,
   existing: Page | null,
   sources: SourceFragment[],
+  evidence?: string,
+  extractOnly = false,
 ): string {
-  const src = sources
+  const src = evidence ? "" : sources
     .map((fragment) => {
       const part = fragment.totalParts > 1
         ? ` part="${fragment.part}/${fragment.totalParts}"`
@@ -325,7 +344,9 @@ function generatePrompt(
     })
     .join("\n\n");
   const parts = [
-    `请为知识页「${op.title}」(slug: ${slug}, 类型: ${op.type}) 生成完整内容。`,
+    extractOnly
+      ? `请为知识页「${op.title}」(slug: ${slug}, 类型: ${op.type}) 提取当前来源分段中的相关知识。`
+      : `请为知识页「${op.title}」(slug: ${slug}, 类型: ${op.type}) 生成完整内容。`,
     "",
     "## 空间页类型规则",
     store.schema().trim(),
@@ -354,11 +375,15 @@ function generatePrompt(
       "type=\"chat-source-snapshot\" 是 Agent 查询所得的消息快照，不是管理员人工纠错。对同一群、同一 messageId，按来源 metadata 的 updatedAt（缺失时 createdAt）区分版本；最新版本用于描述当前消息，旧版本只用于变更历史。不得把同一消息的多个版本计为多起事件，也不能让旧版本覆盖较新的已知内容。", "");
   }
   parts.push(
-    "## 相关原始来源",
-    src,
+    evidence ? "## 分段提炼结果" : "## 相关原始来源",
+    evidence ?? src,
     "",
     "要求：",
-    "- content 为完整 markdown 正文（整页，不要分片）。",
+    extractOnly
+      ? "- content 只写本段与目标页有关的独立知识片段，不要生成或重写整页，不要复述其他分段。"
+      : evidence
+        ? "- content 为完整主文，组织导读、当前结论与既有知识的更新；来源分段详情由系统完整附加。"
+        : "- content 为完整 markdown 正文（整页，不要分片）。",
     "- 用 [[slug]] 形式链接到相关页面（若知道其 slug）。",
     "- summary 用一句话概括。",
     "- aliases 只填写来源或既有页面明确支持的别名、简称与常见用户问法，用于检索本页。",
@@ -367,14 +392,92 @@ function generatePrompt(
     "- 不要为了提高检索召回而臆造同义词、职责或场景。",
     "- 只根据来源与既有内容写，不要臆造。",
   );
+  if (extractOnly) parts.push(
+    "## 来源分段提取",
+    "- 保留本段相关的全部事实、数字、条件、例外、结论、操作步骤、代码和版本差异，不要只给泛泛摘要。",
+    "- summary 用一句话说明本段贡献，最多 1000 字符；content 不因 summary 而省略细节。",
+    "- 不要补写前文、重复页标题或预测后续分段；既有知识会在最后统一合并。",
+  );
+  if (evidence) parts.push(
+    "- 上方材料来自全部来源分段，完整提炼细节将由系统逐字附加为来源分段详情，不要在主文重复抄写。",
+    "- 主文负责组织主题、当前结论和既有知识的更新；详情是来源证据，可能含旧版本，以主文和上述版本/纠错规则为准。",
+  );
   return parts.join("\n");
 }
 
+const MAX_EVIDENCE_SUMMARY_CHARACTERS = 1_000;
+const EXTRACT_SCHEMA = {
+  ...GENERATE_SCHEMA,
+  properties: {
+    ...GENERATE_SCHEMA.properties,
+    summary: { type: "string", maxLength: MAX_EVIDENCE_SUMMARY_CHARACTERS },
+    content: { type: "string", description: "only the knowledge contributed by this source group; never a whole page" },
+  },
+};
+const OVERVIEW_SCHEMA = {
+  type: "object",
+  properties: { summary: { type: "string", minLength: 1, maxLength: MAX_EVIDENCE_SUMMARY_CHARACTERS } },
+  required: ["summary"],
+};
+
+function validateEvidence(raw: unknown): GeneratedPage {
+  const note = validateGenerate(raw);
+  if (note.summary.length > MAX_EVIDENCE_SUMMARY_CHARACTERS) throw new Error("source evidence summary is too long");
+  return note;
+}
+
+function evidenceSources(group: SourceFragment[]): string {
+  return JSON.stringify(group.map(({ raw, part, totalParts }) => ({
+    rawId: raw.id, type: isChatSourceSnapshot(raw) ? "chat-source-snapshot" : raw.source,
+    createdAt: raw.createdAt, part, totalParts,
+    ...(isChatSourceSnapshot(raw) ? { chatId: raw.chatId, messageId: raw.messageId, updatedAt: chatRawEntryUpdatedAt(raw) } : {}),
+  })));
+}
+
+/** Reduce only navigation text. The evidence bodies are retained unchanged. */
+async function evidenceForMerge(
+  client: LlmClient, notes: GeneratedPage[], groups: SourceFragment[][], model: string | undefined, store: SpaceStore,
+  signal?: AbortSignal,
+): Promise<string> {
+  const full = notes.map((note, index) => `### 分段 ${index + 1}\n来源：${evidenceSources(groups[index]!)}\n${note.content}`).join("\n\n");
+  if (full.length <= MAX_GENERATE_SOURCE_CHARACTERS) return full;
+  let overview = notes.map((note, index) => `分段 ${index + 1}（来源：${evidenceSources(groups[index]!)}）：${note.summary || note.title}`).join("\n");
+  while (overview.length > MAX_GENERATE_SOURCE_CHARACTERS) {
+    const reduced: string[] = [];
+    // Reuse the same Unicode-safe partitioning and source budget as Raw input.
+    for (const fragment of splitText(overview)) {
+      if (signal?.aborted) throw signal.reason ?? new Error("distillation cancelled");
+      const { value } = await client.completeJSON<{ summary: string }>({
+        model, purpose: "distill", space: store.space, maxTokens: AI_GENERATION_MAX_TOKENS,
+        system: "你严格按 schema 输出结构化结果。",
+        prompt: `## 分段提炼导读压缩\n将下列小节导读归纳为主题导航，保留纠错和版本变化提示。原始知识片段会完整附加，不需要重写正文。\n${fragment.content}`,
+        schema: OVERVIEW_SCHEMA,
+        validate(raw) {
+          if (!raw || typeof raw !== "object" || !("summary" in raw)
+            || typeof raw.summary !== "string" || !raw.summary.trim()
+            || raw.summary.length > MAX_EVIDENCE_SUMMARY_CHARACTERS) throw new Error("invalid evidence overview");
+          return { summary: raw.summary };
+        },
+      });
+      reduced.push(value.summary);
+    }
+    overview = reduced.join("\n");
+  }
+  return overview;
+}
+
 /** sha256 of the material a page is built from — the incremental-cache key. */
-function sourceHash(sources: RawRecord[], existing: Page | null): string {
+function sourceHash(sources: RawRecord[], existing: Page | null, fragments?: SourceFragment[]): string {
   const h = new Bun.CryptoHasher("sha256");
-  for (const r of [...sources].sort((a, b) => a.id.localeCompare(b.id))) {
-    h.update(r.id + "\u0000" + r.content + "\u0000");
+  if (fragments) {
+    h.update("source-fragments:v1\u0000");
+    for (const fragment of fragments) {
+      h.update(JSON.stringify([fragment.raw.id, fragment.start, fragment.end]) + "\u0000" + fragment.content + "\u0000");
+    }
+  } else {
+    for (const r of [...sources].sort((a, b) => a.id.localeCompare(b.id))) {
+      h.update(r.id + "\u0000" + r.content + "\u0000");
+    }
   }
   // Fold in the prior page identity so an update off a changed base re-runs.
   if (existing) h.update("base:" + existing.slug);
@@ -397,47 +500,61 @@ async function generate(
   model: string | undefined,
   onProgress?: (progress: DreamProgress) => void,
   pageIndex = 1,
+  signal?: AbortSignal,
 ): Promise<GeneratedPage> {
-  const groups = groupSourceFragments(splitSourceFragments(sources));
-  let current = existing;
-  let final: GeneratedPage | undefined;
+  const groups = groupSourceFragments(op.sourceFragments ?? splitSourceFragments(sources));
+  const notes: GeneratedPage[] = [];
   for (const [index, group] of groups.entries()) {
+    if (signal?.aborted) throw signal.reason ?? new Error("distillation cancelled");
+    const extractOnly = groups.length > 1;
     onProgress?.({
-      stage: "generating", page: { slug, title: op.title.slice(0, 255), index: pageIndex },
+      stage: extractOnly ? "extracting" : "generating", page: { slug, title: op.title.slice(0, 255), index: pageIndex },
       chunk: { index: index + 1, total: groups.length },
       sources: dreamSourceRefs(group.map((fragment) => fragment.raw)), sourceCount: group.length,
     });
     const { value } = await client.completeJSON<GeneratedPage>({
       model,
-      system: "你严格按 schema 输出结构化结果，content 为完整 markdown 正文。",
-      prompt: generatePrompt(store, op, slug, current, group),
-      schema: GENERATE_SCHEMA as unknown as Record<string, unknown>,
-      validate: validateGenerate,
+      system: extractOnly ? "你严格按 schema 输出结构化结果，只提取当前来源分段的知识，不重写整页。" : "你严格按 schema 输出结构化结果，content 为完整 markdown 正文。",
+      prompt: generatePrompt(store, op, slug, extractOnly ? null : existing, group, undefined, extractOnly),
+      schema: extractOnly ? EXTRACT_SCHEMA : GENERATE_SCHEMA,
+      validate: extractOnly ? validateEvidence : validateGenerate,
       maxTokens: AI_GENERATION_MAX_TOKENS,
       purpose: "distill",
       space: store.space,
     });
-    final = {
-      ...value,
-      aliases: resolveSearchMetadata(current?.aliases, value.aliases),
-      tags: resolveSearchMetadata(current?.tags, value.tags),
-    };
-    current = {
-      slug,
-      type: op.type,
-      title: final.title,
-      summary: final.summary,
-      aliases: final.aliases ?? [],
-      tags: final.tags ?? [],
-      sources: [...new Set([...(current?.sources ?? []), ...group.map((item) => item.raw.id)])],
-      links: final.links,
-      content: final.content,
-      updatedAt: Date.now(),
-      contentHash: "",
+    notes.push(value);
+  }
+  let final = notes[0];
+  if (!final) throw new Error("knowledge page generation has no source content");
+  if (notes.length > 1) {
+    onProgress?.({ stage: "generating", page: { slug, title: op.title.slice(0, 255), index: pageIndex },
+      sources: dreamSourceRefs(sources), sourceCount: sources.length });
+    let evidence = await evidenceForMerge(client, notes, groups, model, store, signal);
+    const aliases = normalizeSearchMetadata(notes.flatMap(note => note.aliases ?? []));
+    const tags = normalizeSearchMetadata(notes.flatMap(note => note.tags ?? []));
+    evidence += `\n\n分段中有来源支持的检索元数据候选（仍需按当前事实校正）：\naliases: ${JSON.stringify(aliases)}\ntags: ${JSON.stringify(tags)}`;
+    if (signal?.aborted) throw signal.reason ?? new Error("distillation cancelled");
+    const { value } = await client.completeJSON<GeneratedPage>({
+      model, system: "你严格按 schema 输出结构化结果，集中生成知识页主文。全部分段知识由系统原样保留，不要重复抄写。",
+      prompt: generatePrompt(store, op, slug, existing, groups.flat(), evidence),
+      schema: GENERATE_SCHEMA, validate: validateGenerate,
+      maxTokens: AI_GENERATION_MAX_TOKENS, purpose: "distill", space: store.space,
+    });
+    final = value;
+    final = { ...final,
+      // Do not recursively summarize away facts to satisfy a final prompt budget.
+      // These are source evidence, rather than a second set of current conclusions.
+      content: `${final.content.trimEnd()}\n\n## 来源分段详情\n\n> 以下保留全部分段提炼证据，可能包含历史版本；当前结论及纠错以上方主文为准。\n\n${notes.map((note, index) => {
+        const refs = groups[index]!.map(fragment => `${fragment.raw.id}（${fragment.part}/${fragment.totalParts}）`).join("、");
+        return `### 来源分段 ${index + 1}\n\n来源 Raw：${refs}\n\n来源元数据：${evidenceSources(groups[index]!)}\n\n${note.content}`;
+      }).join("\n\n")}`,
+      links: [...new Set([...final.links, ...notes.flatMap(note => note.links)])],
     };
   }
-  if (!final) throw new Error("knowledge page generation has no source content");
-  return final;
+  return { ...final,
+    aliases: resolveSearchMetadata(existing?.aliases, final.aliases),
+    tags: resolveSearchMetadata(existing?.tags, final.tags),
+  };
 }
 
 function pageBaseHash(page: Page | null): string | null {
@@ -500,6 +617,11 @@ function quarantine(
     title: op.title,
     rawIds: sources.map((source) => source.id),
     basePageHash: pageBaseHash(existing),
+    ...(op.sourceFragments ? { sourceFragments: op.sourceFragments.map(fragment => ({
+      rawId: fragment.raw.id, start: fragment.start, end: fragment.end,
+      part: fragment.part, totalParts: fragment.totalParts,
+      contentHash: new Bun.CryptoHasher("sha256").update(fragment.content).digest("hex"),
+    })) } : {}),
   };
   writeQuarantineRecord(store, {
     slug,
@@ -631,6 +753,15 @@ export async function retryQuarantinedDreamOperation(
     name: operation.name,
     title: operation.title,
     rawIds: [...operation.rawIds],
+    ...(operation.sourceFragments ? { sourceFragments: operation.sourceFragments.map(fragment => {
+      const raw = sources.find(source => source.id === fragment.rawId);
+      if (!raw || fragment.end > raw.content.length) throw new Error("quarantine source fragment is unavailable");
+      const content = raw.content.slice(fragment.start, fragment.end);
+      if (new Bun.CryptoHasher("sha256").update(content).digest("hex") !== fragment.contentHash) {
+        throw new Error("quarantine source fragment has changed");
+      }
+      return { ...fragment, raw, content };
+    }) } : {}),
   };
   const client = deps.client ?? gatewayClient;
   const model = opts.model ?? config().model;
@@ -658,7 +789,7 @@ export async function retryQuarantinedDreamOperation(
       links: generated.links,
       content: `${generated.content.trimEnd()}\n`,
       updatedAt: Date.now(),
-      contentHash: sourceHash(sources, existing),
+      contentHash: sourceHash(sources, existing, op.sourceFragments),
     };
     deps.onProgress?.({ stage: "saving", page: { slug: record.slug, title: operation.title.slice(0, 255), index: 1 } });
     store.writePage(page);
@@ -801,7 +932,7 @@ export async function runDreamCycle(
       continue;
     }
     const existing = idx.getPage(slug);
-    const hash = sourceHash(sources, existing);
+    const hash = sourceHash(sources, existing, op.sourceFragments);
 
     if (isCacheHit(existing, hash, force)) {
       // Unchanged source set — keep the page, mark its raw ingested.
@@ -812,7 +943,7 @@ export async function runDreamCycle(
     }
 
     try {
-      const gen = await generate(client, store, op, slug, existing, sources, model, deps.onProgress, operationIndex + 1);
+      const gen = await generate(client, store, op, slug, existing, sources, model, deps.onProgress, operationIndex + 1, opts.signal);
       throwIfAborted();
       const mergedSources = [...new Set([...(existing?.sources ?? []), ...sources.map((s) => s.id)])];
       const page: Page = {

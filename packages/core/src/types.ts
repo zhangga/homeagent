@@ -91,6 +91,15 @@ export interface QuarantinedDreamOperation {
   rawIds: string[];
   /** Hash of the Knowledge page base used by the failed generation; null means create. */
   basePageHash: string | null;
+  /** Relevant source ranges frozen by planning. Absent on legacy/full-source operations. */
+  sourceFragments?: Array<{
+    rawId: string;
+    start: number;
+    end: number;
+    part: number;
+    totalParts: number;
+    contentHash: string;
+  }>;
 }
 
 export interface QuarantineRecord {

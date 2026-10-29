@@ -898,6 +898,14 @@ export function healthView(
             : ""}
         </div>`
       : "";
+    const executionDetails = component.details;
+    const executionStatus = typeof executionDetails?.running === "boolean"
+      ? html`<p class="muted">当前：${executionDetails.running ? "运行中" : "空闲"}
+          · 上次完成：${executionDetails.lastStatus === "error" ? "失败" : executionDetails.lastStatus === "ok" ? "成功" : "暂无记录"}
+          ${typeof (executionDetails.lastStatus === "error" ? executionDetails.lastFailureAt : executionDetails.lastSuccessAt) === "number"
+            ? fmtTime(Number(executionDetails.lastStatus === "error" ? executionDetails.lastFailureAt : executionDetails.lastSuccessAt)) : ""}
+          ${executionDetails.running && executionDetails.lastStatus === "error" ? "；本轮结果待定，就绪检查将在完成后更新。" : ""}</p>`
+      : "";
     const details = component.details
       ? html`<details><summary class="muted">查看详情</summary><pre>${raw(
           escapePre(JSON.stringify(component.details, null, 2)),
@@ -909,6 +917,7 @@ export function healthView(
         <span class="badge ${component.status}">${component.status}</span>
       </div>
       <div style="margin-top:8px">${component.summary}</div>
+      ${executionStatus}
       ${serviceControls}
       ${details}
     </div>`;

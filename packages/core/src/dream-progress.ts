@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DreamReport, RawRecord, SpaceId } from "@homeagent/shared";
 
-export type DreamStage = "queued" | "preparing" | "analyzing" | "generating" | "saving" | "indexing";
+export type DreamStage = "queued" | "preparing" | "analyzing" | "extracting" | "generating" | "saving" | "indexing";
 export type DreamTrigger = "manual" | "scheduled" | "import" | "redistill" | "retry" | "task";
 export interface DreamSourceRef { id: string; name: string }
 export interface DreamProgress {

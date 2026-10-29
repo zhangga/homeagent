@@ -62,7 +62,7 @@ test("reports queued work, blocked model calls, every fragment and terminal coun
     space: SPACE, source: "manual", content: `PRIVATE_BODY_${"甲".repeat(100_000)}`,
   }, { attachment: { kind: "file", ref: "test", name: "长资料.jsonl" }, bytes: new TextEncoder().encode("original") });
   for (let i = 0; i < 3; i += 1) fake.queueJSON({ operations: [{ type: "concept", name: "release", title: "发布约定", rawIds: [rawId] }], skippedRawIds: [] });
-  for (let i = 0; i < 3; i += 1) fake.queueJSON({ title: "发布约定", summary: "summary", content: "正文", links: [] });
+  for (let i = 0; i < 4; i += 1) fake.queueJSON({ title: "发布约定", summary: "summary", content: "正文", links: [] });
   const first = engine.runDreamCycle(SPACE, { trigger: "import", batch: { index: 1, total: 2 } });
   await analysisEntered.promise;
   const second = engine.runDreamCycle(SPACE);
@@ -78,7 +78,7 @@ test("reports queued work, blocked model calls, every fragment and terminal coun
     analysisRelease.resolve();
     await generationEntered.promise;
     expect(engine.listDreamRuns().find((run) => run.status === "running")).toMatchObject({
-      stage: "generating", page: { title: "发布约定", index: 1 }, chunk: { index: 1, total: 3 }, pagesTotal: 1,
+      stage: "extracting", page: { title: "发布约定", index: 1 }, chunk: { index: 1, total: 3 }, pagesTotal: 1,
     });
   } finally {
     analysisRelease.resolve();

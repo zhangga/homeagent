@@ -1485,6 +1485,20 @@ describe("web backend (read-only)", () => {
     expect(homeBody).toContain("/readyz");
   });
 
+  test("health distinguishes a running recovery from the previous completed failure", async () => {
+    const snapshot: SystemHealthSnapshot = {
+      status: "down", ready: false, checkedAt: 1_783_932_000_000,
+      components: { dreamScheduler: { status: "degraded", summary: "Dream Cycle 调度器运行中；上次完成失败，本轮结果待定",
+        details: { started: true, running: true, lastStatus: "error", lastFailureAt: 1_783_931_000_000 } } },
+    };
+    const app = createWebApp({ engine, health: async () => snapshot });
+    const body = await (await app.request("/health")).text();
+    expect(body).toContain("当前：运行中");
+    expect(body).toContain("上次完成：失败");
+    expect(body).toContain("本轮结果待定，就绪检查将在完成后更新");
+    expect((await app.request("/readyz")).status).toBe(503);
+  });
+
   test("managed service status exposes a guarded restart action", async () => {
     let restarts = 0;
     const snapshot: SystemHealthSnapshot = {

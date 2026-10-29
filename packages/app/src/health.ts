@@ -58,10 +58,10 @@ function loopComponent(label: string, health?: RuntimeLoopHealth): ComponentHeal
   const latestRunFailed = health.lastStatus === "error";
   return {
     status: latestRunFailed ? "degraded" : "ok",
-    summary: latestRunFailed
-      ? `${label}最近一次执行失败`
-      : health.running
-        ? `${label}运行中`
+    summary: health.running
+      ? `${label}运行中${latestRunFailed ? "；上次完成失败，本轮结果待定" : ""}`
+      : latestRunFailed
+        ? `${label}上次完成失败，当前空闲`
         : `${label}正常`,
     details: { ...health },
   };
@@ -332,7 +332,7 @@ export function createSystemHealthReporter(
     components.dreamCycles = {
       status: failedDreams.length > 0 ? "degraded" : "ok",
       summary: runningDreams.length > 0
-        ? `${runningDreams.length} 个 Dream Cycle 运行中`
+        ? `${runningDreams.length} 个 Dream Cycle 运行中${failedDreams.length > 0 ? `；${failedDreams.length} 个空间上次完成失败` : ""}`
         : failedDreams.length > 0
           ? `${failedDreams.length} 个空间最近提炼失败`
           : "Dream Cycle 无近期失败",
