@@ -9,6 +9,7 @@
  *     reported as skipped and never becomes a page (plan Q7).
  *   Step 2 (generate): short inputs produce a page directly. Long inputs first
  *     yield independent evidence notes, then merge into the existing page once.
+ *     Fragments feeding multiple pages are extracted together once per cycle.
  *     Notes remain verbatim in source-detail sections; oversized merge inputs use
  *     a reduced overview. Intermediate pages are never replayed.
  *
@@ -37,7 +38,9 @@ import type {
 } from "./types.ts";
 import { gatewayClient, type LlmClient } from "./llm.ts";
 import { canonicalSlug } from "./slug.ts";
-import { isKnowledgeContentRef, refreshDigest } from "./digest.ts";
+import { refreshDigest } from "./digest.ts";
+import { DreamCatalog, dreamCatalogBatches } from "./dream-catalog.ts";
+import { PAGE_UPDATE_CHARACTERS, updateLargePage, type GeneratedPage } from "./dream-page-update.ts";
 import {
   removeQuarantineRecordsCoveredBy,
   writeQuarantineRecord,
@@ -121,13 +124,8 @@ function validateAnalyze(raw: unknown): AnalyzeResult {
   return { operations, skippedRawIds: (o.skippedRawIds as unknown[]).map(String) };
 }
 
-function analyzePrompt(store: SpaceStore, batch: SourceFragment[]): string {
-  const index = store
-    .index()
-    .listPages()
-    .filter(isKnowledgeContentRef)
-    .map((r) => `- ${r.slug} (${r.type})：${r.title}｜${r.summary}`)
-    .join("\n");
+function analyzePrompt(store: SpaceStore, batch: SourceFragment[], catalog: DreamCatalog): string {
+  const index = catalog.prompt(batch.map(fragment => fragment.content));
   const entries = batch
     .map(({ raw: r, content, part, totalParts }) => {
       const meta = [r.source, r.author ? `by ${r.author}` : ""].filter(Boolean).join(" ");
@@ -143,8 +141,8 @@ function analyzePrompt(store: SpaceStore, batch: SourceFragment[]): string {
     "## 页类型规则",
     store.schema().trim(),
     "",
-    "## 现有知识页（用于判断新建还是更新）",
-    index || "（暂无）",
+    catalog.complete ? "## 现有知识页（用于判断新建还是更新）" : "## 现有知识页候选目录（用于判断新建还是更新）",
+    index || (catalog.size === 0 ? "（暂无）" : "（本段未直接命中候选；不代表空间没有知识页）"),
     "",
     "## 待提炼的原始条目",
     entries,
@@ -154,7 +152,68 @@ function analyzePrompt(store: SpaceStore, batch: SourceFragment[]): string {
     "- 值得沉淀的，规划成对页面的 create/update 操作；若与现有页相关请复用其 name/slug 以更新。",
     "- 每个操作的 rawIds 必须来自上面条目的真实 id。",
     "- 带 part 的条目是完整来源的一段；仅规划本段实际出现的知识，后续会合并同一知识页的计划。",
+    ...(!catalog.complete ? ["- 候选目录不是全库。优先复用相关候选；拟新建时填写清楚 title 和 reason 中的主题、对象与用途，系统将补查其他旧页。"] : []),
   ].join("\n");
+}
+
+function reuseOperationLine(item: { id: string; op: PlannedOp }): string {
+  return JSON.stringify({ operation: item.id, type: item.op.type, name: item.op.name.slice(0, 240),
+    title: item.op.title.slice(0, 255), reason: (item.op.reason ?? "").slice(0, 1_000) });
+}
+
+async function reusePlannedPages(
+  client: LlmClient, store: SpaceStore, catalog: DreamCatalog, operations: PlannedOp[], model: string | undefined, signal?: AbortSignal,
+): Promise<PlannedOp[]> {
+  if (catalog.complete) return operations;
+  const resolved = new Map<PlannedOp, PlannedOp>();
+  const novel = operations.map((op, index) => ({ id: `op-${index + 1}`, op }))
+    .filter(({ op }) => !catalog.get(canonicalSlug(op.type, op.name)));
+  for (const operationBatch of dreamCatalogBatches(novel, reuseOperationLine)) {
+    let pending = operationBatch;
+    for (const pages of catalog.reuseBatches(pending.map(({ op }) => `${op.name}\n${op.title}\n${op.reason ?? ""}`))) {
+      if (signal?.aborted) throw signal.reason ?? new Error("distillation cancelled");
+      const ids = new Set(pending.map(item => item.id));
+      const pagesBySlug = new Map(pages.map(({ ref }) => [ref.slug, ref]));
+      const { value } = await client.completeJSON<Array<{ operation: string; slug: string }>>({
+        model, space: store.space, purpose: "distill", maxTokens: AI_ROUTING_MAX_TOKENS,
+        system: "你严格按 schema 输出结构化结果，核对新建知识页是否应复用旧页。",
+        prompt: ["## 新建页面复用检查", "## 拟新建页面", ...pending.map(reuseOperationLine), "",
+          "## 本空间已有页面（本批）", ...pages.map(page => page.line), "",
+          "逐项判断是否与本批某个旧页描述同一知识主题、对象与用途；同义表达和别名也应复用。",
+          "只在应合并更新而非仅相关时返回 operation 和已有页 slug；每个 operation 最多匹配一个旧页。",
+          "无对应旧页的 operation 不放入 matches；后续会继续检查剩余目录，不在这里创建页面。"].join("\n"),
+        schema: { type: "object", properties: { matches: { type: "array", maxItems: pending.length,
+          items: { type: "object", properties: { operation: { type: "string", enum: [...ids] },
+            slug: { type: "string", enum: [...pagesBySlug.keys()] } }, required: ["operation", "slug"] } } }, required: ["matches"] },
+        validate(raw) {
+          if (!raw || typeof raw !== "object" || !("matches" in raw) || !Array.isArray(raw.matches)
+            || raw.matches.length > pending.length) throw new Error("invalid Dream catalog matches");
+          const seen = new Set<string>();
+          const matches: Array<{ operation: string; slug: string }> = [];
+          for (const match of raw.matches) {
+            if (!match || typeof match !== "object" || typeof match.operation !== "string" || typeof match.slug !== "string"
+              || !ids.has(match.operation) || seen.has(match.operation) || !pagesBySlug.has(match.slug)) {
+              throw new Error("invalid Dream catalog match identity");
+            }
+            seen.add(match.operation);
+            matches.push({ operation: match.operation, slug: match.slug });
+          }
+          return matches;
+        },
+      });
+      if (signal?.aborted) throw signal.reason ?? new Error("distillation cancelled");
+      for (const match of value) {
+        const item = pending.find(item => item.id === match.operation)!;
+        const page = pagesBySlug.get(match.slug)!;
+        const type = page.type;
+        if (type !== "entity" && type !== "concept" && type !== "source" && type !== "analysis") throw new Error("invalid Dream catalog page type");
+        resolved.set(item.op, { ...item.op, type, name: page.slug, title: page.title });
+      }
+      pending = pending.filter(item => !resolved.has(item.op));
+      if (pending.length === 0) break;
+    }
+  }
+  return operations.map(op => resolved.get(op) ?? op);
 }
 
 async function analyze(
@@ -166,6 +225,7 @@ async function analyze(
   signal?: AbortSignal,
 ): Promise<AnalyzeResult> {
   const groups = groupSourceFragments(splitSourceFragments(batch, MAX_ANALYZE_SOURCE_CHARACTERS));
+  const catalog = new DreamCatalog(store);
   const operations = new Map<string, PlannedOp>();
   const skipped = new Map<string, number>();
   const appearances = new Map<string, number>();
@@ -179,14 +239,17 @@ async function analyze(
     const { value } = await client.completeJSON<AnalyzeResult>({
       model,
       system: "你严格按 schema 输出结构化结果，不要输出多余文本。",
-      prompt: analyzePrompt(store, group),
+      prompt: analyzePrompt(store, group, catalog),
       schema: ANALYZE_SCHEMA as unknown as Record<string, unknown>,
       validate: validateAnalyze,
       maxTokens: AI_ROUTING_MAX_TOKENS,
       purpose: "distill",
       space: store.space,
     });
-    for (const op of value.operations) {
+    const validOperations = value.operations.map(op => ({ ...op, rawIds: [...new Set(op.rawIds.filter(id => ids.has(id)))] }))
+      .filter(op => op.rawIds.length > 0);
+    const planned = await reusePlannedPages(client, store, catalog, validOperations, model, signal);
+    for (const op of planned) {
       const rawIds = [...new Set(op.rawIds.filter(id => ids.has(id)))];
       if (rawIds.length === 0) continue;
       const key = canonicalSlug(op.type, op.name);
@@ -196,6 +259,8 @@ async function analyze(
         ? { ...previous, rawIds: [...new Set([...previous.rawIds, ...rawIds])],
           sourceFragments: [...new Set([...previous.sourceFragments!, ...sourceFragments])] }
         : { ...op, rawIds, sourceFragments });
+      catalog.remember({ slug: key, type: op.type, title: op.title, summary: op.reason ?? "本轮已规划的知识页",
+        aliases: [], tags: [] });
     }
     for (const id of new Set(value.skippedRawIds.filter(id => ids.has(id)))) skipped.set(id, (skipped.get(id) ?? 0) + 1);
     const classifiedIds = new Set([...value.operations.flatMap(op => op.rawIds), ...value.skippedRawIds]);
@@ -210,15 +275,6 @@ async function analyze(
 }
 
 // ---- step 2: generate ------------------------------------------------------
-
-interface GeneratedPage {
-  title: string;
-  summary: string;
-  aliases?: string[];
-  tags?: string[];
-  links: string[];
-  content: string;
-}
 
 const MAX_SEARCH_METADATA_ITEMS = 64;
 const MAX_SEARCH_METADATA_VALUE_CHARACTERS = 200;
@@ -333,6 +389,8 @@ function generatePrompt(
   sources: SourceFragment[],
   evidence?: string,
   extractOnly = false,
+  sharedTargets?: Array<{ slug: string; op: PlannedOp }>,
+  partialUpdate = false,
 ): string {
   const src = evidence ? "" : sources
     .map((fragment) => {
@@ -344,7 +402,10 @@ function generatePrompt(
     })
     .join("\n\n");
   const parts = [
-    extractOnly
+    sharedTargets
+      ? "请一次阅读当前来源分段，为每个目标知识页分别提取相关知识。"
+      : partialUpdate ? `请为知识页「${op.title}」(slug: ${slug}, 类型: ${op.type}) 更新受新来源影响的内容块。`
+      : extractOnly
       ? `请为知识页「${op.title}」(slug: ${slug}, 类型: ${op.type}) 提取当前来源分段中的相关知识。`
       : `请为知识页「${op.title}」(slug: ${slug}, 类型: ${op.type}) 生成完整内容。`,
     "",
@@ -352,6 +413,15 @@ function generatePrompt(
     store.schema().trim(),
     "",
   ];
+  if (sharedTargets) parts.push(
+    "## 多页共享提取",
+    ...sharedTargets.map(({ slug: targetSlug, op: target }) => JSON.stringify({ slug: targetSlug, title: target.title, type: target.type })),
+    "- pages 必须恰好包含上述每个 slug 一次，不得遗漏、重复或新增目标页。",
+    "- 每项的 content、summary、aliases、tags、links 仅属于该目标页；不要混入其他目标页的专属知识。",
+    "- 所有目标页均已规划使用本组来源；逐页保留相关的全部细节，不要因同时提取多个页面而缩写或遗漏。",
+    `来源 metadata：${evidenceSources(sources)}`,
+    "",
+  );
   if (existing) {
     parts.push(
       "## 该页现有内容（请在此基础上合并更新，不要丢失既有信息）",
@@ -379,7 +449,8 @@ function generatePrompt(
     evidence ?? src,
     "",
     "要求：",
-    extractOnly
+    partialUpdate ? "- 按局部更新契约返回内容块修改，不输出整页；其余内容由系统保留。"
+      : extractOnly
       ? "- content 只写本段与目标页有关的独立知识片段，不要生成或重写整页，不要复述其他分段。"
       : evidence
         ? "- content 为完整主文，组织导读、当前结论与既有知识的更新；来源分段详情由系统完整附加。"
@@ -432,6 +503,105 @@ function evidenceSources(group: SourceFragment[]): string {
     createdAt: raw.createdAt, part, totalParts,
     ...(isChatSourceSnapshot(raw) ? { chatId: raw.chatId, messageId: raw.messageId, updatedAt: chatRawEntryUpdatedAt(raw) } : {}),
   })));
+}
+
+interface SharedExtraction {
+  sources: SourceFragment[];
+  targets: Array<{ slug: string; op: PlannedOp }>;
+  result?: Promise<Map<string, GeneratedPage>>;
+}
+
+/** Group only identical target sets, so every note has exactly these sources. */
+function sharedExtractions(operations: PlannedOp[], batch: RawRecord[]): Map<SourceFragment, SharedExtraction> {
+  // analyze() shares the same fragment objects between all matching operations.
+  const targetsBySource = new Map<SourceFragment, SharedExtraction["targets"]>();
+  for (const op of operations) {
+    const target = { slug: canonicalSlug(op.type, op.name), op };
+    for (const fragment of op.sourceFragments ?? []) {
+      const targets = targetsBySource.get(fragment) ?? [];
+      targets.push(target);
+      targetsBySource.set(fragment, targets);
+    }
+  }
+  const rawOrder = new Map(batch.map((raw, index) => [raw.id, index]));
+  const fragments = [...targetsBySource.keys()].sort((a, b) => rawOrder.get(a.raw.id)! - rawOrder.get(b.raw.id)! || a.start - b.start);
+  const shared = new Map<SourceFragment, SharedExtraction>();
+  let current: SharedExtraction | undefined;
+  let currentCharacters = 0;
+  for (const fragment of fragments) {
+    const targets = targetsBySource.get(fragment)!;
+    if (targets.length < 2) {
+      current = undefined;
+      continue;
+    }
+    if (!current || currentCharacters + fragment.content.length > MAX_GENERATE_SOURCE_CHARACTERS
+      || targets.length !== current.targets.length || targets.some((target, index) => target.slug !== current!.targets[index]!.slug)) {
+      current = { sources: [], targets };
+      currentCharacters = 0;
+    }
+    current.sources.push(fragment);
+    currentCharacters += fragment.content.length;
+    shared.set(fragment, current);
+  }
+  return shared;
+}
+
+function generationSteps(fragments: SourceFragment[], shared: Map<SourceFragment, SharedExtraction>): Array<{
+  sources: SourceFragment[]; shared?: SharedExtraction;
+}> {
+  const steps: Array<{ sources: SourceFragment[]; shared?: SharedExtraction }> = [];
+  const seen = new Set<SharedExtraction>();
+  let privateSources: SourceFragment[] = [];
+  const flush = () => {
+    steps.push(...groupSourceFragments(privateSources).map(sources => ({ sources })));
+    privateSources = [];
+  };
+  for (const fragment of fragments) {
+    const extraction = shared.get(fragment);
+    if (!extraction) privateSources.push(fragment);
+    else {
+      flush();
+      if (!seen.has(extraction)) steps.push({ sources: extraction.sources, shared: extraction });
+      seen.add(extraction);
+    }
+  }
+  flush();
+  return steps;
+}
+
+async function extractShared(
+  client: LlmClient, store: SpaceStore, extraction: SharedExtraction, model: string | undefined,
+): Promise<Map<string, GeneratedPage>> {
+  // Retain failures too: a sibling page must not repeat the same failed call.
+  extraction.result ??= (async () => {
+    const slugs = extraction.targets.map(target => target.slug);
+    const first = extraction.targets[0]!;
+    const { value } = await client.completeJSON<Map<string, GeneratedPage>>({
+      model, purpose: "distill", space: store.space, maxTokens: AI_GENERATION_MAX_TOKENS,
+      system: "你严格按 schema 输出结构化结果，一次读取来源，为每个目标页分别提取知识，不重写整页。",
+      prompt: generatePrompt(store, first.op, first.slug, null, extraction.sources, undefined, true, extraction.targets),
+      schema: {
+        type: "object",
+        properties: { pages: { type: "array", minItems: slugs.length, maxItems: slugs.length,
+          items: { ...EXTRACT_SCHEMA, properties: { ...EXTRACT_SCHEMA.properties, slug: { type: "string", enum: slugs } },
+            required: [...EXTRACT_SCHEMA.required, "slug"] } } },
+        required: ["pages"],
+      },
+      validate(raw) {
+        if (!raw || typeof raw !== "object" || !("pages" in raw) || !Array.isArray(raw.pages)
+          || raw.pages.length !== slugs.length) throw new Error("shared extraction missing planned pages");
+        const notes = new Map<string, GeneratedPage>();
+        for (const page of raw.pages) {
+          if (!page || typeof page !== "object" || typeof page.slug !== "string"
+            || !slugs.includes(page.slug) || notes.has(page.slug)) throw new Error("shared extraction has invalid page identity");
+          notes.set(page.slug, validateEvidence(page));
+        }
+        return notes;
+      },
+    });
+    return value;
+  })();
+  return extraction.result;
 }
 
 /** Reduce only navigation text. The evidence bodies are retained unchanged. */
@@ -501,23 +671,49 @@ async function generate(
   onProgress?: (progress: DreamProgress) => void,
   pageIndex = 1,
   signal?: AbortSignal,
+  shared = new Map<SourceFragment, SharedExtraction>(),
 ): Promise<GeneratedPage> {
-  const groups = groupSourceFragments(op.sourceFragments ?? splitSourceFragments(sources));
+  const partialUpdate = existing !== null && existing.content.length > PAGE_UPDATE_CHARACTERS && op.sourceFragments !== undefined;
+  const completePage = async (group: SourceFragment[], evidence?: string): Promise<GeneratedPage> => {
+    if (partialUpdate && existing) return updateLargePage({
+      page: existing, client, model, space: store.space, signal,
+      prompt: generatePrompt(store, op, slug, null, group, evidence, false, undefined, true)
+        + `\n\n来源 metadata：${evidenceSources(group)}`,
+      query: evidence ?? group.map(fragment => fragment.content).join("\n"),
+      reviewAll: group.some(fragment => fragment.raw.source === "manual"),
+      versions: group.filter(fragment => isChatSourceSnapshot(fragment.raw)).map(fragment => fragment.raw),
+      validate: validateGenerate,
+    });
+    const { value } = await client.completeJSON<GeneratedPage>({ model,
+      system: "你严格按 schema 输出结构化结果，content 为完整 markdown 正文。",
+      prompt: generatePrompt(store, op, slug, existing, group, evidence),
+      schema: GENERATE_SCHEMA, validate: validateGenerate, maxTokens: AI_GENERATION_MAX_TOKENS, purpose: "distill", space: store.space });
+    return value;
+  };
+  const steps = generationSteps(op.sourceFragments ?? splitSourceFragments(sources), shared);
+  const groups = steps.map(step => step.sources);
+  const extractOnly = steps.length > 1 || steps.some(step => step.shared);
   const notes: GeneratedPage[] = [];
-  for (const [index, group] of groups.entries()) {
+  for (const [index, step] of steps.entries()) {
+    const group = step.sources;
     if (signal?.aborted) throw signal.reason ?? new Error("distillation cancelled");
-    const extractOnly = groups.length > 1;
     onProgress?.({
       stage: extractOnly ? "extracting" : "generating", page: { slug, title: op.title.slice(0, 255), index: pageIndex },
       chunk: { index: index + 1, total: groups.length },
       sources: dreamSourceRefs(group.map((fragment) => fragment.raw)), sourceCount: group.length,
     });
+    if (step.shared) {
+      const extracted = await extractShared(client, store, step.shared, model);
+      notes.push(extracted.get(slug)!);
+      continue;
+    }
+    if (!extractOnly) { notes.push(await completePage(group)); continue; }
     const { value } = await client.completeJSON<GeneratedPage>({
       model,
-      system: extractOnly ? "你严格按 schema 输出结构化结果，只提取当前来源分段的知识，不重写整页。" : "你严格按 schema 输出结构化结果，content 为完整 markdown 正文。",
-      prompt: generatePrompt(store, op, slug, extractOnly ? null : existing, group, undefined, extractOnly),
-      schema: extractOnly ? EXTRACT_SCHEMA : GENERATE_SCHEMA,
-      validate: extractOnly ? validateEvidence : validateGenerate,
+      system: "你严格按 schema 输出结构化结果，只提取当前来源分段的知识，不重写整页。",
+      prompt: generatePrompt(store, op, slug, null, group, undefined, true),
+      schema: EXTRACT_SCHEMA,
+      validate: validateEvidence,
       maxTokens: AI_GENERATION_MAX_TOKENS,
       purpose: "distill",
       space: store.space,
@@ -526,7 +722,7 @@ async function generate(
   }
   let final = notes[0];
   if (!final) throw new Error("knowledge page generation has no source content");
-  if (notes.length > 1) {
+  if (extractOnly) {
     onProgress?.({ stage: "generating", page: { slug, title: op.title.slice(0, 255), index: pageIndex },
       sources: dreamSourceRefs(sources), sourceCount: sources.length });
     let evidence = await evidenceForMerge(client, notes, groups, model, store, signal);
@@ -534,13 +730,7 @@ async function generate(
     const tags = normalizeSearchMetadata(notes.flatMap(note => note.tags ?? []));
     evidence += `\n\n分段中有来源支持的检索元数据候选（仍需按当前事实校正）：\naliases: ${JSON.stringify(aliases)}\ntags: ${JSON.stringify(tags)}`;
     if (signal?.aborted) throw signal.reason ?? new Error("distillation cancelled");
-    const { value } = await client.completeJSON<GeneratedPage>({
-      model, system: "你严格按 schema 输出结构化结果，集中生成知识页主文。全部分段知识由系统原样保留，不要重复抄写。",
-      prompt: generatePrompt(store, op, slug, existing, groups.flat(), evidence),
-      schema: GENERATE_SCHEMA, validate: validateGenerate,
-      maxTokens: AI_GENERATION_MAX_TOKENS, purpose: "distill", space: store.space,
-    });
-    final = value;
+    final = await completePage(groups.flat(), evidence);
     final = { ...final,
       // Do not recursively summarize away facts to satisfy a final prompt budget.
       // These are source evidence, rather than a second set of current conclusions.
@@ -551,6 +741,7 @@ async function generate(
       links: [...new Set([...final.links, ...notes.flatMap(note => note.links)])],
     };
   }
+  if (partialUpdate && pageBaseHash(store.index().getPage(slug)) !== pageBaseHash(existing)) throw new Error("knowledge page changed during local update");
   return { ...final,
     aliases: resolveSearchMetadata(existing?.aliases, final.aliases),
     tags: resolveSearchMetadata(existing?.tags, final.tags),
@@ -923,18 +1114,22 @@ export async function runDreamCycle(
   deps.onProgress?.({ stage: "preparing", pagesTotal: plan.operations.length,
     pagesCompleted: 0, skippedRaw: report.skipped });
 
-  for (const [operationIndex, op] of plan.operations.entries()) {
-    throwIfAborted();
+  const prepared = plan.operations.map(op => {
     const slug = canonicalSlug(op.type, op.name);
-    const sources = op.rawIds.map((id) => rawById.get(id)).filter((r): r is RawRecord => !!r);
+    const sources = op.rawIds.map(id => rawById.get(id)).filter((raw): raw is RawRecord => !!raw);
+    const existing = idx.getPage(slug);
+    const hash = sourceHash(sources, existing, op.sourceFragments);
+    return { op, slug, sources, existing, hash, cached: isCacheHit(existing, hash, force) };
+  });
+  const shared = sharedExtractions(prepared.filter(page => page.sources.length > 0 && !page.cached).map(page => page.op), batch);
+
+  for (const [operationIndex, { op, slug, sources, existing, hash, cached }] of prepared.entries()) {
+    throwIfAborted();
     if (sources.length === 0) {
       deps.onProgress?.({ stage: "preparing", pagesCompleted: operationIndex + 1 });
       continue;
     }
-    const existing = idx.getPage(slug);
-    const hash = sourceHash(sources, existing, op.sourceFragments);
-
-    if (isCacheHit(existing, hash, force)) {
+    if (cached) {
       // Unchanged source set — keep the page, mark its raw ingested.
       for (const s of sources) ingestedIds.add(s.id);
       report.distilled += sources.length;
@@ -943,7 +1138,7 @@ export async function runDreamCycle(
     }
 
     try {
-      const gen = await generate(client, store, op, slug, existing, sources, model, deps.onProgress, operationIndex + 1, opts.signal);
+      const gen = await generate(client, store, op, slug, existing, sources, model, deps.onProgress, operationIndex + 1, opts.signal, shared);
       throwIfAborted();
       const mergedSources = [...new Set([...(existing?.sources ?? []), ...sources.map((s) => s.id)])];
       const page: Page = {
