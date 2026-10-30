@@ -10,6 +10,7 @@
  *   Step 2 (generate): short inputs produce a page directly. Long inputs first
  *     yield independent evidence notes, then merge into the existing page once.
  *     Fragments feeding multiple pages are extracted together once per cycle.
+ *     Independent extractions run with bounded concurrency and retain source order.
  *     Notes remain verbatim in source-detail sections; oversized merge inputs use
  *     a reduced overview. Intermediate pages are never replayed.
  *
@@ -21,13 +22,13 @@
  * After distillation the deterministic topic maps plus index/glossary/overview
  * are refreshed and a log entry is appended.
  */
-import type { DreamReport, Page, RawRecord } from "@homeagent/shared";
+import type { DreamModels, DreamReport, Page, RawRecord } from "@homeagent/shared";
 import { chatRawEntryUpdatedAt, isChatSourceSnapshot } from "./chat-raw-import.ts";
 import { dreamSourceRefs, type DreamProgress } from "./dream-progress.ts";
 import {
+  AI_DREAM_EXTRACTION_CONCURRENCY,
   AI_GENERATION_MAX_TOKENS,
   AI_ROUTING_MAX_TOKENS,
-  config,
   logger,
 } from "@homeagent/shared";
 import type { SpaceStore } from "./space.ts";
@@ -41,6 +42,8 @@ import { canonicalSlug } from "./slug.ts";
 import { refreshDigest } from "./digest.ts";
 import { DreamCatalog, dreamCatalogBatches } from "./dream-catalog.ts";
 import { PAGE_UPDATE_CHARACTERS, updateLargePage, type GeneratedPage } from "./dream-page-update.ts";
+import { DreamExtractionCache, extractionDigest } from "./dream-extraction-cache.ts";
+import { DreamExecution, dreamMetricsLog } from "./dream-execution.ts";
 import {
   removeQuarantineRecordsCoveredBy,
   writeQuarantineRecord,
@@ -485,6 +488,8 @@ const EXTRACT_SCHEMA = {
     content: { type: "string", description: "only the knowledge contributed by this source group; never a whole page" },
   },
 };
+const EXTRACT_SYSTEM = "你严格按 schema 输出结构化结果，只提取当前来源分段的知识，不重写整页。";
+const SHARED_EXTRACT_SYSTEM = "你严格按 schema 输出结构化结果，一次读取来源，为每个目标页分别提取知识，不重写整页。";
 const OVERVIEW_SCHEMA = {
   type: "object",
   properties: { summary: { type: "string", minLength: 1, maxLength: MAX_EVIDENCE_SUMMARY_CHARACTERS } },
@@ -509,6 +514,7 @@ interface SharedExtraction {
   sources: SourceFragment[];
   targets: Array<{ slug: string; op: PlannedOp }>;
   result?: Promise<Map<string, GeneratedPage>>;
+  failure?: { error: unknown };
 }
 
 /** Group only identical target sets, so every note has exactly these sources. */
@@ -569,17 +575,107 @@ function generationSteps(fragments: SourceFragment[], shared: Map<SourceFragment
   return steps;
 }
 
+type ExtractionStep = ReturnType<typeof generationSteps>[number];
+interface ExtractionPlan { steps: ExtractionStep[]; cache?: DreamExtractionCache }
+
+/** A cache failure may cost another extraction, but must not lose usable evidence. */
+function tryExtractionCache<T>(action: () => T): T | undefined {
+  try { return action(); }
+  catch { log.warn("Dream extraction checkpoint unavailable; continuing from Raw"); return undefined; }
+}
+
+function sameFragments(a: SourceFragment[], b: SourceFragment[]): boolean {
+  return a.length === b.length && a.every((source, index) => source === b[index]);
+}
+
+/** Keep each page's original group boundaries, even when retrying a shared result alone. */
+class ExtractionSession {
+  private readonly plans = new Map<PlannedOp, ExtractionPlan>();
+  constructor(
+    readonly client: LlmClient,
+    private readonly store: SpaceStore,
+    readonly model: string | undefined,
+    private readonly sources: RawRecord[],
+    private readonly shared = new Map<SourceFragment, SharedExtraction>(),
+    private readonly reuse = true,
+    readonly reusedExtraction: () => void = () => {},
+  ) {}
+
+  forOperation(op: PlannedOp): ExtractionPlan {
+    const prior = this.plans.get(op);
+    if (prior) return prior;
+    const fragments = op.sourceFragments ?? splitSourceFragments(this.sources.filter(raw => op.rawIds.includes(raw.id)));
+    const original = generationSteps(fragments, this.shared);
+    const create = original.length > 1 || original.some(step => step.shared);
+    const cache = tryExtractionCache(() => {
+      const identity = this.client.cacheIdentity;
+      if (!identity) return undefined;
+      const slug = canonicalSlug(op.type, op.name);
+      // Hash the actual extraction rules, target, provider configuration and every
+      // frozen source range. No Raw text or provider configuration enters filenames.
+      const key = extractionDigest({ version: 1, space: this.store.space, identity, model: this.model,
+        purpose: this.store.purpose(), schema: EXTRACT_SCHEMA, systems: [EXTRACT_SYSTEM, SHARED_EXTRACT_SYSTEM],
+        maxTokens: AI_GENERATION_MAX_TOKENS, groupCharacters: MAX_GENERATE_SOURCE_CHARACTERS,
+        sharedRules: generatePrompt(this.store, op, slug, null, [], undefined, true, [{ slug, op }]),
+        fragments: fragments.map(fragment => [fragment.start, fragment.end, evidenceSources([fragment]),
+          extractionDigest(generatePrompt(this.store, op, slug, null, [fragment], undefined, true))]),
+      });
+      return DreamExtractionCache.open(this.store, { key, rawIds: [...new Set(fragments.map(fragment => fragment.raw.id))],
+        groups: original.map(step => step.sources.length), create, reuse: this.reuse });
+    });
+    let steps = original;
+    if (cache) {
+      let offset = 0;
+      steps = cache.groups.map(size => {
+        const sources = fragments.slice(offset, offset += size);
+        const shared = this.shared.get(sources[0]!);
+        return { sources, ...(shared && sameFragments(shared.sources, sources) ? { shared } : {}) };
+      });
+      // A malformed grouping cannot bypass the normal input budget.
+      if (steps.some(step => step.sources.reduce((size, source) => size + source.content.length, 0) > MAX_GENERATE_SOURCE_CHARACTERS)) {
+        tryExtractionCache(() => cache.complete());
+        const result = { steps: original };
+        this.plans.set(op, result);
+        return result;
+      }
+    }
+    const result = { steps, ...(cache ? { cache } : {}) };
+    this.plans.set(op, result);
+    return result;
+  }
+
+  load(op: PlannedOp, index: number): GeneratedPage | undefined {
+    return tryExtractionCache(() => this.forOperation(op).cache?.get(index));
+  }
+  save(op: PlannedOp, index: number, note: GeneratedPage): void {
+    tryExtractionCache(() => this.forOperation(op).cache?.put(index, note));
+  }
+  complete(op: PlannedOp): void {
+    tryExtractionCache(() => this.plans.get(op)?.cache?.complete());
+  }
+}
+
 async function extractShared(
   client: LlmClient, store: SpaceStore, extraction: SharedExtraction, model: string | undefined,
+  session: ExtractionSession,
 ): Promise<Map<string, GeneratedPage>> {
   // Retain failures too: a sibling page must not repeat the same failed call.
   extraction.result ??= (async () => {
-    const slugs = extraction.targets.map(target => target.slug);
-    const first = extraction.targets[0]!;
+    const notes = new Map<string, GeneratedPage>();
+    const pending = extraction.targets.flatMap(target => {
+      const index = session.forOperation(target.op).steps.findIndex(step => sameFragments(step.sources, extraction.sources));
+      if (index < 0) return [];
+      const cached = session.load(target.op, index);
+      if (cached) { notes.set(target.slug, cached); return []; }
+      return [{ ...target, index }];
+    });
+    if (!pending.length) return notes;
+    const slugs = pending.map(target => target.slug);
+    const first = pending[0]!;
     const { value } = await client.completeJSON<Map<string, GeneratedPage>>({
       model, purpose: "distill", space: store.space, maxTokens: AI_GENERATION_MAX_TOKENS,
-      system: "你严格按 schema 输出结构化结果，一次读取来源，为每个目标页分别提取知识，不重写整页。",
-      prompt: generatePrompt(store, first.op, first.slug, null, extraction.sources, undefined, true, extraction.targets),
+      system: SHARED_EXTRACT_SYSTEM,
+      prompt: generatePrompt(store, first.op, first.slug, null, extraction.sources, undefined, true, pending),
       schema: {
         type: "object",
         properties: { pages: { type: "array", minItems: slugs.length, maxItems: slugs.length,
@@ -599,9 +695,18 @@ async function extractShared(
         return notes;
       },
     });
-    return value;
+    for (const target of pending) {
+      const note = value.get(target.slug)!;
+      session.save(target.op, target.index, note);
+      notes.set(target.slug, note);
+    }
+    return notes;
   })();
-  return extraction.result;
+  try { return await extraction.result; }
+  catch (error) {
+    extraction.failure = { error };
+    throw error;
+  }
 }
 
 /** Reduce only navigation text. The evidence bodies are retained unchanged. */
@@ -671,7 +776,7 @@ async function generate(
   onProgress?: (progress: DreamProgress) => void,
   pageIndex = 1,
   signal?: AbortSignal,
-  shared = new Map<SourceFragment, SharedExtraction>(),
+  session = new ExtractionSession(client, store, model, sources),
 ): Promise<GeneratedPage> {
   const partialUpdate = existing !== null && existing.content.length > PAGE_UPDATE_CHARACTERS && op.sourceFragments !== undefined;
   const completePage = async (group: SourceFragment[], evidence?: string): Promise<GeneratedPage> => {
@@ -690,27 +795,28 @@ async function generate(
       schema: GENERATE_SCHEMA, validate: validateGenerate, maxTokens: AI_GENERATION_MAX_TOKENS, purpose: "distill", space: store.space });
     return value;
   };
-  const steps = generationSteps(op.sourceFragments ?? splitSourceFragments(sources), shared);
+  const { steps, cache } = session.forOperation(op);
   const groups = steps.map(step => step.sources);
-  const extractOnly = steps.length > 1 || steps.some(step => step.shared);
+  const extractOnly = !!cache || steps.length > 1 || steps.some(step => step.shared);
+  // A previous page may already have observed a shared failure. Do not start
+  // more work for a page whose required evidence is known to be unavailable.
+  const failedShared = steps.find((step, index) => step.shared?.failure && !session.load(op, index))?.shared?.failure;
+  if (failedShared) throw failedShared.error;
   const notes: GeneratedPage[] = [];
-  for (const [index, step] of steps.entries()) {
+  let reused = 0;
+  const extractStep = async (index: number): Promise<GeneratedPage> => {
+    const step = steps[index]!;
     const group = step.sources;
-    if (signal?.aborted) throw signal.reason ?? new Error("distillation cancelled");
-    onProgress?.({
-      stage: extractOnly ? "extracting" : "generating", page: { slug, title: op.title.slice(0, 255), index: pageIndex },
-      chunk: { index: index + 1, total: groups.length },
-      sources: dreamSourceRefs(group.map((fragment) => fragment.raw)), sourceCount: group.length,
-    });
+    const cached = session.load(op, index);
+    if (cached) { reused++; session.reusedExtraction(); return cached; }
     if (step.shared) {
-      const extracted = await extractShared(client, store, step.shared, model);
-      notes.push(extracted.get(slug)!);
-      continue;
+      const extracted = await extractShared(session.client, store, step.shared, session.model, session);
+      return extracted.get(slug)!;
     }
-    if (!extractOnly) { notes.push(await completePage(group)); continue; }
-    const { value } = await client.completeJSON<GeneratedPage>({
-      model,
-      system: "你严格按 schema 输出结构化结果，只提取当前来源分段的知识，不重写整页。",
+    if (!extractOnly) return completePage(group);
+    const { value } = await session.client.completeJSON<GeneratedPage>({
+      model: session.model,
+      system: EXTRACT_SYSTEM,
       prompt: generatePrompt(store, op, slug, null, group, undefined, true),
       schema: EXTRACT_SCHEMA,
       validate: validateEvidence,
@@ -718,8 +824,56 @@ async function generate(
       purpose: "distill",
       space: store.space,
     });
-    notes.push(value);
-  }
+    session.save(op, index, value);
+    return value;
+  };
+  const throwIfAborted = () => {
+    if (signal?.aborted) throw signal.reason ?? new Error("distillation cancelled");
+  };
+  let next = 0;
+  let completed = 0;
+  let failed = false;
+  let failure: unknown;
+  const active = new Set<number>();
+  const progress = () => {
+    const first = active.values().next().value;
+    const currentSources = first === undefined ? sources
+      : [...new Set([...active].flatMap(index => steps[index]!.sources.map(fragment => fragment.raw)))];
+    onProgress?.({
+      stage: extractOnly ? "extracting" : "generating", page: { slug, title: op.title.slice(0, 255), index: pageIndex },
+      ...(first === undefined ? {} : { chunk: { index: first + 1, total: steps.length } }),
+      ...(extractOnly ? { extraction: { active: active.size, completed, total: steps.length, reused } } : {}),
+      sources: dreamSourceRefs(currentSources), sourceCount: currentSources.length,
+    });
+  };
+  const worker = async () => {
+    try {
+      while (!failed && next < steps.length) {
+        throwIfAborted();
+        const index = next++;
+        active.add(index);
+        try {
+          progress();
+          throwIfAborted();
+          const note = await extractStep(index);
+          throwIfAborted();
+          // Completion order must never change evidence order or provenance.
+          notes[index] = note;
+          completed++;
+        } finally {
+          active.delete(index);
+          progress();
+        }
+      }
+    } catch (error) {
+      if (!failed) { failed = true; failure = error; }
+    }
+  };
+  // Drain started calls before merge, quarantine, cancellation or releasing the
+  // Space serializer. Successful shared results remain reusable by sibling pages.
+  await Promise.all(Array.from({ length: Math.min(extractOnly ? AI_DREAM_EXTRACTION_CONCURRENCY : 1, steps.length) }, worker));
+  throwIfAborted();
+  if (failed) throw failure;
   let final = notes[0];
   if (!final) throw new Error("knowledge page generation has no source content");
   if (extractOnly) {
@@ -828,7 +982,7 @@ export async function regeneratePageFromSources(
   store: SpaceStore,
   slug: string,
   extraRawIds: string[] = [],
-  opts: { model?: string; allowMissingExistingSources?: boolean } = {},
+  opts: { model?: string; models?: DreamModels; allowMissingExistingSources?: boolean } = {},
   deps: DreamDeps = {},
 ): Promise<Page> {
   const existing = store.index().getPage(slug);
@@ -862,10 +1016,13 @@ export async function regeneratePageFromSources(
     title: existing.title,
     rawIds,
   };
-  const client = deps.client ?? gatewayClient;
-  const model = opts.model ?? config().model;
+  const execution = new DreamExecution(deps.client ?? gatewayClient, opts, deps.onProgress);
+  const { client, model } = execution.phase("merge");
+  const extracting = execution.phase("extraction");
+  const session = new ExtractionSession(extracting.client, store, extracting.model, sources, undefined, false, () => execution.reusedExtraction());
   try {
-    const generated = await generate(client, store, op, slug, existing, sources, model);
+    execution.progress({ stage: "preparing", rawCount: sources.length, pagesTotal: 1, sources: dreamSourceRefs(sources), sourceCount: sources.length });
+    const generated = await generate(client, store, op, slug, existing, sources, model, execution.progress, 1, undefined, session);
     const page: Page = {
       slug,
       type: op.type,
@@ -889,12 +1046,16 @@ export async function regeneratePageFromSources(
     }
     store.index().markIngested([...availableRawIds]);
     removeQuarantineRecordsCoveredBy(store, slug, availableRawIds);
+    session.complete(op);
+    execution.progress({ stage: "indexing", pagesCompleted: 1, pagesWritten: 1, processedRaw: sources.length });
     return page;
   } catch (error) {
     removeQuarantineRecordsCoveredBy(store, slug, availableRawIds);
     quarantine(store, slug, error, sources, op, existing);
     store.index().markIngested([...availableRawIds]);
     throw error;
+  } finally {
+    execution.flush();
   }
 }
 
@@ -902,7 +1063,7 @@ export async function regeneratePageFromSources(
 export async function retryQuarantinedDreamOperation(
   store: SpaceStore,
   record: QuarantineRecord,
-  opts: { model?: string } = {},
+  opts: { model?: string; models?: DreamModels } = {},
   deps: DreamDeps = {},
 ): Promise<DreamReport> {
   const startedAt = Date.now();
@@ -954,10 +1115,12 @@ export async function retryQuarantinedDreamOperation(
       return { ...fragment, raw, content };
     }) } : {}),
   };
-  const client = deps.client ?? gatewayClient;
-  const model = opts.model ?? config().model;
+  const execution = new DreamExecution(deps.client ?? gatewayClient, opts, deps.onProgress);
+  const { client, model } = execution.phase("merge");
+  const extracting = execution.phase("extraction");
+  const session = new ExtractionSession(extracting.client, store, extracting.model, sources, undefined, true, () => execution.reusedExtraction());
   try {
-    deps.onProgress?.({ stage: "preparing", rawCount: sources.length, pagesTotal: 1,
+    execution.progress({ stage: "preparing", rawCount: sources.length, pagesTotal: 1,
       sources: dreamSourceRefs(sources), sourceCount: sources.length });
     const generated = await generate(
       client,
@@ -967,7 +1130,10 @@ export async function retryQuarantinedDreamOperation(
       existing,
       sources,
       model,
-      deps.onProgress,
+      execution.progress,
+      1,
+      undefined,
+      session,
     );
     const page: Page = {
       slug: record.slug,
@@ -982,10 +1148,10 @@ export async function retryQuarantinedDreamOperation(
       updatedAt: Date.now(),
       contentHash: sourceHash(sources, existing, op.sourceFragments),
     };
-    deps.onProgress?.({ stage: "saving", page: { slug: record.slug, title: operation.title.slice(0, 255), index: 1 } });
+    execution.progress({ stage: "saving", page: { slug: record.slug, title: operation.title.slice(0, 255), index: 1 } });
     store.writePage(page);
     try {
-      deps.onProgress?.({ stage: "indexing" });
+      execution.progress({ stage: "indexing" });
       refreshDigest(store);
     } catch (error) {
       if (existing) store.writePage(existing);
@@ -994,16 +1160,20 @@ export async function retryQuarantinedDreamOperation(
       throw error;
     }
     store.index().markIngested(operation.rawIds);
+    session.complete(op);
     report.processedRawIds = [...operation.rawIds];
     report.distilled = operation.rawIds.length;
     report.pagesWritten = 1;
-    deps.onProgress?.({ stage: "indexing", pagesCompleted: 1, pagesWritten: 1, processedRaw: sources.length });
+    execution.progress({ stage: "indexing", pagesCompleted: 1, pagesWritten: 1, processedRaw: sources.length });
   } catch (error) {
     quarantine(store, record.slug, error, sources, op, existing);
     store.index().markIngested(operation.rawIds);
     report.processedRawIds = [...operation.rawIds];
     report.pagesQuarantined = 1;
     report.errors.push(`generate ${record.slug} failed: ${String(error)}`);
+  } finally {
+    report.metrics = execution.snapshot();
+    execution.flush();
   }
   report.finishedAt = Date.now();
   try {
@@ -1015,7 +1185,8 @@ export async function retryQuarantinedDreamOperation(
 }
 
 function appendLog(store: SpaceStore, report: DreamReport): void {
-  const line = `- ${new Date(report.finishedAt).toISOString()}: examined=${report.examined} distilled=${report.distilled} skipped=${report.skipped} written=${report.pagesWritten} quarantined=${report.pagesQuarantined}`;
+  const line = `- ${new Date(report.finishedAt).toISOString()}: examined=${report.examined} distilled=${report.distilled} skipped=${report.skipped} written=${report.pagesWritten} quarantined=${report.pagesQuarantined}`
+    + (report.metrics ? dreamMetricsLog(report.metrics) : "");
   const existing = store.index().getPage("log");
   const header = "# Log\n\n提炼历史记录（自动生成）。\n\n";
   const body = (existing ? existing.content.replace(/^# Log[\s\S]*?\n\n[\s\S]*?\n\n/, "") : "") + line + "\n";
@@ -1047,8 +1218,18 @@ export async function runDreamCycle(
   opts: DreamOptions = {},
   deps: DreamDeps = {},
 ): Promise<DreamReport> {
-  const client = deps.client ?? gatewayClient;
-  const model = opts.model ?? config().model;
+  const execution = new DreamExecution(deps.client ?? gatewayClient, opts, deps.onProgress);
+  try {
+    const report = await executeDreamCycle(store, opts, execution);
+    report.metrics = execution.snapshot();
+    return report;
+  } finally { execution.flush(); }
+}
+
+async function executeDreamCycle(store: SpaceStore, opts: DreamOptions, execution: DreamExecution): Promise<DreamReport> {
+  const { client, model } = execution.phase("merge");
+  const planning = execution.phase("planning");
+  const extracting = execution.phase("extraction");
   const force = opts.force ?? false;
   const startedAt = Date.now();
   const errors: string[] = [];
@@ -1098,9 +1279,9 @@ export async function runDreamCycle(
   let plan: AnalyzeResult;
   try {
     throwIfAborted();
-    deps.onProgress?.({ stage: "analyzing", rawCount: batch.length,
+    execution.progress({ stage: "analyzing", rawCount: batch.length,
       sources: dreamSourceRefs(batch), sourceCount: batch.length });
-    plan = await analyze(client, store, batch, model, deps.onProgress, opts.signal);
+    plan = await analyze(planning.client, store, batch, planning.model, execution.progress, opts.signal);
     throwIfAborted();
   } catch (err) {
     throwIfAborted();
@@ -1111,7 +1292,7 @@ export async function runDreamCycle(
 
   const ingestedIds = new Set<string>(plan.skippedRawIds.filter((id) => rawById.has(id)));
   report.skipped = ingestedIds.size;
-  deps.onProgress?.({ stage: "preparing", pagesTotal: plan.operations.length,
+  execution.progress({ stage: "preparing", pagesTotal: plan.operations.length,
     pagesCompleted: 0, skippedRaw: report.skipped });
 
   const prepared = plan.operations.map(op => {
@@ -1122,23 +1303,27 @@ export async function runDreamCycle(
     return { op, slug, sources, existing, hash, cached: isCacheHit(existing, hash, force) };
   });
   const shared = sharedExtractions(prepared.filter(page => page.sources.length > 0 && !page.cached).map(page => page.op), batch);
+  const session = new ExtractionSession(extracting.client, store, extracting.model, batch, shared, !force, () => execution.reusedExtraction());
+  const completedOperations: PlannedOp[] = [];
 
   for (const [operationIndex, { op, slug, sources, existing, hash, cached }] of prepared.entries()) {
     throwIfAborted();
     if (sources.length === 0) {
-      deps.onProgress?.({ stage: "preparing", pagesCompleted: operationIndex + 1 });
+      execution.progress({ stage: "preparing", pagesCompleted: operationIndex + 1 });
       continue;
     }
     if (cached) {
       // Unchanged source set — keep the page, mark its raw ingested.
       for (const s of sources) ingestedIds.add(s.id);
       report.distilled += sources.length;
-      deps.onProgress?.({ stage: "preparing", pagesCompleted: operationIndex + 1 });
+      session.forOperation(op);
+      completedOperations.push(op);
+      execution.progress({ stage: "preparing", pagesCompleted: operationIndex + 1 });
       continue;
     }
 
     try {
-      const gen = await generate(client, store, op, slug, existing, sources, model, deps.onProgress, operationIndex + 1, opts.signal, shared);
+      const gen = await generate(client, store, op, slug, existing, sources, model, execution.progress, operationIndex + 1, opts.signal, session);
       throwIfAborted();
       const mergedSources = [...new Set([...(existing?.sources ?? []), ...sources.map((s) => s.id)])];
       const page: Page = {
@@ -1154,8 +1339,9 @@ export async function runDreamCycle(
         updatedAt: Date.now(),
         contentHash: hash,
       };
-      deps.onProgress?.({ stage: "saving", page: { slug, title: op.title.slice(0, 255), index: operationIndex + 1 } });
+      execution.progress({ stage: "saving", page: { slug, title: op.title.slice(0, 255), index: operationIndex + 1 } });
       store.writePage(page);
+      completedOperations.push(op);
       report.pagesWritten += 1;
       report.distilled += sources.length;
       for (const s of sources) ingestedIds.add(s.id);
@@ -1169,25 +1355,27 @@ export async function runDreamCycle(
       for (const s of sources) ingestedIds.add(s.id);
       errors.push(`generate ${slug} failed: ${String(err)}`);
     }
-    deps.onProgress?.({ stage: "preparing", pagesCompleted: operationIndex + 1,
+    execution.progress({ stage: "preparing", pagesCompleted: operationIndex + 1,
       pagesWritten: report.pagesWritten, pagesFailed: report.pagesQuarantined });
   }
 
   throwIfAborted();
-  deps.onProgress?.({ stage: "saving" });
+  execution.progress({ stage: "saving" });
   idx.markIngested([...ingestedIds]);
+  for (const op of completedOperations) session.complete(op);
   report.processedRawIds = [...ingestedIds];
 
   // Refresh the deterministic map pages and append a log line.
   if (report.pagesWritten > 0) {
     try {
-      deps.onProgress?.({ stage: "indexing", processedRaw: ingestedIds.size });
+      execution.progress({ stage: "indexing", processedRaw: ingestedIds.size });
       refreshDigest(store);
     } catch (err) {
       errors.push(`digest failed: ${String(err)}`);
     }
   }
   report.finishedAt = Date.now();
+  report.metrics = execution.snapshot();
   try {
     appendLog(store, report);
   } catch (err) {

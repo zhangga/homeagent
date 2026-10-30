@@ -1,5 +1,6 @@
 import { html, raw } from "hono/html";
 import type { DreamRunSnapshot, DreamStage, DreamTrigger } from "@homeagent/core";
+import type { DreamMetrics, DreamPhase } from "@homeagent/shared";
 
 const STAGES: Record<DreamStage, string> = {
   queued: "等待执行", preparing: "准备资料与计划", analyzing: "分析资料，规划知识页",
@@ -20,6 +21,23 @@ function duration(ms: number): string {
 
 function time(at: number): string {
   return new Date(at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+}
+
+function phaseMetrics(metrics: DreamMetrics, runId: string) {
+  const phases: Array<[DreamPhase, string]> = [["planning", "规划"], ["extraction", "分段提取"], ["merge", "生成与合并"]];
+  return html`<details class="dream-usage" data-dream-details="${runId}-metrics"><summary id="${runId}-metrics-title">阶段耗时与 token 用量</summary>
+    <div style="overflow-x:auto"><table><thead><tr><th>阶段 / 模型</th><th>模型耗时</th><th>已完成调用 / 失败</th><th>已知输入 / 输出 token</th><th>缓存输入 token</th><th>未知用量调用</th></tr></thead>
+    <tbody>${phases.map(([phase, label]) => {
+      const item = metrics.phases[phase];
+      return html`<tr><td>${label}<br/><small>${item.provider ? `${item.provider} · ` : ""}${item.model ?? "Provider 默认模型"}</small>
+        ${item.reusedExtractions ? html`<br/><small>复用 ${item.reusedExtractions} 段</small>` : ""}</td>
+        <td>${item.elapsedMs < 1000 ? `${item.elapsedMs} 毫秒` : `${(item.elapsedMs / 1000).toFixed(2)} 秒`}</td>
+        <td>${item.calls} / ${item.failedCalls}${item.activeCalls ? html`<br/><small>进行中 ${item.activeCalls}</small>` : ""}</td>
+        <td>${item.calls ? `${item.inputTokens ?? "未知"} / ${item.outputTokens ?? "未知"}` : "未调用"}</td>
+        <td>${item.cachedInputTokens ?? "—"}</td><td>${item.unknownTokenCalls}</td></tr>`;
+    })}</tbody></table></div>
+    <p class="muted">耗时按各阶段模型调用的实际经过时间统计，并发重叠只计一次；token 只汇总已报告值，未知用量不按零计算。复用分段不增加模型调用或用量。</p>
+  </details>`;
 }
 
 export function dreamRunsFragment(runs: DreamRunSnapshot[], now = Date.now()) {
@@ -43,9 +61,12 @@ export function dreamRunsFragment(runs: DreamRunSnapshot[], now = Date.now()) {
       <div class="dream-stage"><span class="dream-stage-mark" aria-hidden="true"></span><strong>${stage}</strong></div>
       ${run.page ? html`<div class="dream-current">${active ? "当前知识页" : "最后处理的知识页"}：<strong>${run.page.title}</strong>
         <span class="muted">（第 ${run.page.index}${run.pagesTotal ? ` / ${run.pagesTotal}` : ""} 页）</span></div>` : ""}
-      ${run.chunk ? html`<div class="dream-current">来源分段：第 <strong>${run.chunk.index} / ${run.chunk.total}</strong> 段
+      ${run.extraction ? html`<div class="dream-current">分段提取：已完成 <strong>${run.extraction.completed} / ${run.extraction.total}</strong> 段
+        ${run.extraction.reused ? html`<span class="muted"> · 复用 ${run.extraction.reused} 段</span>` : ""}
+        ${active ? html`<span class="muted"> · 正在处理 ${run.extraction.active} 段</span>` : ""}</div>`
+        : run.chunk ? html`<div class="dream-current">来源分段：第 <strong>${run.chunk.index} / ${run.chunk.total}</strong> 段
         <span class="muted"> · 分段结果会合并为完整知识页</span></div>` : ""}
-      ${waiting ? html`<p class="dream-wait">正在等待模型返回${run.stage === "analyzing" ? "分析计划" : run.stage === "extracting" ? "这一段的知识片段" : "完整知识页"}，包括 Provider 准备与自动重试。
+      ${waiting ? html`<p class="dream-wait">正在等待模型返回${run.stage === "analyzing" ? "分析计划" : run.stage === "extracting" ? (run.extraction ? "分段知识片段" : "这一段的知识片段") : "完整知识页"}，包括 Provider 准备与自动重试。
         当前步骤已用 ${duration(now - run.stageStartedAt)}；模型返回前不会增加完成数量。</p>` : ""}
       ${run.status === "queued" ? html`<p class="dream-wait">正在等待本空间前面的写入或提炼工作完成。</p>` : ""}
       <dl class="dream-metrics">
@@ -54,6 +75,7 @@ export function dreamRunsFragment(runs: DreamRunSnapshot[], now = Date.now()) {
         <div><dt>已写入 / 失败</dt><dd>${run.pagesWritten ?? 0} / ${run.pagesFailed ?? 0}<small> 页</small></dd></div>
         <div><dt>${run.status === "queued" ? "已等待" : "执行耗时"}</dt><dd>${duration(endedAt - (run.startedAt ?? run.queuedAt))}</dd></div>
       </dl>
+      ${run.metrics ? phaseMetrics(run.metrics, run.id) : ""}
       ${knownPlan && run.pagesTotal! > 0 ? html`<progress class="dream-progress" max="${run.pagesTotal}" value="${run.pagesCompleted ?? 0}" aria-label="已处理知识页"></progress>` : ""}
       <div class="dream-times muted">${run.startedAt ? `开始于 ${time(run.startedAt)}` : `排队于 ${time(run.queuedAt)}`}
         · ${active ? `最近进展在 ${duration(now - run.updatedAt)}前` : `结束于 ${time(run.finishedAt!)}`}</div>

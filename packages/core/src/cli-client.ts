@@ -31,6 +31,8 @@ import { runProviderDetailed as realRunProvider } from "@homeagent/llm";
 import {
   ProviderRunError,
   recordCall,
+  CODEX_REASONING_EFFORTS,
+  codexReasoningEffortsForModel,
 } from "@homeagent/llm";
 import { logger, publicModelId } from "@homeagent/shared";
 import type { LlmClient } from "./llm.ts";
@@ -230,6 +232,20 @@ export function makeCliClient(
     system?.trim() ? `${system.trim()}\n\n${body}` : body;
 
   return {
+    model: cliModel,
+    provider,
+    forModel: selected => {
+      const supported = provider === "codex" ? codexReasoningEffortsForModel(selected) : [];
+      const effort = reasoningEffort && supported.length && !supported.includes(reasoningEffort)
+        ? supported.filter(value => CODEX_REASONING_EFFORTS.indexOf(value) <= CODEX_REASONING_EFFORTS.indexOf(reasoningEffort)).at(-1) ?? supported[0]
+        : reasoningEffort;
+      return makeCliClient(provider, selected, accountingDataDir, run, timeoutMs, effort,
+        signal, execution, skills, workdir, skillInputs, nativeTopic, acquireExecutionPermit);
+    },
+    cacheIdentity: new Bun.CryptoHasher("sha256").update(JSON.stringify({
+      version: 1, provider, model: cliModel ?? null, reasoningEffort: reasoningEffort ?? null,
+      execution: execution ?? null, skills, skillInputs, workdir: workdir ?? null, nativeTopic,
+    })).digest("hex"),
     async complete(opts: CompleteOptions): Promise<CompleteResult> {
       const base = opts.prompt ?? (opts.messages ?? []).map((m) => m.content).join("\n\n");
       const prompt = withSystem(opts.system, base);

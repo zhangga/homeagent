@@ -203,6 +203,10 @@ export function observeLlmUsage(
     } } : {}),
   });
   return {
+    get cacheIdentity() { return client.cacheIdentity; },
+    get model() { return client.model; },
+    get provider() { return client.provider; },
+    ...(client.forModel ? { forModel: (model: string) => observeLlmUsage(client.forModel!(model), record, onExecutionEvidence, onProgress) } : {}),
     async complete(options) {
       try {
         const result = await client.complete(observe(options));

@@ -85,6 +85,7 @@ export const DATA_GITIGNORE = `# HomeAgent runtime-only and rebuildable files
 /logs/
 /bin/
 /provider-state/
+**/.dream-extractions/
 **/.index.db
 **/.index.db-shm
 **/.index.db-wal

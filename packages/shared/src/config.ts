@@ -33,6 +33,10 @@ export interface Config {
   modelFast: string;
   /** heavy model reserved for complex synthesis (opt-in) */
   modelHeavy: string;
+  /** Optional Dream stage overrides; empty strings inherit the Space's effective model. */
+  dreamPlanningModel: string;
+  dreamExtractionModel: string;
+  dreamMergeModel: string;
   /** observe-only daily cost reference; never gates Provider calls */
   dailyBudgetUsd: number;
   /** maximum provider runtime for an interactive chat answer */
@@ -90,6 +94,9 @@ export interface PersistedSettings {
   model?: string;
   modelFast?: string;
   modelHeavy?: string;
+  dreamPlanningModel?: string;
+  dreamExtractionModel?: string;
+  dreamMergeModel?: string;
   dailyBudgetUsd?: number;
   chatTimeoutMinutes?: number;
   webPort?: number;
@@ -114,6 +121,9 @@ export const EDITABLE_KEYS: (keyof PersistedSettings)[] = [
   "model",
   "modelFast",
   "modelHeavy",
+  "dreamPlanningModel",
+  "dreamExtractionModel",
+  "dreamMergeModel",
   "dailyBudgetUsd",
   "chatTimeoutMinutes",
   "webPort",
@@ -175,6 +185,15 @@ export function canonicalModelId(model: string): string {
   return value === "gpt-5.6" ? "gpt-5.6-sol" : value;
 }
 
+export const DREAM_MODEL_KEYS = ["dreamPlanningModel", "dreamExtractionModel", "dreamMergeModel"] as const;
+
+export function normalizeDreamModel(value: unknown): string {
+  if (typeof value !== "string" || value.length > 240 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error("提炼模型必须是不超过 240 字符的单行模型 ID");
+  }
+  return canonicalModelId(value);
+}
+
 /** Read the persisted editable settings, tolerating a missing/corrupt file. */
 export function readSettings(dataDir: string): PersistedSettings {
   const path = settingsPath(dataDir);
@@ -212,6 +231,9 @@ export function loadConfig(env = process.env): Config {
     model: brandedEnv(env, "LLM_MODEL") ?? "claude-sonnet-5",
     modelFast: brandedEnv(env, "LLM_MODEL_FAST") ?? "claude-haiku-4-5-20251001",
     modelHeavy: brandedEnv(env, "LLM_MODEL_HEAVY") ?? "claude-opus-4-8",
+    dreamPlanningModel: normalizeDreamModel(brandedEnv(env, "DREAM_PLANNING_MODEL") ?? ""),
+    dreamExtractionModel: normalizeDreamModel(brandedEnv(env, "DREAM_EXTRACTION_MODEL") ?? ""),
+    dreamMergeModel: normalizeDreamModel(brandedEnv(env, "DREAM_MERGE_MODEL") ?? ""),
     dailyBudgetUsd: num(env, "DAILY_BUDGET_USD", 5),
     chatTimeoutMinutes: chatTimeoutMinutes(
       num(env, "CHAT_TIMEOUT_MINUTES", DEFAULT_CHAT_TIMEOUT_MINUTES),
@@ -243,6 +265,7 @@ export function loadConfig(env = process.env): Config {
   if (persisted.model) base.model = persisted.model;
   if (persisted.modelFast) base.modelFast = persisted.modelFast;
   if (persisted.modelHeavy) base.modelHeavy = persisted.modelHeavy;
+  for (const key of DREAM_MODEL_KEYS) if (persisted[key] !== undefined) base[key] = normalizeDreamModel(persisted[key]);
   if (typeof persisted.dailyBudgetUsd === "number") base.dailyBudgetUsd = persisted.dailyBudgetUsd;
   if (typeof persisted.chatTimeoutMinutes === "number") {
     base.chatTimeoutMinutes = chatTimeoutMinutes(
@@ -311,6 +334,7 @@ export function config(): Config {
  */
 export function saveSettings(patch: PersistedSettings, dataDir = config().dataDir): PersistedSettings {
   if (patch.feishuAppId !== undefined) normalizeFeishuAppId(patch.feishuAppId);
+  for (const key of DREAM_MODEL_KEYS) if (patch[key] !== undefined) normalizeDreamModel(patch[key]);
   const current = readSettings(dataDir);
   const next: PersistedSettings = { ...current };
   for (const key of EDITABLE_KEYS) {
@@ -320,6 +344,7 @@ export function saveSettings(patch: PersistedSettings, dataDir = config().dataDi
     }
   }
   if (next.defaultModel !== undefined) next.defaultModel = canonicalModelId(next.defaultModel);
+  for (const key of DREAM_MODEL_KEYS) if (next[key] !== undefined) next[key] = normalizeDreamModel(next[key]);
   mkdirSync(join(dataDir, "config"), { recursive: true });
   writeFileSync(settingsPath(dataDir), JSON.stringify(next, null, 2), "utf8");
   resetConfig();

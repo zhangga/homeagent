@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { DreamReport, RawRecord, SpaceId } from "@homeagent/shared";
+import type { DreamMetrics, DreamReport, RawRecord, SpaceId } from "@homeagent/shared";
 
 export type DreamStage = "queued" | "preparing" | "analyzing" | "extracting" | "generating" | "saving" | "indexing";
 export type DreamTrigger = "manual" | "scheduled" | "import" | "redistill" | "retry" | "task";
@@ -15,8 +15,10 @@ export interface DreamProgress {
   pagesFailed?: number;
   page?: { slug: string; title: string; index: number };
   chunk?: { index: number; total: number };
+  extraction?: { active: number; completed: number; total: number; reused?: number };
   sources?: DreamSourceRef[];
   sourceCount?: number;
+  metrics?: DreamMetrics;
 }
 export interface DreamRunSnapshot extends DreamProgress {
   id: string;
@@ -76,6 +78,7 @@ export class DreamRunTracker {
     // A later stage must not keep showing the previous model fragment as current work.
     if (!progress.page) delete run.page;
     if (!progress.chunk) delete run.chunk;
+    if (!progress.extraction) delete run.extraction;
   }
 
   finish(id: string, report?: DreamReport, cancelled = false): void {
@@ -89,6 +92,7 @@ export class DreamRunTracker {
     if (report) Object.assign(run, {
       rawCount: report.examined, processedRaw: report.processedRawIds.length,
       skippedRaw: report.skipped, pagesWritten: report.pagesWritten, pagesFailed: report.pagesQuarantined,
+      ...(report.metrics ? { metrics: structuredClone(report.metrics) } : {}),
     });
     const finished = [...this.runs.values()].filter((item) => item.finishedAt !== undefined)
       .sort((a, b) => a.finishedAt! - b.finishedAt!);

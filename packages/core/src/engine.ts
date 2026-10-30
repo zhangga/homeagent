@@ -227,7 +227,8 @@ import {
 import type { LlmClient } from "./llm.ts";
 import { makeCliClient, type RunProviderFn } from "./cli-client.ts";
 import { observeLlmUsage, RunUsageAccumulator } from "./usage.ts";
-import { DEFAULT_PURPOSE, DEFAULT_SCHEMA } from "./space.ts";
+import { removeDreamExtractionsForRaw } from "./dream-extraction-cache.ts";
+import { DEFAULT_PURPOSE, DEFAULT_SCHEMA, type SpaceStore } from "./space.ts";
 import { ensureDataRepositoryAgentGuides } from "./agent-guides.ts";
 import {
   appendKnowledgeGovernanceAudit,
@@ -2835,6 +2836,37 @@ export class KnowledgeEngine implements Knowledge {
     });
   }
 
+  private async regeneratePageWithProgress(
+    store: SpaceStore, slug: string, extraRawIds: string[],
+    options: Parameters<typeof regeneratePageFromSources>[3],
+  ): Promise<Page> {
+    const runId = this.dreamProgress.enqueue(store.space, "redistill");
+    this.dreamProgress.start(runId);
+    const report: DreamReport = { space: store.space, examined: 0, processedRawIds: [], distilled: 0, skipped: 0,
+      pagesWritten: 0, pagesQuarantined: 0, startedAt: Date.now(), finishedAt: 0, errors: [] };
+    try {
+      const page = await regeneratePageFromSources(store, slug, extraRawIds, options, {
+        client: this.llmClientForSpace(store.space),
+        onProgress: progress => {
+          this.dreamProgress.update(runId, progress);
+          if (progress.rawCount !== undefined) report.examined = progress.rawCount;
+          if (progress.metrics) report.metrics = structuredClone(progress.metrics);
+        },
+      });
+      report.pagesWritten = 1;
+      report.processedRawIds = store.index().listRawByIds(page.sources, { onlyPending: false, onlyAdmitted: true }).map(raw => raw.id);
+      report.distilled = report.processedRawIds.length;
+      return page;
+    } catch (error) {
+      report.pagesQuarantined = 1;
+      report.errors.push("知识页重新生成未完成");
+      throw error;
+    } finally {
+      report.finishedAt = Date.now();
+      this.dreamProgress.finish(runId, report);
+    }
+  }
+
   async regenerateKnowledgePage(
     space: SpaceId,
     slug: string,
@@ -2849,12 +2881,11 @@ export class KnowledgeEngine implements Knowledge {
       const existing = store.index().getPage(safeSlug);
       if (!existing) return { status: "not_found", slug: safeSlug, rawIds: [] };
       try {
-        const page = await regeneratePageFromSources(
+        const page = await this.regeneratePageWithProgress(
           store,
           safeSlug,
           [],
           { model },
-          { client: this.llmClientForSpace(space) },
         );
         appendKnowledgeGovernanceAudit(store, {
           action: "page_regenerated",
@@ -2921,12 +2952,11 @@ export class KnowledgeEngine implements Knowledge {
       const allRawIds = [...new Set([...existing.sources, rawId])];
       let page: Page;
       try {
-        page = await regeneratePageFromSources(
+        page = await this.regeneratePageWithProgress(
           store,
           safeSlug,
           [rawId],
           { model, allowMissingExistingSources: true },
-          { client: this.llmClientForSpace(space) },
         );
       } catch (error) {
         appendKnowledgeGovernanceAudit(store, {
@@ -4381,7 +4411,11 @@ export class KnowledgeEngine implements Knowledge {
   private async removeRawAfterFailedLearningAnswer(space: SpaceId, rawId: string): Promise<void> {
     try {
       await this.serializer.run(space, async () => {
-        if (this.registry.has(space)) this.registry.store(space).index().deleteRaw(rawId);
+        if (this.registry.has(space)) {
+          const store = this.registry.store(space);
+          removeDreamExtractionsForRaw(store, new Set([rawId]));
+          store.index().deleteRaw(rawId);
+        }
       });
     } catch (error) {
       log.warn("failed to roll back incomplete learning record", {
@@ -4455,6 +4489,7 @@ export class KnowledgeEngine implements Knowledge {
       ));
 
       const store = this.registry.store(space);
+      removeDreamExtractionsForRaw(store, removedSourceIds);
       const affectedPages = index
         .allPages()
         .filter((page) => page.sources.some((sourceId) => removedSourceIds.has(sourceId)))
@@ -5235,6 +5270,7 @@ export class KnowledgeEngine implements Knowledge {
             .map((raw) => raw.id),
         );
         if (expiredRawIds.size === 0) return 0;
+        removeDreamExtractionsForRaw(this.registry.store(meta.id), expiredRawIds);
         const expiredFileDigests = new Set(
           index.listRaw({})
             .filter((raw) => expiredRawIds.has(raw.id))
@@ -6587,7 +6623,7 @@ export class KnowledgeEngine implements Knowledge {
             task.space,
             async () => this.executeDreamCycle(
               task.space,
-              { signal: controller.signal, trigger: "task" },
+              { signal: controller.signal, trigger: "task", models: { planning: "", extraction: "", merge: "" } },
               dreamContext,
             ),
           );

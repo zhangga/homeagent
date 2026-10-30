@@ -3395,6 +3395,9 @@ function integrationGroupCard(
 export interface SettingsData {
   defaultProvider: string;
   defaultModel: string;
+  dreamPlanningModel?: string;
+  dreamExtractionModel?: string;
+  dreamMergeModel?: string;
   dailyBudgetUsd: number;
   chatTimeoutMinutes: number;
   dreamHour: number;
@@ -3427,6 +3430,9 @@ export interface DataDirectorySettingsData {
 export interface SettingsFormValues {
   defaultProvider: string;
   defaultModel: string;
+  dreamPlanningModel: string;
+  dreamExtractionModel: string;
+  dreamMergeModel: string;
   dailyBudgetUsd: string;
   chatTimeoutMinutes: string;
   dreamHour: string;
@@ -3455,6 +3461,9 @@ export function settingsView(
   const values: SettingsFormValues = submitted ?? {
     defaultProvider: s.defaultProvider,
     defaultModel: s.defaultModel,
+    dreamPlanningModel: s.dreamPlanningModel ?? "",
+    dreamExtractionModel: s.dreamExtractionModel ?? "",
+    dreamMergeModel: s.dreamMergeModel ?? "",
     dailyBudgetUsd: String(s.dailyBudgetUsd),
     chatTimeoutMinutes: String(s.chatTimeoutMinutes),
     dreamHour: String(s.dreamHour),
@@ -3495,6 +3504,9 @@ export function settingsView(
   const fieldIds: Record<keyof SettingsFormValues, string> = {
     defaultProvider: "default-provider",
     defaultModel: "default-model",
+    dreamPlanningModel: "dream-planning-model",
+    dreamExtractionModel: "dream-extraction-model",
+    dreamMergeModel: "dream-merge-model",
     dailyBudgetUsd: "daily-budget",
     chatTimeoutMinutes: "chat-timeout-minutes",
     dreamHour: "dream-hour",
@@ -3598,6 +3610,22 @@ export function settingsView(
             ${errorMessage("defaultModel", "default-model-error")}
           </div>
         </div>
+      </fieldset>
+
+      <fieldset class="settings-section">
+        <legend>提炼阶段模型</legend>
+        <p class="settings-section-description">留空沿用当前空间的模型；有配置时覆盖对应阶段，Provider 保持不变。请使用该 Provider 支持的模型 ID。设置从下一轮提炼生效；任务完成后的即时提炼仍沿用该任务的模型。</p>
+        <datalist id="dream-model-options">${[...new Set(Object.values(models).flat())].map(model => html`<option value="${model}"></option>`)}</datalist>
+        <div class="grid2">${([
+          ["dreamPlanningModel", "规划模型", "资料分类、知识页规划与旧页目录核对。"],
+          ["dreamExtractionModel", "分段提取模型", "独立与多页共享的知识分段提取。"],
+          ["dreamMergeModel", "合并模型", "短资料直接生成、导读整理、整页合并与旧页局部更新。"],
+        ] as const).map(([key, label, help]) => html`<div class="field">
+          <label for="${fieldIds[key]}">${label}</label>
+          <input id="${fieldIds[key]}" name="${key}" value="${values[key]}" maxlength="240" list="dream-model-options" placeholder="继承当前模型"
+            aria-describedby="${describedBy(key, `${fieldIds[key]}-help`, `${fieldIds[key]}-error`)}" aria-invalid="${errors[key] ? "true" : "false"}" />
+          <p class="field-help" id="${fieldIds[key]}-help">${help}</p>${errorMessage(key, `${fieldIds[key]}-error`)}
+        </div>`)}</div>
       </fieldset>
 
       <fieldset class="settings-section">

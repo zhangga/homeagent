@@ -188,6 +188,33 @@ export interface AskResult {
   skillWarnings?: SkillWarningView[];
 }
 
+export type DreamPhase = "planning" | "extraction" | "merge";
+export type DreamModels = Partial<Record<DreamPhase, string>>;
+
+/** Per-phase logical calls. Missing token totals are unknown, never inferred zeros. */
+export interface DreamPhaseMetrics {
+  model?: string;
+  provider?: string;
+  /** Wall time inside model calls, with concurrent intervals counted once. */
+  elapsedMs: number;
+  calls: number;
+  activeCalls: number;
+  failedCalls: number;
+  knownTokenCalls: number;
+  unknownTokenCalls: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  reasoningTokens?: number;
+  reusedExtractions: number;
+}
+
+export interface DreamMetrics {
+  elapsedMs: number;
+  phases: Record<DreamPhase, DreamPhaseMetrics>;
+}
+
 /** Summary of one dream-cycle run. */
 export interface DreamReport {
   space: SpaceId;
@@ -208,6 +235,7 @@ export interface DreamReport {
   errors: string[];
   /** Agent Skills skipped for this cycle; the base Agent still ran. */
   skillWarnings?: SkillWarningView[];
+  metrics?: DreamMetrics;
 }
 
 /** Health probe result for the knowledge layer. */

@@ -5040,6 +5040,32 @@ describe("management backend (read-write)", () => {
     expect(readSettings(dir)).toEqual({});
   });
 
+  test("settings persist independent Dream models, preserve omitted fields, and clear an explicit empty value", async () => {
+    const form = { defaultProvider: "claude", defaultModel: "", dailyBudgetUsd: "5", dreamHour: "3", webPort: "3000", rawRetentionDays: "90" };
+    const post = (body: Record<string, string>) => app.request("/settings", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(body).toString() });
+    expect((await post({ ...form, dreamPlanningModel: "plan-model", dreamExtractionModel: "extraction-model", dreamMergeModel: "merge-model" })).status).toBe(302);
+    expect(readSettings(dir)).toMatchObject({ dreamPlanningModel: "plan-model", dreamExtractionModel: "extraction-model", dreamMergeModel: "merge-model" });
+    const view = await (await app.request("/settings")).text();
+    expect(view).toContain("提炼阶段模型");
+    expect(view).toContain('name="dreamPlanningModel" value="plan-model"');
+    expect(view).toContain('name="dreamExtractionModel" value="extraction-model"');
+    expect((await post(form)).status).toBe(302);
+    expect(readSettings(dir).dreamExtractionModel).toBe("extraction-model");
+    expect((await post({ ...form, dreamMergeModel: "" })).status).toBe(302);
+    expect(readSettings(dir).dreamMergeModel).toBe("");
+  });
+
+  test("invalid Dream model settings retain the current configuration and show bounded-field errors", async () => {
+    saveSettings({ dreamExtractionModel: "existing" }, dir);
+    for (const invalid of ["x".repeat(241), "model\nnext"]) {
+      const response = await app.request("/settings", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ defaultProvider: "codex", defaultModel: "", dailyBudgetUsd: "5", dreamHour: "3", webPort: "3000", rawRetentionDays: "90", dreamExtractionModel: invalid }).toString() });
+      expect(response.status).toBe(400);
+      expect(await response.text()).toContain("不超过 240 字符");
+      expect(readSettings(dir).dreamExtractionModel).toBe("existing");
+    }
+  });
+
   test("management shell exposes accessible narrow-screen navigation controls", async () => {
     const response = await app.request("/settings");
     expect(response.status).toBe(200);

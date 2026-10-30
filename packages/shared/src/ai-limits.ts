@@ -16,3 +16,6 @@ export const AI_ROUTING_MAX_TOKENS = 8_192;
 
 /** Full answers, knowledge pages, and learning material may use a large output budget. */
 export const AI_GENERATION_MAX_TOKENS = 65_536;
+
+/** Independent Dream source extractions per run; planning and page commits stay ordered. */
+export const AI_DREAM_EXTRACTION_CONCURRENCY = 2;

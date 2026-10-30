@@ -28,6 +28,27 @@ afterEach(() => {
 });
 
 describe("editable settings overlay", () => {
+  test("Dream model overrides inherit by default, persist across reopen, and empty settings override environment defaults", () => {
+    expect(loadConfig({ HOMEAGENT_DATA_DIR: dir })).toMatchObject({ dreamPlanningModel: "", dreamExtractionModel: "", dreamMergeModel: "" });
+    const env = { HOMEAGENT_DATA_DIR: dir, HOMEAGENT_DREAM_PLANNING_MODEL: "env-plan", HOMEAGENT_DREAM_EXTRACTION_MODEL: "env-extract", HOMEAGENT_DREAM_MERGE_MODEL: "env-merge" };
+    expect(loadConfig(env)).toMatchObject({ dreamPlanningModel: "env-plan", dreamExtractionModel: "env-extract", dreamMergeModel: "env-merge" });
+    saveSettings({ dreamPlanningModel: " new-plan ", dreamExtractionModel: "gpt-5.6", dreamMergeModel: "" }, dir);
+    resetConfig();
+    expect(readSettings(dir)).toMatchObject({ dreamPlanningModel: "new-plan", dreamExtractionModel: "gpt-5.6-sol", dreamMergeModel: "" });
+    expect(loadConfig(env)).toMatchObject({ dreamPlanningModel: "new-plan", dreamExtractionModel: "gpt-5.6-sol", dreamMergeModel: "" });
+  });
+
+  test("invalid Dream model patches fail before mutation and accept the exact bounded model ID", () => {
+    saveSettings({ dreamPlanningModel: "x".repeat(240), dreamHour: 5 }, dir);
+    const path = join(dir, "config", "settings.json");
+    const before = readFileSync(path, "utf8");
+    for (const invalid of ["x".repeat(241), "model\nnext", "model\u0000", "model\u007f"]) {
+      expect(() => saveSettings({ dreamPlanningModel: invalid, dreamHour: 7 }, dir)).toThrow("提炼模型");
+      expect(readFileSync(path, "utf8")).toBe(before);
+    }
+    expect(loadConfig({ HOMEAGENT_DATA_DIR: dir }).dreamPlanningModel).toHaveLength(240);
+  });
+
   test("persists the selected Feishu app independently of the CLI default", () => {
     saveSettings({ feishuAppId: "cli_homeagent", feishuBotName: "HomeAgent" }, dir);
     resetConfig();

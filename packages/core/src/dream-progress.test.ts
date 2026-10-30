@@ -37,6 +37,20 @@ function gate() {
   return { promise, resolve };
 }
 
+test("manual page regeneration exposes the same phase metrics and accurate terminal progress", async () => {
+  const fake = new FakeLlm().onJSON(() => ({ title: "Topic", summary: "Summary", content: "Evidence", links: [] }));
+  createEngine(fake);
+  const id = await engine.remember({ space: SPACE, source: "message", content: "Private Raw ".padEnd(96_000, "文") });
+  engine.registry.store(SPACE).writePage({ slug: "concepts/topic", type: "concept", title: "Topic", summary: "Old", content: "Old", aliases: [], tags: [], links: [], sources: [id], updatedAt: 1, contentHash: "old" });
+  expect((await engine.regenerateKnowledgePage(SPACE, "concepts/topic", "operator")).status).toBe("regenerated");
+  const run = engine.listDreamRuns(SPACE)[0]!;
+  expect(run).toMatchObject({ trigger: "redistill", status: "completed", rawCount: 1, pagesWritten: 1,
+    metrics: { phases: { planning: { calls: 0 }, extraction: { calls: 2, unknownTokenCalls: 2 }, merge: { calls: 1, unknownTokenCalls: 1 } } } });
+  expect(JSON.stringify(run)).not.toContain("Private Raw");
+  run.metrics!.phases.extraction.calls = 99;
+  expect(engine.listDreamRuns(SPACE)[0]!.metrics!.phases.extraction.calls).toBe(2);
+});
+
 test("reports queued work, blocked model calls, every fragment and terminal counts without source bodies", async () => {
   const fake = new FakeLlm();
   const analysisEntered = gate();
@@ -51,9 +65,9 @@ test("reports queued work, blocked model calls, every fragment and terminal coun
     async completeJSON(opts) {
       const planning = opts.prompt?.includes("## 待提炼的原始条目") === true;
       if (planning && ++analyses === 1) { analysisEntered.resolve(); await analysisRelease.promise; }
-      if (!planning && ++generations === 1) { generationEntered.resolve(); await generationRelease.promise; }
-      const chunk = engine.listDreamRuns().find((run) => run.status === "running")?.chunk;
-      if (chunk && !planning) fragments.push(chunk.index);
+      const part = /<source\b[^>]*part="(\d+)\/3"/u.exec(opts.prompt ?? "");
+      if (part && !planning) fragments.push(Number(part[1]));
+      if (!planning && ++generations <= 2) { generationEntered.resolve(); await generationRelease.promise; }
       return fake.completeJSON(opts);
     },
   };
@@ -79,6 +93,7 @@ test("reports queued work, blocked model calls, every fragment and terminal coun
     await generationEntered.promise;
     expect(engine.listDreamRuns().find((run) => run.status === "running")).toMatchObject({
       stage: "extracting", page: { title: "发布约定", index: 1 }, chunk: { index: 1, total: 3 }, pagesTotal: 1,
+      extraction: { active: 2, completed: 0, total: 3 },
     });
   } finally {
     analysisRelease.resolve();
@@ -90,6 +105,7 @@ test("reports queued work, blocked model calls, every fragment and terminal coun
   expect(engine.listDreamRuns().find((run) => run.trigger === "import")).toMatchObject({
     pagesWritten: 1, pagesCompleted: 1, pagesTotal: 1, processedRaw: 1, errorCount: 0,
   });
+  expect(engine.listDreamRuns().find((run) => run.trigger === "import")).not.toHaveProperty("extraction");
   expect(engine.listDreamRuns("team/oc_other")).toEqual([]);
   engine.close();
   createEngine(fake);
@@ -137,4 +153,19 @@ test("tracker keeps active runs plus 50 terminal runs and measures progress with
   expect(tracker.list()[0]?.id).toBe(active);
   tracker.removeSpace(SPACE);
   expect(tracker.list()).toEqual([]);
+});
+
+test("concurrent extraction counters are cloned and cleared when merging starts", () => {
+  const tracker = new DreamRunTracker(() => 100);
+  const id = tracker.enqueue(SPACE, "manual");
+  tracker.start(id);
+  const extraction = { active: 2, completed: 1, total: 5 };
+  tracker.update(id, { stage: "extracting", extraction });
+  extraction.completed = 5;
+  const snapshot = tracker.list()[0]!;
+  expect(snapshot.extraction?.completed).toBe(1);
+  snapshot.extraction!.active = 0;
+  expect(tracker.list()[0]?.extraction?.active).toBe(2);
+  tracker.update(id, { stage: "generating" });
+  expect(tracker.list()[0]).not.toHaveProperty("extraction");
 });

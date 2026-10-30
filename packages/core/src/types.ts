@@ -3,7 +3,7 @@
  * the Knowledge seam live here so the interface file stays declarative.
  */
 import type { ImageInput, NativeSessionRequest } from "@homeagent/llm";
-import type { DreamReport, SpaceId } from "@homeagent/shared";
+import type { DreamModels, DreamReport, SpaceId } from "@homeagent/shared";
 import type { AggregatedRunUsage } from "./usage.ts";
 import type { DreamTrigger } from "./dream-progress.ts";
 
@@ -24,6 +24,8 @@ export interface DreamOptions {
   force?: boolean;
   /** model override for distillation */
   model?: string;
+  /** Explicit phase overrides; an empty entry inherits the Space model for that phase. */
+  models?: DreamModels;
   /** cancel the active CLI work without starting more distillation steps */
   signal?: AbortSignal;
 }

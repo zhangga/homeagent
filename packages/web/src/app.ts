@@ -27,6 +27,8 @@ import {
   config,
   logger,
   saveSettings,
+  DREAM_MODEL_KEYS,
+  normalizeDreamModel,
   MAX_CHAT_TIMEOUT_MINUTES,
   MIN_CHAT_TIMEOUT_MINUTES,
   isSpaceId,
@@ -245,6 +247,9 @@ function parseSettingsForm(body: Record<string, unknown>): {
   const values: SettingsFormValues = {
     defaultProvider: str(body, "defaultProvider"),
     defaultModel: str(body, "defaultModel"),
+    dreamPlanningModel: body.dreamPlanningModel === undefined ? config().dreamPlanningModel : str(body, "dreamPlanningModel"),
+    dreamExtractionModel: body.dreamExtractionModel === undefined ? config().dreamExtractionModel : str(body, "dreamExtractionModel"),
+    dreamMergeModel: body.dreamMergeModel === undefined ? config().dreamMergeModel : str(body, "dreamMergeModel"),
     dailyBudgetUsd: str(body, "dailyBudgetUsd"),
     chatTimeoutMinutes:
       str(body, "chatTimeoutMinutes") || String(config().chatTimeoutMinutes),
@@ -253,6 +258,10 @@ function parseSettingsForm(body: Record<string, unknown>): {
     webPort: str(body, "webPort"),
   };
   const errors: SettingsFieldErrors = {};
+  for (const key of DREAM_MODEL_KEYS) {
+    try { values[key] = normalizeDreamModel(values[key]); }
+    catch { errors[key] = "请输入不超过 240 字符的单行模型 ID，留空则继承当前模型"; }
+  }
   const budget = Number(values.dailyBudgetUsd);
   if (values.dailyBudgetUsd.trim() === "" || !Number.isFinite(budget)) {
     errors.dailyBudgetUsd = "每日成本参考线必须是有效数字";
@@ -306,6 +315,7 @@ function parseSettingsForm(body: Record<string, unknown>): {
     rawRetentionDays: retentionDays,
     webPort: port,
   };
+  for (const key of DREAM_MODEL_KEYS) if (body[key] !== undefined) patch[key] = values[key];
   return { values, errors, patch };
 }
 
@@ -3524,6 +3534,9 @@ export function createWebApp(opts: WebOptions): Hono {
           {
             defaultProvider: cfg.defaultProvider,
             defaultModel: cfg.defaultModel,
+            dreamPlanningModel: cfg.dreamPlanningModel,
+            dreamExtractionModel: cfg.dreamExtractionModel,
+            dreamMergeModel: cfg.dreamMergeModel,
             dailyBudgetUsd: cfg.dailyBudgetUsd,
             chatTimeoutMinutes: cfg.chatTimeoutMinutes,
             dreamHour: cfg.dreamHour,
@@ -3569,6 +3582,9 @@ export function createWebApp(opts: WebOptions): Hono {
             {
               defaultProvider: cfg.defaultProvider,
               defaultModel: cfg.defaultModel,
+              dreamPlanningModel: cfg.dreamPlanningModel,
+              dreamExtractionModel: cfg.dreamExtractionModel,
+              dreamMergeModel: cfg.dreamMergeModel,
               dailyBudgetUsd: cfg.dailyBudgetUsd,
               chatTimeoutMinutes: cfg.chatTimeoutMinutes,
               dreamHour: cfg.dreamHour,

@@ -99,6 +99,7 @@ describe("runtime data directory settings", () => {
     const gitignore = readFileSync(join(directory, ".gitignore"), "utf8");
     expect(gitignore).toContain("private-notes/\n");
     expect(gitignore.match(/\/provider-state\//gu)).toHaveLength(1);
+    expect(gitignore.match(/\*\*\/\.dream-extractions\//gu)).toHaveLength(1);
     expect(gitignore.match(/# HomeAgent runtime-only and rebuildable files/gu)).toHaveLength(1);
   });
 
