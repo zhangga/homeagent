@@ -457,7 +457,8 @@ export class SpaceIndex {
   captureImportedRaw(id: string, entry: RawEntry): boolean {
     const chatImport = /^chat-import-[a-f0-9]{64}$/.test(id) && entry.source === "manual";
     const documentImport = /^doc-import-[a-f0-9]{64}$/.test(id) && entry.source === "doc";
-    if ((!chatImport && !documentImport) || entry.workActionId || entry.admission) {
+    const messageImport = /^message-import-[a-f0-9]{64}$/.test(id) && entry.source === "message";
+    if ((!chatImport && !documentImport && !messageImport) || entry.workActionId || entry.admission) {
       throw new Error("Invalid imported Raw capture");
     }
     // The journal may already have committed when a previous projection write failed.
@@ -473,10 +474,13 @@ export class SpaceIndex {
       if (documentImport && (existing.content !== entry.content || JSON.stringify(documentFiles(existing)) !== JSON.stringify(documentFiles(entry)))) {
         throw new Error("Imported document content conflict");
       }
+      if (messageImport && existing.content !== entry.content) throw new Error("Imported message content conflict");
       if (!this.getRaw(id)) this.insertRawProjection(existing);
       return false;
     }
-    const record: RawRecord = { ...structuredClone(entry), id, admission: "ready", ingested: false, createdAt: entry.createdAt ?? Date.now() };
+    const record: RawRecord = { ...structuredClone(entry), id, admission: "ready", ingested: false, createdAt: entry.createdAt ?? Date.now(),
+      ...(messageImport ? { agentHandled: entry.agentHandled ?? Boolean(entry.agentId) } : {}),
+    };
     this.rawJournal?.insert(record);
     this.insertRawProjection(record);
     return true;

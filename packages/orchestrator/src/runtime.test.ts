@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2098,6 +2099,120 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(question).toContain("被回复的消息");
     expect(question).toContain("蓝色方案的预算是 42 万元");
     expect(question).not.toContain("红色方案的预算是 99 万元");
+  });
+
+  test.each(["@HomeAgent 上周的工作周报也记录下", "@HomeAgent 记住这条周报"])(
+    "recording a quoted HomeAgent report persists its body without another model turn: %s",
+    async (text) => {
+      const body = "工作周报 · 10月26日—11月1日｜本周49个事项有进展，共63条记录。线上交付、本地修改和待验收范围分别保留；本次补齐无新增，不另发日报。";
+      const reactive = connector as CliConnector & Connector;
+      reactive.resolveReplyTarget = async () => ({
+        messageId: "om_weekly_report",
+        senderId: "bot_homeagent",
+        messageType: "text",
+        text: body,
+      });
+      let calls = 0;
+      engine.askWithExecutionPlan = async () => {
+        calls++;
+        return { answer: "请回复包含完整正文的消息。", source: "general", citations: [] };
+      };
+      await orch.start();
+      await connector.inject({ kind: "message", eventId: "record-weekly-report", chatType: "group", chatId: "oc_team",
+        senderId: "ou_me", text, messageId: "om_record_report", parentMessageId: "om_weekly_report",
+        mentionsBot: true, createdAt: Date.now() });
+
+      expect(engine.registry.store("team/oc_team").index().findRawsByMessageId("om_weekly_report", "oc_team")).toEqual([
+        expect.objectContaining({ content: body, author: "bot_homeagent", admission: "ready" }),
+      ]);
+      expect(calls).toBe(0);
+      expect(connector.sent.at(-1)?.markdown).toContain("已记下被回复消息的正文");
+    },
+  );
+
+  test.each(["group", "p2p"] as const)("quoted long reports retain their complete body, ownership and timestamp across retries/reopen: %s", async chatType => {
+    const space = chatType === "group" ? "team/oc_team" : "personal/ou_me";
+    const body = "本周工作进展。".repeat(30_000) + "\n末尾：验收尚未完成，不能当作线上交付。";
+    const createdAt = Date.parse("2026-11-01T12:00:00+08:00");
+    const fetcher = new FeishuConnector({ runCommand: async cmd => JSON.stringify({ ok: true, data: { items: [
+      cmd.some(part => part.endsWith("/om_long_report"))
+        ? { message_id: "om_long_report", msg_type: "post", sender: { id: "bot_homeagent" }, create_time: String(createdAt),
+            body: { content: JSON.stringify({ zh_cn: { title: "工作周报", content: [[{ tag: "md", text: body }]] } }) } }
+        : { parent_id: "om_long_report" },
+    ] } }) });
+    (connector as CliConnector & Connector).resolveReplyTarget = (id, options) => fetcher.resolveReplyTarget(id, options);
+    engine.askWithExecutionPlan = async () => { throw new Error("recording quoted text must not invoke a Provider"); };
+    await orch.start();
+    for (let i = 0; i < 2; i++) {
+      await connector.inject({ kind: "message", eventId: `record-long-${i}`, chatType, chatId: chatType === "group" ? "oc_team" : "oc_dm",
+        senderId: "ou_me", text: "@HomeAgent 上周的工作周报也记录下", messageId: `om_record_long_${i}`,
+        parentMessageId: "om_long_report", mentionsBot: true, createdAt: Date.now() });
+      expect(connector.sent.at(-1)?.markdown).toContain("已记下被回复消息的正文");
+    }
+    const records = engine.registry.store(space).index().findRawsByMessageId("om_long_report", chatType === "group" ? "oc_team" : "oc_dm");
+    expect(records).toHaveLength(2);
+    const first = records.find(raw => raw.content.startsWith("正文分段：1/2\n\n"));
+    const second = records.find(raw => raw.content.startsWith("正文分段：2/2\n\n"));
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    expect(first!.content.replace(/^正文分段：1\/2\n\n/u, "") + second!.content.replace(/^正文分段：2\/2\n\n/u, "")).toBe(`工作周报\n${body}`);
+    expect(records.every(raw => raw.createdAt === createdAt && raw.author === "bot_homeagent" && raw.admission === "ready")).toBe(true);
+    await orch.stop();
+    engine.close();
+    const reopened = new KnowledgeEngine({ dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }) });
+    try {
+      expect(reopened.registry.store(space).index().findRawsByMessageId("om_long_report", chatType === "group" ? "oc_team" : "oc_dm")
+        .map(raw => raw.id).sort()).toEqual(records.map(raw => raw.id).sort());
+    } finally { reopened.close(); }
+  });
+
+  test.each(["missing", "truncated", "retracted"] as const)("quoted report capture does not acknowledge an unavailable body: %s", async state => {
+    engine.ensureSpace("team/oc_team");
+    if (state === "retracted") {
+      await engine.remember({ space: "team/oc_team", source: "message", chatId: "oc_team", messageId: "om_unavailable_report",
+        author: "bot_homeagent", content: "不能作为完整周报保存的正文" });
+      await engine.retractMessage("team/oc_team", {
+        chatId: "oc_team", messageId: "om_unavailable_report", requestedBy: "bot_homeagent",
+      });
+    }
+    (connector as CliConnector & Connector).resolveReplyTarget = async () => state === "missing" ? undefined : {
+      messageId: "om_unavailable_report", senderId: "bot_homeagent", messageType: "text", text: "不能作为完整周报保存的正文",
+      ...(state === "truncated" ? { textTruncated: true as const } : {}),
+    };
+    engine.askWithExecutionPlan = async () => { throw new Error("recording quoted text must not invoke a Provider"); };
+    await orch.start();
+    await connector.inject({ kind: "message", eventId: "unavailable-report", chatType: "group", chatId: "oc_team", senderId: "ou_me",
+      text: "@HomeAgent 上周的工作周报也记录下", messageId: "om_record_unavailable", parentMessageId: "om_unavailable_report",
+      mentionsBot: true, createdAt: Date.now() });
+    expect(engine.registry.store("team/oc_team").index().findRawsByMessageId("om_unavailable_report", "oc_team")).toHaveLength(0);
+    expect(connector.sent.at(-1)?.markdown).not.toContain("已记下被回复消息的正文");
+    expect(connector.sent.at(-1)?.markdown).toContain(state === "retracted" ? "已撤回" : "未取得");
+  });
+
+  test("a quoted report projection failure reports failure and retries ingestion without a model or duplicate", async () => {
+    const body = "周报正文：待验收项仍须保留。";
+    engine.ensureSpace("team/oc_team");
+    const store = engine.registry.store("team/oc_team");
+    const db = new Database(store.dbPath);
+    (connector as CliConnector & Connector).resolveReplyTarget = async () => ({
+      messageId: "om_failing_report", messageType: "text", text: body,
+    });
+    engine.askWithExecutionPlan = async () => { throw new Error("recording quoted text must not invoke a Provider"); };
+    try {
+      db.exec("CREATE TRIGGER fail_report BEFORE INSERT ON raw WHEN NEW.message_id = 'om_failing_report' BEGIN SELECT RAISE(FAIL, 'private fixture diagnostic'); END");
+      await orch.start();
+      await connector.sendGroup("@HomeAgent 上周的工作周报也记录下", true);
+      const failed = engine.chatRuns.list("team/oc_team")[0]!;
+      expect(failed.status).toBe("failed");
+      expect(connector.sent.at(-1)?.markdown).toContain("未完成收录");
+      expect(connector.sent.at(-1)?.markdown).not.toContain("private fixture diagnostic");
+      db.exec("DROP TRIGGER fail_report");
+      const retried = await orch.retryChatRun(failed.id);
+      expect(retried.status).toBe("succeeded");
+      expect(retried.executionPlan).toEqual(failed.executionPlan);
+      expect(connector.sent.at(-1)?.markdown).toContain("已记下被回复消息的正文");
+      expect(store.index().findRawsByMessageId("om_failing_report", "oc_team")).toHaveLength(1);
+    } finally { db.close(); }
   });
 
   test("an explicit reply cannot reintroduce a retracted Feishu target into Provider context", async () => {

@@ -131,6 +131,9 @@ export interface ReplyTarget {
   senderId?: string;
   /** Human-readable source content when the connector can retrieve it. */
   text?: string;
+  /** A bounded preview must never be acknowledged as a complete saved body. */
+  textTruncated?: true;
+  createdAt?: number;
   /** Native source message type, useful for honest attachment context. */
   messageType?: string;
 }
@@ -184,7 +187,7 @@ export interface Connector {
   /** remove a previously-added platform-native reaction */
   removeReaction?(messageId: string, reactionId: string): Promise<void>;
   /** resolve the original message targeted by a reply/thread command */
-  resolveReplyTarget?(messageId: string): Promise<ReplyTarget | undefined>;
+  resolveReplyTarget?(messageId: string, options?: { fullText?: boolean }): Promise<ReplyTarget | undefined>;
   /** whether a user may administer knowledge for the given group chat */
   isChatAdministrator?(chatId: string, userId: string): Promise<boolean>;
   /** current Bot-visible group metadata; throws when verification is unavailable */

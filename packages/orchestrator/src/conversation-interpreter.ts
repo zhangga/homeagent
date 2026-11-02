@@ -87,6 +87,11 @@ export function prefilterChitchat(text: string): boolean {
 
 function isExplicitRememberRequest(text: string): boolean {
   const compact = text.replace(/[。.!！]+$/u, "").trim();
+  // A quoted report is often named before the memory verb. Keep compound
+  // generation requests (e.g. "总结后保存") on the conversation path.
+  if (/^(?:(?:请|帮我|麻烦)\s*)?(?:把\s*)?(?:(?:上周|本周|这周|上次|刚才|之前|上面|前面)(?:的)?|你(?:刚才|之前|上次)(?:发的|生成的|的)|(?:这|那|该)(?:条|份|个|篇))(?:工作)?(?:周报|日报|总结|报告|消息|内容|信息)(?:也|再)?(?:记录(?:一下|下来|下)?|记下|保存(?:一下|下来|下)?|收录(?:一下|下)?)(?:吧)?$/u.test(compact)) {
+    return true;
+  }
   return /^(?:(?:请|帮我)\s*)?(?:记住|记下|记录下来)/u.test(compact)
     || /^(?:(?:请|帮我)\s*)?(?:记录|收录|保存)(?:这个|这份|该)?(?:原)?(?:文件|附件|资料)/u.test(compact)
     || /^(?:请\s*)?(?:把\s*)?(?:这个|这份|该)?(?:原)?(?:文件|附件|资料)(?:帮我)?(?:记录|收录|保存)(?:下来)?$/u.test(compact)

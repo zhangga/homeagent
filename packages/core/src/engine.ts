@@ -3745,7 +3745,7 @@ export class KnowledgeEngine implements Knowledge {
     }).client;
   }
 
-  private rememberSerialized(entry: RawEntry): string {
+  private rememberSerialized(entry: RawEntry, deduplicateMessage = false): string {
     const requestedWorkItem = entry.workItemId
       ? this.workItems.get(entry.workItemId)
       : this.workItems.activeForSpace(entry.space);
@@ -3769,7 +3769,15 @@ export class KnowledgeEngine implements Knowledge {
     const normalizedEntry: RawEntry = requestedWorkItem
       ? { ...entry, workItemId: requestedWorkItem.id }
       : entry;
-    const id = index.insertRaw(normalizedEntry);
+    let id: string;
+    if (deduplicateMessage) {
+      id = `message-import-${createHash("sha256").update(JSON.stringify([
+        entry.space, entry.chatId, entry.messageId, entry.content,
+      ])).digest("hex")}`;
+      index.captureImportedRaw(id, normalizedEntry);
+    } else {
+      id = index.insertRaw(normalizedEntry);
+    }
     if (requestedWorkItem) this.workItems.attachRaw(requestedWorkItem.id, id);
     log.debug("remembered raw entry", { space: entry.space, source: entry.source, id });
     return id;
@@ -3778,6 +3786,16 @@ export class KnowledgeEngine implements Knowledge {
   async remember(entry: RawEntry): Promise<string> {
     // Capture is a write; serialize per space so it never races distillation.
     return this.serializer.run(entry.space, async () => this.rememberSerialized(entry));
+  }
+
+  /** Save an explicitly selected message body; retry repairs its projection. */
+  async rememberMessageText(entry: RawEntry): Promise<string> {
+    if (entry.source !== "message" || !entry.chatId || !entry.messageId || entry.attachments?.length
+      || entry.content.length > MAX_MATERIAL_BYTES) {
+      throw new Error("Message text capture requires a source message identity and no attachments");
+    }
+    const frozen = structuredClone(entry);
+    return this.serializer.run(frozen.space, async () => this.rememberSerialized(frozen, true));
   }
 
   async rememberFile(

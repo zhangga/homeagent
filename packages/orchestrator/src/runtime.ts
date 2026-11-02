@@ -23,6 +23,7 @@ import type { SpaceId } from "@homeagent/shared";
 import {
   AI_OPERATION_TIMEOUT_MS,
   AI_QUEUE_TIMEOUT_MS,
+  MAX_MATERIAL_BYTES,
   Serializer,
   config,
   logger,
@@ -470,7 +471,9 @@ export class Orchestrator {
       const { readSpaces, writeSpace } = attribute(msg);
       const retry = this.startChatRun(msg, writeSpace, previous.rawId, previous.id);
       await this.scheduleChatRun(msg, writeSpace, retry, (signal) =>
-        this.answer(msg, readSpaces, writeSpace, retry.id, previous.input, signal)
+        interpretConversation(previous.input).disposition === "remember"
+          ? this.completeRememberChatRun(msg, writeSpace, retry.id, "好的，我记下了。", signal)
+          : this.answer(msg, readSpaces, writeSpace, retry.id, previous.input, signal)
       );
       return this.engine.chatRuns.get(retry.id)!;
       },
@@ -1118,12 +1121,14 @@ export class Orchestrator {
             msg,
             writeSpace,
             chatRun,
-            () => this.completeChatRunAndSend(
+            (signal) => this.completeRememberChatRun(
               msg,
+              writeSpace,
               chatRun.id,
               sourceSync.succeeded > 0
                 ? "好的，我已读取并记下来源正文。"
                 : "好的，我记下了。",
+              signal,
             ),
           );
         case "chitchat":
@@ -1486,12 +1491,12 @@ export class Orchestrator {
               interpretation.text,
               signal,
             )
+          : interpretation.disposition === "remember"
+          ? this.completeRememberChatRun(msg, run.space, run.id, "好的，我记下了。", signal)
           : this.completeChatRunAndSend(
               msg,
               run.id,
-              interpretation.disposition === "remember"
-                ? "好的，我记下了。"
-                : "👋 我在。有需要随时问我，或把要记住的事告诉我。",
+              "👋 我在。有需要随时问我，或把要记住的事告诉我。",
             ),
       );
       this.pendingEvents.add(pending);
@@ -1506,6 +1511,81 @@ export class Orchestrator {
         },
       );
     }
+  }
+
+  private async completeRememberChatRun(
+    msg: InboundMessage,
+    space: SpaceId,
+    runId: string,
+    notice: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    let target;
+    try {
+      target = await this.connector.resolveReplyTarget?.(msg.messageId, { fullText: true });
+    } catch {
+      log.warn("remember reply target lookup failed", { runId });
+    }
+    const assertActive = (): void => {
+      if (signal.aborted || this.engine.chatRuns.get(runId)?.status !== "running"
+        || (msg.chatType === "group" && this.connector.name === "feishu" && !this.activeGroupBinding(msg.chatId))) {
+        throw new ChatRunCancelledError();
+      }
+    };
+    assertActive();
+    const targetId = target?.messageId ?? msg.parentMessageId;
+    if (targetId && targetId !== msg.messageId) {
+      if (this.messageWasRetracted(space, msg.chatId, targetId)) {
+        notice = "被回复的消息已撤回，未收录其正文。";
+      } else {
+        const index = this.engine.registry.store(space).index();
+        const existing = index.findRawsByMessageId(targetId, msg.chatId);
+        const body = target?.messageType && ["image", "file", "audio", "media"].includes(target.messageType)
+          ? undefined : target?.text;
+        if (body?.trim() && !target?.textTruncated && body.length <= MAX_MATERIAL_BYTES) {
+          const parts = splitMaterialText(body).map((content, index, chunks) => chunks.length === 1
+            ? content : `正文分段：${index + 1}/${chunks.length}\n\n${content}`);
+          try {
+            for (const content of parts) {
+              assertActive();
+              if (this.messageWasRetracted(space, msg.chatId, targetId)) break;
+              const prior = existing.find(raw => raw.content === content);
+              if (prior) continue;
+              await this.engine.rememberMessageText({
+                space,
+                source: "message",
+                author: target?.senderId,
+                chatId: msg.chatId,
+                messageId: targetId,
+                content,
+                createdAt: target?.createdAt,
+              });
+            }
+          } catch {
+            assertActive();
+            const failed = this.engine.chatRuns.fail(runId, {
+              finishedAt: Date.now(), error: { kind: "unknown", message: "被回复消息正文收录失败。" },
+            });
+            if (failed) {
+              this.recordTerminalRunEvent(runId, "failed", failed.finishedAt);
+              await this.send(msg, "被回复消息的正文未完成收录，请稍后重试。", runId);
+            }
+            return;
+          }
+          assertActive();
+          const stored = index.findRawsByMessageId(targetId, msg.chatId);
+          notice = !this.messageWasRetracted(space, msg.chatId, targetId)
+            && parts.every(content => stored.some(raw => raw.content === content && raw.admission === "ready"))
+            ? "已记下被回复消息的正文，后续会进入知识提炼。"
+            : "被回复消息的正文未完成收录。";
+        } else if (!target && existing.some(raw => raw.source === "message" && raw.admission === "ready")) {
+          notice = "当前空间已有被回复消息的收录记录；本轮未能重新取得完整正文。";
+        } else if (!target?.messageType || !["image", "file", "audio", "media"].includes(target.messageType) || target.textTruncated) {
+          notice = "未取得被回复消息的完整正文，尚未收录该正文。";
+        }
+      }
+    }
+    await this.completeChatRunAndSend(msg, runId, notice);
   }
 
   private async completeChatRunAndSend(

@@ -132,6 +132,13 @@ Chat 文件新写入 v8，读取 v1–v8；Task 文件新写入 v13，读取 v2�
 
 ## Raw journal
 
+用户显式回复消息并要求记录时，Orchestrator 通过 Connector 读取该条消息的完整文本，Core 以 `source=message`
+保存到发起请求的唯一 Space，不需要 Provider 文件写权限或 Skill。Markdown 富文本正文与普通文本同样收录，
+长正文沿用 200,000 字符分段并保留分段序号；来源作者与可取得的原消息时间一同保存。
+新正文使用 `message-import-<摘要>` Raw ID 绑定 Space、来源群、消息 ID 与该段内容，沿用 journal 先提交、
+SQLite projection 后提交的路径；重试修复投影而不重复 Raw、不改变准入状态，消息撤回继续按来源消息 ID 治理。
+未取得完整正文或写入失败不能返回正文收录成功；这不改变 Raw journal 的权威归属或 Space archive schema。
+
 飞书文档与 ByteTech 正文由后台先同步到当前 Space 的 Raw journal，与 Provider 文件写权限无关。
 显式记录文章时，Chat Run 先核对本轮消息关联的已同步 Raw，再决定是否需要文件交接；只读 Agent 也可直接使用已同步正文并获得后台确认回执。
 回执只确认正文已收录，不推断嵌入表格或媒体原件完整；同一请求中未同步的 URL 单独交接，发送回执前重新核对已同步来源的可用状态。

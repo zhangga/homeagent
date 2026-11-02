@@ -146,6 +146,19 @@ describe("conversation interpretation", () => {
     ].join("\n")).disposition).toBe("conversation");
   });
 
+  test("recognizes a request to record the quoted weekly report", () => {
+    for (const text of [
+      "@HomeAgent 上周的工作周报也记录下",
+      "把你刚才的工作总结保存下来",
+      "这条消息也记下吧",
+    ]) {
+      expect(interpretConversation(text).disposition).toBe("remember");
+    }
+    for (const text of ["上周的工作周报不要记录", "工作周报怎么记录", "记录工作周报有什么用？"]) {
+      expect(interpretConversation(text).disposition).toBe("conversation");
+    }
+  });
+
   test("parses narrow knowledge controls without hijacking related questions", () => {
     expect(parseKnowledgeControl("重新提炼")).toBe("redistill");
     expect(parseKnowledgeControl("@agent 帮我重新提炼一下知识")).toBe("redistill");

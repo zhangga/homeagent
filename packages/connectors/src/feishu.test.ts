@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { MAX_MATERIAL_BYTES } from "@homeagent/shared";
 import type { InboundEvent } from "./connector.ts";
 import type { ProcHandle, ProcSpawner } from "./process.ts";
 import { FeishuConnector, runFeishuCommand } from "./feishu.ts";
@@ -1041,6 +1042,55 @@ describe("FeishuConnector outbound", () => {
     const text = (await connector.resolveReplyTarget("om_reply"))?.text ?? "";
     expect(text.length).toBeLessThan(20_100);
     expect(text).toEndWith("【上下文已截断】");
+  });
+
+  test.each(["zh_CN", "zh_cn"])("a quoted report retains Markdown post blocks rather than only its title: %s", async locale => {
+    const body = "## 本周进展\n\n完成 49 个事项，共 63 条记录。\n\n## 待验收\n\n保留线上交付、本地修改和待验收范围。";
+    const responses = [
+      { items: [{ message_id: "om_reply", parent_id: "om_report" }] },
+      { items: [{ message_id: "om_report", msg_type: "post", body: { content: JSON.stringify({
+        [locale]: { title: "10 月 26 日—11 月 1 日工作周报", content: [[{ tag: "md", text: body }]] },
+      }) } }] },
+    ];
+    connector = new FeishuConnector({ spawner: new FakeSpawner(),
+      runCommand: async () => JSON.stringify({ ok: true, data: responses.shift()! }) });
+    expect((await connector.resolveReplyTarget("om_reply"))?.text).toBe(`10 月 26 日—11 月 1 日工作周报\n${body}`);
+  });
+
+  test("explicit preservation reads past the reply preview limit and retains the source timestamp", async () => {
+    const body = "周报正文".repeat(6_000) + "\n末尾待验收事项";
+    const source = { message_id: "om_report", msg_type: "text", create_time: "1793577600000",
+      body: { content: JSON.stringify({ text: body }) } };
+    connector = new FeishuConnector({ spawner: new FakeSpawner(), runCommand: async cmd => JSON.stringify({ ok: true, data: {
+      items: [cmd.some(part => part.endsWith("/om_reply")) ? { parent_id: "om_report" } : source],
+    } }) });
+    const preview = await connector.resolveReplyTarget("om_reply");
+    expect(preview?.textTruncated).toBe(true);
+    const full = await connector.resolveReplyTarget("om_reply", { fullText: true });
+    expect(full?.text).toBe(body);
+    expect(full?.textTruncated).toBeUndefined();
+    expect(full?.createdAt).toBe(1793577600000);
+  });
+
+  test.each([0, 1])("full reply preservation reports its material boundary accurately: excess=%s", async excess => {
+    const text = "x".repeat(MAX_MATERIAL_BYTES + excess);
+    connector = new FeishuConnector({ spawner: new FakeSpawner(), runCommand: async cmd => JSON.stringify({ ok: true, data: {
+      items: [cmd.some(part => part.endsWith("/om_reply")) ? { parent_id: "om_report" }
+        : { message_id: "om_report", msg_type: "text", body: { content: JSON.stringify({ text }) } }],
+    } }) });
+    const target = await connector.resolveReplyTarget("om_reply", { fullText: true });
+    expect(target?.textTruncated === true).toBe(excess > 0);
+    expect(target?.text?.length).toBe(MAX_MATERIAL_BYTES + (excess ? "\n【上下文已截断】".length : 0));
+  });
+
+  test("full reply preservation discloses a rich-text traversal limit instead of claiming a complete body", async () => {
+    connector = new FeishuConnector({ spawner: new FakeSpawner(), runCommand: async cmd => JSON.stringify({ ok: true, data: {
+      items: [cmd.some(part => part.endsWith("/om_reply")) ? { parent_id: "om_report" }
+        : { msg_type: "post", body: { content: JSON.stringify({ title: "工作周报", content: [
+          ...Array.from({ length: 1002 }, () => [{ tag: "text", text: "事项" }]), [{ tag: "text", text: "不能遗漏的尾部" }],
+        ] }) } }],
+    } }) });
+    expect((await connector.resolveReplyTarget("om_reply", { fullText: true }))?.textTruncated).toBe(true);
   });
 
   test("falls back to root_id when a reply has no parent_id", async () => {

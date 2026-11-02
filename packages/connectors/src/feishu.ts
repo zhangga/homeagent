@@ -184,12 +184,13 @@ interface FetchedMessage {
   message_id?: string;
   parent_id?: string;
   root_id?: string;
+  create_time?: string;
   sender?: { id?: string };
   msg_type?: string;
   body?: { content?: string };
 }
 
-function renderFetchedMessage(message: FetchedMessage | undefined): string | undefined {
+function renderFetchedMessage(message: FetchedMessage | undefined, maxChars = MAX_REPLY_CONTEXT_CHARS): string | undefined {
   if (!message) return undefined;
   const type = message.msg_type;
   const content = message.body?.content;
@@ -202,41 +203,47 @@ function renderFetchedMessage(message: FetchedMessage | undefined): string | und
   try {
     parsed = JSON.parse(content);
   } catch {
-    return boundReplyContext(content);
+    return boundReplyContext(content, maxChars);
   }
-  if (typeof parsed !== "object" || parsed === null) return boundReplyContext(content);
+  if (typeof parsed !== "object" || parsed === null) return boundReplyContext(content, maxChars);
 
   const value = parsed as Record<string, unknown>;
-  if (typeof value.text === "string" && value.text.trim()) return boundReplyContext(value.text);
+  if (typeof value.text === "string" && value.text.trim()) return boundReplyContext(value.text, maxChars);
   if (type === "file") {
     const name = typeof value.file_name === "string" ? value.file_name.trim() : "";
     return name ? `【文件：${name}】` : "【文件】";
   }
 
   const parts: string[] = [];
-  collectRichText(parsed, parts);
+  const scan = { truncated: false };
+  collectRichText(parsed, parts, 0, scan);
   const rendered = parts.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  return boundReplyContext(rendered || content);
+  const text = boundReplyContext(rendered || content, maxChars);
+  return scan.truncated && text && !text.endsWith("\n【上下文已截断】")
+    ? `${text}\n【上下文已截断】` : text;
 }
 
-function boundReplyContext(text: string): string | undefined {
+function boundReplyContext(text: string, maxChars = MAX_REPLY_CONTEXT_CHARS): string | undefined {
   const normalized = text.trim();
   if (!normalized) return undefined;
-  if (normalized.length <= MAX_REPLY_CONTEXT_CHARS) return normalized;
-  return `${normalized.slice(0, MAX_REPLY_CONTEXT_CHARS)}\n【上下文已截断】`;
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars)}\n【上下文已截断】`;
 }
 
-function collectRichText(value: unknown, parts: string[], depth = 0): void {
-  if (depth > 20 || parts.length > 1_000) return;
+function collectRichText(value: unknown, parts: string[], depth: number, scan: { truncated: boolean }): void {
+  if (depth > 20 || parts.length > 1_000) {
+    scan.truncated = true;
+    return;
+  }
   if (Array.isArray(value)) {
-    for (const item of value) collectRichText(item, parts, depth + 1);
+    for (const item of value) collectRichText(item, parts, depth + 1, scan);
     return;
   }
   if (typeof value !== "object" || value === null) return;
 
   const node = value as Record<string, unknown>;
   const tag = typeof node.tag === "string" ? node.tag : undefined;
-  if (tag === "text" && typeof node.text === "string" && node.text.trim()) {
+  if ((tag === "text" || tag === "md") && typeof node.text === "string" && node.text.trim()) {
     parts.push(node.text.trim());
     return;
   }
@@ -257,10 +264,10 @@ function collectRichText(value: unknown, parts: string[], depth = 0): void {
   }
 
   if (typeof node.title === "string" && node.title.trim()) parts.push(node.title.trim());
-  if ("content" in node) collectRichText(node.content, parts, depth + 1);
+  if ("content" in node) collectRichText(node.content, parts, depth + 1, scan);
   for (const [key, child] of Object.entries(node)) {
     if (key === "title" || key === "content" || key === "tag") continue;
-    if (/^[a-z]{2}_[A-Z]{2}$/.test(key)) collectRichText(child, parts, depth + 1);
+    if (/^[a-z]{2}_[a-z]{2}$/i.test(key)) collectRichText(child, parts, depth + 1, scan);
   }
 }
 
@@ -704,7 +711,7 @@ export class FeishuConnector implements Connector {
     }
   }
 
-  async resolveReplyTarget(messageId: string): Promise<ReplyTarget | undefined> {
+  async resolveReplyTarget(messageId: string, options?: { fullText?: boolean }): Promise<ReplyTarget | undefined> {
     try {
       const current = await this.fetchMessage(messageId);
       const targetId = current?.parent_id ?? current?.root_id;
@@ -714,8 +721,11 @@ export class FeishuConnector implements Connector {
         messageId: targetId,
         senderId: target?.sender?.id,
       };
-      const text = renderFetchedMessage(target);
+      const text = renderFetchedMessage(target, options?.fullText ? MAX_MATERIAL_BYTES : MAX_REPLY_CONTEXT_CHARS);
       if (text) resolved.text = text;
+      if (text?.endsWith("\n【上下文已截断】")) resolved.textTruncated = true;
+      const createdAt = Number(target?.create_time);
+      if (target?.create_time && Number.isSafeInteger(createdAt) && createdAt >= 0) resolved.createdAt = createdAt;
       if (target?.msg_type) resolved.messageType = target.msg_type;
       return resolved;
     } catch (err) {
