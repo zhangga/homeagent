@@ -10,3 +10,5 @@ export * from "./lark.ts";
 export * from "./run-events.ts";
 export * from "./material-zip.ts";
 export * from "./material-text.ts";
+export * from "./work-message.ts";
+export * from "./file-proof.ts";

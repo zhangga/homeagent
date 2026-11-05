@@ -259,7 +259,10 @@ export class TaskScheduler {
         if (!shouldRunTask(task, now)) continue;
         log.info("running scheduled task", { taskId: task.id, space: task.space, reason });
         try {
-          const started = this.engine.startTaskRun(task.id, { trigger: "scheduled" });
+          const started = await this.engine.startTaskRunAsync(task.id, { trigger: "scheduled" });
+          // Admission of the next task yields to a Worker. Observe failures now;
+          // the completion/notification loop below still reports the outcome.
+          void started.completion.catch(() => {});
           ran.push(task.id);
           startedTasks.push({ task, started });
         } catch (err) {

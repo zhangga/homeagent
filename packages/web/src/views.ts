@@ -42,6 +42,7 @@ import type {
   RunQueueInfo,
   AggregatedRunUsage,
   WorkItem,
+  WorkInput,
   WorkAction,
   WorkContinuationPolicy,
   AgentKnowledgeFeedback,
@@ -983,7 +984,7 @@ export function governanceView(
     </div>
     <div class="card">
       <h2 style="margin-top:0">恢复空间</h2>
-      <p class="muted">接受 homeagent.space v1–v20 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录，v19 包含按 SHA-256 校验的完整原文件，v20 保留 Agent 执行模式意图但不包含本机完全访问确认；已有同名空间不会被覆盖。</p>
+      <p class="muted">接受 homeagent.space v1–v21 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录，v19 包含按 SHA-256 校验的完整原文件，v20 保留 Agent 执行模式意图但不包含本机完全访问确认，v21 保留多事项及默认焦点，不恢复本机分派队列和执行准入；已有同名空间不会被覆盖。</p>
       <form method="post" action="/governance/restore" enctype="multipart/form-data" class="actions">
         <input type="file" name="archive" accept="application/json,.json" required />
         <button type="submit">上传并恢复</button>
@@ -1300,6 +1301,7 @@ export function workItemsView(
   actions: WorkAction[] = [],
   continuationPolicy?: WorkContinuationPolicy,
   flashMsg?: string,
+  coordination?: { currentIds: string[]; inputs: WorkInput[]; chatRuns: ChatRun[] },
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const listItems = items.map((item) => html`
     <a class="item ${selected?.id === item.id ? "active" : ""}"
@@ -1320,7 +1322,7 @@ export function workItemsView(
         </option>`)}
       </select></div>`;
   const phase = selected?.phase ?? "active";
-  const activation = selected && !selected.active && selected.phase !== "completed"
+  const activation = selected && !coordination?.currentIds.includes(selected.id)
     ? html`<form method="post" action="/work/${encodeURIComponent(selected.id)}/activate" class="inline-form">
         <button type="submit" class="secondary">设为当前工作项</button>
       </form>`
@@ -1446,7 +1448,7 @@ export function workItemsView(
     : "";
 
   return html`<h1>工作上下文</h1>
-    <p class="subtitle">把目标、当前进展、下一步和证据放在同一条工作线上；新的输入与运行会自动归入当前项。</p>
+    <p class="subtitle">多个事项可以同时推进。回复结果或说出事项名称即可补充要求；选择当前事项仅改变默认焦点。</p>
     <div class="split">
       <div class="listcol">
         <a class="item ${newActive}" href="/work"><div class="name">＋ 新建工作项</div>
@@ -1455,12 +1457,26 @@ export function workItemsView(
       </div>
       <div>
         ${flash(flashMsg)}
+        ${selected ? html`<section class="card">
+          <h2>事项进度</h2>
+          <p>${selected.active ? "允许后续执行" : "后续执行已暂停"} · ${coordination?.currentIds.includes(selected.id) ? "当前默认事项" : "独立事项"}</p>
+          ${selected.phase !== "completed" ? html`<form method="post" action="/work/${encodeURIComponent(selected.id)}/activity">
+            <input type="hidden" name="active" value="${selected.active ? "false" : "true"}" />
+            <button type="submit" class="secondary">${selected.active ? "暂停后续执行" : "继续后续执行"}</button>
+          </form>` : ""}
+          ${(coordination?.chatRuns ?? []).map(run => html`<p><a href="/chats/runs/${encodeURIComponent(run.id)}">${run.input.slice(0, 100)}</a> · ${{ queued: "排队中", running: "执行中", succeeded: "本轮已完成", failed: "执行失败", cancelled: "已取消", timed_out: "执行超时" }[run.status]}</p>`)}
+          <h3>待处理输入</h3>
+          ${(coordination?.inputs ?? []).length ? coordination!.inputs.map(input => html`<p>${input.message.text.slice(0, 300)}<br /><span class="muted">${{
+            received: "已接收", preparing: "正在准备", waiting: "等待事项继续", planned: "已有执行计划", dispatched: "已派发",
+            settled: "已处理", interrupted: "处理曾中断，请查看运行或重新发送要求", cancelled: "已取消",
+          }[input.state]}</span></p>`) : html`<p class="muted">暂无待处理输入。</p>`}
+        </section>` : ""}
         ${controls}
         <section class="card work-editor">
           <p class="work-kicker">Operational context</p>
           <div class="work-head">
             <div><h2>${selected ? selected.title : "建立工作项"}</h2>
-              ${selected?.active ? html`<span class="work-current">● 当前工作项</span>` : ""}
+              ${selected && coordination?.currentIds.includes(selected.id) ? html`<span class="work-current">● 当前工作项</span>` : ""}
             </div>
             ${activation}
           </div>

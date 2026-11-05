@@ -27,8 +27,10 @@ import type {
   DownloadedAttachment,
   FetchedDocument,
   InboundEvent,
+  InboundHandler,
   NoticeOptions,
   OutboundReply,
+  OutboundReceipt,
   LiveReplyHandle,
   LiveReplySnapshot,
   ReplyTarget,
@@ -283,7 +285,7 @@ export class FeishuConnector implements Connector {
   private maxAttachmentBytes: number;
   private replyRetryDelayMs: number;
   private runCommand: RunCommand;
-  private handler?: (event: InboundEvent) => void | Promise<void>;
+  private handler?: InboundHandler;
   private consumers: Consumer[] = [];
   private cardActions: boolean;
   private stopping = false;
@@ -308,7 +310,7 @@ export class FeishuConnector implements Connector {
     this.runCommand = (command, options) => runCommand(withLarkProfile(command, this.profile), options);
   }
 
-  async start(onEvent: (event: InboundEvent) => void | Promise<void>): Promise<void> {
+  async start(onEvent: InboundHandler): Promise<void> {
     this.handler = onEvent;
     this.stopping = false;
     this.consumers = [
@@ -476,10 +478,23 @@ export class FeishuConnector implements Connector {
             : normalizeBotAdded(obj);
         if (!event) continue;
         c.lastEventAt = Date.now();
-        try {
-          await this.handler?.(event);
-        } catch (err) {
-          log.error("event handler threw", { key: c.key, err: String(err) });
+        for (let attempt = 0; !this.stopping && !c.stopped; attempt++) {
+          try {
+            const receipt = await this.handler?.(event);
+            // The intake handler owns completion/error reporting after durable receipt.
+            if (receipt) void receipt.completion.catch(() => {});
+            c.lastError = undefined;
+            c.state = "ready";
+            break;
+          } catch {
+            c.lastError = "Inbound event has not been durably accepted";
+            c.state = "backoff";
+            log.error("event receipt failed; retaining event for retry", { key: c.key });
+            const until = Date.now() + Math.min(this.backoffBaseMs * 2 ** Math.min(attempt, 20), this.backoffMaxMs);
+            while (!this.stopping && !c.stopped && Date.now() < until) {
+              await Bun.sleep(Math.min(100, until - Date.now()));
+            }
+          }
         }
       }
     } catch (err) {
@@ -573,7 +588,7 @@ export class FeishuConnector implements Connector {
   async finalizeLiveReply(handle: LiveReplyHandle, snapshot: LiveReplySnapshot): Promise<void> {
     await this.updateLiveReply(handle, snapshot);
   }
-  async reply(out: OutboundReply): Promise<void> {
+  async reply(out: OutboundReply): Promise<void | OutboundReceipt> {
     const idempotencyKey = replyIdempotencyKey(out);
     const cmd = [
       this.larkBin,
@@ -582,14 +597,19 @@ export class FeishuConnector implements Connector {
       "--as",
       "bot",
       "--markdown",
-      formatFeishuLocalFileLinks(out.markdown),
+      "-",
     ];
     if (out.replyToMessageId) cmd.push("--message-id", out.replyToMessageId);
     if (out.inThread) cmd.push("--reply-in-thread");
     if (idempotencyKey) cmd.push("--idempotency-key", idempotencyKey);
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        await this.runCommand(cmd);
+        const output = await this.runCommand(cmd, { stdin: formatFeishuLocalFileLinks(out.markdown) });
+        // A missing/changed response shape cannot turn successful delivery into a retry.
+        try {
+          const messageId = nestedStringField(JSON.parse(output), new Set(["message_id"]));
+          if (messageId && /^[a-zA-Z0-9_-]{1,512}$/u.test(messageId)) return { messageId };
+        } catch { /* Legacy CLI output does not always include a JSON receipt. */ }
         return;
       } catch (err) {
         if (attempt === 1) {

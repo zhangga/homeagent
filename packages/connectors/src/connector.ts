@@ -80,6 +80,11 @@ export interface CardActionEvent {
 
 export type InboundEvent = InboundMessage | BotAddedEvent | CardActionEvent;
 
+/** Resolution acknowledges durable receipt; completion is optional for interactive callers. */
+export interface InboundReceipt { completion: Promise<void> }
+export type InboundHandler = (event: InboundEvent) => void | InboundReceipt | Promise<void | InboundReceipt>;
+export interface OutboundReceipt { messageId: string }
+
 /** How the orchestrator asks a connector to send a reply. */
 export interface OutboundReply {
   chatId: string;
@@ -167,9 +172,9 @@ export interface NoticeOptions {
  */
 export interface Connector {
   readonly name: string;
-  start(onEvent: (event: InboundEvent) => void | Promise<void>): Promise<void>;
+  start(onEvent: InboundHandler): Promise<void>;
   stop(): Promise<void>;
-  reply(out: OutboundReply): Promise<void>;
+  reply(out: OutboundReply): Promise<void | OutboundReceipt>;
   /** Create a platform-native live reply when the transport supports updates. */
   createLiveReply?(out: OutboundReply, snapshot: LiveReplySnapshot): Promise<LiveReplyHandle>;
   /** Update the same live reply; implementations must ignore stale revisions. */

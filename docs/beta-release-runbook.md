@@ -22,13 +22,26 @@ Provider 启动许可为同步 Interface；未来若 Store 改为异步提交或
 确认保留门禁需覆盖每 Agent 100 条、集合 10,000 条与紧凑 UTF-8 JSON 16 MiB：新发布只淘汰无引用旧记录，保留当前发布、所有非终态 Run 和在途临时调用。
 验证原生预检/普通问答没有持久化 Run 时仍受保护、并发引用独立释放、错误退出释放引用、未知引用/关闭后拒绝清理，及清理与发布/回滚写失败不产生部分生效。
 清理后的终态 Run 和 Agent revision 重启仍可读，旧引用无法恢复执行权限；支持平台 crash-recovery 和真实恢复验收不能以 Windows 假 Provider 测试替代。
-本阶段另需验证 Chat 文件 v6/v7→v8 后旧 v1 计划的已送达话题能继续 fork，计划 v2 使用独立兼容摘要；旧证据保持未知、新证据重启不丢失，
+本阶段另需验证 Chat 文件 v6/v7/v8→v9 后旧 v1 计划的已送达话题能继续 fork，计划 v2 使用独立兼容摘要；旧证据保持未知、新证据重启不丢失，
 以及未来格式拒绝读取。Task v12→v13 不改写旧审批或计划；损坏/未来运行文件不能按空历史覆盖。
 Registry 无版本→v1、飞书绑定 v1/v2→v3 必须先原子保存 epoch；策略 A→B→A、解绑重连、导入均不能复活旧确认，写失败不改变内存。
 还需验证 Agents v4→v5 保留旧快照且不补造确认、正常同机重启保留确认、
-旧备份恢复先撤销确认且写失败不能启动 Store。Space 归档 v20 的专用历史计划 DTO 不能导出本机确认、scope、epoch 或执行证据；恢复到新目录必须重新确认，不能直接执行/重试历史 DTO。
+旧备份恢复先撤销确认且写失败不能启动 Store。Space 归档 v21 的专用历史计划 DTO 不能导出本机确认、scope、epoch 或执行证据；恢复到新目录必须重新确认，不能直接执行/重试历史 DTO。
 
 ## 1. 候选代码本地预检
+
+多事项协调新增验收：
+
+- WorkItems v1→v2 保留旧 active 值并建立默认焦点；多个 active 项重启后保留，切换默认焦点不暂停其他工作。
+- 真实 NDJSON 消费流连续发送两个独立请求，确认第二个在第一个 Provider 尚未完成时已持久接收；资料同步和语义路由同样不阻塞后续接收。接收落盘失败时不越过当前事件。
+- 同群同一个 Agent 的独立事项可重叠运行，覆盖只读、可写和已授权的完全访问模式，并验证全局／Provider 模型并发额度仍生效；同原生话题从资料读取到最终送达保持顺序，后续 fork 只使用已送达 parent，同事项补充仍按顺序执行。可写与完全访问 Task 分别取得原有逐次审批后才能并行，输出仍等待验收。
+- 核对新建 Run、关联事项/输入和 admission 三处提交失败及重启恢复，每条输入最多派发一次；完整输入超过 Chat 展示摘要后仍可恢复/重试。运行中的进程与中断的路由准备不能自动重放。
+- 查询进度不调用模型；补充先保存、下一轮执行；暂停不终止当前执行，取消不误伤另一事项。真实回复 receipt 和已送达列表序号能定位事项；缺失 receipt 时不能伪造消息 ID 或为取得 ID 重发结果。
+- 队列停止/恢复、绑定失效、原消息撤回、延迟成功和投递落盘失败均有测试；来源撤回不能留下可重新执行的本机输入。Web 事项页的默认焦点、活动状态、等待输入和关联 Run 与持久状态一致。
+- Space archive v21 保留多事项及默认焦点，剥离本机消息分派/执行准入、取消意图和真实回复 ID；v1–v20 原有验证不放宽。未完成输入阻止导出/删除/迁移，删除失败恢复原焦点与分派记录。
+- 升级前备份完整旧数据并停止应用。旧二进制不能直接读取新 WorkItems v2/Chat v9 数据；回退使用完整旧备份，不删除新状态伪造兼容。
+
+以上离线测试不替代真实飞书、支持平台崩溃恢复及长时运行验收。
 
 飞书过程展示验收需同时覆盖空知识库与命中知识库后的结构化回答：工具阶段的公开结果说明应实时出现，
 不能只显示开始/结束。核对查询数量、零结果、仍有分页、失败说明与实际返回一致，连续工具明细中同次调用只显示最新状态；
@@ -200,7 +213,7 @@ arm64 和 Intel 架构至少各完成一次；测试机不得依赖仓库 checko
    Codex 0.152.1 的 macOS/Linux/Windows 都使用统一 `codex sandbox` 入口，但 fake runner 或另一平台的结果不能替代
    Ubuntu/macOS 支持主机实测；Windows 若无法启用强制 root-deny backend，只能显示 `nativeSessions=false`，不得放宽 profile。
    检查退出码 73/74/75 必须分别展示状态目录可读、授权目录不可读、受保护数据目录可读的固定原因，且不得显示“完全可用”或自动无状态重试。
-   单个 Skill 连同已安装依赖超过 16 MiB、但未超过 128 MiB / 50,000 条目时仍须完整加载、冻结并验证依赖；整个目录未超过 128 MiB / 200,000 条目时，实际副本数量必须与冻结目录一致。超过总预算应整轮失败、清理副本、保留有界准备失败证据，不得静默删减。原生权限中的共同 Skill 读取根必须只覆盖本轮已验证副本，不得覆盖 live Skill 根或整个临时目录。普通测试会话不应反复追加无关 Skill 告警；明确点名的不可用 Skill 应说明已识别的失败原因。
+   单个 Skill 连同已安装依赖超过 16 MiB、但未超过 128 MiB / 50,000 条目时仍须完整加载、冻结并验证依赖。按需路径的普通问答应准备零个 bundle；显式技能、后续依赖均须可按名称加载，实际副本数量与本轮已加载的不同技能数一致。完整清单超过 128 MiB 但本轮只使用少量技能时仍可执行；实际加载累计超过 128 MiB / 200,000 条目则整轮失败、清理副本、保留有界准备失败证据，不得静默删减。预检、路由和最终回答复用本轮副本，并行 Run 不共享；普通受限 Codex 路径仍完整准备并在同轮复用。原生权限中的共同 Skill 读取根必须只覆盖本轮已验证副本，不得覆盖 live Skill 根或整个临时目录。普通测试会话不应反复追加无关 Skill 告警；明确点名的不可用 Skill 应说明已识别的失败原因。
    Claude 仍必须保持一次性隔离调用。
    Provider 安装、登录和升级由机器所有者管理，HomeAgent 不得下载或替换该程序。
 6. 创建或连接飞书机器人，确认两个必需消息事件消费者就绪；检查独立 `card.action.trigger` 消费者状态。
@@ -308,8 +321,8 @@ Maintenance 不得增加调用次数。Wiki Maintenance 必须分别报告无 Ra
    Dream/Maintenance Provider 调用或增加 token；运行状态只显示聚合计数，不得泄露 query/note/正文。
 5. 启用反馈写入口后 MCP 应额外声明 `submit_knowledge_feedback` 为 non-destructive、idempotent、closed-world，
    但不是 read-only；未启用时仍只能看到六个读取工具。分别 smoke MCP 与 `homeagent feedback` JSON CLI。
-6. 导出 `homeagent.space v20` 并恢复到全新目录，确认 open/resolved 状态、revision、处置说明与幂等键保持；
-   v1–v17 归档应归一化为空反馈集合，跨 Space、伪造处置关系或超过 5000 条反馈的 v18–v20 归档必须 fail-closed。
+6. 导出 `homeagent.space v21` 并恢复到全新目录，确认 open/resolved 状态、revision、处置说明与幂等键保持；
+   v1–v17 归档应归一化为空反馈集合，跨 Space、伪造处置关系或超过 5000 条反馈的 v18–v21 归档必须 fail-closed。
 
 原文件持久化另做以下回归：
 
@@ -318,7 +331,7 @@ Maintenance 不得增加调用次数。Wiki Maintenance 必须分别报告无 Ra
    再分别上传二进制、无效 UTF-8 和空文件，确认均创建 Raw 且可原样下载，不把乱码或占位文本冒充原正文。
 2. 在飞书回复一份文件并明确说“请记录这个原文件”；即使文本提取失败或格式不支持，也必须在对应 Space 的
    `raw/sources/` 留下按 SHA-256 寻址的完整文件，并能从 Raw 详情页下载。临时下载文件清理失败不得回滚已保存原件。
-3. 导出 `homeagent.space v20`，确认原文件载荷、摘要、字节数和 Raw attachment 双向一致；篡改 base64、摘要、
+3. 导出 `homeagent.space v21`，确认原文件载荷、摘要、字节数和 Raw attachment 双向一致；篡改 base64、摘要、
    字节数或引用关系必须在创建目标 Space 前 fail-closed。恢复到全新目录后再次下载并逐字节比对。
 
 ### 4.1 Agent 发布与 Skill 执行边界验收
@@ -337,11 +350,14 @@ Maintenance 不得增加调用次数。Wiki Maintenance 必须分别报告无 Ra
    当前消息时，确认该显式回复目标仍作为本 turn 来源上下文传入；未显式回复时，不得从同一 chat 的最近附件启发式
    注入另一话题的来源正文。新建另一个话题必须从空会话开始。每轮都必须
    忽略用户与项目指令/Rules/Hooks/Plugins、关闭 Codex 自动 Skill 发现、禁止交互审批，并按冻结的 Permission、Workdir 与完整 Skill 证据执行。
-   路由/分类与最终生成必须分别从同一冻结摘要生成本轮私有 Skill 副本、复验后仅授权副本，并使用同一规则构造 exact
+   路由/分类与最终生成必须共用本次 Run 的技能加载器，首次使用时从冻结摘要生成完整私有副本、复用前复验，并使用同一规则构造 exact
    filesystem profile；只有最终生成携带 native session。原 live Skill 路径不得进入 prompt/profile，fork 必须明确忽略历史中已清理的旧副本路径；
    若 routing 后 live bundle 改变，最终生成应 fail-closed 且不得创建 child session。
    在同一隔离配置下执行的 `codex mcp list --json` 必须严格为 `[]`；无模型 sandbox probe 还必须证明本轮允许目录可读、
    隔离 `CODEX_HOME` sentinel 不可读，以及位于 `<dataDir>/run/`、仅受 `:root=deny` 保护的 sibling sentinel 不可读。
+   加载脚本可读、专用空请求标记目录可写，而加载器根目录和结果目录不可写；网络保持关闭，Workdir 权限不变。首次加载前修改源 bundle、复用前修改冻结副本、加载中取消或超过累计容量均须停止并清理，不留下等待中的加载脚本。
+   运行 `bun test packages/app/src/skill-preparation.test.ts` 验收连接器收件、持久化入队、冻结目录、路由、最终生成与投递的完整离线链路；外部进程应持续探测 `/work` 和 `/healthz`，覆盖首次建索引、同轮复用、按需依赖与独立消息并行。不能用仅覆盖 Provider 的计时代替消息入队验收。首次目录遍历与散列必须在 Worker 中完成，复用时仍须检测变更；进程启动的授权与 Workdir 检查不得改成可跨异步间隙复用的结果。
+   打包产物必须包含 `skill-catalog-worker.ts` 与 `skill-bundle-worker.ts`；运行 `bun test scripts/skill-worker-bundle.test.ts` 检查打包后的路径与实际 Worker 启动。该离线检查不代表真实飞书、模型、macOS 签名或公证通过。
    `full`、Workdir 与数据目录任一方向重叠、冻结 Skill 路径变更或根拒绝无法落实，都必须在任何模型调用前 fail-closed。
    临时加入一个 System/MDM MCP
    后应在模型调用前固定失败，管理页同时标记 `nativeSessions=false`，且错误不得泄露 server 名称或配置。
@@ -357,23 +373,23 @@ Maintenance 不得增加调用次数。Wiki Maintenance 必须分别报告无 Ra
 7. 临时修改 Skill 目录中的一个非 `SKILL.md` 资源文件，再运行先前已排队的显式任务；必须因完整目录树摘要变化而
    fail-closed，不能只校验入口文件或静默使用新内容。恢复目录并重新创建 Run 后才允许执行。
 8. 在工作上下文中配置两个下一动作，手动续作第一个并确认 Task Run 成功后先生成“结果 / 检查 / 证据”验收报告；`read-only` 仅在 Raw 已落盘、输出未截断且 Provider 返回严格 JSON 报告（`outcome=completed`、无 blocker、全部检查通过）时自动验收。普通文本或畸形报告必须停在人工验收，结构化 `blocked` 必须形成 blocker 且不得消费动作；`write/full` 即使执行前已审批，执行后仍必须人工接受。接受后才写入 checkpoint、消费当前首个动作；驳回必须填写原因，保留动作和证据并允许从同一边界重试。修改计划后可显式放弃旧的受阻动作，确认系统 blocker 被清除且新的首个动作可继续。待验收时自动续跑暂停，旧 Run 页面不能决定新重试结果。失败应转为阻塞，取消不得消费动作；重启后排队动作按冻结计划恢复，已中断的运行中动作只转为阻塞、不得重放。
-9. 导出并恢复该空间，确认格式为 `homeagent.space v20`，Agent 发布历史、运行所引用的 revision、完整 Skill 证据、跳过原因、工作上下文、WorkAction/checkpoint/验收审计、自动续作策略、Raw 准入状态、分层知识地图、本地 Agent 知识反馈、完整原文件及 Wiki Maintenance 最近完成时间/有界摘要保持不变；待验收动作必须阻止导出与删除。Provider 原生会话 ID/路由不得出现在归档，恢复后同一飞书话题必须新建 Provider 会话。验收前 Raw 必须为 `held` 且不能被 Dream、强制重跑、隔离重试或人工重新提炼读取；接受后才变为 `ready`，驳回、取消或失败后必须为 `excluded`。
+9. 导出并恢复该空间，确认格式为 `homeagent.space v21`，Agent 发布历史、运行所引用的 revision、完整 Skill 证据、跳过原因、工作上下文、WorkAction/checkpoint/验收审计、自动续作策略、Raw 准入状态、分层知识地图、本地 Agent 知识反馈、完整原文件及 Wiki Maintenance 最近完成时间/有界摘要保持不变；待验收动作必须阻止导出与删除。Provider 原生会话 ID/路由不得出现在归档，恢复后同一飞书话题必须新建 Provider 会话。验收前 Raw 必须为 `held` 且不能被 Dream、强制重跑、隔离重试或人工重新提炼读取；接受后才变为 `ready`，驳回、取消或失败后必须为 `excluded`。
 
 这里验收的是当前 native Skill 冻结与执行链。`ManagedSkillStore` 仍是未接入 Provider 运行时的安全基础设施；不得把 Git/URL
 导入、Managed release 执行或 Skill 市场写成已发布能力。
 
-### 4.2 v10–v19 真实归档迁移验收
+### 4.2 v10–v20 真实归档迁移验收
 
-从对应历史版本各准备一份脱敏的真实 `homeagent.space v10`、v11、v12、v13、v14、v15、v16、v17、v18、v19 归档；不得只修改 JSON 的 `version` 字段伪造。
+从对应历史版本各准备一份脱敏的真实 `homeagent.space v10`、v11、v12、v13、v14、v15、v16、v17、v18、v19、v20 归档；不得只修改 JSON 的 `version` 字段伪造。
 每份归档使用独立的全新数据目录执行以下步骤，避免同名空间相互覆盖：
 
 1. 先只读保存原归档、文件摘要和来源版本，再通过管理后台导入；导入失败时保留原文件和错误，不手改历史审计绕过校验。
 2. v10 确认冻结执行计划仍可查看；v11 确认 Agent 发布历史和已有审批审计仍在；v12 确认审批期限与通知审计仍在；
    v13 确认用量、失败分类和自动重试关系仍在；v14 确认 Chat 评测 Trace 与已结束重评审计仍在；v15 确认工作上下文、WorkAction、checkpoint 与验收审计仍在，且历史 WorkAction Raw 按事实迁移为 `ready/excluded`，引用非准入来源的污染页被移除。旧版本本来没有的字段应保持 legacy/未知，不得补成虚假的成功、0 成本或已审批。
 3. 对缺少可验证审批或执行计划的历史 `write/full` 活动运行做负向检查：恢复必须 fail-closed，不能用当前 Agent 配置继续执行。
-4. 将迁移后的空间重新导出，确认版本为 `homeagent.space v20`；重启 HomeAgent 后再次导出，比对知识及分层地图、Agent revision、Task/Chat Run、工作上下文、WorkAction/checkpoint、Raw 准入状态、自动续作策略、
+4. 将迁移后的空间重新导出，确认版本为 `homeagent.space v21`；重启 HomeAgent 后再次导出，比对知识及分层地图、Agent revision、Task/Chat Run、工作上下文、WorkAction/checkpoint、Raw 准入状态、自动续作策略、
    审批/通知/重试/用量审计、提醒和学习数据的数量与关键 ID。
-5. 把该 v20 归档导入第二个全新数据目录，确认没有重复通知、自动续跑、重复动作 checkpoint、重复原始材料、悬空工作关联、未验收 Raw 污染 Wiki、丢失原文件或悬空质量 trace。把原归档摘要、两次 v20
+5. 把该 v21 归档导入第二个全新数据目录，确认没有重复通知、自动续跑、重复动作 checkpoint、重复原始材料、悬空工作关联、未验收 Raw 污染 Wiki、丢失原文件或悬空质量 trace。把原归档摘要、两次 v21
    导出摘要及逐项结果附到发布记录。
 
 ### 4.3 用量与质量重新评测验收
@@ -591,9 +607,9 @@ metadata，不得包含消息正文、Instruction、Prompt、凭据或完整模�
 - 两个架构的签名、公证和 DMG smoke 全绿；
 - 至少一个全新用户环境在预装机器 Provider 的前提下完成 DMG、LaunchAgent、Provider 探测和首次设置验收；
 - 自动与真实崩溃恢复均通过；
-- v10、v11、v12、v13、v14、v15、v16、v17、v18、v19 十份真实归档均完成独立迁移、v20 再导出、重启和二次恢复，比对记录已归档；
+- v10、v11、v12、v13、v14、v15、v16、v17、v18、v19、v20 十一份真实归档均完成独立迁移、v21 再导出、重启和二次恢复，比对记录已归档；
 - Agent 草稿/发布/回滚、`write/full` 审批与过期、定时只读自动重试三个真实飞书灰度场景全部通过；
-- 普通调用的 Claude strict no-tools 或 Codex 临时只读、普通/话题 Chat 的冻结 Skill 摘要、逐调用私有副本与无 ambient Skill、no-tools 后台路径的 Skill 跳过、TRAE 安全拒绝和图片输入边界均有真实消息证据；
+- 普通调用的 Claude strict no-tools 或 Codex 临时只读、普通/话题 Chat 的冻结 Skill 摘要、按需准备与同 Run 复用且跨 Run 独立的私有副本、无 ambient Skill、no-tools 后台路径的 Skill 跳过、TRAE 安全拒绝和图片输入边界均有真实消息证据；
 - 用量页面没有把未知成本显示为 0，质量重新评测没有外发副作用且被标记为 re-evaluation 而非 deterministic replay；
 - 24 小时 soak 达标；公开 Beta 前完成 48 小时 soak；
 - 已记录仍由飞书管理员完成的权限、发布和外部共享步骤。

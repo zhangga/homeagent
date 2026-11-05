@@ -1,16 +1,21 @@
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { Worker } from "node:worker_threads";
 import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import {
   hashProviderSkillBundle,
+  hashProviderSkillBundleAsync,
   providerCodexHome,
   providerSkillReference,
   SKILL_STAGING_MAX_BYTES,
   type ProviderSkillInput,
   type ProviderId,
 } from "@homeagent/llm";
-import type { SkillWarningView } from "@homeagent/shared";
+import { fileIdentity, type FileIdentity, type SkillWarningView } from "@homeagent/shared";
+
+type SkillHashSteps<T> = Generator<string, T, string>;
 
 export type SkillRootKind =
   | "shared-agents"
@@ -182,6 +187,26 @@ export interface SkillCatalogOptions {
   };
 }
 
+export interface SkillCatalogRequest {
+  provider: ProviderId;
+  bindings?: readonly (SkillBindingRequest | LegacySkillBindingRequest)[];
+}
+
+export interface SkillCatalogResolution {
+  skills: ResolvedAgentSkills;
+  inputs: ProviderSkillInput[];
+  snapshot: SkillCatalogSnapshot;
+  proof: FileIdentity[];
+}
+
+interface CatalogLease {
+  request: SkillCatalogRequest;
+  ticket: number;
+  resolution: Omit<SkillCatalogResolution, "proof">;
+}
+
+type RecordIdentity = (path: string) => void;
+
 export function defaultSkillRoots(
   homeDirectory = homedir(),
   codexHome = providerCodexHome(),
@@ -316,13 +341,14 @@ function catalogEntries(sources: SkillSource[]): SkillCatalogEntry[] {
  * falls through to the authoritative content hash, which keeps the symlink,
  * escape and size rules of `hashProviderSkillBundle` in force.
  */
-function skillBundleSignature(skillFile: string, maxEntries: number): string {
+function skillBundleSignature(skillFile: string, maxEntries: number, record?: RecordIdentity): string {
   const root = dirname(skillFile);
   const parts: string[] = [];
   const pending = [{ directory: root, relativeDir: "", depth: 0 }];
   let entries = 0;
   while (pending.length > 0) {
     const current = pending.pop()!;
+    record?.(current.directory);
     if (current.depth > 32) throw new Error("Skill bundle is too deeply nested");
     const children = readdirSync(current.directory, { withFileTypes: true })
       .sort((left, right) => left.name.localeCompare(right.name));
@@ -332,6 +358,7 @@ function skillBundleSignature(skillFile: string, maxEntries: number): string {
       const fullPath = join(current.directory, child.name);
       const relativePath = join(current.relativeDir, child.name).split(sep).join("/");
       const metadata = lstatSync(fullPath);
+      record?.(fullPath);
       const kind = metadata.isSymbolicLink()
         ? "l"
         : metadata.isDirectory()
@@ -361,12 +388,13 @@ function skillBundleSignature(skillFile: string, maxEntries: number): string {
   return createHash("sha256").update(parts.join("\n")).digest("hex");
 }
 
-function skillDirectories(root: string, maxDepth: number, maxEntries: number): string[] {
+function skillDirectories(root: string, maxDepth: number, maxEntries: number, record?: RecordIdentity): string[] {
   const pending = [{ directory: root, depth: 0 }];
   const found: string[] = [];
   let visitedEntries = 0;
   while (pending.length > 0) {
     const { directory, depth } = pending.pop()!;
+    record?.(directory);
     let entries;
     try {
       entries = readdirSync(directory, { withFileTypes: true });
@@ -403,6 +431,23 @@ export class SkillCatalog {
   private readonly now: () => number;
   private snapshot?: SkillCatalogSnapshot;
   private snapshotVersion = 0;
+  private readonly scope = new AsyncLocalStorage<CatalogLease | undefined>();
+  private readonly workerOptions: Omit<SkillCatalogOptions, "now">;
+  private worker?: Worker;
+  private requestSequence = 0;
+  private closed = false;
+  private publishedTicket?: number;
+  private workerScans = 0;
+  /** In-process preparation diagnostic; no paths, content, or persisted state. */
+  backgroundScanCount(): number { return this.workerScans; }
+  private readonly pending = new Map<number, {
+    resolve: (reply: { ticket: number; resolution: Omit<SkillCatalogResolution, "proof"> }) => void;
+    reject: (error: Error) => void;
+  }>();
+  private recording?: Map<string, FileIdentity>;
+  private record: RecordIdentity = path => {
+    if (this.recording && !this.recording.has(path)) this.recording.set(path, fileIdentity(path));
+  };
   /** In-memory invalidation only; never scans disk or resolves Skills. */
   cachedSnapshotVersion(): number { return this.snapshotVersion; }
   /** Bundle hashes produced by the immediately preceding synchronous resolve. */
@@ -416,6 +461,7 @@ export class SkillCatalog {
   private readonly bundleHashCache = new Map<string, string | { failure: string }>();
 
   constructor(options: SkillCatalogOptions) {
+    this.workerOptions = { roots: structuredClone(options.roots), limits: options.limits };
     this.roots = options.roots.map((root) => ({
       ...root,
       providerIds: [...root.providerIds],
@@ -436,17 +482,141 @@ export class SkillCatalog {
     this.now = options.now ?? Date.now;
   }
 
+  /** Called only by the catalog worker; proof capture shares the actual traversal. */
+  captureResolution(request: SkillCatalogRequest, initialSnapshot?: SkillCatalogSnapshot): SkillCatalogResolution {
+    return this.readHashesSync(this.captureResolutionSteps(request, initialSnapshot));
+  }
+
+  /** Worker messages stay serialized while content I/O within each bundle overlaps. */
+  async captureResolutionAsync(request: SkillCatalogRequest, initialSnapshot?: SkillCatalogSnapshot): Promise<SkillCatalogResolution> {
+    const steps = this.captureResolutionSteps(request, initialSnapshot);
+    let step = steps.next();
+    while (!step.done) {
+      let hash: string;
+      try { hash = await hashProviderSkillBundleAsync(step.value, this.maxEntries, this.maxBundleBytes); }
+      catch (error) { step = steps.throw(error); continue; }
+      step = steps.next(hash);
+    }
+    return step.value;
+  }
+
+  private readHashesSync<T>(steps: SkillHashSteps<T>): T {
+    let step = steps.next();
+    while (!step.done) {
+      let hash: string;
+      try { hash = hashProviderSkillBundle(step.value, this.maxEntries, this.maxBundleBytes); }
+      catch (error) { step = steps.throw(error); continue; }
+      step = steps.next(hash);
+    }
+    return step.value;
+  }
+
+  private *captureResolutionSteps(request: SkillCatalogRequest, initialSnapshot?: SkillCatalogSnapshot): SkillHashSteps<SkillCatalogResolution> {
+    this.recording = new Map();
+    try {
+      const previous = this.snapshot ?? initialSnapshot;
+      const snapshot = this.refresh();
+      const skills = request.bindings === undefined ? yield* this.resolveAllSteps(request.provider)
+        : yield* this.resolveAgentBindingSteps(request.bindings, request.provider);
+      if (request.bindings === undefined && previous) {
+        const present = new Set(snapshot.sources.map(source => source.sourceKey));
+        for (const source of previous.sources) {
+          if (skills.requested.length >= this.maxSkills) break;
+          if (source.status !== "available" || !source.providerIds.includes(request.provider) || present.has(source.sourceKey)) continue;
+          skills.requested.push({ kind: "source", sourceKey: source.sourceKey, name: source.name });
+          const skipped: SkippedSkillSnapshot = { sourceKey: source.sourceKey, name: source.name,
+            code: "missing_source", message: "Skill source is unavailable" };
+          skills.skipped.push(skipped); skills.warnings.push({ ...skipped });
+        }
+      }
+      const inputs = this.executionInputsAfterValidation(skills.resolved);
+      return { skills, inputs, snapshot, proof: [...this.recording.values()] };
+    } finally { this.recording = undefined; }
+  }
+
+  private request(operation: "resolve" | "validate", request?: SkillCatalogRequest, ticket?: number) {
+    if (this.closed) return Promise.reject(new Error("Skill catalog is closed"));
+    if (!this.worker) {
+      const worker = new Worker(new URL("./skill-catalog-worker.ts", import.meta.url));
+      this.worker = worker;
+      worker.on("message", (reply: { id: number; scans: number; error?: string; ticket: number; resolution: Omit<SkillCatalogResolution, "proof"> }) => {
+        this.workerScans = reply.scans;
+        const pending = this.pending.get(reply.id);
+        this.pending.delete(reply.id);
+        if (reply.error) pending?.reject(new Error(reply.error));
+        else pending?.resolve(reply);
+        if (this.pending.size === 0) worker.unref();
+      });
+      const fail = () => {
+        if (this.worker !== worker) return;
+        this.worker = undefined;
+        this.closed = true;
+        for (const pending of this.pending.values()) pending.reject(new Error("Skill catalog worker stopped"));
+        this.pending.clear();
+      };
+      worker.on("error", fail);
+      worker.on("exit", fail);
+    }
+    const id = ++this.requestSequence;
+    this.worker.ref();
+    const promise = new Promise<{ ticket: number; resolution: Omit<SkillCatalogResolution, "proof"> }>((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+    });
+    this.worker.postMessage({ id, operation, ticket,
+      ...(operation === "resolve" ? { request, options: this.workerOptions, snapshot: this.snapshot } : {}) });
+    return promise;
+  }
+
+  /** One Run shares resolution without making synchronous callers rescan. */
+  async withResolution<T>(request: SkillCatalogRequest, run: () => T | Promise<T>): Promise<T> {
+    if (request.bindings?.length === 0) return this.scope.run(undefined, run);
+    const reply = await this.request("resolve", request);
+    const lease = { request, ...reply };
+    // Readiness/UI caches may reuse metadata, but never authorize from it.
+    if (this.publishedTicket !== reply.ticket) {
+      this.snapshot = structuredClone(reply.resolution.snapshot);
+      this.snapshotVersion++;
+      this.publishedTicket = reply.ticket;
+    }
+    try { return await this.scope.run(lease, run); }
+    finally { this.worker?.postMessage({ operation: "release", ticket: reply.ticket }); }
+  }
+
+  async validatePrepared(): Promise<void> {
+    const lease = this.scope.getStore();
+    if (lease) await this.request("validate", undefined, lease.ticket);
+  }
+
+  hasPreparedResolution(): boolean { return this.scope.getStore() !== undefined; }
+
+  close(): void {
+    this.closed = true;
+    for (const pending of this.pending.values()) pending.reject(new Error("Skill catalog is closed"));
+    this.pending.clear();
+    void this.worker?.terminate();
+    this.worker = undefined;
+  }
+
+  private prepared(provider: ProviderId, bindings?: readonly (SkillBindingRequest | LegacySkillBindingRequest)[]): ResolvedAgentSkills | undefined {
+    const lease = this.scope.getStore();
+    if (!lease) return undefined;
+    if (lease.request.provider !== provider || JSON.stringify(lease.request.bindings) !== JSON.stringify(bindings)) {
+      throw new Error("Skill preparation does not match the frozen Agent");
+    }
+    return structuredClone(lease.resolution.skills);
+  }
+
   /**
    * Authoritative bundle hash, memoized on a bounded metadata signature.
    * A cache hit still proves nothing was written since the stored hash, and a
    * miss recomputes through `hashProviderSkillBundle`, so every symlink, escape,
    * entry-count and size rule keeps failing closed exactly as before.
    */
-  private bundleHash(skillFile: string): string {
+  private *bundleHashSteps(skillFile: string): SkillHashSteps<string> {
     let signature: string | undefined;
     try {
       signature = `${realpathSync(skillFile)}\u0000${
-        skillBundleSignature(skillFile, this.maxEntries)
+        skillBundleSignature(skillFile, this.maxEntries, this.record)
       }`;
     } catch {
       // An unreadable or hostile tree must reach the authoritative hash below,
@@ -468,7 +638,7 @@ export class SkillCatalog {
     };
     let hash: string;
     try {
-      hash = hashProviderSkillBundle(skillFile, this.maxEntries, this.maxBundleBytes);
+      hash = yield skillFile;
     } catch (error) {
       const failure = skillBundleFailure(error);
       remember({ failure });
@@ -479,12 +649,15 @@ export class SkillCatalog {
   }
 
   refresh(): SkillCatalogSnapshot {
+    const prepared = this.scope.getStore();
+    if (prepared) return structuredClone(prepared.resolution.snapshot);
     const sources: SkillSource[] = [];
     const diagnostics: SkillCatalogDiagnostic[] = [];
     let totalBytes = 0;
     const seenRootPaths = new Set<string>();
     rootLoop:
     for (const root of this.roots) {
+      this.record(root.path);
       let resolvedRoot: string;
       try {
         resolvedRoot = realpathSync(root.path);
@@ -498,9 +671,10 @@ export class SkillCatalog {
       }
       if (seenRootPaths.has(resolvedRoot)) continue;
       seenRootPaths.add(resolvedRoot);
-      for (const directory of skillDirectories(root.path, this.maxDepth, this.maxEntries)) {
+      for (const directory of skillDirectories(root.path, this.maxDepth, this.maxEntries, this.record)) {
         if (sources.length >= this.maxSkills) break rootLoop;
         const skillFile = join(directory, "SKILL.md");
+        this.record(skillFile);
         const relativeDir = normalizedRelativeDir(root.path, directory);
         try {
           const fileSize = statSync(skillFile).size;
@@ -567,6 +741,11 @@ export class SkillCatalog {
   }
 
   current(): SkillCatalogSnapshot {
+    const prepared = this.scope.getStore();
+    if (prepared) return structuredClone(prepared.resolution.snapshot);
+    // A cold hash can outlive the UI cache TTL. Its resolution must still use
+    // the one discovery snapshot captured at the start, not trigger a rescan.
+    if (this.recording && this.snapshot) return this.snapshot;
     if (
       this.snapshot
       && this.now() - this.snapshot.refreshedAt < this.cacheTtlMs
@@ -574,6 +753,11 @@ export class SkillCatalog {
       return this.snapshot;
     }
     return this.refresh();
+  }
+
+  async currentAsync(force = false): Promise<SkillCatalogSnapshot> {
+    if (!force && this.snapshot && this.now() - this.snapshot.refreshedAt < this.cacheTtlMs) return structuredClone(this.snapshot);
+    return this.withResolution({ provider: "gateway" }, () => this.current());
   }
 
   resolveLegacyName(
@@ -612,11 +796,20 @@ export class SkillCatalog {
     bindings: readonly (SkillBindingRequest | LegacySkillBindingRequest)[],
     provider: ProviderId,
   ): ResolvedAgentSkills {
+    return this.readHashesSync(this.resolveAgentBindingSteps(bindings, provider));
+  }
+
+  private *resolveAgentBindingSteps(
+    bindings: readonly (SkillBindingRequest | LegacySkillBindingRequest)[], provider: ProviderId,
+  ): SkillHashSteps<ResolvedAgentSkills> {
+    if (bindings.length === 0) return { requested: [], resolved: [], skipped: [], warnings: [] };
+    const prepared = this.prepared(provider, bindings);
+    if (prepared) return prepared;
     const sourceBindings = bindings.filter(
       (binding): binding is SkillBindingRequest => !("kind" in binding)
         || binding.kind !== "legacy-name",
     );
-    const result = this.resolve(sourceBindings, provider);
+    const result = yield* this.resolveSteps(sourceBindings, provider);
     const legacySkipped: SkippedSkillSnapshot[] = bindings
       .filter((binding): binding is LegacySkillBindingRequest =>
         "kind" in binding && binding.kind === "legacy-name"
@@ -640,6 +833,12 @@ export class SkillCatalog {
 
   /** Resolve every valid Skill that the selected Provider can invoke. */
   resolveAll(provider: ProviderId): ResolvedAgentSkills {
+    return this.readHashesSync(this.resolveAllSteps(provider));
+  }
+
+  private *resolveAllSteps(provider: ProviderId): SkillHashSteps<ResolvedAgentSkills> {
+    const prepared = this.prepared(provider);
+    if (prepared) return prepared;
     const snapshot = this.current();
     const names = new Map<string, string>();
     for (const source of snapshot.sources) {
@@ -659,7 +858,7 @@ export class SkillCatalog {
       .sort((left, right) =>
         left.name.localeCompare(right.name) || left.sourceKey.localeCompare(right.sourceKey)
       );
-    return this.resolve(
+    return yield* this.resolveSteps(
       sources.map((source) => ({
         sourceKey: source.sourceKey,
         name: source.name,
@@ -709,6 +908,7 @@ export class SkillCatalog {
         }
         return {
           name: skill.invocationName,
+          description: source.description,
           directory,
           skillFile,
           bundleHash: skill.skillFileHash,
@@ -726,6 +926,14 @@ export class SkillCatalog {
   executionInputsAfterValidation(
     resolved: readonly ResolvedSkillSnapshot[],
   ): ProviderSkillInput[] {
+    if (resolved.length === 0) return [];
+    const lease = this.scope.getStore();
+    if (lease) {
+      if (JSON.stringify(resolved) !== JSON.stringify(lease.resolution.skills.resolved)) {
+        throw new Error("Queued Run Skill snapshot changed after enqueue; refusing to execute mutable Skill content.");
+      }
+      return structuredClone(lease.resolution.inputs);
+    }
     const byKey = new Map(this.current().sources.map((source) => [source.sourceKey, source]));
     return resolved.map((skill) => {
       const source = byKey.get(skill.sourceKey);
@@ -751,6 +959,7 @@ export class SkillCatalog {
         }
         return {
           name: skill.invocationName,
+          description: source.description,
           directory,
           skillFile,
           bundleHash: skill.skillFileHash,
@@ -762,6 +971,11 @@ export class SkillCatalog {
   }
 
   resolve(bindings: readonly SkillBindingRequest[], provider: ProviderId): ResolvedAgentSkills {
+    return this.readHashesSync(this.resolveSteps(bindings, provider));
+  }
+
+  private *resolveSteps(bindings: readonly SkillBindingRequest[], provider: ProviderId): SkillHashSteps<ResolvedAgentSkills> {
+    if (bindings.length === 0) return { requested: [], resolved: [], skipped: [], warnings: [] };
     const snapshot = this.current();
     const byKey = new Map(snapshot.sources.map((source) => [source.sourceKey, source]));
     const requested = bindings.map((binding): SkillRequestSnapshot => ({
@@ -869,7 +1083,7 @@ export class SkillCatalog {
       }
       let bundleHash: string;
       try {
-        bundleHash = this.bundleHash(resolvedSource.skillFile);
+        bundleHash = yield* this.bundleHashSteps(resolvedSource.skillFile);
       } catch (error) {
         skipped.push({
           ...binding,

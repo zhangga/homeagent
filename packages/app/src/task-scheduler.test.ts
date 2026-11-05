@@ -6,6 +6,7 @@ import { type SpaceId } from "@homeagent/shared";
 import {
   DEFAULT_TASK_RUN_APPROVAL_TTL_MS,
   KnowledgeEngine,
+  SkillCatalog,
   type Task,
   type TaskRun,
 } from "@homeagent/core";
@@ -221,7 +222,7 @@ describe("TaskScheduler.tick", () => {
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "hb-tsched-"));
     engine = new KnowledgeEngine({
-      dataDir: dir,
+      dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => "研究结果要点",
     });
     engine.ensureSpace(SPACE);
@@ -254,7 +255,7 @@ describe("TaskScheduler.tick", () => {
     });
     let providerCalls = 0;
     engine = new KnowledgeEngine({
-      dataDir: dir,
+      dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => {
         providerCalls += 1;
         return providerCalls === 1 ? firstCompletion : "第二个任务完成";
@@ -284,6 +285,7 @@ describe("TaskScheduler.tick", () => {
     });
 
     const ticking = scheduler.tick("independent-due-tasks", T10);
+    expect(await waitFor(() => engine.listTaskRuns(second.id).length === 1)).toBe(true);
     const secondRunsBeforeFirstCompletion = engine.listTaskRuns(second.id).length;
     const secondFinishedBeforeFirstCompletion = await waitFor(() => {
       const run = engine.listTaskRuns(second.id)[0];
@@ -308,7 +310,7 @@ describe("TaskScheduler.tick", () => {
     engine.close();
     let providerCalls = 0;
     engine = new KnowledgeEngine({
-      dataDir: dir,
+      dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => {
         providerCalls += 1;
         return "retry recovered";
@@ -371,7 +373,7 @@ describe("TaskScheduler.tick", () => {
       finishRetry = resolve;
     });
     engine = new KnowledgeEngine({
-      dataDir: dir,
+      dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async (_provider, input) => (
         input.prompt.includes("slow retry topic")
           ? retryCompletion
@@ -433,6 +435,7 @@ describe("TaskScheduler.tick", () => {
     });
 
     const ticking = scheduler.tick("slow-due-retry", T10);
+    expect(await waitFor(() => engine.listTaskRuns(independent.id).length === 1)).toBe(true);
     const independentRunsBeforeRetryCompletion = engine.listTaskRuns(independent.id).length;
     const retryRunsBeforeRetryCompletion = engine.listTaskRuns(retryTask.id).length;
     const independentFinishedBeforeRetryCompletion = await waitFor(() => {
@@ -605,7 +608,7 @@ describe("TaskScheduler.tick", () => {
     })!;
     const pending = engine.startTaskRun(t.id, { trigger: "scheduled" }).run;
     engine.close();
-    engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "must not run" });
+    engine = new KnowledgeEngine({ dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }), runProvider: async () => "must not run" });
 
     const deliveryKeys: string[] = [];
     const sched = new TaskScheduler(engine, {
@@ -667,7 +670,7 @@ describe("TaskScheduler.tick", () => {
     engine.close();
     let finish: ((value: string) => void) | undefined;
     engine = new KnowledgeEngine({
-      dataDir: dir,
+      dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => new Promise<string>((resolve) => {
         finish = resolve;
       }),
@@ -689,7 +692,8 @@ describe("TaskScheduler.tick", () => {
     }));
     expect(engine.listTaskRuns(task.id)).toHaveLength(1);
 
-    finish?.("完成");
+    expect(await waitFor(() => finish !== undefined)).toBe(true);
+    finish!("完成");
     await active.completion;
   });
 

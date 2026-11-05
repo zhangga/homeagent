@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { KnowledgeEngine } from "@homeagent/core";
+import { KnowledgeEngine, SkillCatalog } from "@homeagent/core";
 import type { SpaceId } from "@homeagent/shared";
 import { WorkContinuationScheduler } from "./work-continuation-scheduler.ts";
 
@@ -25,7 +25,7 @@ describe("WorkContinuationScheduler", () => {
   test("runs at most one next action per opted-in work item in a tick", async () => {
     let providerCalls = 0;
     engine = new KnowledgeEngine({
-      dataDir: dir,
+      dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => {
         providerCalls += 1;
         return JSON.stringify({
@@ -54,16 +54,18 @@ describe("WorkContinuationScheduler", () => {
   });
 
   test("submits one action for every independent work item before awaiting completion", async () => {
+    const bothStarted = Promise.withResolvers<void>();
     let finishFirst!: (value: string) => void;
     const firstCompletion = new Promise<string>((resolve) => {
       finishFirst = resolve;
     });
     let providerCalls = 0;
     engine = new KnowledgeEngine({
-      dataDir: dir,
+      dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => {
         providerCalls += 1;
         if (providerCalls === 1) return firstCompletion;
+        bothStarted.resolve();
         return JSON.stringify({
           version: 1,
           outcome: "completed",
@@ -90,6 +92,7 @@ describe("WorkContinuationScheduler", () => {
     const scheduler = new WorkContinuationScheduler(engine);
 
     const ticking = scheduler.tick("independent-work-items");
+    await bothStarted.promise;
     const stillDueBeforeFirstCompletion = engine.listDueWorkContinuations()
       .map((item) => item.id);
     finishFirst(JSON.stringify({
@@ -112,6 +115,7 @@ describe("WorkContinuationScheduler", () => {
   });
 
   test("observes every submitted completion rejection before an earlier run settles", async () => {
+    const submitted = Promise.withResolvers<void>();
     let finishFirst!: () => void;
     const firstCompletion = new Promise<void>((resolve) => {
       finishFirst = resolve;
@@ -122,10 +126,12 @@ describe("WorkContinuationScheduler", () => {
     });
     const schedulerEngine = {
       listDueWorkContinuations: () => [{ id: "work-first" }, { id: "work-second" }],
-      startWorkContinuation: (workItemId: string) => ({
+      startWorkContinuationAsync: async (workItemId: string) => {
+        if (workItemId === "work-second") submitted.resolve();
+        return ({
         state: "scheduled" as const,
         completion: workItemId === "work-first" ? firstCompletion : secondCompletion,
-      }),
+      }); },
     } as unknown as KnowledgeEngine;
     const scheduler = new WorkContinuationScheduler(schedulerEngine);
     const unhandled: string[] = [];
@@ -135,6 +141,7 @@ describe("WorkContinuationScheduler", () => {
     process.on("unhandledRejection", recordUnhandled);
 
     const ticking = scheduler.tick("early-rejection");
+    await submitted.promise;
     failSecond(new Error("second completion failed early"));
     await Bun.sleep(20);
     const earlyUnhandled = [...unhandled];

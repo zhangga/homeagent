@@ -78,8 +78,9 @@ export interface WorkPageReference {
 }
 
 interface WorkItemsFile {
-  version: 1;
+  version: 1 | 2;
   items: Record<string, WorkItem>;
+  currentBySpace?: Record<string, string>;
 }
 
 const log = logger.child("work-items");
@@ -208,6 +209,7 @@ export class WorkItemStore {
   private readonly configPath: string;
   private readonly workspaceRoot: string;
   private items: Map<string, WorkItem>;
+  private currentBySpace = new Map<SpaceId, string>();
 
   constructor(dataDir: string) {
     this.configPath = join(dataDir, "config", "work-items.json");
@@ -221,19 +223,33 @@ export class WorkItemStore {
     if (!existsSync(this.configPath)) return items;
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<WorkItemsFile>;
-      for (const [id, item] of Object.entries(parsed.items ?? {})) {
-        if (!isWorkItem(item) || item.id !== id) continue;
+      if (parsed.version !== 1 && parsed.version !== 2) throw new Error("Unsupported WorkItem version");
+      if (!parsed.items || typeof parsed.items !== "object" || Array.isArray(parsed.items)) throw new Error("Invalid WorkItem collection");
+      for (const [id, item] of Object.entries(parsed.items)) {
+        if (!isWorkItem(item) || item.id !== id) throw new Error("Invalid WorkItem");
         items.set(id, clone(item));
+        if (parsed.version === 1 && item.active) {
+          if (this.currentBySpace.has(item.space)) throw new Error("Invalid legacy WorkItem selection");
+          this.currentBySpace.set(item.space, id);
+        }
+      }
+      if (parsed.version === 2) {
+        if (!parsed.currentBySpace || typeof parsed.currentBySpace !== "object" || Array.isArray(parsed.currentBySpace)) throw new Error("Invalid WorkItem selection");
+        for (const [space, id] of Object.entries(parsed.currentBySpace)) {
+          if (!isSpaceId(space) || items.get(id)?.space !== space) throw new Error("Invalid WorkItem selection");
+          this.currentBySpace.set(space, id);
+        }
       }
     } catch (error) {
-      log.warn("failed to load work item store", { error: String(error) });
+      throw new Error("WorkItem state is invalid; refusing to overwrite it", { cause: error });
     }
     return items;
   }
 
-  private persist(items: Map<string, WorkItem>): void {
+  private persist(items: Map<string, WorkItem>, currentBySpace: Map<SpaceId, string>): void {
     const file: WorkItemsFile = {
-      version: 1,
+      version: 2,
+      currentBySpace: Object.fromEntries(currentBySpace),
       items: Object.fromEntries([...items].map(([id, item]) => [id, clone(item)])),
     };
     atomicWrite(this.configPath, `${JSON.stringify(file, null, 2)}\n`);
@@ -276,12 +292,19 @@ export class WorkItemStore {
   }
 
   /** Persist a detached candidate before making it visible to readers. */
-  private commit<T>(change: (candidate: Map<string, WorkItem>) => T): T {
+  private commit<T>(change: (candidate: Map<string, WorkItem>, current: Map<SpaceId, string>) => T): T {
     const candidate = new Map([...this.items].map(([id, item]) => [id, clone(item)]));
-    const result = change(candidate);
-    this.persist(candidate);
+    const current = new Map(this.currentBySpace);
+    const result = change(candidate, current);
+    const changed = [...candidate.values()].filter(item => JSON.stringify(item) !== JSON.stringify(this.items.get(item.id)));
+    for (const [space, id] of current) if (candidate.get(id)?.space !== space) current.delete(space);
+    this.persist(candidate, current);
     this.items = candidate;
-    this.projectAll();
+    this.currentBySpace = current;
+    for (const item of changed) {
+      try { this.project(item); }
+      catch (error) { log.warn("failed to project work item", { id: item.id, error: String(error) }); }
+    }
     return result;
   }
 
@@ -298,11 +321,28 @@ export class WorkItemStore {
   }
 
   activeForSpace(space: SpaceId): WorkItem | undefined {
-    const item = [...this.items.values()].find((candidate) => candidate.space === space && candidate.active);
+    return this.currentForSpace(space);
+  }
+
+  currentForSpace(space: SpaceId): WorkItem | undefined {
+    const id = this.currentBySpace.get(space);
+    const item = id ? this.items.get(id) : undefined;
     return item ? clone(item) : undefined;
   }
 
-  create(input: WorkItemInput, now = Date.now()): WorkItem {
+  select(id: string): WorkItem {
+    const item = this.get(id);
+    if (!item) throw new Error("Unknown WorkItem");
+    return this.commit((_candidate, current) => { current.set(item.space, id); return item; });
+  }
+
+  create(input: WorkItemInput, now = Date.now(), id = `work_${randomUUID()}`): WorkItem {
+    if (!WORK_ITEM_ID_RE.test(id)) throw new Error("Invalid WorkItem id");
+    const previous = this.get(id);
+    if (previous) {
+      if (previous.space !== input.space || previous.brief !== (input.brief?.trim() ?? "")) throw new Error("WorkItem identity conflict");
+      return previous;
+    }
     const space = input.space.trim();
     const title = trimText(input.title, MAX_TITLE_LENGTH);
     if (!isSpaceId(space)) throw new Error("invalid work item space");
@@ -311,7 +351,7 @@ export class WorkItemStore {
     if (!PHASES.has(phase)) throw new Error("invalid work item phase");
     const active = phase !== "completed" && input.active !== false;
     const item: WorkItem = {
-      id: `work_${randomUUID()}`,
+      id,
       space,
       title,
       brief: trimText(input.brief),
@@ -330,8 +370,8 @@ export class WorkItemStore {
       createdAt: now,
       updatedAt: now,
     };
-    return this.commit((candidate) => {
-      if (item.active) this.deactivateSpace(candidate, item.space, now);
+    return this.commit((candidate, current) => {
+      if (item.active) current.set(item.space, item.id);
       candidate.set(item.id, clone(item));
       return clone(item);
     });
@@ -363,28 +403,14 @@ export class WorkItemStore {
       }
       const wantsActive = update.active ?? item.active;
       item.active = item.phase !== "completed" && wantsActive;
-      if (item.active) this.deactivateSpace(candidate, item.space, now, item.id);
       item.updatedAt = now;
       return clone(item);
     });
   }
 
   activate(id: string, now = Date.now()): WorkItem {
-    return this.update(id, { active: true }, now);
-  }
-
-  private deactivateSpace(
-    items: Map<string, WorkItem>,
-    space: SpaceId,
-    now: number,
-    exceptId?: string,
-  ): void {
-    for (const item of items.values()) {
-      if (item.space === space && item.id !== exceptId && item.active) {
-        item.active = false;
-        item.updatedAt = now;
-      }
-    }
+    this.update(id, { active: true }, now);
+    return this.select(id);
   }
 
   private attach(id: string, field: "rawIds" | "chatRunIds" | "taskRunIds", reference: string, now: number): WorkItem {
@@ -531,8 +557,11 @@ export class WorkItemStore {
   restore(items: WorkItem[]): number {
     this.assertCanRestore(items);
     if (items.length === 0) return 0;
-    this.commit((candidate) => {
-      for (const item of items) candidate.set(item.id, clone(item));
+    this.commit((candidate, current) => {
+      for (const item of items) {
+        candidate.set(item.id, clone(item));
+        if (item.active && !current.has(item.space)) current.set(item.space, item.id);
+      }
     });
     return items.length;
   }

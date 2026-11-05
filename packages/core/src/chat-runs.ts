@@ -74,6 +74,7 @@ export interface ChatRunLiveReply {
 }
 
 export interface ChatRunDelivery {
+  messageId?: string;
   status: ChatRunDeliveryStatus;
   attempts: number;
   lastAttemptAt?: number;
@@ -83,6 +84,11 @@ export interface ChatRunDelivery {
 }
 
 export interface ChatRun {
+  sourceInputId?: string;
+  dispatchKey?: string;
+  dispatchDigest?: string;
+  launchAdmission?: "pending" | "admitted";
+  cancelRequestedAt?: number;
   /** Redacted tool metadata, kept only in the local run history. */
   executionEvidence?: ExecutionEvidence;
   id: string;
@@ -131,6 +137,9 @@ export function isChatRunDeliveryInFlight(
 }
 
 export interface StartChatRunInput {
+  sourceInputId?: string;
+  dispatchKey?: string;
+  launchAdmission?: "pending" | "admitted";
   space: SpaceId;
   workItemId?: string;
   rawId?: string;
@@ -202,7 +211,7 @@ interface TopicNativeSessionRecord {
 }
 
 interface ChatRunsFile {
-  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
   runs: Record<string, ChatRun>;
   topicNativeSessionPlans?: Record<string, TopicNativeSessionPlan>;
   topicNativeSessions?: Record<string, TopicNativeSessionRecord>;
@@ -556,6 +565,13 @@ export function isChatRun(value: unknown): value is ChatRun {
   const delivery = run.delivery;
   return (
     typeof run.id === "string"
+    && (run.sourceInputId === undefined || /^input_[a-f0-9]{64}$/.test(run.sourceInputId))
+    && (run.dispatchKey === undefined || /^input_[a-f0-9]{64}$/.test(run.dispatchKey))
+    && (run.dispatchDigest === undefined || /^[a-f0-9]{64}$/.test(run.dispatchDigest))
+    && (run.launchAdmission === undefined || ["pending", "admitted"].includes(run.launchAdmission))
+    && (!run.dispatchKey || (!!run.dispatchDigest && !!run.launchAdmission))
+    && (run.cancelRequestedAt === undefined || Number.isFinite(run.cancelRequestedAt))
+    && (delivery?.messageId === undefined || (typeof delivery.messageId === "string" && delivery.messageId.length > 0 && delivery.messageId.length <= 512))
     && typeof run.space === "string"
     && isSpaceId(run.space)
     && typeof run.input === "string"
@@ -697,13 +713,13 @@ export class ChatRunStore {
     } catch {
       throw new Error("Chat Run history is corrupt; refusing to overwrite it");
     }
-    if (![1, 2, 3, 4, 5, 6, 7, 8].some(version => version === parsed.version)) {
+    if (![1, 2, 3, 4, 5, 6, 7, 8, 9].some(version => version === parsed.version)) {
       throw new Error("Chat Run history uses an unsupported newer version");
     }
     if (!parsed.runs || typeof parsed.runs !== "object" || Array.isArray(parsed.runs)) {
       throw new Error("Chat Run history is corrupt; refusing to overwrite it");
     }
-    const hasNativeSessions = parsed.version === 6 || parsed.version === 7 || parsed.version === 8;
+    const hasNativeSessions = [6, 7, 8, 9].includes(parsed.version!);
     if (hasNativeSessions && (
       (parsed.topicNativeSessionPlans !== undefined && (
         !parsed.topicNativeSessionPlans
@@ -735,9 +751,9 @@ export class ChatRunStore {
           : hasNativeSessions
           ? legacy
           : legacyWithoutTopicNativeSessionExpected;
-        if (normalized.executionPlan?.version === 2 && parsed.version !== 8) throw new Error("Unexpected v2 execution plan");
+        if (normalized.executionPlan?.version === 2 && parsed.version! < 8) throw new Error("Unexpected v2 execution plan");
         if (!isChatRun(normalized) || normalized.id !== id) {
-          if (parsed.version === 8) throw new Error("Invalid Chat Run");
+          if (parsed.version! >= 8) throw new Error("Invalid Chat Run");
           continue;
         }
         runs.set(id, clone(normalized));
@@ -803,7 +819,7 @@ export class ChatRunStore {
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const tempPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
     const file: ChatRunsFile = {
-      version: 8,
+      version: 9,
       runs: Object.fromEntries(runs),
       topicNativeSessionPlans: Object.fromEntries(topicNativeSessionPlans),
       topicNativeSessions: Object.fromEntries(topicNativeSessions),
@@ -892,10 +908,10 @@ export class ChatRunStore {
     this.commit((candidate) => {
       for (const run of candidate.values()) {
         if (run.status !== "running") continue;
-        run.status = "failed";
+        run.status = run.cancelRequestedAt === undefined ? "failed" : "cancelled";
         run.finishedAt = Math.max(now, run.runStartedAt ?? run.startedAt);
         run.error = {
-          kind: "interrupted",
+          kind: run.cancelRequestedAt === undefined ? "interrupted" : "cancelled",
           message: "The application stopped before the chat response completed.",
         };
       }
@@ -934,6 +950,15 @@ export class ChatRunStore {
   }
 
   start(input: StartChatRunInput): ChatRun {
+    const dispatchDigest = input.dispatchKey ? createHash("sha256").update(canonicalJson(input)).digest("hex") : undefined;
+    if (input.dispatchKey) {
+      if (!/^input_[a-f0-9]{64}$/.test(input.dispatchKey) || input.launchAdmission !== "pending") throw new Error("Invalid Chat dispatch plan");
+      const existing = [...this.runs.values()].find(run => run.dispatchKey === input.dispatchKey);
+      if (existing) {
+        if (existing.dispatchDigest !== dispatchDigest) throw new Error("Chat dispatch plan conflict");
+        return clone(existing);
+      }
+    }
     if (
       input.timeoutMs !== undefined
       && (!Number.isInteger(input.timeoutMs) || input.timeoutMs <= 0)
@@ -963,7 +988,8 @@ export class ChatRunStore {
       const { topicNativeSession, ...chatRunInput } = input;
       const run: ChatRun = {
         ...chatRunInput,
-        id: `chat_run_${randomUUID()}`,
+        id: input.dispatchKey ? `chat_run_${input.dispatchKey.slice(6)}` : `chat_run_${randomUUID()}`,
+        ...(dispatchDigest ? { dispatchDigest } : {}),
         input: input.input.slice(0, MAX_CHAT_RUN_INPUT_CHARACTERS),
         inputTruncated:
           input.input.length > MAX_CHAT_RUN_INPUT_CHARACTERS || undefined,
@@ -999,13 +1025,31 @@ export class ChatRunStore {
   }
 
   begin(id: string, runStartedAt = Date.now()): ChatRun | undefined {
-    if (this.runs.get(id)?.status !== "queued") return undefined;
+    const current = this.runs.get(id);
+    if (current?.status !== "queued" || current.launchAdmission === "pending" || current.cancelRequestedAt !== undefined) return undefined;
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
       run.status = "running";
       run.runStartedAt = Math.max(runStartedAt, run.queuedAt);
       return clone(run);
     });
+  }
+
+  admit(id: string): ChatRun {
+    const current = this.runs.get(id);
+    if (!current || current.status !== "queued") throw new Error("Chat Run cannot be admitted");
+    return this.commit(candidate => {
+      const run = candidate.get(id)!;
+      run.launchAdmission = "admitted";
+      return clone(run);
+    });
+  }
+
+  requestCancel(id: string, now = Date.now()): boolean {
+    const current = this.runs.get(id);
+    if (!current || !["queued", "running"].includes(current.status)) return false;
+    this.commit(candidate => { candidate.get(id)!.cancelRequestedAt = now; });
+    return true;
   }
 
   topicNativeSessionForRun(id: string): TopicNativeSessionPlan | undefined {
@@ -1152,6 +1196,8 @@ export class ChatRunStore {
   }
 
   succeed(id: string, result: FinishChatRunSuccessInput): ChatRun | undefined {
+    const current = this.runs.get(id);
+    if (current?.launchAdmission === "pending" || current?.cancelRequestedAt !== undefined) return undefined;
     if (!["queued", "running"].includes(this.runs.get(id)?.status ?? "")) {
       return undefined;
     }
@@ -1337,7 +1383,8 @@ export class ChatRunStore {
     });
   }
 
-  deliverySent(id: string, sentAt: number): ChatRun | undefined {
+  deliverySent(id: string, sentAt: number, messageId?: string): ChatRun | undefined {
+    if (messageId !== undefined && (!messageId || messageId.length > 512)) throw new Error("Invalid delivery message id");
     if (!this.runs.has(id)) return undefined;
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
@@ -1345,6 +1392,7 @@ export class ChatRunStore {
         ...run.delivery,
         status: "sent",
         sentAt,
+        ...(messageId ? { messageId } : {}),
         error: undefined,
       };
       return clone(run);

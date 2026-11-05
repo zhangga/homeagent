@@ -81,9 +81,10 @@ export class WorkContinuationScheduler {
       const scheduled: Array<{ workItemId: string; completion: Promise<unknown> }> = [];
       for (const item of this.engine.listDueWorkContinuations()) {
         try {
-          const started = this.engine.startWorkContinuation(item.id, { trigger: "scheduled" });
+          const started = await this.engine.startWorkContinuationAsync(item.id, { trigger: "scheduled" });
           ran.push(item.id);
           if (started.state === "scheduled") {
+            void started.completion.catch(() => {});
             scheduled.push({ workItemId: item.id, completion: started.completion });
           }
         } catch (error) {

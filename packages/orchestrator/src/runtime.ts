@@ -22,6 +22,7 @@
 import type { SpaceId } from "@homeagent/shared";
 import {
   AI_OPERATION_TIMEOUT_MS,
+  AI_ROUTING_MAX_TOKENS,
   AI_QUEUE_TIMEOUT_MS,
   MAX_MATERIAL_BYTES,
   Serializer,
@@ -44,6 +45,9 @@ import {
   type AnswerOutcome,
   type AskFailureTrace,
   type ChatRun,
+  type WorkInput,
+  type StartChatRunInput,
+  workInputId,
   type ChatRunError,
   type FeishuGroupBinding,
   type FinishChatRunFailureInput,
@@ -64,6 +68,7 @@ import type {
   LiveReplyHandle,
 } from "@homeagent/connectors";
 import { extractAttachmentText } from "./attachment-extractor.ts";
+import { newWorkTitle, routeWork, workControl, resolveSupplement, WORK_ROUTING_INSTRUCTION } from "./work-routing.ts";
 import { splitMaterialText } from "@homeagent/shared";
 import { isLiveReplyTerminal, liveReplySnapshot } from "@homeagent/connectors";
 import { attribute } from "./attribution.ts";
@@ -117,6 +122,8 @@ const RECENT_CONTEXT_SCAN_LIMIT = 50;
 const RECENT_ANSWER_SAMPLE_SIZE = 50;
 const CHAT_QUEUE_TIMEOUT_MS = AI_QUEUE_TIMEOUT_MS;
 const LEGACY_CHAT_PROVIDER_TIMEOUT_MS = AI_OPERATION_TIMEOUT_MS;
+
+class ChatRunDeferredError extends Error {}
 
 class ChatRunCancelledError extends Error {
   constructor() {
@@ -195,6 +202,7 @@ interface RuntimeTimingMetrics {
 }
 
 export interface OrchestratorHealth {
+  workInputs: { pending: number; waiting: number; interrupted: number; duplicates: number; receiptFailures: number };
   queue: SerializerSnapshot;
   runs: RunSchedulerSnapshot;
   events: {
@@ -309,6 +317,13 @@ export class Orchestrator {
   private pendingReminderConfirmations = new Map<string, PendingReminderConfirmation>();
   private chatRunControllers = new Map<string, AbortController>();
   private pendingEvents = new Set<Promise<void>>();
+  private pendingReactions = new Set<Promise<void>>();
+  private inputCompletions = new Map<string, Promise<void>>();
+  private stopping = false;
+  private dispatchTimer?: ReturnType<typeof setInterval>;
+  private routingControllers = new Map<string, AbortController>();
+  private intakeDuplicates = 0;
+  private intakeFailures = 0;
   private liveReplies = new Map<string, LiveReplyHandle>();
   private liveReplyUpdates = new Map<string, Promise<void>>();
   private liveReplyCreates = new Map<string, Promise<void>>();
@@ -374,17 +389,359 @@ export class Orchestrator {
   }
 
   async start(): Promise<void> {
-    await this.connector.start((event) => this.enqueue(event));
+    this.stopping = false;
+    for (const input of this.engine.workDispatch.summaries()) {
+      if (input.connector !== this.connector.name || input.appId !== (this.activeFeishuAppId ?? "")) continue;
+      if (input.state === "cancelled" && input.runId) {
+        const run = this.engine.chatRuns.get(input.runId);
+        if (run?.status === "queued") this.cancelChatRun(run.id);
+      } else if (input.state === "preparing") {
+        this.engine.workDispatch.update(input.id, input.revision, { state: "interrupted" });
+      } else if (["received", "planned", "dispatched"].includes(input.state)) {
+        this.dispatchInput(this.engine.workDispatch.get(input.id)!);
+      }
+    }
     this.resumeQueuedChatRuns();
+    this.dispatchTimer = setInterval(() => this.flushWorkInputs(), 1_000);
+    try {
+      await this.connector.start(event => event.kind !== "message" || (event.chatType === "group" && !this.activeGroupBinding(event.chatId))
+        ? this.processEvent(event) : this.receive(event));
+    } catch (error) {
+      clearInterval(this.dispatchTimer);
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
+    clearInterval(this.dispatchTimer);
+    await this.connector.stop();
+    for (const controller of this.routingControllers.values()) controller.abort(new ChatRunCancelledError());
+    for (const [id, controller] of this.chatRunControllers) {
+      if (this.engine.chatRuns.get(id)?.status === "running") controller.abort(new Error("Application stopped"));
+    }
     await Promise.allSettled([
       ...this.pendingEvents,
       ...this.liveReplyCreates.values(),
       ...this.liveReplyUpdates.values(),
     ]);
-    await this.connector.stop();
+    // An accepted event may enter withThinking while shutdown drains its work.
+    await Promise.allSettled([...this.pendingReactions]);
+  }
+
+  private inputFor(msg: InboundMessage): WorkInput | undefined {
+    return this.engine.workDispatch.get(workInputId({ connector: this.connector.name,
+      appId: this.activeFeishuAppId, space: attribute(msg).writeSpace, message: msg }));
+  }
+
+  /** A transport acknowledgement is returned only after atomic intake persistence. */
+  private receive(event: InboundEvent): { completion: Promise<void> } {
+    if (this.stopping) throw new Error("Message intake is stopping");
+    if (event.kind !== "message" || (event.chatType === "group" && !this.activeGroupBinding(event.chatId))) {
+      return { completion: this.processEvent(event) };
+    }
+    if (this.messageWasRetracted(attribute(event).writeSpace, event.chatId, event.messageId)) {
+      return { completion: Promise.resolve() };
+    }
+    const acceptedBefore = this.inputFor(event);
+    if (acceptedBefore) this.intakeDuplicates++;
+    let input: WorkInput;
+    try { input = this.engine.workDispatch.accept({ connector: this.connector.name,
+      appId: this.activeFeishuAppId, space: attribute(event).writeSpace, message: event,
+      bindingId: event.chatType === "group" ? this.activeGroupBinding(event.chatId)?.executionScopeEpoch : undefined }); }
+    catch (error) { this.intakeFailures++; throw error; }
+    return { completion: this.dispatchInput(input) };
+  }
+
+  private dispatchInput(input: WorkInput): Promise<void> {
+    const existing = this.inputCompletions.get(input.id);
+    if (existing) return existing;
+    if (!["received", "planned", "dispatched"].includes(input.state)) return Promise.resolve();
+    if (!this.inputBindingCurrent(input)) {
+      this.engine.workDispatch.update(input.id, input.revision, { state: "interrupted" });
+      return Promise.resolve();
+    }
+    input = this.routeInput(input);
+    this.eventMetrics.total++;
+    const receivedAt = Date.now();
+    // Reserve topic order before asynchronous source preparation begins.
+    const m = input.message;
+    const control = ["status", "cancel", "pause", "resume", "clarify"].includes(input.operation ?? "");
+    const key = control || input.state === "waiting" ? `control:${input.id}` : m.chatType === "group"
+      ? `topic:${input.space}:${m.chatId}:${m.rootMessageId ?? m.messageId}`
+      : input.workItemId && input.operation !== "chat" ? `work:${input.workItemId}` : `input:${input.id}`;
+    const pending = this.serializer.run(key, async () => {
+      let current = this.engine.workDispatch.get(input.id);
+      if (!current) return; // Source retraction may remove an input while it waits.
+      if (this.stopping || current.state === "cancelled") return;
+      try {
+        if (current.operation === "clarify" && !workControl(m.text) && !/第.+个/u.test(m.text) && m.text.length <= 20_000) {
+          const target = await this.resolveInputSupplement(current);
+          current = this.engine.workDispatch.get(input.id)!;
+          if (target) {
+            this.engine.workDispatch.update(current.id, current.revision, { operation: "followup", workItemId: target, state: "waiting" });
+            await this.workReceipt(current.id, "已保存补充要求，将在当前事项可继续执行时按顺序处理。");
+            return;
+          }
+        }
+        if (control) {
+          await this.controlWork(current);
+        } else if (current.state === "waiting") {
+          await this.workReceipt(current.id, current.operation === "followup"
+            ? "已保存补充要求，将在当前事项可继续执行时按顺序处理。"
+            : "已保存请求，将在本话题前面的请求处理完毕后按顺序执行。");
+          return;
+        } else if (current.plan) {
+          const run = this.admitInputRun(current);
+          if (run.status === "queued") {
+            const { space, response } = current;
+            await this.scheduleChatRun(m, space, run, signal => this.executeInputResponse(m, space, run.id, response, signal));
+          } else if (run.status === "succeeded" && run.delivery.status !== "sent" && run.output) {
+            await this.send(m, run.output, run.id);
+          }
+        } else {
+          this.engine.workDispatch.update(current.id, current.revision, { state: "preparing" });
+          await this.handle(m);
+        }
+        const done = this.engine.workDispatch.get(input.id);
+        if (done && done.state !== "cancelled") this.engine.workDispatch.update(done.id, done.revision, { state: "settled" });
+      } catch (error) {
+        const failed = this.engine.workDispatch.get(input.id);
+        if (!failed || failed.state === "cancelled") return;
+        if (!failed.plan) this.engine.workDispatch.update(failed.id, failed.revision, {
+          state: !failed.routing && !control && !this.seen.has(`message:${m.chatId}\u0000${m.messageId}`) ? "received" : "interrupted",
+        });
+        else if (failed.runId) {
+          const run = this.engine.chatRuns.get(failed.runId);
+          if (!run || !["queued", "running"].includes(run.status)) {
+            this.engine.workDispatch.update(failed.id, failed.revision, { state: run ? "settled" : "interrupted" });
+          }
+        }
+        log.error("accepted input processing failed", { inputId: input.id });
+        throw error;
+      }
+    });
+    this.inputCompletions.set(input.id, pending);
+    this.pendingEvents.add(pending);
+    const cleanup = () => {
+      this.inputCompletions.delete(input.id); this.pendingEvents.delete(pending);
+      const latencyMs = Math.max(0, Date.now() - receivedAt);
+      this.eventMetrics.totalLatencyMs += latencyMs;
+      this.eventMetrics.maxLatencyMs = Math.max(this.eventMetrics.maxLatencyMs, latencyMs);
+    };
+    void pending.then(() => { this.eventMetrics.completed++; cleanup(); }, () => { this.eventMetrics.failed++; cleanup(); });
+    return pending;
+  }
+
+  private inputBindingCurrent(input: WorkInput): boolean {
+    if (attribute(input.message).writeSpace !== input.space) return false;
+    if (input.message.chatType !== "group") return true;
+    const binding = this.activeGroupBinding(input.message.chatId);
+    return !!binding && binding.spaceId === input.space && binding.executionScopeEpoch === input.bindingId;
+  }
+
+  private routeInput(input: WorkInput): WorkInput {
+    if (input.operation || input.plan) return input;
+    const m = input.message;
+    const binding = m.chatType === "group" ? this.activeGroupBinding(m.chatId) : undefined;
+    // Existing automation and capture controls keep their original precedence and authorization.
+    const ordinary = parseTaskCommand(m.text) || parseLearningCommand(m.text) || parseLearningAnswer(m.text)
+      || parseKnowledgeControl(m.text) || isReminderAutomationMessage(m.text)
+      || this.pendingReminderConfirmations.has(this.pendingReminderKey(m, input.space));
+    const addressed = m.chatType === "p2p" || m.mentionsBot || binding?.responseMode === "all_messages";
+    const route = ordinary || !addressed ? { operation: "chat" as const }
+      : routeWork(m, this.engine.workItems.list(input.space), this.engine.chatRuns.list(input.space), this.engine.workDispatch.summaries(input.space));
+    let workItemId = route.workItemId;
+    if (route.operation === "chat") {
+      const current = this.engine.workItems.currentForSpace(input.space);
+      if (current?.active) workItemId = current.id;
+    }
+    if (route.operation === "new") {
+      const h = input.id.slice(6, 38);
+      workItemId = `work_${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+      this.engine.ensureSpace(input.space, { chatId: m.chatId });
+      this.engine.workItems.create({ space: input.space, title: newWorkTitle(m.text), brief: m.text.slice(0, 200_000) }, m.createdAt, workItemId);
+    }
+    const waiting = (route.operation === "followup" && workItemId && this.workBusy(workItemId, input.id))
+      || (["chat", "new", "followup"].includes(route.operation) && this.topicWaitsForInput(input));
+    return this.engine.workDispatch.update(input.id, input.revision, {
+      operation: route.operation, workItemId, ...(waiting ? { state: "waiting" as const } : {}),
+    });
+  }
+
+  private workBusy(workItemId: string, exceptInput?: string): boolean {
+    const item = this.engine.workItems.get(workItemId);
+    if (!item?.active || item.phase === "completed") return true;
+    if (this.engine.workContinuations.activeForWorkItem(workItemId)) return true;
+    if (this.engine.chatRuns.list(item.space).some(run => run.workItemId === workItemId && ["queued", "running"].includes(run.status))) return true;
+    if (this.engine.taskRuns.list().some(run => run.workItemId === workItemId && ["queued", "running", "awaiting_approval"].includes(run.status))) return true;
+    return this.engine.workDispatch.summaries(item.space).some(input => input.id !== exceptInput && input.workItemId === workItemId
+      && ["received", "preparing", "planned", "dispatched"].includes(input.state));
+  }
+
+  private topicWaitsForInput(input: Pick<WorkInput, "space" | "sequence" | "message">): boolean {
+    const message = input.message;
+    if (message.chatType !== "group") return false;
+    const root = message.rootMessageId ?? message.messageId;
+    return this.engine.workDispatch.summaries(input.space).some(earlier => earlier.sequence < input.sequence
+      && earlier.message.chatId === message.chatId && (earlier.message.rootMessageId ?? earlier.message.messageId) === root
+      && (earlier.state === "waiting" || (earlier.operation === "clarify" && ["received", "preparing"].includes(earlier.state))));
+  }
+
+  private async resolveInputSupplement(input: WorkInput): Promise<string | undefined> {
+    const snapshot = this.engine.agentRunExecutionSnapshot(input.space, false);
+    const candidates = this.engine.workItems.list(input.space);
+    const controller = new AbortController();
+    this.routingControllers.set(input.id, controller);
+    const matches: string[] = [];
+    try {
+      for (let offset = 0; offset < candidates.length; offset += 100) {
+        const plan = { version: 1 as const, provider: snapshot.provider, model: snapshot.model,
+          reasoningEffort: snapshot.reasoningEffort, instruction: WORK_ROUTING_INSTRUCTION,
+          timeoutMs: AI_OPERATION_TIMEOUT_MS, maxTokens: AI_ROUTING_MAX_TOKENS,
+          candidates: candidates.slice(offset, offset + 100).map(item => ({ id: item.id, title: item.title, updatedAt: item.updatedAt })) };
+        const current = this.engine.workDispatch.get(input.id)!;
+        if (current.state === "cancelled" || controller.signal.aborted) return;
+        this.engine.workDispatch.update(input.id, current.revision, { state: "preparing", routing: plan });
+        const id = `routing:${input.id}:${offset}`;
+        const cancel = () => { this.engine.runScheduler.cancel(id); };
+        controller.signal.addEventListener("abort", cancel, { once: true });
+        try {
+          const match = await this.engine.runScheduler.schedule({ id, priority: "interactive", queueTimeoutMs: AI_QUEUE_TIMEOUT_MS,
+            layers: this.engine.runConcurrencyLayers({ provider: plan.provider, model: plan.model, conversationId: id, independentReadOnly: true }),
+            execute: () => {
+              if (controller.signal.aborted || !this.engine.workDispatch.get(input.id)) throw new ChatRunCancelledError();
+              return resolveSupplement(this.llm ?? this.engine.workRoutingClient(plan, controller.signal), plan, input.message.text, input.space);
+            } });
+          if (match && this.engine.workItems.get(match)?.space === input.space) matches.push(match);
+        } finally { controller.signal.removeEventListener("abort", cancel); }
+      }
+      return matches.length === 1 ? matches[0] : undefined;
+    } catch { return undefined; }
+    finally { this.routingControllers.delete(input.id); }
+  }
+
+  /** App-owned runtime tick: inputs resume only at an existing action boundary. */
+  flushWorkInputs(): void {
+    if (this.stopping) return;
+    for (const input of this.engine.workDispatch.summaries()) {
+      if (input.connector !== this.connector.name || input.appId !== (this.activeFeishuAppId ?? "")) continue;
+      if (input.state !== "waiting" || this.inputCompletions.has(input.id)) continue;
+      try {
+        // Older routing could attach a fresh post-cancellation request to the
+        // stopped item by title. Repair only unstarted requests, never a frozen
+        // plan, an explicit continuation, or work that predates the cancellation.
+        const item = input.workItemId ? this.engine.workItems.get(input.workItemId) : undefined;
+        if (item && !item.active && input.operation === "followup" && !input.runId) {
+          const complete = this.engine.workDispatch.get(input.id)!;
+          const lastControl = this.engine.workDispatch.summaries(input.space).filter(previous => previous.workItemId === item.id
+            && previous.state === "settled" && ["cancel", "pause", "resume"].includes(previous.operation ?? "")).at(-1);
+          if (!complete.plan && !complete.routing && lastControl?.operation === "cancel" && lastControl.sequence < input.sequence
+            && routeWork(complete.message, this.engine.workItems.list(input.space), this.engine.chatRuns.list(input.space),
+              this.engine.workDispatch.summaries(input.space)).operation === "new") {
+            const repaired = this.engine.workDispatch.update(input.id, input.revision, {
+              state: "received", operation: undefined, workItemId: undefined,
+            });
+            void this.dispatchInput(repaired).catch(() => {});
+            continue;
+          }
+        }
+        if ((input.workItemId && this.workBusy(input.workItemId, input.id))
+          || this.topicWaitsForInput(this.engine.workDispatch.get(input.id)!)) continue;
+        const ready = this.engine.workDispatch.update(input.id, input.revision, { state: "received" });
+        void this.dispatchInput(ready).catch(() => {});
+      } catch { log.error("work input dispatch failed", { inputId: input.id }); }
+    }
+  }
+
+  private async workReceipt(inputId: string, text: string): Promise<void> {
+    let input = this.engine.workDispatch.get(inputId)!;
+    if (input.receipt?.status === "sent") return;
+    input = this.engine.workDispatch.update(input.id, input.revision, { receipt: { text, status: "pending" } });
+    const receipt = await this.connector.reply({ chatId: input.message.chatId, replyToMessageId: input.message.messageId,
+      idempotencyKey: `${input.id}:receipt`, markdown: text,
+      inThread: this.activeGroupBinding(input.message.chatId)?.replyInThread ?? false });
+    // Operational projections do not advance or invalidate a Provider-native conversation.
+    const current = this.engine.workDispatch.get(input.id)!;
+    try { this.engine.workDispatch.update(input.id, current.revision, { receipt: { text, status: "sent", ...(receipt ? { messageId: receipt.messageId } : {}) } }); }
+    catch { log.error("work receipt delivery persistence failed", { inputId }); }
+  }
+
+  private async controlWork(input: WorkInput): Promise<void> {
+    if (!this.inputBindingCurrent(input)) throw new Error("Work control binding changed");
+    const item = input.workItemId ? this.engine.workItems.get(input.workItemId) : undefined;
+    if (!item || input.operation === "status" || input.operation === "clarify") {
+      const page = Math.max(0, Number(input.message.text.match(/第(\d+)页/u)?.[1] ?? 1) - 1);
+      const allItems = this.engine.workItems.list(input.space);
+      const items = item ? [item] : allItems.slice(page * 100, page * 100 + 100);
+      const current = this.engine.workDispatch.get(input.id)!;
+      this.engine.workDispatch.update(input.id, current.revision, { presentedItemIds: items.map(candidate => candidate.id) });
+      const lines = items.map((candidate, index) => {
+        const run = this.engine.chatRuns.list(input.space).find(run => run.workItemId === candidate.id);
+        const task = this.engine.taskRuns.list().find(run => run.space === input.space && run.workItemId === candidate.id);
+        const action = this.engine.workContinuations.activeForWorkItem(candidate.id);
+        const waiting = this.engine.workDispatch.summaries(input.space).filter(pending => pending.workItemId === candidate.id && pending.state === "waiting").length;
+        const status = action?.status === "awaiting_acceptance" ? "等待验收"
+          : task && (!run || task.startedAt > run.startedAt) ? ({ awaiting_approval: "等待审批", queued: "排队中", running: "执行中", succeeded: "已完成本轮", failed: "执行失败", cancelled: "已取消", timed_out: "执行超时" })[task.status]
+          : run ? ({ queued: "排队中", running: run.cancelRequestedAt ? "正在停止" : "执行中", succeeded: "已完成本轮", failed: "执行失败", cancelled: "已取消", timed_out: "执行超时" })[run.status] : "待执行";
+        return `${index + 1}. ${candidate.title}：${status}${!candidate.active ? "，后续已暂停" : ""}${waiting ? `，${waiting} 条补充待处理` : ""}`;
+      });
+      await this.workReceipt(input.id, lines.length ? `${input.operation === "clarify" ? "请指定事项名称或回复相应结果：\n" : ""}${lines.join("\n")}${!item && allItems.length > (page + 1) * 100 ? `\n更多事项：发送「事项列表第${page + 2}页」。` : ""}` : "当前没有已跟踪的工作事项。");
+      return;
+    }
+    if (item.space !== input.space) throw new Error("Work control Space mismatch");
+    let ownedRuns = this.engine.chatRuns.list(input.space).filter(run => run.workItemId === item.id);
+    let taskRuns = this.engine.taskRuns.list().filter(run => run.space === input.space && run.workItemId === item.id);
+    const sourceInputs = this.engine.workDispatch.summaries(input.space).filter(source => source.workItemId === item.id
+      && ["new", "chat", "followup"].includes(source.operation ?? ""));
+    if (input.message.chatType === "group" && (taskRuns.length || ownedRuns.some(run => run.author !== input.message.senderId)
+      || sourceInputs.some(source => source.message.senderId !== input.message.senderId) || !ownedRuns.length && !sourceInputs.length)) {
+      if (!await this.authorizeGroupAutomation(input.message, "请由事项发起人或群管理员操作。", input.id)) return;
+    }
+    if (!this.inputBindingCurrent(input)) throw new Error("Work control binding changed");
+    ownedRuns = this.engine.chatRuns.list(input.space).filter(run => run.workItemId === item.id);
+    taskRuns = this.engine.taskRuns.list().filter(run => run.space === input.space && run.workItemId === item.id);
+    if (input.operation === "resume") {
+      if (item.phase === "completed") {
+        await this.workReceipt(input.id, `「${item.title}」已结束。请发送新的要求以创建下一轮工作。`);
+        return;
+      }
+      this.engine.workItems.update(item.id, { active: true });
+      await this.workReceipt(input.id, `已继续「${item.title}」，将处理尚未执行的补充；中断或失败的运行需明确重试。`);
+      this.flushWorkInputs();
+      return;
+    }
+    this.engine.workItems.update(item.id, { active: false });
+    const wasRunning = ownedRuns.some(run => ["queued", "running"].includes(run.status))
+      || taskRuns.some(run => ["queued", "running", "awaiting_approval"].includes(run.status));
+    if (input.operation === "cancel") {
+      for (const pending of this.engine.workDispatch.summaries(input.space)) {
+        if (pending.id !== input.id && pending.workItemId === item.id && !["settled", "interrupted", "cancelled"].includes(pending.state)) {
+          this.engine.workDispatch.update(pending.id, pending.revision, { state: "cancelled" });
+          if (pending.runId) this.cancelChatRun(pending.runId);
+        }
+      }
+      for (const run of ownedRuns) this.cancelChatRun(run.id);
+      for (const run of taskRuns) {
+        if (run.workActionId) this.engine.cancelWorkAction(run.workActionId);
+        else this.engine.cancelTaskRun(run.id);
+      }
+    }
+    await this.workReceipt(input.id, input.operation === "cancel"
+      ? wasRunning ? `已请求取消「${item.title}」，待处理输入已取消，正在停止当前执行。`
+        : `「${item.title}」当前没有运行中的任务，已取消待处理输入并停止后续执行。`
+      : `已暂停「${item.title}」的后续执行；当前运行会完成本轮。`);
+  }
+
+  private admitInputRun(input: WorkInput): ChatRun {
+    if (!input.plan) throw new Error("Work input has no frozen plan");
+    if (input.runId && !this.engine.chatRuns.has(input.runId)) throw new Error("Work input Run is missing; refusing to replay");
+    let run = this.engine.chatRuns.start(input.plan);
+    if (run.space !== input.space || run.dispatchKey !== input.id) throw new Error("Work input Run mismatch");
+    if (input.workItemId) this.engine.workItems.attachChatRun(input.workItemId, run.id);
+    this.engine.workDispatch.update(input.id, input.revision, { state: "dispatched", runId: run.id });
+    if (run.launchAdmission === "pending") run = this.engine.chatRuns.admit(run.id);
+    return run;
   }
 
   /**
@@ -393,11 +750,17 @@ export class Orchestrator {
    */
   async retryChatRun(runId: string): Promise<ChatRun> {
     const previousForKey = this.engine.chatRuns.get(runId);
+    const topic = this.engine.chatRuns.topicNativeSessionForRun(runId);
     return this.serializer.run(
-      `chat:${previousForKey?.chatId ?? "retry"}`,
+      topic ? `topic:${previousForKey!.space}:${topic.chatId}:${topic.rootMessageId}`
+        : previousForKey?.workItemId ? `work:${previousForKey.workItemId}` : `chat:${previousForKey?.chatId ?? "retry"}`,
       async () => {
       const previous = this.engine.chatRuns.get(runId);
       if (!previous) throw new Error(`unknown chat run: ${runId}`);
+      const sourceInputId = previous.sourceInputId ?? previous.dispatchKey;
+      const sourceInput = sourceInputId ? this.engine.workDispatch.get(sourceInputId) : undefined;
+      if (sourceInputId && (!sourceInput || sourceInput.space !== previous.space)) throw new Error("Chat Run source input is missing");
+      const retryText = sourceInput?.message.text ?? previous.input;
       if (!previous.chatId || !previous.messageId) {
         throw new Error("chat run is missing its delivery target");
       }
@@ -410,7 +773,7 @@ export class Orchestrator {
           ?? (previous.space.startsWith("personal/")
             ? previous.space.slice("personal/".length)
             : "unknown"),
-        text: previous.input,
+        text: retryText,
         messageId: previous.messageId,
         mentionsBot: true,
         createdAt: previous.startedAt,
@@ -469,11 +832,12 @@ export class Orchestrator {
       }
 
       const { readSpaces, writeSpace } = attribute(msg);
-      const retry = this.startChatRun(msg, writeSpace, previous.rawId, previous.id);
+      const retry = await this.startChatRun(msg, writeSpace, previous.rawId, previous.id);
       await this.scheduleChatRun(msg, writeSpace, retry, (signal) =>
-        interpretConversation(previous.input).disposition === "remember"
+        sourceInput?.response ? this.executeInputResponse(msg, writeSpace, retry.id, sourceInput.response, signal)
+        : interpretConversation(retryText).disposition === "remember"
           ? this.completeRememberChatRun(msg, writeSpace, retry.id, "好的，我记下了。", signal)
-          : this.answer(msg, readSpaces, writeSpace, retry.id, previous.input, signal)
+          : this.answer(msg, readSpaces, writeSpace, retry.id, retryText, signal)
       );
       return this.engine.chatRuns.get(retry.id)!;
       },
@@ -482,6 +846,10 @@ export class Orchestrator {
 
   /** Process one event. Exposed for tests; connectors call it via start(). */
   enqueue(event: InboundEvent): Promise<void> {
+    try { return this.receive(event).completion; } catch (error) { return Promise.reject(error); }
+  }
+
+  private processEvent(event: InboundEvent): Promise<void> {
     this.eventMetrics.total += 1;
     const key = event.kind === "message" || event.kind === "card_action" ? `chat:${event.chatId}` : "main";
     const pending = this.serializer.run(key, async () => {
@@ -507,6 +875,7 @@ export class Orchestrator {
   }
 
   health(): OrchestratorHealth {
+    const workInputs = this.engine.workDispatch.summaries();
     const settledEvents = this.eventMetrics.completed + this.eventMetrics.failed;
     const settledAnswers =
       this.answerMetrics.succeeded + this.answerMetrics.failed + this.answerMetrics.timedOut;
@@ -522,6 +891,10 @@ export class Orchestrator {
     const recentSampleSize = this.recentAnswerOutcomes.length;
     return {
       queue: this.serializer.snapshotAll("main"),
+      workInputs: { pending: workInputs.filter(input => !["settled", "interrupted", "cancelled"].includes(input.state)).length,
+        waiting: workInputs.filter(input => input.state === "waiting").length,
+        interrupted: workInputs.filter(input => input.state === "interrupted").length,
+        duplicates: this.intakeDuplicates, receiptFailures: this.intakeFailures },
       runs: this.engine.runScheduler.snapshot(),
       events: {
         total: this.eventMetrics.total,
@@ -639,6 +1012,7 @@ export class Orchestrator {
   private async authorizeGroupAutomation(
     msg: InboundMessage,
     denial: string,
+    workInputId?: string,
   ): Promise<boolean> {
     if (msg.chatType !== "group") return true;
     try {
@@ -652,7 +1026,8 @@ export class Orchestrator {
         err: String(err),
       });
     }
-    await this.send(msg, denial);
+    if (workInputId) await this.workReceipt(workInputId, denial);
+    else await this.send(msg, denial);
     return false;
   }
 
@@ -869,8 +1244,9 @@ export class Orchestrator {
             chatId: msg.chatId,
             messageId: msg.messageId,
             content: msg.text,
+            workItemId: this.inputFor(msg)?.workItemId,
             createdAt: msg.createdAt,
-          });
+          }, { useCurrentWorkItem: false });
           markDurableMutation();
         }
       }
@@ -1070,7 +1446,11 @@ export class Orchestrator {
     }
 
     return this.withThinking(msg, async () => {
+      const preparationStarted = performance.now();
+      log.info("chat input preparation started", { messageId: msg.messageId });
       await captureInputs();
+      const captureMs = Math.round(performance.now() - preparationStarted);
+      if (this.messageWasRetracted(writeSpace, msg.chatId, msg.messageId)) return;
       const interpretation = proactiveParticipation
         ? {
             disposition: "conversation" as const,
@@ -1081,78 +1461,46 @@ export class Orchestrator {
         disposition: interpretation.disposition,
         chatType: msg.chatType,
       });
-      const chatRun = this.startChatRun(
+      const response: NonNullable<WorkInput["response"]> = sourceSync.attempted > 0 && sourceSync.succeeded === 0
+        ? { kind: "static", text: "我已收录这条消息，但未能读取链接正文，因此不能确认已经理解或完整收录文章内容。请确认该资料在 HomeAgent 运行环境中可访问后重试。" }
+        : interpretation.disposition === "conversation" ? { kind: "answer", question: interpretation.text }
+        : interpretation.disposition === "remember" ? { kind: "remember", text: sourceSync.succeeded > 0 ? "好的，我已读取并记下来源正文。" : "好的，我记下了。" }
+        : { kind: "static", text: "👋 我在。有需要随时问我，或把要记住的事告诉我。" };
+      const chatRun = await this.startChatRun(
         msg,
         writeSpace,
         capturedMessageRawId,
+        undefined,
+        response,
       );
+      const preparationMs = Math.round(performance.now() - preparationStarted);
+      log.info("chat input preparation completed", {
+        messageId: msg.messageId, runId: chatRun.id,
+        captureMs, planMs: preparationMs - captureMs, preparationMs,
+      });
       markDurableMutation();
 
-      if (sourceSync.attempted > 0 && sourceSync.succeeded === 0) {
-        return this.scheduleChatRun(
-          msg,
-          writeSpace,
-          chatRun,
-          () => this.completeChatRunAndSend(
-            msg,
-            chatRun.id,
-            "我已收录这条消息，但未能读取链接正文，因此不能确认已经理解或完整收录文章内容。请确认该资料在 HomeAgent 运行环境中可访问后重试。",
-          ),
-        );
-      }
-
-      switch (interpretation.disposition) {
-        case "conversation":
-          return this.scheduleChatRun(
-            msg,
-            writeSpace,
-            chatRun,
-            (signal) => this.answer(
-              msg,
-              readSpaces,
-              writeSpace,
-              chatRun.id,
-              interpretation.text,
-              signal,
-            ),
-          );
-        case "remember":
-          return this.scheduleChatRun(
-            msg,
-            writeSpace,
-            chatRun,
-            (signal) => this.completeRememberChatRun(
-              msg,
-              writeSpace,
-              chatRun.id,
-              sourceSync.succeeded > 0
-                ? "好的，我已读取并记下来源正文。"
-                : "好的，我记下了。",
-              signal,
-            ),
-          );
-        case "chitchat":
-        default:
-          return this.scheduleChatRun(
-            msg,
-            writeSpace,
-            chatRun,
-            () => this.completeChatRunAndSend(
-              msg,
-              chatRun.id,
-              "👋 我在。有需要随时问我，或把要记住的事告诉我。",
-            ),
-          );
-      }
+      return this.scheduleChatRun(msg, writeSpace, chatRun, signal =>
+        this.executeInputResponse(msg, writeSpace, chatRun.id, response, signal));
     });
   }
 
-  private startChatRun(
+  private executeInputResponse(msg: InboundMessage, space: SpaceId, runId: string,
+    response: WorkInput["response"], signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.reject(signal.reason);
+    if (response?.kind === "static") return this.completeChatRunAndSend(msg, runId, response.text);
+    if (response?.kind === "remember") return this.completeRememberChatRun(msg, space, runId, response.text, signal);
+    return this.answer(msg, attribute(msg).readSpaces, space, runId,
+      response?.kind === "answer" ? response.question : interpretConversation(msg.text).text, signal);
+  }
+
+  private async startChatRun(
     msg: InboundMessage,
     writeSpace: SpaceId,
     rawId?: string,
     retryOf?: string,
-  ): ChatRun {
+    response?: WorkInput["response"],
+  ): Promise<ChatRun> {
     const retrySource = retryOf ? this.engine.chatRuns.get(retryOf) : undefined;
     if (retryOf && !retrySource) {
       throw new Error(`unknown chat run: ${retryOf}`);
@@ -1173,9 +1521,9 @@ export class Orchestrator {
           executionPlan: retrySource.executionPlan,
           timeoutMs: retrySource.timeoutMs,
         }
-      : (() => {
+      : await (async () => {
           // Freeze the full compatible catalog, just like ordinary Task runs.
-          const current = this.engine.agentRunExecutionSnapshot(writeSpace);
+          const current = await this.engine.agentRunExecutionSnapshotAsync(writeSpace);
           return {
             agentId: current.agent?.id,
             provider: current.provider,
@@ -1193,9 +1541,10 @@ export class Orchestrator {
     const rawWorkItemId = rawId && this.engine.registry.has(writeSpace)
       ? this.engine.registry.store(writeSpace).index().getRaw(rawId)?.workItemId
       : undefined;
-    const workItemId = rawWorkItemId
-      ?? retrySource?.workItemId
-      ?? this.engine.workItems.activeForSpace(writeSpace)?.id;
+    const routedInput = this.inputFor(msg);
+    if (!retrySource && routedInput?.state === "cancelled") throw new Error("Work input was cancelled");
+    const workItemId = rawWorkItemId ?? retrySource?.workItemId
+      ?? (routedInput ? routedInput.workItemId : this.engine.workItems.currentForSpace(writeSpace)?.id);
     const retryTopic = retrySource
       ? this.engine.chatRuns.topicNativeSessionForRun(retrySource.id)
       : undefined;
@@ -1242,7 +1591,8 @@ export class Orchestrator {
         msg.rootMessageId ?? msg.messageId,
       );
     }
-    const run = this.engine.chatRuns.start({
+    const input = retryOf ? undefined : this.inputFor(msg);
+    const plan: StartChatRunInput = {
       space: writeSpace,
       workItemId,
       rawId,
@@ -1260,8 +1610,15 @@ export class Orchestrator {
       executionPlan: snapshot.executionPlan,
       timeoutMs: snapshot.timeoutMs,
       retryOf,
+      sourceInputId: retrySource?.sourceInputId ?? retrySource?.dispatchKey,
       ...(topicNativeSession ? { topicNativeSession } : {}),
-    });
+      ...(input ? { dispatchKey: input.id, launchAdmission: "pending" as const } : {}),
+    };
+    const run = input
+      ? this.admitInputRun(this.engine.workDispatch.update(input.id, input.revision, {
+          state: "planned", workItemId, plan, response,
+        }))
+      : this.engine.chatRuns.start(plan);
     if (workItemId) this.engine.workItems.attachChatRun(workItemId, run.id);
     this.recordRunEvent({ runId: run.id, at: run.queuedAt, kind: "run.queued", visibility: "public", phase: "queue", status: "pending", title: "请求已进入队列" });
     const liveReplyCreate = this.startLiveReply(msg, run.id).finally(() => {
@@ -1300,9 +1657,19 @@ export class Orchestrator {
           provider: run.provider,
           model: run.model,
           agentId: run.agentId,
-          conversationId: writeSpace,
+          conversationId: run.dispatchKey
+            ? `${writeSpace}:${msg.chatId}:${msg.rootMessageId ?? run.workItemId ?? msg.messageId}`
+            : writeSpace,
+          independentReadOnly: !!run.dispatchKey && run.executionPlan?.execution?.permission === "read-only",
+          workItemId: run.workItemId,
         }),
         execute: async () => {
+          if (this.stopping) throw new ChatRunDeferredError("Queued work retained for restart");
+          if (run.dispatchKey) {
+            const input = this.engine.workDispatch.get(run.dispatchKey);
+            if (this.messageWasRetracted(writeSpace, msg.chatId, msg.messageId)) return;
+            if (!input || !this.inputBindingCurrent(input) || input.state === "cancelled") throw new Error("Work input is no longer executable");
+          }
           if (!this.engine.chatRuns.begin(run.id)) {
             throw new Error(`queued chat run is no longer active: ${run.id}`);
           }
@@ -1320,6 +1687,7 @@ export class Orchestrator {
       });
     } catch (error) {
       const current = this.engine.chatRuns.get(run.id);
+      if (error instanceof ChatRunDeferredError) throw error;
       if (error instanceof NativeTopicFailureCommitError) {
         if (current?.status !== "running") return;
         log.warn("atomic native topic failure persistence failed; retrying", {
@@ -1401,8 +1769,9 @@ export class Orchestrator {
   cancelChatRun(runId: string): boolean {
     const run = this.engine.chatRuns.get(runId);
     if (!run || !["queued", "running"].includes(run.status)) return false;
+    this.engine.chatRuns.requestCancel(runId);
     if (run.status === "queued") {
-      if (!this.engine.runScheduler.cancel(runId)) return false;
+      this.engine.runScheduler.cancel(runId);
       const cancelled = this.engine.chatRuns.cancel(runId, {
         finishedAt: Date.now(),
         error: {
@@ -1421,7 +1790,7 @@ export class Orchestrator {
 
   private resumeQueuedChatRuns(): void {
     const queued = this.engine.chatRuns.list()
-      .filter((run) => run.status === "queued")
+      .filter((run) => run.status === "queued" && !run.dispatchKey)
       .sort((a, b) => a.queuedAt - b.queuedAt || a.id.localeCompare(b.id));
     for (const run of queued) {
       if (!run.executionPlan) {
@@ -2292,13 +2661,14 @@ export class Orchestrator {
         await this.engine.rememberFiles({
           space: writeSpace,
           source: "doc",
+          workItemId: this.inputFor(msg)?.workItemId,
           author: msg.senderId,
           chatId: msg.chatId,
           messageId: msg.messageId,
           content: `# 来源资料：${link}\n\n${md}${typeof document !== "string" && document.imageNotice ? `\n\n配图归档：${document.imageNotice}` : ""}`,
           createdAt: msg.createdAt,
           attachments: missingImages,
-        }, downloads.map(download => ({ attachment: download.attachment, localPath: download.localPath })));
+        }, downloads.map(download => ({ attachment: download.attachment, localPath: download.localPath })), { useCurrentWorkItem: false });
         succeeded += 1;
         log.info("synced source into space", { space: writeSpace });
       } catch (err) {
@@ -2353,6 +2723,7 @@ export class Orchestrator {
             space: writeSpace,
             source: "message",
             author: source.author ?? msg.senderId,
+            workItemId: this.inputFor(msg)?.workItemId,
             chatId: msg.chatId,
             messageId: sourceMessageId,
             content,
@@ -2362,6 +2733,7 @@ export class Orchestrator {
             attachment: download.attachment,
             localPath: download.localPath,
           },
+          { useCurrentWorkItem: false },
         );
       } catch (err) {
         log.warn("attachment preservation failed", {
@@ -2382,29 +2754,37 @@ export class Orchestrator {
   }
 
   private async withThinking<T>(msg: InboundMessage, work: () => Promise<T>): Promise<T> {
-    let reactionId: string | undefined;
-    try {
-      reactionId = await this.connector.addReaction?.(msg.messageId, "THINKING");
-    } catch (err) {
-      // Optional UX must not interfere with the actual answer path, including
-      // connectors implemented outside this repository.
-      log.warn("thinking reaction failed", { messageId: msg.messageId, err: String(err) });
-    }
-
+    if (!this.connector.addReaction) return work();
+    const finished = Promise.withResolvers<void>();
+    // Reactions follow the work lifecycle without holding intake, Run creation,
+    // delivery, or the next topic turn behind an external presentation request.
+    const reaction = (async () => {
+      const started = performance.now();
+      let reactionId: string | undefined;
+      try {
+        reactionId = await this.connector.addReaction!(msg.messageId, "THINKING");
+      } catch {
+        log.warn("thinking reaction failed", { messageId: msg.messageId });
+      }
+      log.info("thinking reaction completed", {
+        messageId: msg.messageId, durationMs: Math.round(performance.now() - started), added: reactionId !== undefined,
+      });
+      if (reactionId) {
+        // A late add must still be removed, including after failure/cancellation.
+        await finished.promise;
+        try {
+          await this.connector.removeReaction?.(msg.messageId, reactionId);
+        } catch {
+          log.warn("thinking reaction cleanup failed", { messageId: msg.messageId });
+        }
+      }
+    })();
+    this.pendingReactions.add(reaction);
+    void reaction.finally(() => this.pendingReactions.delete(reaction));
     try {
       return await work();
     } finally {
-      if (reactionId) {
-        try {
-          await this.connector.removeReaction?.(msg.messageId, reactionId);
-        } catch (err) {
-          log.warn("thinking reaction cleanup failed", {
-            messageId: msg.messageId,
-            reactionId,
-            err: String(err),
-          });
-        }
-      }
+      finished.resolve();
     }
   }
 
@@ -2443,6 +2823,7 @@ export class Orchestrator {
     if (chatRunId) {
       this.recordRunEvent({ runId: chatRunId, at: Date.now(), kind: "delivery.started", visibility: "public", phase: "delivery", status: "running", title: "正在更新飞书回复" });
     }
+    let deliveredMessageId: string | undefined;
     try {
       if (chatRunId) {
         try {
@@ -2455,13 +2836,14 @@ export class Orchestrator {
           this.engine.chatRuns.clearLiveReply(chatRunId);
         }
       }
-      await this.connector.reply({
+      const receipt = await this.connector.reply({
         chatId: msg.chatId,
         replyToMessageId: msg.messageId,
         idempotencyKey: chatRunId ? `${chatRunId}:final` : `source:${msg.messageId}`,
         markdown,
         inThread,
       });
+      deliveredMessageId = receipt?.messageId;
     } catch (err) {
       if (chatRunId) {
         try {
@@ -2478,7 +2860,7 @@ export class Orchestrator {
     }
     if (chatRunId) {
       try {
-        this.engine.chatRuns.deliverySent(chatRunId, Date.now());
+        this.engine.chatRuns.deliverySent(chatRunId, Date.now(), deliveredMessageId);
         this.recordRunEvent({ runId: chatRunId, at: Date.now(), kind: "delivery.updated", visibility: "public", phase: "delivery", status: "succeeded", title: "飞书回复已更新" });
       } catch (err) {
         // Delivery already succeeded; never throw and invite an external retry.

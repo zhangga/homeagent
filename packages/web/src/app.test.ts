@@ -2566,11 +2566,12 @@ describe("management backend (read-write)", () => {
     const governanceBody = await governance.text();
     expect(governanceBody).toContain("数据治理");
     expect(governanceBody).toContain("原始消息保留");
-    expect(governanceBody).toContain("homeagent.space v1–v20");
+    expect(governanceBody).toContain("homeagent.space v1–v21");
     expect(governanceBody).toContain("v17 包含系统生成的分层知识地图");
     expect(governanceBody).toContain("v18 包含本地 Agent 知识消费反馈及处置记录");
     expect(governanceBody).toContain("v19 包含按 SHA-256 校验的完整原文件");
     expect(governanceBody).toContain("v20 保留 Agent 执行模式意图但不包含本机完全访问确认");
+    expect(governanceBody).toContain("v21 保留多事项及默认焦点");
 
     const exported = await app.request(`/spaces/${encodeURIComponent(SPACE)}/export`);
     expect(exported.status).toBe(200);
@@ -2579,7 +2580,7 @@ describe("management backend (read-write)", () => {
     expect(JSON.parse(archiveText)).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 20,
+        version: 21,
         sourceFiles: [],
         agentKnowledgeFeedback: [],
         agentRevisions: [],
@@ -3062,7 +3063,7 @@ describe("management backend (read-write)", () => {
   });
 
   test("Skill catalog refresh degrades to a safe Agent-page warning", async () => {
-    engine.skillCatalog.refresh = () => {
+    engine.skillCatalog.currentAsync = async () => {
       throw new Error("C:\\private\\skill-root failed");
     };
 
@@ -5317,6 +5318,26 @@ describe("management backend (read-write)", () => {
     expect(view).toContain("当前工作项");
   });
 
+  test("work context: focus selection does not pause another item and pending inputs remain visible", async () => {
+    const first = engine.workItems.create({ space: SPACE, title: "调研方案" });
+    const second = engine.workItems.create({ space: SPACE, title: "项目周报" });
+    const accepted = engine.workDispatch.accept({ connector: "cli", space: SPACE, message: {
+      kind: "message", eventId: "event", chatType: "group", chatId: "chat", senderId: "user",
+      messageId: "message", text: "补充国内方案", mentionsBot: true, createdAt: 1,
+    } });
+    engine.workDispatch.update(accepted.id, accepted.revision, { state: "waiting", workItemId: first.id });
+    await app.request(`/work/${first.id}/activate`, { method: "POST" });
+    expect(engine.workItems.currentForSpace(SPACE)?.id).toBe(first.id);
+    expect(engine.workItems.get(second.id)?.active).toBe(true);
+    const response = await app.request(`/work/${first.id}/activity`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "active=false" });
+    expect([302, 303]).toContain(response.status);
+    const view = await (await app.request(`/work/${first.id}`)).text();
+    expect(view).toContain("补充国内方案");
+    expect(view).toContain("后续执行已暂停");
+    expect(view).toContain("继续后续执行");
+    expect(engine.workItems.get(second.id)?.active).toBe(true);
+  });
+
   test("work context: opt in, continue, cancel, and retry controls are rendered", async () => {
     const agent = engine.agents.create({
       name: "工作续跑助手",
@@ -6056,12 +6077,14 @@ describe("management backend (read-write)", () => {
   });
 
   test("tasks: a duplicate manual run redirects to the active run", async () => {
+    const providerStarted = Promise.withResolvers<void>();
     let finish: ((value: string) => void) | undefined;
     const isolatedEngine = new KnowledgeEngine({
       dataDir: join(dir, "duplicate-run"),
       skillCatalog: new SkillCatalog({ roots: [] }),
       runProvider: async () => new Promise<string>((resolve) => {
         finish = resolve;
+        providerStarted.resolve();
       }),
     });
     isolatedEngine.ensureSpace(SPACE);
@@ -6079,7 +6102,8 @@ describe("management backend (read-write)", () => {
     expect(response.headers.get("location")).toContain(`/tasks/runs/${active.run.id}`);
     expect(decodeURIComponent(response.headers.get("location")!)).toContain("任务正在运行");
     expect(isolatedEngine.listTaskRuns(task.id)).toHaveLength(1);
-    finish?.("完成");
+    await providerStarted.promise;
+    finish!("完成");
     await active.completion;
     isolatedEngine.close();
   });

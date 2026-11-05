@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpaceId } from "@homeagent/shared";
@@ -42,7 +42,7 @@ describe("WorkItemStore", () => {
     }, NOW + 2_000);
 
     expect(store.get(first.id)).toEqual(expect.objectContaining({
-      active: false,
+      active: true,
       phase: "blocked",
       blockers: ["缺少生产环境审批"],
     }));
@@ -51,11 +51,38 @@ describe("WorkItemStore", () => {
     const restarted = new WorkItemStore(dir);
     expect(restarted.activeForSpace(SPACE)).toEqual(second);
     expect(restarted.get(first.id)?.summary).toBe("回归完成，等待权限。");
+    restarted.select(first.id);
+    expect(restarted.currentForSpace(SPACE)?.id).toBe(first.id);
+    expect(restarted.get(second.id)?.active).toBe(true);
 
     const projectionDir = join(dir, "workspaces", spaceToDir(SPACE), "work", first.id);
     expect(existsSync(join(projectionDir, "status.json"))).toBe(true);
     expect(readFileSync(join(projectionDir, "brief.md"), "utf8")).toContain("明确验收标准");
     expect(readFileSync(join(projectionDir, "runbook.md"), "utf8")).toContain("检查审计记录");
+  });
+
+  test("migrates v1's single active item into an independent durable current selection", () => {
+    const store = new WorkItemStore(dir);
+    const item = store.create({ space: SPACE, title: "旧事项" });
+    writeFileSync(join(dir, "config", "work-items.json"), JSON.stringify({ version: 1, items: { [item.id]: item } }));
+    const reopened = new WorkItemStore(dir);
+    expect(reopened.currentForSpace(SPACE)?.id).toBe(item.id);
+    const another = reopened.create({ space: SPACE, title: "新事项" });
+    reopened.select(item.id);
+    const again = new WorkItemStore(dir);
+    expect(again.currentForSpace(SPACE)?.id).toBe(item.id);
+    expect(again.get(another.id)?.active).toBe(true);
+    expect(JSON.parse(readFileSync(join(dir, "config", "work-items.json"), "utf8")).version).toBe(2);
+  });
+
+  test("refuses malformed or future WorkItem files instead of treating them as empty", () => {
+    new WorkItemStore(dir).create({ space: SPACE, title: "保留工作" });
+    const path = join(dir, "config", "work-items.json");
+    for (const value of [{ version: 2, currentBySpace: {} }, { version: 2, items: [], currentBySpace: {} }, { version: 3, items: {}, currentBySpace: {} }]) {
+      writeFileSync(path, JSON.stringify(value));
+      expect(() => new WorkItemStore(dir)).toThrow("WorkItem state is invalid");
+      expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(value);
+    }
   });
 
   test("does not consume a later action when the current boundary changed during execution", () => {

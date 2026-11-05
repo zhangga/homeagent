@@ -26,12 +26,12 @@ export function learningCommandNeedsSource(command: LearningCommand): boolean {
   return command.verb === "new" || command.verb === "add";
 }
 
-function withSkillWarnings(
+async function withSkillWarnings(
   message: string,
   engine: KnowledgeEngine,
   space: SpaceId,
-): string {
-  const warning = formatSkillWarnings(engine.skillWarningsForSpace(space));
+): Promise<string> {
+  const warning = formatSkillWarnings(await engine.skillWarningsForSpaceAsync(space));
   return warning ? `${message}\n\n${warning}` : message;
 }
 

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstatSync } from "node:fs";
 import { AI_OPERATION_TIMEOUT_MS, config } from "@homeagent/shared";
-import { codexPreparationIdentity, providerPreparationFailure, resolveCodexExecutionPolicy, type CodexExecutionMode, type ProviderPreparationFailure } from "@homeagent/llm";
+import { codexPreparationIdentity, providerPreparationFailure, resolveCodexExecutionPolicy, withProviderSkillSession, type CodexExecutionMode, type ProviderPreparationFailure } from "@homeagent/llm";
 import { resolveAgentExecution, resolveAgentWorkdir, type AgentStore } from "./agents.ts";
 import type { SkillCatalog } from "./skill-catalog.ts";
 import type { LocalExecutionAuthorizations } from "./local-execution-scopes.ts";
@@ -112,17 +112,16 @@ export class AgentReadiness {
       stop = this.options.localExecution.watch(() => {
         if (this.closed || this.context(id)?.configurationKey !== context.configurationKey) throw new Error("Readiness context changed");
       }, () => controller.abort());
-      this.options.skills.refresh();
-      const resolved = this.options.skills.resolveAll("codex");
-      const inputs = this.options.skills.executionInputs(resolved.resolved);
-      skillKey = hash([resolved.resolved, inputs]);
-      const execution = { ...resolveAgentExecution(agent), executionMode: context.mode, skillMode: "all" as const, skills: resolved.resolved.map(skill => skill.invocationName) };
-      await this.options.preflight("codex", AI_OPERATION_TIMEOUT_MS, controller.signal, execution.workdir, execution, inputs, this.options.dataDir);
-      if (controller.signal.aborted) throw new Error("Readiness cancelled");
-      this.options.skills.refresh();
-      const latest = this.options.skills.resolveAll("codex");
-      const latestInputs = this.options.skills.executionInputs(latest.resolved);
-      if (skillKey !== hash([latest.resolved, latestInputs])) throw new Error("Skill configuration changed");
+      await this.options.skills.withResolution({ provider: "codex" }, async () => {
+        controller.signal.throwIfAborted();
+        const resolved = this.options.skills.resolveAll("codex");
+        const inputs = this.options.skills.executionInputsAfterValidation(resolved.resolved);
+        skillKey = hash([resolved.resolved, inputs]);
+        const execution = { ...resolveAgentExecution(agent), executionMode: context.mode, skillMode: "all" as const, skills: resolved.resolved.map(skill => skill.invocationName) };
+        await withProviderSkillSession(() => this.options.preflight("codex", AI_OPERATION_TIMEOUT_MS, controller.signal, execution.workdir, execution, inputs, this.options.dataDir));
+        if (controller.signal.aborted) throw new Error("Readiness cancelled");
+        await this.options.skills.validatePrepared();
+      });
       // Refreshing for another Agent must not discard an unchanged shared catalog.
       // Preserve the original configuration key and expiry: this is not a new proof.
       for (const cached of this.cache.values()) {

@@ -1374,6 +1374,9 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     connector = new CliConnector({ groupChatId: "oc_team", p2pChatId: "oc_dm", userId: "ou_me" });
     orch = new Orchestrator({ engine, connector });
     await orch.start();
+    for (let attempt = 0; attempt < 100 && engine.chatRuns.get(queued.id)?.delivery.status !== "sent"; attempt++) {
+      await Bun.sleep(5);
+    }
     await orch.stop();
 
     expect(engine.chatRuns.get(queued.id)).toEqual(expect.objectContaining({
@@ -1725,10 +1728,10 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     const sending = connector.sendGroup("Alice 今天更新了后端服务。", false);
     await classificationStarted;
     const queued = connector.sendGroup("Bob 今天更新了客户端。", false);
-    await Promise.resolve();
+    for (let i = 0; i < 100 && engine.registry.store("team/oc_team").index().countRaw(true) < 2; i++) await Bun.sleep(5);
     expect(orch.health().queue).toEqual(expect.objectContaining({
-      queued: 1,
-      running: 1,
+      queued: 0,
+      running: 2,
       pending: 2,
       maxPending: 2,
     }));
@@ -1738,7 +1741,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     releaseClassification();
     await Promise.all([sending, queued]);
 
-    expect(capturedBeforeDecision).toBe(1);
+    expect(capturedBeforeDecision).toBe(2);
     expect(connector.sent).toHaveLength(0);
   });
 

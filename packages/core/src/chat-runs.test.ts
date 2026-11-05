@@ -24,6 +24,25 @@ afterEach(() => {
 });
 
 describe("ChatRunStore", () => {
+  test("dispatch admission and cancellation survive reopen and reject stale success", () => {
+    let store = new ChatRunStore(dir);
+    const plan = { space: SPACE, input: "frozen", trigger: "message" as const,
+      dispatchKey: `input_${"a".repeat(64)}`, launchAdmission: "pending" as const,
+      executionPlan: { version: 1 as const, instruction: "original" } };
+    const run = store.start(plan);
+    expect(store.begin(run.id)).toBeUndefined();
+    expect(store.succeed(run.id, { finishedAt: 5, output: "not admitted" })).toBeUndefined();
+    store = new ChatRunStore(dir);
+    expect(store.start(plan).id).toBe(run.id);
+    expect(() => store.start({ ...plan, input: "changed" })).toThrow("conflict");
+    store.admit(run.id);
+    store.begin(run.id);
+    store.requestCancel(run.id);
+    expect(store.succeed(run.id, { finishedAt: Date.now(), output: "late result" })).toBeUndefined();
+    const recovered = new ChatRunStore(dir, { recoverInterrupted: true });
+    expect(recovered.get(run.id)?.status).toBe("cancelled");
+    expect(recovered.get(run.id)?.output).toBeUndefined();
+  });
   test("persists live reply handle without changing delivery commit status", () => {
     let store = new ChatRunStore(dir);
     const run = store.start({ space: SPACE, input: "live", trigger: "message", startedAt: 100 });
@@ -64,7 +83,7 @@ describe("ChatRunStore", () => {
     expect(store.topicInputsThroughRun(standalone.id)).toEqual(["普通消息"]);
   });
 
-  test("reads v6 history without inventing mode evidence and writes new metadata as v8", () => {
+  test("reads v6 history without inventing mode evidence and writes new metadata as v9", () => {
     const path = join(dir, "config", "chat-runs.json");
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify({ version: 6, runs: {
@@ -78,7 +97,7 @@ describe("ChatRunStore", () => {
         executionMode: "local-full-access", sandboxCheck: "not-applicable", effectiveSandbox: "danger-full-access", process: "not-started", model: "unknown",
       } }],
     } });
-    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(8);
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(9);
     expect(new ChatRunStore(dir).get("legacy")?.executionEvidence?.calls[0]?.execution?.sandboxCheck).toBe("not-applicable");
   });
   test("execution evidence survives reopen and cannot be mutated or polluted", () => {
@@ -216,7 +235,7 @@ describe("ChatRunStore", () => {
     expect(new ChatRunStore(dir).get(run.id)?.executionPlan).toEqual(executionPlan);
     expect(new ChatRunStore(dir).get(run.id)?.timeoutMs).toBe(7 * 60_000);
     expect(JSON.parse(readFileSync(join(dir, "config", "chat-runs.json"), "utf8")).version)
-      .toBe(8);
+      .toBe(9);
   });
 
   test.each([6, 7])("reuses a successfully delivered Feishu topic session after its Chat Run commit (v%s)", (version) => {
@@ -1408,7 +1427,7 @@ describe("ChatRunStore", () => {
     const path = join(dir, "config", "chat-runs.json");
     mkdirSync(dirname(path), { recursive: true });
     const future = JSON.stringify({
-      version: 9,
+      version: 10,
       runs: { future_run: { privateFutureState: "preserve-me" } },
     });
     writeFileSync(path, future, "utf8");

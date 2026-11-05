@@ -281,6 +281,8 @@ describe("beta readiness verification", () => {
     for (const file of [
       "Contents/MacOS/homeagent",
       "Contents/Resources/app/homeagent.js",
+        "Contents/Resources/app/skill-catalog-worker.ts",
+        "Contents/Resources/app/skill-bundle-worker.ts",
       "Contents/Resources/bin/bun",
       "Contents/Resources/bin/lark-cli",
       "Contents/Resources/bin/attachment-extract",

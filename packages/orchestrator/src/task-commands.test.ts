@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetConfig, type SpaceId } from "@homeagent/shared";
-import { KnowledgeEngine } from "@homeagent/core";
+import { KnowledgeEngine, SkillCatalog } from "@homeagent/core";
 import { parseTaskCommand, handleTaskCommand } from "./task-commands.ts";
 
 describe("parseTaskCommand", () => {
@@ -40,7 +40,7 @@ describe("handleTaskCommand", () => {
     dir = mkdtempSync(join(tmpdir(), "hb-taskcmd-"));
     process.env.HOMEAGENT_DATA_DIR = dir;
     resetConfig();
-    engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    engine = new KnowledgeEngine({ dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }), runProvider: async () => "ok" });
     engine.ensureSpace(SPACE);
   });
 
@@ -116,11 +116,14 @@ describe("handleTaskCommand", () => {
   });
 
   test("run reports the active run instead of claiming a duplicate started", async () => {
+    const providerStarted = Promise.withResolvers<void>();
     let finish: ((value: string) => void) | undefined;
     const duplicateEngine = new KnowledgeEngine({
+      skillCatalog: new SkillCatalog({ roots: [] }),
       dataDir: join(dir, "duplicate"),
       runProvider: async () => new Promise<string>((resolve) => {
         finish = resolve;
+        providerStarted.resolve();
       }),
     });
     duplicateEngine.ensureSpace(SPACE);
@@ -141,7 +144,8 @@ describe("handleTaskCommand", () => {
     expect(reply).toContain("正在运行");
     expect(reply).toContain(active.run.id);
     expect(duplicateEngine.listTaskRuns(task.id)).toHaveLength(1);
-    finish?.("完成");
+    await providerStarted.promise;
+    finish!("完成");
     await active.completion;
     duplicateEngine.close();
   });

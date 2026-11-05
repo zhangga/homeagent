@@ -192,6 +192,7 @@ describe("system health reporter", () => {
     dirs.push(dir);
     const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
     const runtime = {
+      workInputs: { pending: 0, waiting: 0, interrupted: 0, duplicates: 0, receiptFailures: 0 },
       queue: {
         key: "main",
         queued: 0,

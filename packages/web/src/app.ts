@@ -744,7 +744,7 @@ export function createWebApp(opts: WebOptions): Hono {
     const models = await getModels();
     let catalog;
     try {
-      catalog = engine.skillCatalog.current();
+      catalog = await engine.skillCatalog.currentAsync();
     } catch {
       catalog = undefined;
     }
@@ -2002,7 +2002,7 @@ export function createWebApp(opts: WebOptions): Hono {
   app.get("/skills", async (c) => {
     let catalog;
     try {
-      catalog = engine.skillCatalog.current();
+      catalog = await engine.skillCatalog.currentAsync();
     } catch {
       catalog = undefined;
     }
@@ -2031,7 +2031,7 @@ export function createWebApp(opts: WebOptions): Hono {
       : "/agents";
     const separator = returnTo.includes("?") ? "&" : "?";
     try {
-      engine.skillCatalog.refresh();
+      await engine.skillCatalog.currentAsync(true);
     } catch {
       return c.redirect(
         `${returnTo}${separator}ok=${encodeURIComponent("Skill 目录刷新失败；继续使用上次目录")}`,
@@ -2266,7 +2266,7 @@ export function createWebApp(opts: WebOptions): Hono {
         { provider: cfg.defaultProvider, model: cfg.defaultModel },
       ),
     );
-    const catalog = engine.skillCatalog.current();
+    const catalog = await engine.skillCatalog.currentAsync();
     const validation = validateAgentEditor(values, {
       providers,
       models: await getModels(),
@@ -2312,7 +2312,7 @@ export function createWebApp(opts: WebOptions): Hono {
         { provider: cfg.defaultProvider, model: cfg.defaultModel },
       ),
     );
-    const catalog = engine.skillCatalog.current();
+    const catalog = await engine.skillCatalog.currentAsync();
     const validation = validateAgentEditor(values, {
       providers,
       models: await getModels(),
@@ -2628,6 +2628,11 @@ export function createWebApp(opts: WebOptions): Hono {
         engine.workContinuations.list(item.id),
         engine.workContinuations.policyFor(item.id, item.space),
         ok,
+        { currentIds: engine.registry.list().flatMap(space => {
+            const current = engine.workItems.currentForSpace(space.id); return current ? [current.id] : [];
+          }), inputs: engine.workDispatch.list(item.space).filter(input => input.workItemId === item.id
+            && !["settled", "cancelled"].includes(input.state)),
+          chatRuns: engine.chatRuns.list(item.space).filter(run => run.workItemId === item.id) },
       ),
       "work",
     ));
@@ -2679,12 +2684,22 @@ export function createWebApp(opts: WebOptions): Hono {
     const id = decodeURIComponent(c.req.param("id"));
     if (!engine.workItems.get(id)) return c.notFound();
     try {
-      engine.workItems.activate(id);
+      engine.workItems.select(id);
       return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent("已设为当前工作项")}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "切换失败";
       return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(`切换失败：${message}`)}`);
     }
+  });
+
+  app.post("/work/:id/activity", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    if (!engine.workItems.get(id)) return c.notFound();
+    const body = await c.req.parseBody();
+    const active = str(body, "active");
+    if (active !== "true" && active !== "false") return c.text("无效的事项状态", 400);
+    engine.workItems.update(id, { active: active === "true" });
+    return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(active === "true" ? "已继续后续执行" : "已暂停后续执行，当前运行继续完成")}`);
   });
 
   app.post("/work/:id/continuation", async (c) => {
@@ -2704,7 +2719,7 @@ export function createWebApp(opts: WebOptions): Hono {
     const id = decodeURIComponent(c.req.param("id"));
     if (!engine.workItems.get(id)) return c.notFound();
     try {
-      const started = engine.startWorkContinuation(id);
+      const started = await engine.startWorkContinuationAsync(id);
       const message = started.state === "awaiting_approval"
         ? "动作已冻结，等待审批"
         : "动作已进入执行队列";
@@ -2976,7 +2991,7 @@ export function createWebApp(opts: WebOptions): Hono {
     const id = decodeURIComponent(c.req.param("id"));
     if (!engine.tasks.has(id)) return c.notFound();
     try {
-      const started = engine.startTaskRun(id, { trigger: "manual" });
+      const started = await engine.startTaskRunAsync(id, { trigger: "manual" });
       observeTaskRunCompletion(started);
       const message = started.state === "awaiting_approval"
         ? "高权限任务已提交审批"

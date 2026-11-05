@@ -742,6 +742,50 @@ test("over-capacity catalogs fail before invocation and clean every staged copy"
   }
 }, 30000);
 
+test("an HTTP request can cancel Skill staging before the model launch permit", async () => {
+  const source = realpathSync(mkdtempSync(join(tmpdir(), "ha-skill-responsive-")));
+  const skillFile = join(source, "SKILL.md");
+  const controller = new AbortController();
+  const server = Bun.serve({
+    hostname: "127.0.0.1", port: 0,
+    fetch() {
+      controller.abort(new Error("cancelled during preparation"));
+      return new Response("ok");
+    },
+  });
+  const before = stagedCodexSkillDirectories();
+  let request: Promise<string> | undefined;
+  // Send the request after copying has actually started. An initial yield
+  // followed by one large synchronous copy would still starve this request.
+  const progress = setInterval(() => {
+    if (request) return;
+    const copying = stagedCodexSkillDirectories().some(name => !before.includes(name)
+      && existsSync(join(tmpdir(), name, "skill-0000", "resource-0")));
+    if (copying) request = fetch(new URL("/work", server.url)).then(response => response.text());
+  }, 1);
+  try {
+    writeFileSync(skillFile, "# Fixture\n");
+    for (let i = 0; i < 192; i++) writeFileSync(join(source, `resource-${i}`), "fixture");
+    const skill = { name: "fixture", directory: source, skillFile, bundleHash: hashProviderSkillBundle(skillFile) };
+    let reachedPermit = false;
+    const run = runProviderDetailed("codex", {
+      prompt: "fixture", execution: { permission: "read-only", skills: ["fixture"] }, skillInputs: [skill],
+      acquireExecutionPermit() {
+        reachedPermit = true;
+        throw new Error("reached model launch before the HTTP request");
+      },
+    }, 5000, controller.signal);
+    await expect(run).rejects.toThrow("cancelled during preparation");
+    expect(await request).toBe("ok");
+    expect(reachedPermit).toBe(false);
+    expect(stagedCodexSkillDirectories()).toEqual(before);
+  } finally {
+    clearInterval(progress);
+    await server.stop(true);
+    rmSync(source, { recursive: true, force: true });
+  }
+});
+
 test("the shared staged read root rejects substituted or extra bundles before sandboxing", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-codex-staged-root-contract-")));
   const previous = process.env.HOMEAGENT_CODEX_BIN;
@@ -752,21 +796,30 @@ test("the shared staged read root rejects substituted or extra bundles before sa
   const skillFile = join(source, "SKILL.md");
   writeFileSync(skillFile, "# Frozen\n");
   const stagedBefore = stagedCodexSkillDirectories();
+  const originalSpawn = Bun.spawn;
+  let substituted = false;
+  const probe = spyOn(Bun, "spawn").mockImplementation((...args) => {
+    if (!substituted) {
+      // The first capability probe starts after all copies are staged.
+      const created = stagedCodexSkillDirectories().filter(name => !stagedBefore.includes(name));
+      expect(created).toHaveLength(1);
+      const stagedRoot = join(realpathSync(tmpdir()), created[0]!);
+      renameSync(join(stagedRoot, "skill-0000"), join(stagedRoot, "unlisted-bundle"));
+      substituted = true;
+    }
+    return Reflect.apply(originalSpawn, Bun, args);
+  });
   try {
     process.env.HOMEAGENT_CODEX_BIN = writeArgAndStdinReportingCodexProvider(root);
     const pending = preflightProviderNativeSession("codex", 5000, undefined, workdir,
       { permission: "write", workdir, skills: ["frozen"] },
       [{ name: "frozen", directory: source, skillFile, bundleHash: hashProviderSkillBundle(skillFile) }], dataRoot);
-    // Staging is synchronous before the first fake CLI probe. Substitute its
-    // child while that probe is pending, keeping the directory count unchanged.
-    const created = stagedCodexSkillDirectories().filter(name => !stagedBefore.includes(name));
-    expect(created).toHaveLength(1);
-    const stagedRoot = join(realpathSync(tmpdir()), created[0]!);
-    renameSync(join(stagedRoot, "skill-0000"), join(stagedRoot, "unlisted-bundle"));
     await expect(pending).rejects.toThrow("native session isolation is unavailable");
+    expect(substituted).toBe(true);
     expect(providerProbeCalls(root, "provider").some(args => args.includes("sandbox"))).toBe(false);
     expect(stagedCodexSkillDirectories()).toEqual(stagedBefore);
   } finally {
+    probe.mockRestore();
     if (previous === undefined) delete process.env.HOMEAGENT_CODEX_BIN; else process.env.HOMEAGENT_CODEX_BIN = previous;
     rmSync(root, { recursive: true, force: true });
   }

@@ -93,6 +93,24 @@ afterEach(async () => {
 });
 
 describe("FeishuConnector daemon (fake spawn)", () => {
+  test("retains an unaccepted event with backpressure until durable receipt succeeds", async () => {
+    const spawner = new FakeSpawner();
+    connector = new FeishuConnector({ spawner, runCommand: async () => "{}", backoffBaseMs: 5, backoffMaxMs: 10 });
+    const accepted: string[] = [];
+    let failures = 2;
+    await connector.start(event => {
+      if (event.kind !== "message") return;
+      if (failures-- > 0) throw new Error("disk temporarily unavailable");
+      accepted.push(event.messageId);
+      return { completion: Promise.resolve() };
+    });
+    const proc = await spawner.waitForProc("im.message.receive_v1");
+    proc.emitStderr("[event] ready");
+    for (const id of ["first", "second"]) proc.emitStdout(JSON.stringify({ message_id: id, event_id: id,
+      chat_id: "chat", chat_type: "p2p", sender_id: "user", content: id }));
+    for (let i = 0; i < 200 && accepted.length < 2; i++) await Bun.sleep(5);
+    expect(accepted).toEqual(["first", "second"]);
+  });
   test("receives approval callbacks on an independent ready-gated stream without blocking messages", async () => {
     const spawner = new FakeSpawner();
     const events: InboundEvent[] = [];
@@ -732,14 +750,16 @@ describe("FeishuConnector outbound", () => {
   test("reply builds the correct lark-cli command", async () => {
     const spawner = new FakeSpawner();
     const commands: string[][] = [];
+    const inputs: (string | undefined)[] = [];
     connector = new FeishuConnector({
       spawner,
-      runCommand: async (cmd) => {
+      runCommand: async (cmd, opts) => {
         commands.push(cmd);
-        return "{}";
+        inputs.push(opts?.stdin);
+        return '{"data":{"message_id":"om_reply"}}';
       },
     });
-    await connector.reply({
+    const receipt = await connector.reply({
       chatId: "oc_1",
       replyToMessageId: "om_1",
       markdown: "hello",
@@ -750,20 +770,22 @@ describe("FeishuConnector outbound", () => {
     expect(cmd).toContain("--message-id");
     expect(cmd).toContain("om_1");
     expect(cmd).toContain("--markdown");
-    expect(cmd).toContain("hello");
+    expect(cmd).not.toContain("hello");
+    expect(inputs).toEqual(["hello"]);
+    expect(receipt).toEqual({ messageId: "om_reply" });
     expect(cmd).toContain("--reply-in-thread");
     expect(cmd).toContain("--as");
     expect(cmd).toContain("bot");
   });
 
   test("reply and notice send local file paths as text while preserving web evidence links", async () => {
-    const commands: string[][] = [];
-    connector = new FeishuConnector({ spawner: new FakeSpawner(), runCommand: async cmd => { commands.push(cmd); return "{}"; } });
+    const commands: { cmd: string[]; stdin?: string }[] = [];
+    connector = new FeishuConnector({ spawner: new FakeSpawner(), runCommand: async (cmd, opts) => { commands.push({ cmd, stdin: opts?.stdin }); return "{}"; } });
     const markdown = "[交接文件](D:/Client/homeagent-chat-raw.json)\n[原始消息](https://example.com/message)";
     await connector.reply({ chatId: "oc_one", replyToMessageId: "om_one", markdown });
     await connector.notice("oc_one", markdown);
-    for (const cmd of commands) {
-      const sent = cmd[cmd.indexOf("--markdown") + 1]!;
+    for (const { cmd, stdin } of commands) {
+      const sent = stdin ?? cmd[cmd.indexOf("--markdown") + 1]!;
       expect(sent).toContain("本机文件：` D:/Client/homeagent-chat-raw.json `");
       expect(sent).not.toContain("](D:");
       expect(sent).toContain("[原始消息](https://example.com/message)");

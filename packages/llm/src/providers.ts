@@ -20,7 +20,10 @@
  * gateway.ts, not here; it is always available and is the default.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { AI_OPERATION_TIMEOUT_MS, brandedEnv, config, logger, normalizeFeishuAppId, publicModelId, type ProviderProgressEvent, type PublicRunTool } from "@homeagent/shared";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { AI_OPERATION_TIMEOUT_MS, brandedEnv, config, logger, normalizeFeishuAppId, publicModelId, fileIdentity, fileIdentitiesMatch, type FileIdentity, type ProviderProgressEvent, type PublicRunTool } from "@homeagent/shared";
+import { SkillBundleWorker } from "./skill-bundle-client.ts";
+export { captureProviderSkillBundle, captureProviderSkillBundleAsync, hashProviderSkillBundle, hashProviderSkillBundleAsync } from "./skill-bundle.ts";
 import {
   chmodSync,
   closeSync,
@@ -41,12 +44,14 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { mkdir, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ImageInput } from "./gateway.ts";
 import { codexExecutionEvidenceFromLine, collectCodexExecutionEvidence, type ProviderExecutionEvidence, type ProviderExecutionMetadata } from "./execution-evidence.ts";
-import { ProviderPreparationError, SkillStagingBudget, SKILL_STAGING_MAX_BYTES, NATIVE_SESSION_ISSUE_LABELS, type NativeSessionIssue } from "./provider-preparation.ts";
+import { ProviderPreparationError, SKILL_STAGING_MAX_BYTES, NATIVE_SESSION_ISSUE_LABELS, type NativeSessionIssue } from "./provider-preparation.ts";
 import { resolveCodexExecutionPolicy, type CodexExecutionMode } from "./codex-execution-policy.ts";
+import { createSkillLoader, type SkillLoader } from "./skill-loader.ts";
 
 const log = logger.child("providers");
 
@@ -228,6 +233,8 @@ export interface ProviderExecutionPermit {
 /** Ephemeral path evidence for one frozen Skill; never persisted or returned to clients. */
 export interface ProviderSkillInput {
   name: string;
+  /** Discovery metadata only; bundle bytes remain pinned by bundleHash. */
+  description?: string;
   directory: string;
   skillFile: string;
   /** Frozen complete-bundle digest captured in durable Run evidence. */
@@ -241,6 +248,7 @@ interface PreparedRunInput extends RunInput {
   nativeIsolationReadRoot?: string;
   /** Invocation-owned root containing only verified frozen Skill copies. */
   nativeSkillReadRoot?: string;
+  nativeSkillLoader?: SkillLoader;
   /** Authentication cache selected by a no-completion status probe. */
   codexCredentialStore?: "file" | "keyring";
 }
@@ -311,226 +319,206 @@ function sandboxForPermission(
 // Matches Core's bounded all-Skill execution evidence. The native permission
 // profile below also enforces a platform-specific encoded argv ceiling.
 const MAX_PROVIDER_SKILL_INPUTS = 2_000;
-const MAX_PROVIDER_SKILL_BUNDLE_ENTRIES = 50_000;
 const MAX_CODEX_NATIVE_PERMISSION_CONFIG_CHARS = process.platform === "win32"
   ? 20_000
   : 128_000;
 
-interface ProviderSkillBundleFile {
-  path: string;
-  mode: number;
-  content: Buffer;
-}
-
-interface ProviderSkillBundleSnapshot {
-  hash: string;
-  files: ProviderSkillBundleFile[];
-  entries: number;
-  totalBytes: number;
-}
-
-function sameFileIdentity(
-  before: NonNullable<ReturnType<typeof lstatSync>>,
-  after: NonNullable<ReturnType<typeof lstatSync>>,
-): boolean {
-  return before.dev === after.dev
-    && before.ino === after.ino
-    && before.size === after.size
-    && before.mode === after.mode
-    && before.mtimeMs === after.mtimeMs
-    && before.ctimeMs === after.ctimeMs;
-}
-
-function snapshotProviderSkillBundle(
-  skillFile: string,
-  maxEntries = MAX_PROVIDER_SKILL_BUNDLE_ENTRIES,
-  // Installed runtime dependencies are part of the frozen bundle. A single
-  // Skill may use the existing catalog staging budget; do not discard them.
-  maxTotalBytes = SKILL_STAGING_MAX_BYTES,
-): ProviderSkillBundleSnapshot {
-  const root = dirname(skillFile);
-  const rootBefore = lstatSync(root);
-  const canonicalRoot = realpathSync(root);
-  if (rootBefore.isSymbolicLink() || !rootBefore.isDirectory()) {
-    throw new Error("Skill bundle root is invalid");
-  }
-  const files: ProviderSkillBundleFile[] = [];
-  const pending = [{ directory: root, relativeDir: "", depth: 0 }];
-  let entries = 0;
-  let totalBytes = 0;
-  while (pending.length > 0) {
-    const current = pending.pop()!;
-    if (current.depth > 32) throw new Error("Skill bundle is too deeply nested");
-    const directoryBefore = lstatSync(current.directory);
-    const canonicalDirectory = realpathSync(current.directory);
-    const directoryFromRoot = relative(canonicalRoot, canonicalDirectory);
-    if (
-      directoryBefore.isSymbolicLink()
-      || !directoryBefore.isDirectory()
-      || directoryFromRoot === ".."
-      || directoryFromRoot.startsWith(`..${sep}`)
-      || isAbsolute(directoryFromRoot)
-    ) {
-      throw new Error("Skill bundle directory escapes its root");
-    }
-    const children = readdirSync(current.directory, { withFileTypes: true })
-      .sort((left, right) => left.name.localeCompare(right.name));
-    for (const child of children) {
-      entries += 1;
-      if (entries > maxEntries) throw new Error("Skill bundle has too many entries");
-      const fullPath = join(current.directory, child.name);
-      const metadata = lstatSync(fullPath);
-      if (metadata.isSymbolicLink()) {
-        throw new Error("Skill bundle cannot contain symbolic links");
-      }
-      const canonicalPath = realpathSync(fullPath);
-      const fromRoot = relative(canonicalRoot, canonicalPath);
-      if (
-        fromRoot === ".."
-        || fromRoot.startsWith(`..${sep}`)
-        || isAbsolute(fromRoot)
-      ) {
-        throw new Error("Skill bundle entry escapes its root");
-      }
-      const relativePath = join(current.relativeDir, child.name).split(sep).join("/");
-      if (metadata.isDirectory()) {
-        pending.push({
-          directory: fullPath,
-          relativeDir: relativePath,
-          depth: current.depth + 1,
-        });
-        continue;
-      }
-      if (!metadata.isFile()) throw new Error("Skill bundle contains a non-regular file");
-      totalBytes += metadata.size;
-      if (totalBytes > maxTotalBytes) throw new Error("Skill bundle is too large");
-      const content = readFileSync(fullPath);
-      const after = lstatSync(fullPath);
-      if (after.isSymbolicLink() || !after.isFile() || !sameFileIdentity(metadata, after)) {
-        throw new Error("Skill bundle changed while it was being captured");
-      }
-      files.push({ path: relativePath, mode: metadata.mode & 0o777, content });
-    }
-    const directoryAfter = lstatSync(current.directory);
-    if (!sameFileIdentity(directoryBefore, directoryAfter)) {
-      throw new Error("Skill bundle directory changed while it was being captured");
-    }
-  }
-  const rootAfter = lstatSync(root);
-  if (!sameFileIdentity(rootBefore, rootAfter)) {
-    throw new Error("Skill bundle root changed while it was being captured");
-  }
-  files.sort((left, right) => left.path.localeCompare(right.path));
-  if (!files.some((file) => file.path === "SKILL.md")) {
-    throw new Error("Skill bundle has no SKILL.md");
-  }
-  if (files.length === 1 && files[0]!.path === "SKILL.md") {
-    return {
-      hash: createHash("sha256").update(files[0]!.content).digest("hex"),
-      files,
-      entries,
-      totalBytes,
-    };
-  }
-  const hash = createHash("sha256").update("homeagent-skill-bundle-v1\0");
-  for (const file of files) {
-    hash.update(
-      `${Buffer.byteLength(file.path)}:${file.path}\0${file.mode}\0${file.content.length}\0`,
-    );
-    hash.update(file.content);
-  }
-  return { hash: hash.digest("hex"), files, entries, totalBytes };
-}
-
-/** Compute the complete frozen Skill manifest shared with Core admission. */
-export function hashProviderSkillBundle(
-  skillFile: string,
-  maxEntries?: number,
-  maxTotalBytes?: number,
-): string {
-  return snapshotProviderSkillBundle(skillFile, maxEntries, maxTotalBytes).hash;
-}
-
 interface StagedProviderSkillInputs {
   inputs: ProviderSkillInput[];
   readRoot?: string;
-  cleanup: () => void;
-  verify?: () => void;
+  cleanup: () => void | Promise<void>;
+  verify?: () => Promise<void>;
+  verifyBeforeSpawn?: () => void;
+  loader?: SkillLoader;
 }
 
-function stageProviderSkillInputs(
+interface ProviderSkillSession {
+  resources: Map<string, Promise<StagedProviderSkillInputs>>;
+  controller: AbortController;
+}
+const providerSkillSession = new AsyncLocalStorage<ProviderSkillSession>();
+
+/** One logical Chat/Task Run, including preflight and every internal completion. */
+export async function withProviderSkillSession<T>(run: () => Promise<T>): Promise<T> {
+  const session: ProviderSkillSession = { resources: new Map(), controller: new AbortController() };
+  return providerSkillSession.run(session, async () => {
+    try { return await run(); }
+    finally {
+      session.controller.abort(new Error("provider Skill run ended"));
+      const resources = await Promise.allSettled(session.resources.values());
+      for (const resource of resources) {
+        if (resource.status === "fulfilled") {
+          try { await resource.value.cleanup(); }
+          catch { log.warn("Provider Skill session cleanup failed"); }
+        }
+      }
+    }
+  });
+}
+
+async function prepareProviderSkillInputs(
+  inputs: readonly ProviderSkillInput[],
+  lazy: boolean,
+  signal?: AbortSignal,
+): Promise<StagedProviderSkillInputs> {
+  const session = providerSkillSession.getStore();
+  if (!session || inputs.length === 0) return stageProviderSkillInputs(inputs, signal);
+  session.controller.signal.throwIfAborted();
+  const combinedSignal = signal ? AbortSignal.any([signal, session.controller.signal]) : session.controller.signal;
+  combinedSignal.throwIfAborted();
+  const key = JSON.stringify([lazy, inputs]);
+  let resource = session.resources.get(key);
+  if (!resource) {
+    resource = lazy ? stageLazyProviderSkillInputs(inputs, combinedSignal) : stageProviderSkillInputs(inputs, combinedSignal);
+    session.resources.set(key, resource);
+  }
+  const staged = await resource;
+  combinedSignal.throwIfAborted();
+  if (staged.verify) await staged.verify();
+  return { ...staged, cleanup: () => {} };
+}
+
+async function stageLazyProviderSkillInputs(
+  inputs: readonly ProviderSkillInput[],
+  signal: AbortSignal,
+): Promise<StagedProviderSkillInputs> {
+  const root = stageCodexNativeTemporaryDirectory("homeagent-codex-skills-");
+  const rootIdentity = lstatSync(root);
+  const worker = new SkillBundleWorker(inputs.length);
+  const proofs = new Map<string, FileIdentity[]>();
+  let rootProof = fileIdentity(root, rootIdentity);
+  const staged: ProviderSkillInput[] = [];
+  let loader: SkillLoader | undefined;
+  let loaderRoot: string | undefined;
+  const cleanup = async () => {
+    signal.removeEventListener("abort", stop);
+    try {
+      if (loader) await loader.close();
+      else if (loaderRoot) await rm(loaderRoot, { recursive: true, force: true });
+    } finally {
+      await worker.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  };
+  const stop = () => { void loader?.close().catch(() => { log.warn("Skill loader cleanup failed"); }); };
+  try {
+    loaderRoot = stageCodexNativeTemporaryDirectory("homeagent-skill-loader-");
+    await mkdir(join(loaderRoot, "requests"), { mode: 0o700 });
+    await mkdir(join(loaderRoot, "responses"), { mode: 0o700 });
+    signal.throwIfAborted();
+    loader = createSkillLoader(loaderRoot, inputs.map(input => input.name), async (index, loaderSignal) => {
+      const input = inputs[index]!;
+      const loadSignal = AbortSignal.any([signal, loaderSignal]);
+      loadSignal.throwIfAborted();
+      const pendingRoot = stageCodexNativeTemporaryDirectory("homeagent-codex-skills-");
+      try {
+        const pendingDirectory = join(pendingRoot, "skill");
+        const captured = await stageProviderSkillBundle(input, pendingDirectory, worker, loadSignal);
+        loadSignal.throwIfAborted();
+        const directory = join(root, `skill-${String(index).padStart(4, "0")}`);
+        // Publish directory and manifest in one JS turn so concurrent model
+        // launch validation cannot observe a half-published bundle.
+        renameSync(pendingDirectory, directory);
+        const skillFile = join(directory, "SKILL.md");
+        staged.push({ ...input, directory, skillFile });
+        proofs.set(skillFile, captured.proof.map(item => {
+          const path = join(directory, relative(pendingDirectory, item.path));
+          return item.path === pendingDirectory ? fileIdentity(path) : { ...item, path };
+        }));
+        // Publishing a child changes timestamps, not the root we originally
+        // created. Never accept a replacement root while refreshing the proof.
+        rootProof = { ...fileIdentity(root), dev: rootIdentity.dev, ino: rootIdentity.ino, mode: rootIdentity.mode };
+        worker.remember(staged.at(-1)!, proofs.get(skillFile)!);
+        return skillFile;
+      } finally { await rm(pendingRoot, { recursive: true, force: true }); }
+    });
+    signal.addEventListener("abort", stop, { once: true });
+    const verifyBeforeSpawn = () => {
+      signal.throwIfAborted();
+      loader!.signal.throwIfAborted();
+      loader!.verify();
+      if (!fileIdentitiesMatch([rootProof]) || !samePath(realpathSync(root), root)
+        || [...proofs.values()].some(proof => !fileIdentitiesMatch(proof))) {
+        throw new Error("staged Skill bundle failed verification");
+      }
+    };
+    const verify = async () => {
+      for (const input of staged) {
+        const result = await worker.run("verify", input, undefined, signal);
+        proofs.set(input.skillFile, result.proof);
+      }
+      verifyBeforeSpawn();
+    };
+    return { inputs: staged, readRoot: root, loader, verify, verifyBeforeSpawn, cleanup };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+}
+
+async function stageProviderSkillBundle(
+  input: ProviderSkillInput,
+  directory: string,
+  worker: SkillBundleWorker,
+  signal?: AbortSignal,
+): Promise<{ input: ProviderSkillInput; proof: FileIdentity[] }> {
+  const captured = await worker.run("stage", input, directory, signal);
+  const skillFile = join(directory, "SKILL.md");
+  return { input: { ...input, directory: realpathSync(directory), skillFile: realpathSync(skillFile) }, proof: captured.proof };
+}
+
+async function stageProviderSkillInputs(
   inputs: readonly ProviderSkillInput[],
   signal?: AbortSignal,
-): StagedProviderSkillInputs {
+): Promise<StagedProviderSkillInputs> {
   if (signal?.aborted) {
     throw signal.reason ?? new Error("provider Skill staging cancelled");
   }
   if (inputs.length === 0) return { inputs: [], cleanup: () => {} };
   const stageRoot = stageCodexNativeTemporaryDirectory("homeagent-codex-skills-");
+  const rootIdentity = lstatSync(stageRoot);
+  const worker = new SkillBundleWorker(inputs.length);
   let cleaned = false;
-  const cleanup = () => {
+  const cleanup = async () => {
     if (cleaned) return;
     cleaned = true;
     try {
-      rmSync(stageRoot, { recursive: true, force: true });
+      await worker.close();
+      await rm(stageRoot, { recursive: true, force: true });
     } catch {
       log.warn("Codex staged Skill cleanup failed");
     }
   };
   try {
-    const budget = new SkillStagingBudget(inputs.length);
     const staged: ProviderSkillInput[] = [];
-    inputs.forEach((input, index) => {
+    const proofs = new Map<string, FileIdentity[]>();
+    for (const [index, input] of inputs.entries()) {
       if (signal?.aborted) {
         throw signal.reason ?? new Error("provider Skill staging cancelled");
       }
-      const captured = snapshotProviderSkillBundle(input.skillFile);
-      if (captured.hash !== input.bundleHash) {
-        throw new Error("frozen Skill bundle changed before staging");
-      }
-      budget.reserve(captured.totalBytes, captured.entries);
       const directory = join(stageRoot, `skill-${String(index).padStart(4, "0")}`);
-      mkdirSync(directory, { recursive: false, mode: 0o700 });
-      for (const file of captured.files) {
-        if (signal?.aborted) {
-          throw signal.reason ?? new Error("provider Skill staging cancelled");
-        }
-        const path = join(directory, ...file.path.split("/"));
-        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-        writeFileSync(path, file.content, { flag: "wx", mode: file.mode });
-        chmodSync(path, file.mode);
-      }
-      if (signal?.aborted) {
-        throw signal.reason ?? new Error("provider Skill staging cancelled");
-      }
-      const skillFile = join(directory, "SKILL.md");
-      if (hashProviderSkillBundle(skillFile) !== input.bundleHash) {
+      const captured = await stageProviderSkillBundle(input, directory, worker, signal);
+      staged.push(captured.input);
+      proofs.set(captured.input.skillFile, captured.proof);
+      worker.remember(captured.input, captured.proof);
+    }
+    const rootProof = { ...fileIdentity(stageRoot), dev: rootIdentity.dev, ino: rootIdentity.ino, mode: rootIdentity.mode };
+    const verifyBeforeSpawn = () => {
+      if (!fileIdentitiesMatch([rootProof]) || !samePath(realpathSync(stageRoot), stageRoot)
+        || [...proofs.values()].some(proof => !fileIdentitiesMatch(proof))) {
         throw new Error("staged Skill bundle failed verification");
-      }
-      staged.push({
-        name: input.name,
-        directory: realpathSync(directory),
-        skillFile: realpathSync(skillFile),
-        bundleHash: input.bundleHash,
-      });
-    });
-    const rootIdentity = lstatSync(stageRoot);
-    const verify = () => {
-      const root = lstatSync(stageRoot);
-      const children = readdirSync(stageRoot, { withFileTypes: true });
-      if (root.isSymbolicLink() || !root.isDirectory() || root.dev !== rootIdentity.dev || root.ino !== rootIdentity.ino
-        || !samePath(realpathSync(stageRoot), stageRoot) || children.length !== staged.length
-        || children.some(child => child.isSymbolicLink() || !child.isDirectory()
-          || !staged.some(skill => samePath(skill.directory, join(stageRoot, child.name))))) {
-        throw new Error("staged Skill bundle failed verification");
-      }
-      for (const skill of staged) {
-        if (hashProviderSkillBundle(skill.skillFile) !== skill.bundleHash) throw new Error("staged Skill bundle failed verification");
       }
     };
-    return { inputs: staged, readRoot: stageRoot, cleanup, verify };
+    const verify = async () => {
+      for (const input of staged) {
+        const result = await worker.run("verify", input, undefined, signal);
+        proofs.set(input.skillFile, result.proof);
+      }
+      verifyBeforeSpawn();
+    };
+    return { inputs: staged, readRoot: stageRoot, cleanup, verify, verifyBeforeSpawn };
   } catch (error) {
-    cleanup();
+    await cleanup();
     if (signal?.aborted) throw signal.reason ?? error;
     if (error instanceof ProviderPreparationError) throw error;
     throw new Error("provider Skill input changed after frozen validation");
@@ -611,7 +599,8 @@ function normalizeProviderSkillInputs(inputs: readonly unknown[] | undefined): P
     } catch {
       throw new Error("provider Skill input is unavailable");
     }
-    return { name, directory, skillFile, bundleHash: candidate.bundleHash };
+    return { name, directory, skillFile, bundleHash: candidate.bundleHash,
+      ...(typeof candidate.description === "string" ? { description: candidate.description.slice(0, 500) } : {}) };
   });
 }
 
@@ -666,7 +655,7 @@ function codexNativeIsolationOverrides(
   skillInputs: readonly ProviderSkillInput[],
   probeReadRoot?: string,
   protectedDataRoot?: string,
-  staging: { readRoot?: string; validateOnly?: boolean } = {},
+  staging: { readRoot?: string; validateOnly?: boolean; loader?: SkillLoader } = {},
 ): string[] {
   if (!execution || execution.permission === "full") {
     throw new Error("provider codex native session isolation is unavailable");
@@ -775,6 +764,20 @@ function codexNativeIsolationOverrides(
       throw new Error("provider codex native session isolation is unavailable");
     }
     filesystem.set(canonicalProbeRoot, "read");
+  }
+  if (staging.loader) {
+    const loader = staging.loader;
+    loader.verify();
+    if (!samePath(dirname(loader.root), realpathSync(tmpdir()))
+      || !basename(loader.root).startsWith("homeagent-skill-loader-")
+      || !samePath(loader.requests, join(loader.root, "requests"))
+      || [codexHome, dataRoot, frozenWorkdir].some(root =>
+        pathIsWithinOrEqual(loader.root, root) || pathIsWithinOrEqual(root, loader.root))) {
+      throw new Error(CODEX_NATIVE_SESSION_PREFLIGHT_ERROR);
+    }
+    filesystem.set(loader.root, "read");
+    // Only the empty request markers are writable. Bundles and responses remain read-only.
+    filesystem.set(loader.requests, "write");
   }
   const filesystemToml = [...filesystem]
     .map(([path, access]) => `${JSON.stringify(path)}="${access}"`)
@@ -1277,6 +1280,7 @@ const KNOWN: CliSpec[] = [
       nativeTopic,
       nativeIsolationReadRoot,
       nativeSkillReadRoot,
+      nativeSkillLoader,
       codexCredentialStore,
       outputSchemaPath,
       outputLastMessagePath,
@@ -1344,7 +1348,7 @@ const KNOWN: CliSpec[] = [
           skillInputs ?? [],
           nativeIsolationReadRoot,
           protectedDataRoot,
-          { readRoot: nativeSkillReadRoot },
+          { readRoot: nativeSkillReadRoot, loader: nativeSkillLoader },
         ));
       }
       for (const feature of CODEX_DISABLED_AMBIENT_FEATURES) {
@@ -1727,6 +1731,7 @@ function codexSentinelReadCommand(
   deniedCodexHomePath: string,
   deniedRootPath: string,
   allowedPath: string,
+  skillLoader?: SkillLoader,
 ): string[] {
   if (process.platform === "win32") {
     const quotedCodexHomePath = deniedCodexHomePath.replace(/'/gu, "''");
@@ -1743,8 +1748,13 @@ function codexSentinelReadCommand(
       "} catch {}",
       "try {",
       `  [void][System.IO.File]::ReadAllBytes('${quotedAllowedPath}')`,
-      "  exit 0",
       "} catch { exit 74 }",
+      ...(skillLoader ? [
+        `try { [IO.File]::WriteAllText('${join(skillLoader.root, "responses", ".probe").replaceAll("'", "''")}', ''); exit 76 } catch {}`,
+        `try { [IO.File]::WriteAllText('${join(skillLoader.root, ".probe").replaceAll("'", "''")}', ''); exit 76 } catch {}`,
+        `try { [void][IO.File]::ReadAllBytes('${join(skillLoader.root, "load.ps1").replaceAll("'", "''")}'); [IO.File]::WriteAllText('${join(skillLoader.requests, ".probe").replaceAll("'", "''")}', ''); [IO.File]::Delete('${join(skillLoader.requests, ".probe").replaceAll("'", "''")}') } catch { exit 74 }`,
+      ] : []),
+      "exit 0",
     ].join("\r\n");
     return [
       "powershell.exe",
@@ -1758,11 +1768,14 @@ function codexSentinelReadCommand(
   return [
     "/bin/sh",
     "-c",
-    'if IFS= read -r _ < "$1"; then exit 73; fi; if IFS= read -r _ < "$2"; then exit 75; fi; if IFS= read -r _ < "$3"; then exit 0; else exit 74; fi',
+    'if IFS= read -r _ < "$1"; then exit 73; fi; if IFS= read -r _ < "$2"; then exit 75; fi; if ! IFS= read -r _ < "$3"; then exit 74; fi;'
+      + (skillLoader ? ' if (: > "$4/responses/.probe") 2>/dev/null; then exit 76; fi; if (: > "$4/.probe") 2>/dev/null; then exit 76; fi; if ! IFS= read -r _ < "$4/load.sh"; then exit 74; fi; (: > "$4/requests/.probe" && rm "$4/requests/.probe") || exit 74;' : '')
+      + ' exit 0',
     "homeagent-isolation-probe",
     deniedCodexHomePath,
     deniedRootPath,
     allowedPath,
+    ...(skillLoader ? [skillLoader.root] : []),
   ];
 }
 
@@ -1781,6 +1794,7 @@ async function codexNativeFilesystemIsolationCapability(
   skillInputs: readonly ProviderSkillInput[],
   protectedDataRoot?: string,
   stagedSkillReadRoot?: string,
+  skillLoader?: SkillLoader,
 ): Promise<CodexNativeSessionCapability> {
   let codexHomeSentinel: ReturnType<typeof stageCodexIsolationSentinel> | undefined;
   let rootSentinel: ReturnType<typeof stageCodexRootDenySentinel> | undefined;
@@ -1792,7 +1806,7 @@ async function codexNativeFilesystemIsolationCapability(
       skillInputs,
       context.probeReadRoot,
       protectedDataRoot,
-      { readRoot: stagedSkillReadRoot },
+      { readRoot: stagedSkillReadRoot, loader: skillLoader },
     );
     codexHomeSentinel = stageCodexIsolationSentinel();
     rootSentinel = stageCodexRootDenySentinel(protectedDataRoot);
@@ -1817,6 +1831,7 @@ async function codexNativeFilesystemIsolationCapability(
         codexHomeSentinel.path,
         rootSentinel.path,
         context.allowedSentinel,
+        skillLoader,
       ),
     );
     const probe = await runCmd(
@@ -1949,6 +1964,7 @@ async function assertCodexNativeIsolationContext(
   knownVersion?: string,
   protectedDataRoot?: string,
   stagedSkillReadRoot?: string,
+  skillLoader?: SkillLoader,
 ): Promise<void> {
   const capability = await codexNativeIsolationContextCapability(
     bin,
@@ -1960,6 +1976,7 @@ async function assertCodexNativeIsolationContext(
     knownVersion,
     protectedDataRoot,
     stagedSkillReadRoot,
+    skillLoader,
   );
   if (!capability.available) throw new ProviderPreparationError({
     stage: "native-session", reason: capability.issue ?? "invalid-execution-contract",
@@ -1977,6 +1994,7 @@ async function codexNativeIsolationContextCapability(
   knownVersion?: string,
   protectedDataRoot?: string,
   stagedSkillReadRoot?: string,
+  skillLoader?: SkillLoader,
 ): Promise<CodexNativeSessionCapability> {
   const sessionsAvailable = await codexNativeSessionsCapability(
     bin,
@@ -1995,6 +2013,7 @@ async function codexNativeIsolationContextCapability(
     skillInputs,
     protectedDataRoot,
     stagedSkillReadRoot,
+    skillLoader,
   );
 }
 
@@ -2019,9 +2038,9 @@ export async function preflightProviderNativeSession(
     const policy = resolveCodexExecutionPolicy(execution, true);
     if (policy.mode === "local-full-access") {
       const fullWorkdir = validateCodexFullAccessWorkdir({ execution, workdir, protectedDataRoot });
-      stagedSkillInputs = stageProviderSkillInputs(normalizedSkillInputs, signal);
+      stagedSkillInputs = await prepareProviderSkillInputs(normalizedSkillInputs, true, signal);
       await assertCodexFullAccessCapability(providerBin(spec), timeoutMs, signal, fullWorkdir);
-      stagedSkillInputs.verify?.();
+      if (stagedSkillInputs.verify) await stagedSkillInputs.verify();
       return;
     }
     context = stageCodexNativeIsolationContext(execution, workdir, protectedDataRoot);
@@ -2036,7 +2055,7 @@ export async function preflightProviderNativeSession(
       protectedDataRoot,
       { validateOnly: true },
     );
-    stagedSkillInputs = stageProviderSkillInputs(normalizedSkillInputs, signal);
+    stagedSkillInputs = await prepareProviderSkillInputs(normalizedSkillInputs, true, signal);
     // Validate the exact profile before any subprocess and reject native full:
     // Codex's danger-full-access mode cannot be narrowed by deny entries.
     codexNativeIsolationOverrides(
@@ -2045,7 +2064,7 @@ export async function preflightProviderNativeSession(
       stagedSkillInputs.inputs,
       context.probeReadRoot,
       protectedDataRoot,
-      { readRoot: stagedSkillInputs.readRoot },
+      { readRoot: stagedSkillInputs.readRoot, loader: stagedSkillInputs.loader },
     );
     await assertCodexNativeIsolationContext(
       providerBin(spec),
@@ -2057,6 +2076,7 @@ export async function preflightProviderNativeSession(
       undefined,
       protectedDataRoot,
       stagedSkillInputs.readRoot,
+      stagedSkillInputs.loader,
     );
   } catch (error) {
     if (signal?.aborted) {
@@ -2066,7 +2086,7 @@ export async function preflightProviderNativeSession(
     throw new ProviderPreparationError({ stage: "native-session", reason: "invalid-execution-contract" });
   } finally {
     context?.cleanup();
-    stagedSkillInputs?.cleanup();
+    await stagedSkillInputs?.cleanup();
   }
 }
 
@@ -2567,7 +2587,7 @@ export function curatedProviderModels(): Record<string, string[]> {
   return map;
 }
 
-function injectProviderSkills(id: ProviderId, input: RunInput): RunInput {
+function injectProviderSkills(id: ProviderId, input: RunInput, loader?: SkillLoader): RunInput {
   const skills = normalizeProviderSkills(
     Array.isArray(input.execution?.skills)
       ? input.execution.skills
@@ -2626,9 +2646,15 @@ function injectProviderSkills(id: ProviderId, input: RunInput): RunInput {
       ...prepared,
       prompt: [
         instruction,
-        "以下是本轮唯一有效的技能映射；忽略会话历史中的旧技能路径。使用某个技能前，必须先读取下列映射中的 SKILL.md；只可从对应目录读取技能资源，禁止搜索、发现或加载其他技能。",
+        loader
+          ? "以下是本轮完整技能清单（名称和简介），尚未加载技能正文和资源。普通问答或已有工具足够时无需加载技能；用户指定或任务需要时，按名称加载并读取返回的 SKILL.md。忽略会话历史中的旧技能路径。"
+          : "以下是本轮唯一有效的技能映射；忽略会话历史中的旧技能路径。使用某个技能前，必须先读取下列映射中的 SKILL.md；只可从对应目录读取技能资源，禁止搜索、发现或加载其他技能。",
+        ...(loader ? [
+          `技能加载命令（${process.platform === "win32" ? "PowerShell" : "Shell"}，在末尾追加一个技能名称作为参数）：${loader.command} <技能名称>`,
+          "加载器返回本轮冻结副本的 SKILL.md 路径；同名技能在本轮只准备一次，脚本、references、assets 和已安装依赖均保留在该目录。需要其他技能时继续调用同一加载器，不能读取原始技能目录或自行安装。",
+        ] : []),
         "技能文档若用 ../<技能名>/SKILL.md 引用另一个技能，必须按该名称在本轮映射中解析，不能假设副本目录仍是原来的相邻布局。依赖未列入映射时报告缺失，不读取原始目录或自行安装。",
-        ...skillInputs.map((skill) => `- ${skill.name}: ${JSON.stringify(skill.skillFile)}`),
+        ...skillInputs.map((skill) => `- ${skill.name}: ${JSON.stringify(loader ? skill.description ?? "" : skill.skillFile)}`),
         prepared.execution.skillMode === "all"
           ? "自动选用的技能或资源不可读取时，说明情况并继续使用本轮可用工具完成请求，不要假装已经使用该技能；若用户明确指定该技能，停止依赖它的步骤并明确报告。"
           : "如果任一所需技能或资源不可读取，停止执行并明确报告，不要假装已经使用。",
@@ -2865,13 +2891,16 @@ export async function runProviderDetailed(
       );
     }
     stagedSkillInputs = id === "codex"
-      ? stageProviderSkillInputs(normalizedSkillInputs, signal)
+      ? await prepareProviderSkillInputs(normalizedSkillInputs, policy?.mode === "local-full-access" || nativeIsolation, signal)
       : { inputs: normalizedSkillInputs, cleanup: () => {} };
     effectiveInput = {
       ...effectiveInput,
-      skillInputs: stagedSkillInputs.inputs,
+      skillInputs: stagedSkillInputs.loader ? normalizedSkillInputs : stagedSkillInputs.inputs,
     };
-    const prepared = injectProviderSkills(id, effectiveInput);
+    if (stagedSkillInputs.loader) {
+      signal = signal ? AbortSignal.any([signal, stagedSkillInputs.loader.signal]) : stagedSkillInputs.loader.signal;
+    }
+    const prepared = injectProviderSkills(id, effectiveInput, stagedSkillInputs.loader);
     const bin = providerBin(spec);
     if (policy?.mode === "local-full-access") {
       await assertCodexFullAccessCapability(bin, timeoutMs, signal, validateCodexFullAccessWorkdir(prepared));
@@ -2883,10 +2912,11 @@ export async function runProviderDetailed(
         signal,
         isolationContext!,
         prepared.execution!,
-        prepared.skillInputs ?? [],
+        stagedSkillInputs.inputs,
         undefined,
         prepared.protectedDataRoot,
         stagedSkillInputs.readRoot,
+        stagedSkillInputs.loader,
       );
       if (metadata) metadata.sandboxCheck = "passed";
     }
@@ -2910,6 +2940,8 @@ export async function runProviderDetailed(
     const providerInput: PreparedRunInput = {
       ...prepared,
       nativeSkillReadRoot: stagedSkillInputs.readRoot,
+      nativeSkillLoader: stagedSkillInputs.loader,
+      skillInputs: stagedSkillInputs.inputs,
       ...(id === "codex"
         ? {
             codexCredentialStore:
@@ -2936,14 +2968,21 @@ export async function runProviderDetailed(
       prepared.execution?.workdir ?? prepared.workdir,
       id === "claude" || id === "codex" ? prepared.prompt : undefined,
       input.acquireExecutionPermit,
-      policy?.mode === "local-full-access" ? () => {
-        const current = lstatSync(validateCodexFullAccessWorkdir(prepared));
-        if (current.dev !== fullWorkdirIdentity?.dev || current.ino !== fullWorkdirIdentity?.ino) {
-          throw new ProviderPreparationError({ stage: "execution-policy", reason: "execution-mode-invalid" });
+      policy?.mode === "local-full-access" || stagedSkillInputs.loader ? () => {
+        if (policy?.mode === "local-full-access") {
+          const current = lstatSync(validateCodexFullAccessWorkdir(prepared));
+          if (current.dev !== fullWorkdirIdentity?.dev || current.ino !== fullWorkdirIdentity?.ino) {
+            throw new ProviderPreparationError({ stage: "execution-policy", reason: "execution-mode-invalid" });
+          }
         }
-        stagedSkillInputs?.verify?.();
+        // No yield between grant validation, final Skill verification and spawn.
+        stagedSkillInputs?.verifyBeforeSpawn?.();
       } : undefined,
-      () => { if (metadata) metadata.process = "started"; log.info("running local provider", { id, bin }); },
+      () => {
+        stagedSkillInputs?.loader?.activate();
+        if (metadata) metadata.process = "started";
+        log.info("running local provider", { id, bin });
+      },
       input.onProgress
         ? id === "codex" ? (line) => publishCodexProgress(line, input.onProgress!)
           : id === "claude" ? claudeProgressObserver(input.onProgress) : undefined
@@ -3012,7 +3051,7 @@ export async function runProviderDetailed(
   } finally {
     stagedSchema?.cleanup();
     isolationContext?.cleanup();
-    stagedSkillInputs?.cleanup();
+    await stagedSkillInputs?.cleanup();
     if (metadata) input.onExecutionEvidence?.({
       ...(collectedEvidence ?? { source: "codex-jsonl", events: [], truncated: false }), execution: { ...metadata },
     });

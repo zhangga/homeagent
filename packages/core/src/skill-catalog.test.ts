@@ -694,12 +694,14 @@ describe("SkillCatalog", () => {
 
     expect(catalog.executionInputs(frozen)).toEqual([{
       name: "review",
+      description: "Review.",
       directory: realpathSync(skillDir),
       skillFile: realpathSync(skillFile),
       bundleHash: frozen[0]!.skillFileHash,
     }]);
     expect(catalog.executionInputsAfterValidation(frozen)).toEqual([{
       name: "review",
+      description: "Review.",
       directory: realpathSync(skillDir),
       skillFile: realpathSync(skillFile),
       bundleHash: frozen[0]!.skillFileHash,
@@ -1085,6 +1087,7 @@ describe("SkillCatalog", () => {
     expect(third[0]!.skillFileHash).toBe(first[0]!.skillFileHash);
     expect(catalog.executionInputs(first)).toEqual([{
       name: "review",
+      description: "Review.",
       directory: realpathSync(skillDir),
       skillFile: realpathSync(skillFile),
       bundleHash: first[0]!.skillFileHash,

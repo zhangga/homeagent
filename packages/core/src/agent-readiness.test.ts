@@ -78,13 +78,15 @@ test("readiness expires and a changed CLI identity cannot inherit a previously s
 });
 
 test("concurrent checks coalesce, expose checking, and publication cancels the old probe instead of installing its late result", async () => {
+  const started = Promise.withResolvers<void>();
   let finish!: () => void; let signal: AbortSignal | undefined; let probes = 0;
   const { engine, agentId } = await fixture(async (_id, _timeout, incoming) => {
-    probes++; signal = incoming; await new Promise<void>(resolve => { finish = resolve; });
+    probes++; signal = incoming; started.resolve(); await new Promise<void>(resolve => { finish = resolve; });
   });
   const first = engine.agentReadiness.check(agentId);
   const second = engine.agentReadiness.check(agentId);
   expect(engine.agentReadiness.status(agentId)?.state).toBe("checking");
+  await started.promise;
   const draft = engine.saveAgentDraft(agentId, { instruction: "new release" })!;
   engine.releaseAgent(agentId, draft.id, draft.id);
   expect(signal?.aborted).toBe(true);
@@ -130,14 +132,16 @@ test("Skill resources changing during a probe cannot install a successful readin
 });
 
 test("at most two distinct Agents probe concurrently and Engine close cancels both without granting readiness", async () => {
+  const started = Promise.withResolvers<void>();
   const finishes: (() => void)[] = []; const signals: (AbortSignal | undefined)[] = [];
   const { engine, agentId, workdir } = await fixture(async (_id, _timeout, signal) => {
-    signals.push(signal); await new Promise<void>(resolve => finishes.push(resolve));
+    signals.push(signal); if (signals.length === 2) started.resolve(); await new Promise<void>(resolve => finishes.push(resolve));
   });
   const second = engine.agents.create({ name: "Two", provider: "codex", executionMode: "isolated", workdir });
   const third = engine.agents.create({ name: "Three", provider: "codex", executionMode: "isolated", workdir });
   const pending = [engine.agentReadiness.check(agentId), engine.agentReadiness.check(second.id)];
   expect(await engine.agentReadiness.check(third.id)).toMatchObject({ state: "unknown", reason: "busy" });
+  await started.promise;
   expect(signals).toHaveLength(2);
   engine.close();
   expect(signals.every(signal => signal?.aborted)).toBe(true);

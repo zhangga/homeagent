@@ -25,6 +25,8 @@ describe("macOS bundle smoke preflight", () => {
     for (const file of [
       "Contents/MacOS/homeagent",
       "Contents/Resources/app/homeagent.js",
+      "Contents/Resources/app/skill-catalog-worker.ts",
+      "Contents/Resources/app/skill-bundle-worker.ts",
       "Contents/Resources/bin/bun",
       "Contents/Resources/bin/lark-cli",
       "Contents/Resources/bin/attachment-extract",
@@ -36,7 +38,7 @@ describe("macOS bundle smoke preflight", () => {
       "<plist><dict><key>CFBundleIconFile</key><string>HomeAgent</string></dict></plist>",
     );
 
-    expect(inspectMacOSBundle(app).files).toHaveLength(8);
+    expect(inspectMacOSBundle(app).files).toHaveLength(10);
 
     const icon = join(app, "Contents/Resources/HomeAgent.icns");
     rmSync(icon);

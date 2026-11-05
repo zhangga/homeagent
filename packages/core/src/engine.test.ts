@@ -27,6 +27,11 @@ let dir: string;
 let engine: KnowledgeEngine;
 const SPACE: SpaceId = "team/oc_contract";
 
+async function waitForProvider(check: () => boolean): Promise<void> {
+  for (let i = 0; i < 400 && !check(); i++) await Bun.sleep(5);
+  expect(check()).toBe(true);
+}
+
 function page(slug: string, title: string, content: string): Page {
   return {
     slug,
@@ -236,6 +241,37 @@ describe("Knowledge seam contract", () => {
     expect(raw?.workItemId).toBe(original.id);
     expect(engine.workItems.get(original.id)?.rawIds).toContain(report.rawId!);
     expect(engine.workItems.get(replacement.id)?.rawIds).toEqual([]);
+  });
+
+  test.each(["read-only", "write"] as const)("independent %s WorkItems share provider capacity after any required approval", async permission => {
+    engine.close();
+    const releases: (() => void)[] = [];
+    let released = false;
+    engine = new KnowledgeEngine({ dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }),
+      runProvider: async () => {
+        if (!released) await new Promise<void>(resolve => { releases.push(resolve); });
+        return completedWorkActionOutput("动作已完成");
+      } });
+    engine.ensureSpace(SPACE);
+    const agent = engine.agents.create({ name: "多事项助手", permission, workdir: dir });
+    engine.registry.updateMeta(SPACE, { agentId: agent.id });
+    const items = ["事项 A", "事项 B"].map(title => engine.workItems.create({ space: SPACE, title, nextActions: ["执行检查"] }));
+    const pending = items.map(item => engine.startWorkContinuation(item.id));
+    if (permission === "write") {
+      expect(pending.every(started => started.state === "awaiting_approval")).toBe(true);
+      expect(releases).toHaveLength(0);
+    }
+    const started = permission === "write" ? pending.map(value => engine.approveTaskRun(value.run.id, "operator")) : pending;
+    try {
+      for (let i = 0; i < 200 && releases.length < 2; i++) await Bun.sleep(5);
+      expect(releases).toHaveLength(2);
+      expect(engine.workItems.list(SPACE).filter(item => item.active)).toHaveLength(2);
+      expect(started.every(value => engine.taskRuns.get(value.run.id)?.status === "running")).toBe(true);
+    } finally {
+      released = true; releases.forEach(resolve => resolve());
+      await Promise.all(started.map(value => value.completion));
+    }
+    expect(engine.taskRuns.list().every(run => run.status === "succeeded")).toBe(true);
   });
 
   test("continuing a work item executes its first action and records an action-boundary checkpoint", async () => {
@@ -3322,6 +3358,7 @@ describe("Knowledge seam contract", () => {
         workActionProviderCalls += 1;
         return completedWorkActionOutput("过期排队动作不应执行");
       },
+      runConcurrency: { global: 1 },
     });
     engine.ensureSpace(SPACE);
     const blockingTask = engine.tasks.create({
@@ -3374,6 +3411,7 @@ describe("Knowledge seam contract", () => {
         workActionProviderCalls += 1;
         return completedWorkActionOutput("已阻塞排队动作不应执行");
       },
+      runConcurrency: { global: 1 },
     });
     engine.ensureSpace(SPACE);
     const blockingTask = engine.tasks.create({
@@ -4431,6 +4469,7 @@ describe("Knowledge seam contract", () => {
     expect(() => healthEngine.startTaskRun(task.id, { distill: false })).toThrow(
       `task already running: ${task.id} (${first.run.id})`,
     );
+    await waitForProvider(() => completions.length === 1);
     expect(completions).toHaveLength(1);
 
     let tasks = (await healthEngine.health()).details?.tasks as Array<Record<string, unknown>>;
@@ -4486,12 +4525,14 @@ describe("Knowledge seam contract", () => {
 
     expect(queuedEngine.getTaskRun(first.run.id)?.status).toBe("running");
     expect(queuedEngine.getTaskRun(second.run.id)?.status).toBe("queued");
+    await waitForProvider(() => completions.length === 1);
     expect(completions).toHaveLength(1);
 
     completions[0]!("first complete");
     await first.completion;
     await Promise.resolve();
     expect(queuedEngine.getTaskRun(second.run.id)?.status).toBe("running");
+    await waitForProvider(() => completions.length === 2);
     expect(completions).toHaveLength(2);
 
     completions[1]!("second complete");
@@ -4527,6 +4568,7 @@ describe("Knowledge seam contract", () => {
       status: "cancelled",
       ok: false,
     }));
+    await waitForProvider(() => completions.length === 1);
     expect(completions).toHaveLength(1);
 
     completions[0]!("done");
@@ -4565,6 +4607,7 @@ describe("Knowledge seam contract", () => {
       ok: false,
     }));
     expect(queuedEngine.getTaskRun(queued.run.id)?.runStartedAt).toBeUndefined();
+    await waitForProvider(() => completions.length === 1);
     expect(completions).toHaveLength(1);
 
     completions[0]!("done");
@@ -5510,6 +5553,7 @@ describe("Knowledge seam contract", () => {
 
     const expectedSkillInput = {
       name: "review",
+      description: "Review.",
       directory: realpathSync(skillDir),
       skillFile: realpathSync(join(skillDir, "SKILL.md")),
       bundleHash: snapshot.skillEvidence.resolved[0]!.skillFileHash,
@@ -5987,7 +6031,8 @@ describe("Knowledge seam contract", () => {
     }));
     expect(taskEngine.getTaskRun(started.run.id)?.status).toBe("running");
 
-    finishResearch?.("完整研究输出");
+    await waitForProvider(() => finishResearch !== undefined);
+    finishResearch!("完整研究输出");
     const report = await started.completion;
     expect(report.runId).toBe(started.run.id);
     expect(report.ok).toBe(true);
@@ -6445,6 +6490,7 @@ describe("Knowledge seam contract", () => {
     })!;
 
     const started = taskEngine.startTaskRun(task.id);
+    await waitForProvider(() => providerSignal !== undefined);
     expect(taskEngine.cancelTaskRun(started.run.id)).toBe(true);
     const report = await started.completion;
 
@@ -6506,6 +6552,7 @@ describe("Knowledge seam contract", () => {
     void first.completion.then(() => {
       firstCompleted = true;
     });
+    await waitForProvider(() => providerCalls === 1);
     expect(providerCalls).toBe(1);
     const secondPending = taskEngine.startTaskRun(secondTask.id);
     const second = taskEngine.approveTaskRun(secondPending.run.id, "local-admin");
@@ -6565,17 +6612,18 @@ describe("Knowledge seam contract", () => {
       distillOnRun: false,
     })!;
 
-    const firstPending = taskEngine.startTaskRun(firstTask.id, { timeoutMs: 10 });
+    const firstPending = taskEngine.startTaskRun(firstTask.id, { timeoutMs: 1_000 });
     const first = taskEngine.approveTaskRun(firstPending.run.id, "local-admin");
     let firstCompleted = false;
     void first.completion.then(() => {
       firstCompleted = true;
     });
+    await waitForProvider(() => providerCalls === 1);
     expect(providerCalls).toBe(1);
     const secondPending = taskEngine.startTaskRun(secondTask.id);
     const second = taskEngine.approveTaskRun(secondPending.run.id, "local-admin");
 
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await new Promise((resolve) => setTimeout(resolve, 1_030));
     expect(taskEngine.getTaskRun(first.run.id)?.status).toBe("running");
     expect(taskEngine.getTaskRun(second.run.id)?.status).toBe("queued");
     expect(firstCompleted).toBe(false);

@@ -16,6 +16,7 @@
  */
 import type {
   Connector,
+  InboundHandler,
   InboundEvent,
   InboundMessage,
   NoticeOptions,
@@ -43,7 +44,7 @@ export interface CliConnectorOptions {
 
 export class CliConnector implements Connector {
   readonly name = "cli";
-  private handler?: (event: InboundEvent) => void | Promise<void>;
+  private handler?: InboundHandler;
   private counter = 0;
   private stopped = false;
   private opts: Required<Omit<CliConnectorOptions, "onReply" | "onSlash">> &
@@ -63,7 +64,7 @@ export class CliConnector implements Connector {
     };
   }
 
-  async start(onEvent: (event: InboundEvent) => void | Promise<void>): Promise<void> {
+  async start(onEvent: InboundHandler): Promise<void> {
     this.handler = onEvent;
     if (this.opts.interactive) await this.readStdin();
   }
@@ -140,7 +141,8 @@ export class CliConnector implements Connector {
 
   private async dispatch(event: InboundEvent): Promise<void> {
     if (!this.handler) throw new Error("CliConnector.start must be called before dispatching");
-    await this.handler(event);
+    const receipt = await this.handler(event);
+    if (!this.opts.interactive) await receipt?.completion;
   }
 
   // ---- interactive stdin --------------------------------------------------

@@ -57,7 +57,7 @@ Task 后 Dream 使用冻结 Provider/model 的独立无工具调用，完全访�
 Core 从完整的非终态 Chat/Task Run 元数据读取引用，并对原生预检、整轮普通问答和独立客户端调用临时计数；当前/候选发布版本与新确认也不能被清理。
 引用读取未知、Engine 已关闭或全部记录受保护时拒绝超限发布，失败落盘不替换内存、不发送提交通知。临时引用只阻止淘汰，不产生授权，也不阻止显式撤销。
 终态 Run 与 Agent revision 不因清理而改写，旧历史不能用已淘汰确认恢复执行；没有可信引用读取器的独立 AgentStore 保持超限拒绝，不自行猜测引用。
-空间归档 v20 保留执行模式意图与版本历史，但不携带本机确认、确认 ID 或范围。整份数据目录复制不等于 Space 归档，首版不能识别所有跨机复制或目录回退，应重新确认。
+空间归档 v21 保留执行模式意图与版本历史，但不携带本机确认、确认 ID 或范围。整份数据目录复制不等于 Space 归档，首版不能识别所有跨机复制或目录回退，应重新确认。
 
 `config/spaces.json` v1 的 `agentBindingEpoch` 与 Space 的 Agent/回复策略绑定一起原子保存；
 `config/feishu-group-bindings.json` v3 的 `executionScopeEpoch` 与 Bot、群、连接状态和响应策略一起原子保存。
@@ -118,12 +118,38 @@ Knowledge page 或话题历史。证据仅保留工具类型、状态和可明�
 输出正文，不进入 Space 归档或模型上下文。缺少、截断或未识别的证据不能被解释成未调用工具或没有权限。
 Codex 话题隔离预检失败必须停止；不得自动替换为无状态调用或改变冻结权限。
 新运行还可记录已识别的运行准备失败：固定原因码与隔离测试退出码，或 Skill 副本总预算超限时的请求数/已准备数。
-这仍属于本机运行证据，不是可移植 Space 内容；旧记录缺少该字段时保持未知。副本准备必须完整符合冻结 Skill 目录，不能因总预算不足而静默删减目录并继续调用。
+这仍属于本机运行证据，不是可移植 Space 内容；旧记录缺少该字段时保持未知。冻结证据保留完整 Skill 清单；Codex 本机完全访问和原生话题可在本次 Run 内按需准备并复用完整 bundle。名称与简介仅用于发现，不能替代完整摘要校验；延迟加载仍须符合原冻结证据。临时副本与加载器不持久化、不跨 Run 共享，累计已加载包体超限时停止调用，不能静默删减所需技能继续执行。
 新证据还可记录选定的 executionMode、sandboxCheck、effectiveSandbox，以及进程是否启动、是否收到可验证的
 模型回答事件。`not-applicable` 表示未使用沙箱，不是隔离通过；只有 CLI 启动或普通文本输出时，不推断模型调用已验证。
-Chat 文件新写入 v8，读取 v1–v8；Task 文件新写入 v13，读取 v2–v13。新格式无效记录、损坏文件与未来版本拒绝启动，不能按空历史覆盖。
+Chat 文件新写入 v9，读取 v1–v9；Task 文件新写入 v13，读取 v2–v13。新格式无效记录、损坏文件与未来版本拒绝启动，不能按空历史覆盖。
 旧 v1 计划仍使用 topic compatibility v1，v6/v7 已送达会话可继续；新 v2 计划使用 compatibility v2，模式、确认引用及 scope 都参与摘要。
-当前 Space 归档为 v20，仍不包含本机执行证据；历史 v1 计划按其原形保留。
+当前 Space 归档为 v21，仍不包含本机执行证据；历史 v1 计划按其原形保留。
+
+## WorkItem 与持久消息分派
+
+`config/work-items.json` v2 同时保存 WorkItem 和每个 Space 的 `currentBySpace` 默认焦点。
+多个 WorkItem 可以保持 active；选择当前事项不改变其他事项的活动状态。v1 的唯一 active 项迁移为默认焦点，
+不会激活旧 inactive 项，也不会改变已有 WorkAction 的验收和自动续作策略。
+
+`config/work-dispatch/input_<sha256>.json` 是本机入站输入和分派计划的权威记录，格式 v1，每条独立原子提交。
+身份由 Connector、App、chat 和 message 确定，记录绑定唯一 Space 和接收时的群绑定 epoch；重复投递不能覆盖正文。
+先持久保存完整标准化消息，再向 Connector 返回接收结果。单条正文最多 20,971,520 字符，超出时明确拒绝，
+不会用 Chat Run 的 100,000 字符展示摘要替代原文；重试从原始分派记录读取完整输入。
+
+执行前先冻结响应类别、Agent、Provider、模型、权限、Workdir、Skill 及原生话题计划，再创建带稳定 dispatchKey 的
+Chat Run、保存事项/输入关联，最后持久化 launch admission。任一提交失败都不能提前启动 Provider；恢复沿用原计划。
+`received` 可继续准备，`planned/dispatched` 可修复未完成的提交；`preparing` 在重启后标为 interrupted，
+已运行进程不自动重放。来源撤回会删除相应本机输入副本，后续重复事件不重新入队。
+
+事项路由优先使用真实回复消息 ID、原消息、已送达的序号列表和明确名称；必要的语义路由只从同 Space 的冻结候选中选择，
+不携带执行权限或 Skill。状态读取不调用模型，补充保存为 waiting 输入，在当前动作结束或恢复事项后派发。
+同一原生话题从资料准备开始保持顺序；下一轮只能使用前一轮已持久确认送达的 Provider-native parent。
+状态/控制回执不推进或清空原生会话。取消先保存意图，迟到结果不能提交成功。
+
+独立事项（包括已授权的可写与完全访问事项）复用全局与 Provider／模型配额；同事项、同原生话题保持串行。共享 Agent 配置不再使不同事项互相排队，未关联事项的运行仍使用原有 Agent 配额；可写与完全访问 Task 的逐次审批保持不变。
+普通 Chat 仍是 Chat Run；Task 和 WorkAction 沿用原有审批、冻结计划、通知与验收。
+Space 归档 v21 保存多活动事项和默认焦点，剥离本机分派身份、admission、取消意图及真实回复消息 ID。
+未处理输入会阻止 Space 导出、删除及数据目录迁移；终态本机输入不随 Space 归档恢复执行。
 
 ## Raw
 
@@ -200,7 +226,7 @@ Raw attachment 保存摘要、字节数和文件名。提炼文本可以有独�
 飞书文档后台同步将可取得的配图原件与正文绑定到同一条 `source=doc` Raw，保留正文中的图片引用；未取得原件的图片仅保留 attachment 引用，不伪造文件摘要。批量原件先校验后写入；SQLite projection 写入失败时，已由 Raw journal 引用的原件必须保留以供恢复。此路径复用现有 Raw attachment 与 Space 归档格式，不改变存储所有权。
 后台上传和飞书附件的已解析长正文按每段最多 200,000 字符完整登记为多个 Raw；各段在正文标明顺序，
 共享同一 SHA-256 原件，保留原消息归属、撤回与下载语义，不增加 archive schema。
-原文件随 `homeagent.space v20` 归档导出和恢复，Wiki 只保留指向 Raw 的 provenance，不复制文件正文。
+原文件随 `homeagent.space v21` 归档导出和恢复，Wiki 只保留指向 Raw 的 provenance，不复制文件正文。
 
 ## Knowledge page
 

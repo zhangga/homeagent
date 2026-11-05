@@ -11,6 +11,33 @@ beforeEach(() => { dir = realpathSync(mkdtempSync(join(tmpdir(), "ha-engine-perm
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 const space = "team/oc_permits" as const;
 
+test("cancelling while asynchronous Skill preparation is pending joins it without starting a Provider", async () => {
+  const catalog = new SkillCatalog({ roots: [] });
+  const entered = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  const resolve = catalog.withResolution.bind(catalog);
+  catalog.withResolution = async (request, run) => {
+    entered.resolve();
+    await resume.promise;
+    return resolve(request, run);
+  };
+  let calls = 0;
+  const engine = new KnowledgeEngine({ dataDir: join(dir, "data"), skillCatalog: catalog,
+    runProvider: async () => { calls++; return "must not run"; } });
+  try {
+    await engine.ensureSpace(space);
+    const agent = engine.agents.create({ provider: "claude", permission: "read-only" });
+    engine.registry.updateMeta(space, { agentId: agent.id });
+    const task = engine.tasks.create({ space, topic: "offline cancellation", distillOnRun: false })!;
+    const started = engine.startTaskRun(task.id);
+    await entered.promise;
+    expect(engine.cancelTaskRun(started.run.id)).toBe(true);
+    resume.resolve();
+    expect((await started.completion).status).toBe("cancelled");
+    expect(calls).toBe(0);
+  } finally { resume.resolve(); engine.close(); }
+});
+
 async function fixture(options: Pick<EngineOptions, "runProvider" | "llm" | "nativeSessionPreflight" | "skillCatalog"> = {}) {
   const engine = new KnowledgeEngine({ dataDir: join(dir, "data"), skillCatalog: new SkillCatalog({ roots: [] }), ...options });
   try {
@@ -52,7 +79,9 @@ test("a confirmed full native Chat starts with a Core permit, and revocation dur
     expect((await ask()).answer).toBe("offline answer");
     expect(started).toBe(1);
     revokeDuringPreparation = true;
-    await expect(ask()).rejects.toThrow("local-execution-consent-revoked");
+    // Settle before asserting: Bun 1.3's rejects matcher stalls replies from a
+    // reused Worker when invoked from an earlier message's microtask.
+    expect(await ask().catch(error => error)).toMatchObject({ message: expect.stringContaining("local-execution-consent-revoked") });
     expect(started).toBe(1);
   } finally { engine.close(); }
 });
@@ -79,6 +108,55 @@ test("full Tasks require their own approval and never transfer full access to po
   } finally { engine.close(); }
 });
 
+test("independent full WorkActions run concurrently with the same Agent after separate approvals", async () => {
+  const release = Promise.withResolvers<void>();
+  let launches = 0;
+  const { engine, agentId, snapshot, workdir } = await fixture({ runProvider: async (_provider, input) => {
+    const permit = input.acquireExecutionPermit!();
+    const unregister = permit.register(() => {});
+    permit.release();
+    try {
+      expect(input.execution?.permission).toBe("full");
+      expect(input.execution?.executionMode).toBe("local-full-access");
+      expect(input.execution?.workdir).toBe(workdir);
+      launches++;
+      await release.promise;
+      return JSON.stringify({ version: 1, outcome: "completed", result: "离线检查完成",
+        blockers: [], checks: [{ name: "检查结果", status: "passed" }] });
+    } finally { unregister(); }
+  } });
+  const completions: Promise<unknown>[] = [];
+  try {
+    const items = ["接口检查", "文档整理", "待审批事项"].map(title =>
+      engine.workItems.create({ space, title, nextActions: ["完成当前检查"] }));
+    const pending = items.map(item => engine.startWorkContinuation(item.id));
+    expect(pending.every(started => started.state === "awaiting_approval")).toBe(true);
+    expect(launches).toBe(0);
+    const approved = pending.slice(0, 2).map(started => engine.approveTaskRun(started.run.id, "offline-human"));
+    completions.push(...approved.map(started => started.completion));
+    for (let i = 0; i < 200 && launches < 2; i++) await Bun.sleep(5);
+    expect(launches).toBe(2);
+    expect(approved.every(started => {
+      const run = engine.taskRuns.get(started.run.id)!;
+      return run.status === "running" && run.agentId === agentId
+        && run.executionPlan?.agentRevisionId === snapshot.executionPlan?.agentRevisionId;
+    })).toBe(true);
+    expect(engine.taskRuns.get(pending[2]!.run.id)?.status).toBe("awaiting_approval");
+    release.resolve();
+    expect((await Promise.all(approved.map(started => started.completion))).every(report => report.ok)).toBe(true);
+    expect(launches).toBe(2);
+    for (const started of approved) {
+      expect(engine.workContinuations.get(started.run.workActionId!)?.status).toBe("awaiting_acceptance");
+      const run = engine.taskRuns.get(started.run.id)!;
+      expect(engine.registry.store(space).index().getRaw(run.rawId!)?.admission).toBe("held");
+    }
+  } finally {
+    release.resolve();
+    await Promise.allSettled(completions);
+    engine.close();
+  }
+});
+
 test("ordinary Chat and injected clients cannot bypass a changed full-access scope", async () => {
   let calls = 0;
   const { engine } = await fixture({ llm: {
@@ -90,7 +168,7 @@ test("ordinary Chat and injected clients cannot bypass a changed full-access sco
     const captured = engine.agentCallContext(space, { taskExecution: true });
     engine.feishuBindings.disconnect(space);
     await expect(captured.client.complete({ prompt: "old client" })).rejects.toThrow("local-execution-consent-revoked");
-    await expect(engine.ask([space], "new question")).rejects.toThrow();
+    expect(await engine.ask([space], "new question").catch(error => error)).toBeInstanceOf(Error);
     expect(calls).toBe(1);
   } finally { engine.close(); }
 });

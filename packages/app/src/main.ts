@@ -37,6 +37,7 @@ import {
 import { createWebApp, FeishuIntegrationService } from "@homeagent/web";
 import { Scheduler } from "./scheduler.ts";
 import { MaintenanceScheduler } from "./maintenance-scheduler.ts";
+import { prepareStartupSkills } from "./skill-warmup.ts";
 import {
   formatTaskRunNotification,
   TaskScheduler,
@@ -189,6 +190,9 @@ async function run(
     ),
   });
   const larkSetup = new LarkCliSetup({ larkBin: runtimePaths.larkBin });
+  // Start the cold disk scan during process startup, before waiting on Feishu
+  // setup. Transport and HTTP stay available while the catalog Worker prepares.
+  void prepareStartupSkills(engine, cfg.defaultProvider);
   const feishuStartup = await prepareFeishuStartup(
     engine,
     larkSetup,
@@ -402,6 +406,9 @@ async function run(
         };
       },
       scheduleMigration: ({ destination, initializeGit }) => {
+        if (engine.workDispatch.summaries().some(input => !["settled", "interrupted", "cancelled"].includes(input.state))) {
+          throw new Error("存在尚未处理的工作输入，请先完成或取消这些事项");
+        }
         if (process.env.HOMEAGENT_DATA_DIR_LOCKED === "1") {
           throw new Error("当前目录由 HOMEAGENT_DATA_DIR 环境变量固定");
         }

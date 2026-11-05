@@ -58,6 +58,8 @@ export function createMacOSBuildPlan(input: {
       "HomeAgent.app/Contents/Info.plist",
       "HomeAgent.app/Contents/MacOS/homeagent",
       "HomeAgent.app/Contents/Resources/app/homeagent.js",
+      "HomeAgent.app/Contents/Resources/app/skill-catalog-worker.ts",
+      "HomeAgent.app/Contents/Resources/app/skill-bundle-worker.ts",
       "HomeAgent.app/Contents/Resources/bin/bun",
       "HomeAgent.app/Contents/Resources/bin/lark-cli",
       "HomeAgent.app/Contents/Resources/bin/attachment-extract",
@@ -273,6 +275,12 @@ export async function buildMacOSApp(input: {
     `--outfile=${appEntry}`,
   ], plan.repoRoot);
   chmodSync(appEntry, 0o644);
+  for (const [pkg, name] of [["core", "skill-catalog-worker"], ["llm", "skill-bundle-worker"]] as const) {
+    const workerEntry = join(appDir, `${name}.ts`);
+    await mustRun([process.execPath, "build", "--target=bun",
+      join(plan.repoRoot, "packages", pkg, "src", `${name}.ts`), `--outfile=${workerEntry}`], plan.repoRoot);
+    chmodSync(workerEntry, 0o644);
+  }
   const bundledBun = join(binDir, "bun");
   copyFileSync(process.execPath, bundledBun);
   chmodSync(bundledBun, 0o755);

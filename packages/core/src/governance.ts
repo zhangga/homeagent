@@ -135,7 +135,8 @@ export const KNOWLEDGE_MAPS_SPACE_ARCHIVE_VERSION = 17 as const;
 export const AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION = 18 as const;
 export const RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION = 19 as const;
 export const CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION = 20 as const;
-export const SPACE_ARCHIVE_VERSION = CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION;
+export const MULTITASK_SPACE_ARCHIVE_VERSION = 21 as const;
+export const SPACE_ARCHIVE_VERSION = MULTITASK_SPACE_ARCHIVE_VERSION;
 
 export interface RawSourceFileArchive {
   digest: string;
@@ -256,7 +257,11 @@ export interface SpaceArchiveV20 extends Omit<SpaceArchiveV19, "version"> {
 }
 
 /** Current normalized archive shape returned by export and parsing. */
-export type SpaceArchive = SpaceArchiveV20;
+export interface SpaceArchiveV21 extends Omit<SpaceArchiveV20, "version"> {
+  version: typeof MULTITASK_SPACE_ARCHIVE_VERSION;
+  currentWorkItemId?: string;
+}
+export type SpaceArchive = SpaceArchiveV21;
 
 export interface SpaceDeleteResult {
   status: "deleted" | "not_found";
@@ -1207,7 +1212,7 @@ function parseChatRun(
   if (normalized.status === "queued" || normalized.status === "running") {
     throw new Error(`chatRuns[${index}] cannot restore an active record`);
   }
-  const { liveReply: _localLiveReply, ...portableDelivery } = normalized.delivery;
+  const { liveReply: _localLiveReply, messageId: _localMessageId, ...portableDelivery } = normalized.delivery;
 
   return {
     id: nonemptyText(normalized.id, `chatRuns[${index}].id`),
@@ -1999,6 +2004,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       && version !== AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION
       && version !== RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION
       && version !== CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION
+      && version !== MULTITASK_SPACE_ARCHIVE_VERSION
     )
   ) {
     throw new Error("unsupported space archive format or version");
@@ -2194,8 +2200,14 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
     : ((root.workContinuationPolicies ?? []) as unknown[]).map((item, index) =>
         parseWorkContinuationPolicy(item, index, id)
       );
-  if (workItems.filter((item) => item.active).length > 1) {
+  if (version < MULTITASK_SPACE_ARCHIVE_VERSION && workItems.filter((item) => item.active).length > 1) {
     throw new Error("archive has multiple active work items for one space");
+  }
+  const currentWorkItemId = version < MULTITASK_SPACE_ARCHIVE_VERSION
+    ? workItems.find(item => item.active)?.id
+    : root.currentWorkItemId;
+  if (currentWorkItemId !== undefined && (typeof currentWorkItemId !== "string" || !workItemById.has(currentWorkItemId))) {
+    throw new Error("archive has an invalid current WorkItem");
   }
   for (const entry of raw) {
     if (
@@ -2538,6 +2550,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
     taskRuns,
     chatRuns,
     workItems,
+    ...(typeof currentWorkItemId === "string" ? { currentWorkItemId } : {}),
     workActions,
     workContinuationPolicies,
     quality,

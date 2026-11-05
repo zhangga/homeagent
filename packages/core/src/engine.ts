@@ -23,6 +23,7 @@ import type {
 import { lstatSync, realpathSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isAbsolute, join, relative, sep } from "node:path";
+import { WorkDispatchStore, type WorkRoutingPlan } from "./work-dispatch.ts";
 import {
   AI_GENERATION_MAX_TOKENS,
   AI_MAX_CONFIGURABLE_TIMEOUT_MINUTES,
@@ -45,6 +46,7 @@ import {
   resolveCodexModelSettings,
   isProviderTimeoutError,
   preflightProviderNativeSession as preflightLocalProviderNativeSession,
+  withProviderSkillSession,
   runProviderDetailed as runLocalProvider,
   type CodexReasoningEffort,
   type ProviderExecution,
@@ -431,7 +433,6 @@ async function awaitTaskRunStep<T>(
   promise: Promise<T>,
   signal: AbortSignal,
 ): Promise<T> {
-  throwIfTaskRunAborted(signal);
   return new Promise<T>((resolve, reject) => {
     let abortError: Error | undefined;
     let joinTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -450,6 +451,9 @@ async function awaitTaskRunStep<T>(
       joinTimeout = setTimeout(rejectAbort, PROVIDER_ABORT_JOIN_TIMEOUT_MS);
     };
     signal.addEventListener("abort", onAbort, { once: true });
+    // The supplied step may already be pending when cancellation arrives.
+    // Always observe/join it, including an abort before this function is called.
+    if (signal.aborted) onAbort();
     promise.then(
       (value) => {
         const stopped = abortError ?? (signal.aborted ? taskRunAbortReason(signal) : undefined);
@@ -1363,6 +1367,16 @@ function skillsForProviderExecution(
   };
 }
 
+function noToolsSkills(bindings: Agent["skills"]): ResolvedAgentSkills {
+  const skipped = bindings.map(binding => ({
+    ...(binding.kind === "source" ? { sourceKey: binding.sourceKey } : {}),
+    name: binding.name,
+    code: "no_tools_context" as const,
+    message: "Native Skills are disabled for no-tools provider calls",
+  }));
+  return { requested: structuredClone(bindings), resolved: [], skipped, warnings: structuredClone(skipped) };
+}
+
 function answerTraceExecution(
   executionPlan: ResolvedExecutionPlan,
   skillEvidence?: TaskRunSkillEvidence,
@@ -1404,6 +1418,8 @@ function executionResolutionError(error: unknown): string {
 }
 
 export interface RunAdmissionContext {
+  independentReadOnly?: boolean;
+  workItemId?: string;
   provider?: ProviderId;
   model?: string;
   agentId?: string;
@@ -1446,6 +1462,7 @@ interface MaintenanceCycleHealth {
 }
 
 export class KnowledgeEngine implements Knowledge {
+  readonly workDispatch: WorkDispatchStore;
   readonly registry: SpaceRegistry;
   readonly feishuBindings: FeishuGroupBindingStore;
   readonly skillCatalog: SkillCatalog;
@@ -1487,6 +1504,7 @@ export class KnowledgeEngine implements Knowledge {
     ensureDataRepositoryAgentGuides(this.dataDir);
     this.registry = new SpaceRegistry(this.dataDir);
     this.workItems = new WorkItemStore(this.dataDir);
+    this.workDispatch = new WorkDispatchStore(this.dataDir);
     this.workContinuations = new WorkContinuationStore(this.dataDir);
     this.feishuBindings = new FeishuGroupBindingStore(this.dataDir);
     this.skillCatalog = opts.skillCatalog ?? new SkillCatalog({
@@ -3244,6 +3262,14 @@ export class KnowledgeEngine implements Knowledge {
     }).client;
   }
 
+  /** A frozen classification call never inherits the execution Agent's tools or Workdir. */
+  workRoutingClient(plan: WorkRoutingPlan, signal?: AbortSignal): LlmClient {
+    if (this.llm) return this.llm;
+    if (!plan.provider || !isCliProvider(plan.provider)) throw new NoProviderError("personal/router");
+    return makeCliClient(plan.provider, plan.model, this.dataDir, this.runProvider,
+      plan.timeoutMs, plan.reasoningEffort, signal);
+  }
+
   agentCallContext(
     space: SpaceId,
     options: {
@@ -3271,7 +3297,7 @@ export class KnowledgeEngine implements Knowledge {
     const skills = skillsForProviderExecution(
       options.resolvedSkills ?? (options.taskExecution
         ? this.skillCatalog.resolveAll(provider)
-        : this.skillCatalog.resolveAgentBindings(agent?.skills ?? [], provider)),
+        : noToolsSkills(agent?.skills ?? [])),
       options.taskExecution === true,
     );
     const skillNames = skills.resolved.map((skill) => skill.invocationName);
@@ -3333,7 +3359,7 @@ export class KnowledgeEngine implements Knowledge {
       ? resolveCodexModelSettings({ model: selectedModel, reasoningEffort: agent?.reasoningEffort || undefined })
       : { model: selectedModel, reasoningEffort: undefined };
     const skills = skillsForProviderExecution(
-      skillScope === "all"
+      !taskExecution ? noToolsSkills(agent?.skills ?? []) : skillScope === "all"
         ? this.skillCatalog.resolveAll(resolutionProvider)
         : this.skillCatalog.resolveAgentBindings(agent?.skills ?? [], resolutionProvider),
       taskExecution,
@@ -3393,6 +3419,23 @@ export class KnowledgeEngine implements Knowledge {
     };
   }
 
+  private async withAgentSkillResolution<T>(space: SpaceId, taskExecution: boolean, run: () => T | Promise<T>): Promise<T> {
+    const agent = this.agentForSpace(space);
+    const selected = agent?.provider || config().defaultProvider;
+    const provider: ProviderId = isCliProvider(selected) ? selected : "gateway";
+    return this.skillCatalog.withResolution({ provider, ...(taskExecution ? {} : { bindings: agent?.skills ?? [] }) }, run);
+  }
+
+  async agentRunExecutionSnapshotAsync(space: SpaceId): Promise<AgentRunExecutionSnapshot> {
+    return this.withAgentSkillResolution(space, true, () => this.agentRunExecutionSnapshot(space));
+  }
+
+  private withFrozenSkillResolution<T>(plan: ResolvedExecutionPlan, evidence: TaskRunSkillEvidence | undefined,
+    run: () => Promise<T>): Promise<T> {
+    return this.skillCatalog.withResolution({ provider: plan.provider ?? "gateway",
+      ...(plan.skillMode === "all" ? {} : { bindings: resolvedSkillsFromEvidence(evidence).requested }) }, run);
+  }
+
   private executionPlanCallContext(
     space: SpaceId,
     executionPlan: ResolvedExecutionPlan,
@@ -3448,7 +3491,9 @@ export class KnowledgeEngine implements Knowledge {
           throw new Error("Directory identity changed");
         }
         this.validateFrozenWorkdir(executionPlan.workdir);
-        this.validatedSkillsFromEvidence(executionPlan, skillEvidence);
+        // Worker validation runs before preparation. The final atomic permit
+        // only checks authority and Workdir; Provider guards its prepared files.
+        if (!this.skillCatalog.hasPreparedResolution()) this.validatedSkillsFromEvidence(executionPlan, skillEvidence);
       } catch {
         // Preparation failures are terminal, not retrieval failures eligible for FTS fallback.
         throw new ProviderPreparationError({ stage: "execution-policy", reason: "execution-mode-invalid" });
@@ -3476,6 +3521,9 @@ export class KnowledgeEngine implements Knowledge {
       );
     };
     const invoke = async <T>(call: (client: LlmClient) => Promise<T>): Promise<T> => {
+      try { await this.skillCatalog.validatePrepared(); }
+      catch { throw new ProviderPreparationError({ stage: "execution-policy", reason: "execution-mode-invalid" }); }
+      options.signal?.throwIfAborted();
       validateLaunch();
       const controller = new AbortController();
       const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
@@ -3503,10 +3551,20 @@ export class KnowledgeEngine implements Knowledge {
         throw signal.aborted ? signal.reason : error;
       } finally { stop(); releaseReference(); }
     };
+    const isolatedClient = full ? undefined : makeClient();
+    const validatedCall = async <T>(call: () => Promise<T>): Promise<T> => {
+      try { await this.skillCatalog.validatePrepared(); }
+      catch { throw new ProviderPreparationError({ stage: "execution-policy", reason: "execution-mode-invalid" }); }
+      options.signal?.throwIfAborted();
+      return call();
+    };
     const client: LlmClient = full ? {
       complete: opts => invoke(client => client.complete(opts)),
       completeJSON: opts => invoke(client => client.completeJSON(opts)),
-    } : makeClient();
+    } : {
+      complete: opts => validatedCall(() => isolatedClient!.complete(opts)),
+      completeJSON: opts => validatedCall(() => isolatedClient!.completeJSON(opts)),
+    };
     return {
       client,
       skills,
@@ -3642,14 +3700,17 @@ export class KnowledgeEngine implements Knowledge {
         key: `run:provider-model:${providerModel}`,
         limit: this.runConcurrency.providerModel,
       },
-      {
-        key: `run:agent:${context.agentId ?? `conversation:${context.conversationId}`}`,
+      // WorkItems have their own execution slot. An Agent's shared writable
+      // configuration does not merge otherwise independent items into one run.
+      ...(context.workItemId ? [] : [{
+        key: `run:agent:${context.independentReadOnly ? `read:${context.conversationId}` : context.agentId ?? `conversation:${context.conversationId}`}`,
         limit: this.runConcurrency.agent,
-      },
+      }]),
       {
         key: `run:conversation:${context.conversationId}`,
         limit: this.runConcurrency.conversation,
       },
+      ...(context.workItemId ? [{ key: `run:work:${context.workItemId}`, limit: 1 }] : []),
     ];
   }
 
@@ -3700,6 +3761,10 @@ export class KnowledgeEngine implements Knowledge {
     );
   }
 
+  async skillWarningsForSpaceAsync(space: SpaceId): Promise<SkillWarningView[]> {
+    return this.withAgentSkillResolution(space, false, () => this.skillWarningsForSpace(space));
+  }
+
   private makeSpaceCliClient(
     space: SpaceId,
     timeoutMs?: number,
@@ -3745,10 +3810,10 @@ export class KnowledgeEngine implements Knowledge {
     }).client;
   }
 
-  private rememberSerialized(entry: RawEntry, deduplicateMessage = false): string {
+  private rememberSerialized(entry: RawEntry, deduplicateMessage = false, useCurrentWorkItem = true): string {
     const requestedWorkItem = entry.workItemId
       ? this.workItems.get(entry.workItemId)
-      : this.workItems.activeForSpace(entry.space);
+      : useCurrentWorkItem ? this.workItems.currentForSpace(entry.space) : undefined;
     if (entry.workItemId && (!requestedWorkItem || requestedWorkItem.space !== entry.space)) {
       throw new Error(`work item does not belong to space: ${entry.workItemId}`);
     }
@@ -3783,9 +3848,9 @@ export class KnowledgeEngine implements Knowledge {
     return id;
   }
 
-  async remember(entry: RawEntry): Promise<string> {
+  async remember(entry: RawEntry, options?: { useCurrentWorkItem?: boolean }): Promise<string> {
     // Capture is a write; serialize per space so it never races distillation.
-    return this.serializer.run(entry.space, async () => this.rememberSerialized(entry));
+    return this.serializer.run(entry.space, async () => this.rememberSerialized(entry, false, options?.useCurrentWorkItem !== false));
   }
 
   /** Save an explicitly selected message body; retry repairs its projection. */
@@ -3801,12 +3866,13 @@ export class KnowledgeEngine implements Knowledge {
   async rememberFile(
     entry: RawEntry,
     file: RawSourceCapture,
+    options?: { useCurrentWorkItem?: boolean },
   ): Promise<string> {
-    return this.rememberFiles(entry, [file]);
+    return this.rememberFiles(entry, [file], options);
   }
 
   /** Commit one Raw with all of its originals, after validating the whole batch. */
-  async rememberFiles(entry: RawEntry, files: readonly RawSourceCapture[]): Promise<string> {
+  async rememberFiles(entry: RawEntry, files: readonly RawSourceCapture[], options?: { useCurrentWorkItem?: boolean }): Promise<string> {
     if (files.length + (entry.attachments?.length ?? 0) > MAX_MATERIAL_FILES) throw new Error("too many raw source files");
     let inputBytes = 0;
     for (const file of files) if ("bytes" in file) {
@@ -3856,7 +3922,7 @@ export class KnowledgeEngine implements Knowledge {
             ...(entry.attachments ?? []).map((attachment) => ({ ...attachment })),
             ...attachments,
           ],
-        });
+        }, false, options?.useCurrentWorkItem !== false);
       } catch (error) {
         this.removeUnreferencedRawSources(entry.space, written);
         throw error;
@@ -4273,7 +4339,7 @@ export class KnowledgeEngine implements Knowledge {
         { ...preparedPlan },
         { ...source, rawIds: [...source.rawIds] },
         { ...session },
-        this.skillWarningsForSpace(plan.space),
+        await this.skillWarningsForSpaceAsync(plan.space),
       );
       return Boolean(this.learning.markDelivered(session.id, deliveredAt));
     } finally {
@@ -4477,6 +4543,7 @@ export class KnowledgeEngine implements Knowledge {
         // Invalidate all Space heads first, then persist a tombstone so later
         // replies and delayed delivery cannot reintroduce it.
         this.chatRuns.invalidateTopicNativeSessionsForSpace(space);
+        this.workDispatch.removeByMessage(space, request.chatId, request.messageId);
         index.recordMessageRetraction({
           chatId: request.chatId,
           messageId: request.messageId,
@@ -4545,6 +4612,7 @@ export class KnowledgeEngine implements Knowledge {
       // Chat Runs retain retryable input and delivered output. Remove the
       // matching operational copy before deleting its raw provenance.
       this.chatRuns.removeByRawIds(removedSourceIds);
+      this.workDispatch.removeByMessage(space, request.chatId, request.messageId);
       // Commit the authoritative tombstone only after every local private copy
       // and Provider continuation head has been removed. If an earlier cleanup
       // fails, Raw remains eligible for a later retraction retry.
@@ -4869,6 +4937,7 @@ export class KnowledgeEngine implements Knowledge {
         throw new Error(`space has queued or running background work: ${space}`);
       }
       const taskIds = new Set(tasks.map((task) => task.id));
+      if (this.workDispatch.hasPending(space)) throw new Error("Space has pending work inputs");
       const workActionIds = new Set(workContinuation.actions.map((action) => action.id));
       const raw = index.listRaw({});
       const sourceDigests = [...new Set(raw.flatMap((entry) =>
@@ -4917,12 +4986,14 @@ export class KnowledgeEngine implements Knowledge {
           || (run.workActionId !== undefined && workActionIds.has(run.workActionId))
         ).map(run => ({ ...run, executionPlan: run.executionPlan ? archiveExecutionPlan(run.executionPlan) : undefined })),
         // Local execution audits are deliberately not portable Space content.
-        chatRuns: chatRuns.map(({ executionEvidence: _audit, delivery, ...run }) => ({
+        chatRuns: chatRuns.map(({ executionEvidence: _audit, sourceInputId: _sourceInput, dispatchKey: _dispatch, dispatchDigest: _digest,
+          launchAdmission: _admission, cancelRequestedAt: _cancel, delivery, ...run }) => ({
           ...run,
-          delivery: (({ liveReply: _localLiveReply, ...portableDelivery }) => portableDelivery)(delivery),
+          delivery: (({ liveReply: _localLiveReply, messageId: _localMessageId, ...portableDelivery }) => portableDelivery)(delivery),
           executionPlan: run.executionPlan ? archiveExecutionPlan(run.executionPlan) : undefined,
         })),
         workItems,
+        currentWorkItemId: this.workItems.currentForSpace(space)?.id,
         workActions: workContinuation.actions,
         workContinuationPolicies: workContinuation.policies,
         quality: this.quality.exportArchive(chatRuns),
@@ -5047,6 +5118,7 @@ export class KnowledgeEngine implements Knowledge {
         learningRestored = archive.learning.plans.length > 0;
         this.workItems.restore(archive.workItems);
         workItemsRestored = archive.workItems.length > 0;
+        if (archive.currentWorkItemId) this.workItems.select(archive.currentWorkItemId);
         this.workContinuations.restore({
           actions: archive.workActions,
           policies: archive.workContinuationPolicies,
@@ -5171,6 +5243,7 @@ export class KnowledgeEngine implements Knowledge {
       }
       const index = this.registry.store(space).index();
       const pagesDeleted = index.countPages();
+      if (this.workDispatch.hasPending(space)) throw new Error("Space has pending work inputs");
       const rawDeleted = index.countRaw();
       let tasksDeleted = 0;
       let remindersDeleted = 0;
@@ -5178,6 +5251,8 @@ export class KnowledgeEngine implements Knowledge {
       let workItemsDeleted = 0;
       const learningArchive = this.learning.exportBySpace(space);
       const chatRunSnapshot = this.chatRuns.snapshotLocalBySpace(space);
+      const workInputSnapshot = this.workDispatch.list(space);
+      const currentWorkItemId = this.workItems.currentForSpace(space)?.id;
       let chatRunStateRemoved = false;
       try {
         this.taskRuns.removeBySpace(space);
@@ -5188,6 +5263,7 @@ export class KnowledgeEngine implements Knowledge {
         learningPlansDeleted = this.learning.removeBySpace(space);
         this.workContinuations.removeBySpace(space);
         workItemsDeleted = this.workItems.removeBySpace(space).length;
+        this.workDispatch.removeBySpace(space);
         this.registry.remove(space);
       } catch (err) {
         const missingTaskRuns = taskRuns.filter((run) => !this.taskRuns.has(run.id));
@@ -5205,6 +5281,8 @@ export class KnowledgeEngine implements Knowledge {
         }
         const missingWorkItems = workItems.filter((item) => !this.workItems.get(item.id));
         if (missingWorkItems.length > 0) this.workItems.restore(missingWorkItems);
+        if (currentWorkItemId) this.workItems.select(currentWorkItemId);
+        if (workInputSnapshot.length > 0) this.workDispatch.restoreLocalSnapshot(workInputSnapshot);
         if (
           workContinuation.actions.some((action) => !this.workContinuations.get(action.id))
           || workContinuation.policies.some((policy) =>
@@ -5494,6 +5572,22 @@ export class KnowledgeEngine implements Knowledge {
     );
   }
 
+  async startTaskRunAsync(taskId: string, opts: RunTaskOptions = {}): Promise<StartedTaskRun> {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new Error(`unknown task: ${taskId}`);
+    let admitted = false;
+    try {
+      return await this.withAgentSkillResolution(task.space, true, () => {
+        admitted = true;
+        return this.startTaskRun(taskId, opts);
+      });
+    } catch (error) {
+      if (admitted) throw error;
+      return this.launchTaskRun(task, opts.trigger ?? "manual", opts.distill ?? task.distillOnRun,
+        undefined, normalizeTaskRunTimeoutMs(opts.timeoutMs, task.timeoutMinutes * 60_000), undefined, error);
+    }
+  }
+
   cancelTaskRun(runId: string): boolean {
     const run = this.taskRuns.get(runId);
     if (run?.status === "failed" && run.retry?.status === "waiting") {
@@ -5613,6 +5707,12 @@ export class KnowledgeEngine implements Knowledge {
       this.failClosedWorkActionStart(action, reason);
       throw error;
     }
+  }
+
+  async startWorkContinuationAsync(workItemId: string, opts: { trigger?: "manual" | "scheduled" } = {}): Promise<StartedTaskRun> {
+    const item = this.workItems.get(workItemId);
+    if (!item) throw new Error(`work item not found: ${workItemId}`);
+    return this.withAgentSkillResolution(item.space, true, () => this.startWorkContinuation(workItemId, opts));
   }
 
   retryWorkAction(
@@ -6104,6 +6204,7 @@ export class KnowledgeEngine implements Knowledge {
     retryOf?: string,
     timeoutMs = TASK_TIMEOUT_MS,
     workActionId?: string,
+    preparationError?: unknown,
   ): StartedTaskRun {
     const taskId = task.id;
     const activeRunId = this.activeTaskRunId(taskId);
@@ -6121,6 +6222,7 @@ export class KnowledgeEngine implements Knowledge {
     }
     let snapshot: AgentRunExecutionSnapshot;
     try {
+      if (preparationError) throw preparationError;
       snapshot = previous && isResolvedExecutionPlan(previous.executionPlan) ? {
         executionPlan: cloneResolvedExecutionPlan(previous.executionPlan),
         provider: previous.executionPlan.provider,
@@ -6152,7 +6254,7 @@ export class KnowledgeEngine implements Knowledge {
       ? this.workContinuations.get(workActionId)?.workItemId
       : undefined)
       ?? (retryOf ? this.taskRuns.get(retryOf)?.workItemId : undefined)
-      ?? this.workItems.activeForSpace(task.space)?.id;
+      ?? this.workItems.currentForSpace(task.space)?.id;
     const run = this.taskRuns.start({
       task,
       trigger,
@@ -6290,23 +6392,6 @@ export class KnowledgeEngine implements Knowledge {
     }
     const timeoutMs = run.timeoutMs ?? task.timeoutMinutes * 60_000;
     const controller = new AbortController();
-    let callContext: SpaceAgentCallContext | undefined;
-    let setupError: unknown;
-    try {
-      callContext = this.executionPlanCallContext(
-        task.space,
-        run.executionPlan,
-        run.skillEvidence,
-        {
-          timeoutMs,
-          signal: controller.signal,
-          agentId: run.agentId,
-          taskRunId: run.id,
-        },
-      );
-    } catch (error) {
-      setupError = error;
-    }
     const completion = this.scheduleTaskRun({
       task,
       run,
@@ -6314,8 +6399,6 @@ export class KnowledgeEngine implements Knowledge {
       timeoutMs,
       controller,
       executionPlan: run.executionPlan,
-      callContext,
-      setupError,
     });
     return {
       state: "scheduled",
@@ -6355,7 +6438,8 @@ export class KnowledgeEngine implements Knowledge {
         provider: run.provider,
         model: run.model,
         agentId: run.agentId,
-        conversationId: run.space,
+        conversationId: run.workItemId ? `${run.space}:${run.workItemId}` : run.space,
+        workItemId: run.workItemId,
       }),
       execute: async () => {
         const boundaryError = this.workActionExecutionBoundaryError(run);
@@ -6515,18 +6599,6 @@ export class KnowledgeEngine implements Knowledge {
       };
       const timeoutMs = run.timeoutMs ?? storedTask.timeoutMinutes * 60_000;
       const controller = new AbortController();
-      let callContext: SpaceAgentCallContext | undefined;
-      let setupError: unknown;
-      try {
-        callContext = this.executionPlanCallContext(
-          task.space,
-          run.executionPlan,
-          run.skillEvidence,
-          { timeoutMs, signal: controller.signal, agentId: run.agentId, taskRunId: run.id },
-        );
-      } catch (error) {
-        setupError = error;
-      }
       const completion = this.scheduleTaskRun({
         task,
         run,
@@ -6534,8 +6606,6 @@ export class KnowledgeEngine implements Knowledge {
         timeoutMs,
         controller,
         executionPlan: run.executionPlan,
-        callContext,
-        setupError,
       });
       resumed.push({
         state: "scheduled",
@@ -6552,10 +6622,37 @@ export class KnowledgeEngine implements Knowledge {
    * outcome. The dream cycle later distills the raw entry into wiki pages.
    */
   async runTask(taskId: string, opts: RunTaskOptions = {}): Promise<TaskReport> {
-    return this.startTaskRun(taskId, opts).completion;
+    return (await this.startTaskRunAsync(taskId, opts)).completion;
   }
 
   private async executeTaskRun(
+    task: Task,
+    run: TaskRun,
+    distill: boolean,
+    controller: AbortController,
+    executionPlan: ResolvedExecutionPlan,
+    callContext?: SpaceAgentCallContext,
+    setupError?: unknown,
+  ): Promise<TaskReport> {
+    return withProviderSkillSession(async () => {
+      let entered = false;
+      try {
+        return await this.withFrozenSkillResolution(executionPlan, run.skillEvidence, async () => {
+          entered = true;
+          try {
+            callContext = this.executionPlanCallContext(task.space, executionPlan, run.skillEvidence,
+              { timeoutMs: run.timeoutMs, signal: controller.signal, agentId: run.agentId, taskRunId: run.id });
+          } catch (error) { setupError = error; }
+          return this.executeTaskRunInSkillSession(task, run, distill, controller, executionPlan, callContext, setupError);
+        });
+      } catch (error) {
+        if (entered) throw error;
+        return this.executeTaskRunInSkillSession(task, run, distill, controller, executionPlan, undefined, error);
+      }
+    });
+  }
+
+  private async executeTaskRunInSkillSession(
     task: Task,
     run: TaskRun,
     distill: boolean,
@@ -6593,6 +6690,7 @@ export class KnowledgeEngine implements Knowledge {
       // Re-resolve last, immediately before the provider call, so an approval
       // cannot be replayed against a replaced symlink/junction or file.
       this.validateFrozenExecutionWorkdir(executionPlan.execution);
+      throwIfTaskRunAborted(controller.signal);
       failurePhase = "provider";
       const res = await awaitTaskRunStep(
         observedCallContext.client.complete({
@@ -6755,6 +6853,11 @@ export class KnowledgeEngine implements Knowledge {
   }
 
   async ask(spaces: SpaceId[], question: string, opts: AskOptions = {}): Promise<AskResult> {
+    return withProviderSkillSession(() => this.withAgentSkillResolution(spaces[0]!, true,
+      () => this.askInSkillSession(spaces, question, opts)));
+  }
+
+  private async askInSkillSession(spaces: SpaceId[], question: string, opts: AskOptions): Promise<AskResult> {
     // Reads do not go through the serializer. The client is chosen from the
     // primary (write) space — the space the message belongs to.
     const stores = spaces.filter((s) => this.registry.has(s)).map((s) => this.registry.store(s));
@@ -7010,6 +7113,20 @@ export class KnowledgeEngine implements Knowledge {
     executionPlan: ResolvedExecutionPlan,
     skillEvidence?: TaskRunSkillEvidence,
     opts: AskOptions = {},
+    traceAgentId?: string,
+  ): Promise<AskResult> {
+    executionPlan = cloneResolvedExecutionPlan(executionPlan);
+    skillEvidence = skillEvidence ? structuredClone(skillEvidence) : undefined;
+    return withProviderSkillSession(() => this.withFrozenSkillResolution(executionPlan, skillEvidence,
+      () => this.askWithExecutionPlanInSkillSession(spaces, question, executionPlan, skillEvidence, opts, traceAgentId)));
+  }
+
+  private async askWithExecutionPlanInSkillSession(
+    spaces: SpaceId[],
+    question: string,
+    executionPlan: ResolvedExecutionPlan,
+    skillEvidence: TaskRunSkillEvidence | undefined,
+    opts: AskOptions,
     traceAgentId?: string,
   ): Promise<AskResult> {
     if (!isResolvedExecutionPlan(executionPlan)) throw new Error("Resolved execution plan is invalid");
@@ -7485,6 +7602,7 @@ export class KnowledgeEngine implements Knowledge {
   }
 
   close(): void {
+    this.skillCatalog.close();
     this.agentReadiness.close();
     for (const unsubscribe of this.executionSubscriptions.splice(0)) unsubscribe();
     this.localExecution.close();

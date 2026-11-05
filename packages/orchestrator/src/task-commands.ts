@@ -113,7 +113,7 @@ export async function handleTaskCommand(
       deps.runTask(target.id);
       return `已开始运行任务「${target.name}」，完成后结果会写入本空间知识库${target.notify ? "并在此通知你" : ""}。`;
     }
-    const started = engine.startTaskRun(target.id, { trigger: "chat" });
+    const started = await engine.startTaskRunAsync(target.id, { trigger: "chat" });
     void started.completion.catch((err) => {
       log.error("chat task run failed", { id: target.id, runId: started.run.id, err: String(err) });
     });
