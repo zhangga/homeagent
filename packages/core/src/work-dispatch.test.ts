@@ -65,3 +65,20 @@ test("validates collection limits, rejects future state and cannot repurpose a c
     expect(() => new WorkDispatchStore(directory)).toThrow("Invalid work input state");
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test("chat planning instructions are frozen and recovered with the accepted goal", () => {
+  const directory = mkdtempSync(join(tmpdir(), "ha-planning-input-"));
+  try {
+    const store = new WorkDispatchStore(directory);
+    const input = store.accept({ connector: "cli", space: "personal/user", message });
+    expect(() => store.update(input.id, input.revision, { response: { kind: "work-plan", question: "目标", instruction: "x".repeat(20_001) } })).toThrow();
+    const response = { kind: "work-plan" as const, question: "目标", instruction: "冻结规划指令" };
+    const plan = { space: input.space, chatId: message.chatId, messageId: message.messageId,
+      author: message.senderId, input: message.text, trigger: "message" as const, dispatchKey: input.id,
+      launchAdmission: "pending" as const, executionPlan: { version: 1 as const, instruction: "原始 Agent 指令" } };
+    const committed = store.update(input.id, input.revision, { response, plan, state: "planned" });
+    response.instruction = "修改后的指令";
+    expect(new WorkDispatchStore(directory).get(input.id)?.response).toEqual({ kind: "work-plan", question: "目标", instruction: "冻结规划指令" });
+    expect(() => store.update(input.id, committed.revision, { response })).toThrow("immutable");
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

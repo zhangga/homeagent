@@ -23,7 +23,7 @@ import type {
 import { lstatSync, realpathSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isAbsolute, join, relative, sep } from "node:path";
-import { WorkDispatchStore, type WorkRoutingPlan } from "./work-dispatch.ts";
+import { WorkDispatchStore, type WorkInput, type WorkRoutingPlan } from "./work-dispatch.ts";
 import {
   AI_GENERATION_MAX_TOKENS,
   AI_MAX_CONFIGURABLE_TIMEOUT_MINUTES,
@@ -3263,7 +3263,7 @@ export class KnowledgeEngine implements Knowledge {
   }
 
   /** A frozen classification call never inherits the execution Agent's tools or Workdir. */
-  workRoutingClient(plan: WorkRoutingPlan, signal?: AbortSignal): LlmClient {
+  workRoutingClient(plan: Pick<WorkRoutingPlan, "provider" | "model" | "timeoutMs" | "reasoningEffort">, signal?: AbortSignal): LlmClient {
     if (this.llm) return this.llm;
     if (!plan.provider || !isCliProvider(plan.provider)) throw new NoProviderError("personal/router");
     return makeCliClient(plan.provider, plan.model, this.dataDir, this.runProvider,
@@ -5637,7 +5637,49 @@ export class KnowledgeEngine implements Knowledge {
     return this.workContinuations.configure(item, { autoContinue });
   }
 
+  /** Local message identity outlives the bounded Chat Run history. */
+  chatWorkPlanSource(workItemId: string): WorkInput | undefined {
+    const item = this.workItems.get(workItemId);
+    if (!item?.chatPlanRunId) return undefined;
+    const run = item?.chatPlanRunId ? this.chatRuns.get(item.chatPlanRunId) : undefined;
+    const sourceId = run?.sourceInputId ?? run?.dispatchKey ?? this.workDispatch.summaries(item.space)
+      // Failed planning attempts may precede the sole accepted plan. Later turns
+      // cannot replace it; its source may be a followup rather than item creation.
+      .reverse().find(input => input.workItemId === item.id
+        && this.workDispatch.get(input.id)?.response?.kind === "work-plan")?.id;
+    const input = sourceId ? this.workDispatch.get(sourceId) : undefined;
+    if (!input || input.space !== item.space || input.workItemId !== item.id
+      || input.response?.kind !== "work-plan" || input.state === "cancelled") return undefined;
+    if (input.message.chatType === "group") {
+      const binding = this.feishuBindings.activeByChatId(input.message.chatId);
+      if (!binding || binding.spaceId !== item.space || binding.executionScopeEpoch !== input.bindingId
+        || (input.appId && binding.boundAppId !== input.appId)) return undefined;
+    }
+    return input;
+  }
+
+  /** An archive carries plan history, never the local message/delivery authority. */
+  deliveredChatWorkPlan(workItemId: string): ChatRun | undefined {
+    const item = this.workItems.get(workItemId);
+    const run = item?.chatPlanRunId ? this.chatRuns.get(item.chatPlanRunId) : undefined;
+    return item && run?.workItemId === item.id && run.space === item.space && run.status === "succeeded"
+      && run.delivery.status === "sent" && this.chatWorkPlanSource(workItemId) ? run : undefined;
+  }
+
+  /** Repair a crash between receipt delivery and opting into continuation; never replay planning. */
+  reconcileChatWorkPlans(): void {
+    const configured = new Set(this.workContinuations.listPolicies().map(policy => policy.workItemId));
+    for (const item of this.workItems.list()) {
+      if (item.chatPlanRunId && !configured.has(item.id) && this.deliveredChatWorkPlan(item.id)) {
+        this.configureWorkContinuation(item.id, true);
+      }
+    }
+  }
+
   listDueWorkContinuations(): WorkItem[] {
+    this.reconcileChatWorkPlans();
+    const waiting = new Set(this.workDispatch.summaries().filter(input =>
+      !["settled", "interrupted", "cancelled"].includes(input.state)).map(input => input.workItemId));
     return this.workContinuations.listPolicies()
       .filter((policy) => policy.autoContinue)
       .map((policy) => this.workItems.get(policy.workItemId))
@@ -5647,6 +5689,7 @@ export class KnowledgeEngine implements Knowledge {
         && item.phase === "active"
         && item.blockers.length === 0
         && item.nextActions.length > 0
+        && (!item.chatPlanRunId || !waiting.has(item.id))
         && this.workContinuations.activeForWorkItem(item.id) === undefined
       ));
   }
@@ -5865,6 +5908,17 @@ export class KnowledgeEngine implements Knowledge {
   }
 
   private workActionTask(item: WorkItem, action: WorkAction): Task {
+    const accepted = item.chatPlanRunId ? this.workContinuations.list(item.id)
+      .filter(previous => previous.status === "succeeded" && item.completedActionIds?.includes(previous.id))
+      .sort((left, right) => left.createdAt - right.createdAt)
+      .map(previous => {
+        const source = previous.checkpoint?.taskRunId ? this.taskRuns.get(previous.checkpoint.taskRunId) : undefined;
+        const report = source?.space === item.space && source.workItemId === item.id
+          && source.workActionId === previous.id && source.status === "succeeded"
+          ? parseWorkActionProviderReport(source.output ?? "") : undefined;
+        return { instruction: previous.instruction, result: report?.result ?? previous.checkpoint?.summary,
+          rawId: previous.checkpoint?.rawId, taskRunId: previous.checkpoint?.taskRunId };
+      }) : [];
     const topic = [
       "你正在继续一个已持久化的 HomeAgent 工作项。只执行本次动作，不要擅自展开后续动作。",
       "",
@@ -5872,6 +5926,7 @@ export class KnowledgeEngine implements Knowledge {
       item.brief ? `\n## Brief\n${item.brief}` : "",
       item.runbook ? `\n## Runbook\n${item.runbook}` : "",
       item.summary ? `\n## 当前进展\n${item.summary}` : "",
+      accepted.length ? `\n## 已验收的前序成果\n${JSON.stringify(accepted)}` : "",
       item.blockers.length > 0 ? `\n## 已知阻塞\n${item.blockers.join("\n")}` : "",
       `\n## 本次动作\n${action.instruction}`,
       "",

@@ -45,6 +45,7 @@ import {
 import { LearningScheduler, learningNotification } from "./learning-scheduler.ts";
 import { ReminderScheduler } from "./reminder-scheduler.ts";
 import { WorkContinuationScheduler } from "./work-continuation-scheduler.ts";
+import { chatWorkNotification } from "./chat-work-notification.ts";
 import { FeishuTaskApprovals } from "./feishu-task-approvals.ts";
 import { createSystemHealthReporter } from "./health.ts";
 import {
@@ -208,9 +209,15 @@ async function run(
   const nativeAttachmentExtractor = createNativeExtractor({
     attachmentHelper: runtimePaths.attachmentHelper,
   });
+  let workContinuationScheduler: WorkContinuationScheduler | undefined;
   const orchestrator = new Orchestrator({
     engine,
     connector,
+    onWorkPlanReady: workItemId => {
+      void workContinuationScheduler?.wake(workItemId).catch(() => {
+        log.warn("chat work continuation wake failed", { workItemId });
+      });
+    },
     onCardAction: event => taskApprovals.handle(event),
     activeFeishuAppId:
       feishuStartup.status.state === "ready" && feishuStartup.status.verified
@@ -258,6 +265,12 @@ async function run(
   // Push a task's summary to its space-bound feishu chat (shared by the task
   // scheduler and the backend's manual "run now").
   const notifyTaskDone = async (run: TaskRun) => {
+    const reply = chatWorkNotification(engine, run);
+    if (reply) {
+      assertFeishuDeliveryAllowed(run.space, reply.chatId);
+      await connector.reply(reply);
+      return;
+    }
     const chatId = engine.registry.get(run.space)?.chatId;
     if (!chatId) throw new Error(`task space has no bound Feishu chat: ${run.space}`);
     await sendFeishuNotice(
@@ -298,7 +311,6 @@ async function run(
   let scheduler: Scheduler | undefined;
   let maintenanceScheduler: MaintenanceScheduler | undefined;
   let taskScheduler: TaskScheduler | undefined;
-  let workContinuationScheduler: WorkContinuationScheduler | undefined;
   let learningScheduler: LearningScheduler | undefined;
   let reminderScheduler: ReminderScheduler | undefined;
   const reportHealth = createSystemHealthReporter({
@@ -448,7 +460,9 @@ async function run(
   log.info("Wiki Maintenance scheduler started (weekly + catch-up)");
 
   // 5. opted-in WorkItems continue one durable action boundary per tick.
-  workContinuationScheduler = new WorkContinuationScheduler(engine);
+  workContinuationScheduler = new WorkContinuationScheduler(engine, {
+    notify: notifyTaskDone, notifyApproval: notifyTaskApproval,
+  });
   await workContinuationScheduler.start();
   log.info("work continuation scheduler started");
 

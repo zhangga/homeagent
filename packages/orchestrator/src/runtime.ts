@@ -69,6 +69,7 @@ import type {
 } from "@homeagent/connectors";
 import { extractAttachmentText } from "./attachment-extractor.ts";
 import { newWorkTitle, routeWork, workControl, resolveSupplement, WORK_ROUTING_INSTRUCTION } from "./work-routing.ts";
+import { generateWorkPlan, isWorkPlanningCandidate, WORK_PLANNING_INSTRUCTION } from "./work-planning.ts";
 import { splitMaterialText } from "@homeagent/shared";
 import { isLiveReplyTerminal, liveReplySnapshot } from "@homeagent/connectors";
 import { attribute } from "./attribution.ts";
@@ -276,6 +277,8 @@ function discloseUnavailableVision(text: string): string {
 }
 
 export interface RuntimeOptions {
+  /** Wake the existing continuation scheduler after durable plan delivery. */
+  onWorkPlanReady?: (workItemId: string) => void;
   /** Deterministic application callback; card actions never enter knowledge capture or the model. */
   onCardAction?: (event: CardActionEvent) => void | Promise<void>;
   engine: KnowledgeEngine;
@@ -311,6 +314,7 @@ export class Orchestrator {
   private activeFeishuAppId?: string;
   private groupOnboarding: FeishuGroupOnboardingService;
   private llm?: LlmClient;
+  private onWorkPlanReady?: (workItemId: string) => void;
   private serializer = new Serializer();
   private seen = new Set<string>();
   private seenOrder: string[] = [];
@@ -370,6 +374,7 @@ export class Orchestrator {
       port: connectorFeishuGroupAdministrationPort(opts.connector),
     });
     this.llm = opts.llm;
+    this.onWorkPlanReady = opts.onWorkPlanReady;
     this.dedupSize = opts.dedupSize ?? 5000;
     this.docFetcher = opts.docFetcher;
     this.attachmentDownloader = opts.attachmentDownloader
@@ -505,6 +510,10 @@ export class Orchestrator {
         }
         const done = this.engine.workDispatch.get(input.id);
         if (done && done.state !== "cancelled") this.engine.workDispatch.update(done.id, done.revision, { state: "settled" });
+        if (done?.workItemId && this.engine.deliveredChatWorkPlan(done.workItemId)) {
+          this.engine.reconcileChatWorkPlans();
+          this.onWorkPlanReady?.(done.workItemId);
+        }
       } catch (error) {
         const failed = this.engine.workDispatch.get(input.id);
         if (!failed || failed.state === "cancelled") return;
@@ -1461,8 +1470,15 @@ export class Orchestrator {
         disposition: interpretation.disposition,
         chatType: msg.chatType,
       });
+      const input = this.inputFor(msg);
+      const item = input?.workItemId ? this.engine.workItems.get(input.workItemId) : undefined;
+      const shouldPlan = interpretation.disposition === "conversation"
+        && (input?.operation === "new" || input?.operation === "followup")
+        && !!item && !item.chatPlanRunId && !item.runbook && item.nextActions.length === 0 && item.taskRunIds.length === 0
+        && isWorkPlanningCandidate(interpretation.text);
       const response: NonNullable<WorkInput["response"]> = sourceSync.attempted > 0 && sourceSync.succeeded === 0
         ? { kind: "static", text: "我已收录这条消息，但未能读取链接正文，因此不能确认已经理解或完整收录文章内容。请确认该资料在 HomeAgent 运行环境中可访问后重试。" }
+        : shouldPlan ? { kind: "work-plan", question: interpretation.text, instruction: WORK_PLANNING_INSTRUCTION }
         : interpretation.disposition === "conversation" ? { kind: "answer", question: interpretation.text }
         : interpretation.disposition === "remember" ? { kind: "remember", text: sourceSync.succeeded > 0 ? "好的，我已读取并记下来源正文。" : "好的，我记下了。" }
         : { kind: "static", text: "👋 我在。有需要随时问我，或把要记住的事告诉我。" };
@@ -1490,8 +1506,46 @@ export class Orchestrator {
     if (signal.aborted) return Promise.reject(signal.reason);
     if (response?.kind === "static") return this.completeChatRunAndSend(msg, runId, response.text);
     if (response?.kind === "remember") return this.completeRememberChatRun(msg, space, runId, response.text, signal);
+    if (response?.kind === "work-plan") return this.planChatWork(msg, space, runId, response, signal);
     return this.answer(msg, attribute(msg).readSpaces, space, runId,
       response?.kind === "answer" ? response.question : interpretConversation(msg.text).text, signal);
+  }
+
+  private async planChatWork(msg: InboundMessage, space: SpaceId, runId: string,
+    response: Extract<NonNullable<WorkInput["response"]>, { kind: "work-plan" }>, signal: AbortSignal): Promise<void> {
+    const run = this.engine.chatRuns.get(runId)!;
+    if (!run.workItemId || !run.executionPlan) throw new Error("Missing work plan context");
+    const previous = this.engine.workItems.get(run.workItemId);
+    if (!previous) throw new Error("Missing work plan item");
+    let steps: string[];
+    if (previous?.chatPlanRunId) {
+      if (previous.chatPlanRunId !== run.id && previous.chatPlanRunId !== run.retryOf) throw new Error("Planning retry conflicts with saved plan");
+      steps = previous.nextActions;
+    } else {
+      const plan = await generateWorkPlan(this.llm ?? this.engine.workRoutingClient({
+        provider: run.provider, model: run.model, reasoningEffort: run.reasoningEffort,
+        timeoutMs: run.timeoutMs ?? AI_OPERATION_TIMEOUT_MS,
+      }, signal), { ...response, model: run.model, space, agentInstruction: run.executionPlan.instruction,
+        workItem: { id: previous.id, title: previous.title } }, signal);
+      if (plan.kind === "answer") return this.answer(msg, attribute(msg).readSpaces, space, runId, response.question, signal);
+      steps = plan.steps.map((step, index) => `${index + 1}. ${step.instruction}\n完成标准：${step.doneWhen}`);
+    }
+    signal.throwIfAborted();
+    const input = this.inputFor(msg);
+    if (this.engine.chatRuns.get(runId)?.status !== "running" || !input || input.state === "cancelled"
+      || !this.inputBindingCurrent(input)) throw new ChatRunCancelledError();
+    const item = this.engine.workItems.applyChatPlan(run.workItemId, runId, steps, { retryOf: run.retryOf });
+    const requiresApproval = ["write", "full"].includes(run.executionPlan.execution?.permission ?? "");
+    const preview = item.nextActions.slice(0, 10).join("\n\n");
+    await this.completeChatRunAndSend(msg, runId, [
+      `已生成工作计划（共 ${item.nextActions.length} 步）：${item.title}`, "", preview,
+      ...(item.nextActions.length > 10 ? ["", "以上展示前 10 步，完整计划已保存到工作台。"] : []), "",
+      !item.active ? "计划已保存，事项处于暂停状态，恢复后继续。"
+        : requiresApproval ? "已接入续作。按当前 Agent 配置，每步执行前需要审批，执行后需要验收；完成后继续下一步。"
+        : "已接入续作，将按顺序执行；每步通过现有验收后继续，遇到阻塞会停下。",
+      "可在工作台查看进展，也可回复本条消息查询进度、暂停或取消。",
+    ].join("\n"), previous?.chatPlanRunId ? "static" : "model");
+    this.engine.reconcileChatWorkPlans();
   }
 
   private async startChatRun(
@@ -1961,10 +2015,11 @@ export class Orchestrator {
     msg: InboundMessage,
     runId: string,
     markdown: string,
+    replyKind: "model" | "static" = "static",
   ): Promise<void> {
     const run = this.engine.chatRuns.get(runId);
     if (!run) return;
-    const text = withReplyModel(markdown, run, undefined, "static");
+    const text = withReplyModel(markdown, run, undefined, replyKind);
     const succeeded = this.engine.chatRuns.succeed(runId, {
       finishedAt: Date.now(),
       output: text,

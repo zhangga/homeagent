@@ -53,6 +53,34 @@ describe("WorkContinuationScheduler", () => {
     expect(engine.workItems.get(item.id)?.nextActions).toEqual(["检查指标"]);
   });
 
+  test("startup installs the continuation loop without waiting for a slow recovered action", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    engine = new KnowledgeEngine({ dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }),
+      runProvider: async () => {
+        entered.resolve(); await release.promise;
+        return JSON.stringify({ version: 1, outcome: "completed", result: "恢复动作已完成",
+          blockers: [], checks: [{ name: "恢复检查", status: "passed" }] });
+      } });
+    engine.ensureSpace(SPACE);
+    const item = engine.workItems.create({ space: SPACE, title: "恢复工作计划", nextActions: ["恢复首步"] });
+    engine.configureWorkContinuation(item.id, true);
+    const scheduler = new WorkContinuationScheduler(engine);
+    let listening = false;
+    const starting = scheduler.start().then(() => { listening = true; });
+    try {
+      await entered.promise;
+      expect(listening).toBe(true);
+      expect(scheduler.health()).toEqual(expect.objectContaining({ started: true, running: true }));
+    } finally {
+      release.resolve();
+      await starting;
+      scheduler.stop();
+      for (let i = 0; i < 200 && engine.workContinuations.activeForWorkItem(item.id); i++) await Bun.sleep(5);
+      expect(engine.workContinuations.list(item.id)[0]?.status).toBe("succeeded");
+    }
+  });
+
   test("submits one action for every independent work item before awaiting completion", async () => {
     const bothStarted = Promise.withResolvers<void>();
     let finishFirst!: (value: string) => void;

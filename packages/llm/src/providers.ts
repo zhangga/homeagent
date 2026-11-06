@@ -21,6 +21,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { execFile } from "node:child_process";
 import { AI_OPERATION_TIMEOUT_MS, brandedEnv, config, logger, normalizeFeishuAppId, publicModelId, fileIdentity, fileIdentitiesMatch, type FileIdentity, type ProviderProgressEvent, type PublicRunTool } from "@homeagent/shared";
 import { SkillBundleWorker } from "./skill-bundle-client.ts";
 export { captureProviderSkillBundle, captureProviderSkillBundleAsync, hashProviderSkillBundle, hashProviderSkillBundleAsync } from "./skill-bundle.ts";
@@ -2225,29 +2226,64 @@ function claudeProgressObserver(observer: NonNullable<RunInput["onProgress"]>): 
 async function readTextStream(
   stream: ReadableStream<Uint8Array>,
   onLine: (line: string) => void | Promise<void>,
+  drainSignal?: AbortSignal,
 ): Promise<string> {
   const reader = stream.getReader();
+  const drain = () => { void reader.cancel().catch(() => {}); };
+  drainSignal?.addEventListener("abort", drain, { once: true });
+  if (drainSignal?.aborted) drain();
   const decoder = new TextDecoder();
   const chunks: string[] = [];
   let pending = "";
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    const text = decoder.decode(value, { stream: true });
-    chunks.push(text);
-    pending += text;
-    let newline = pending.indexOf("\n");
-    while (newline >= 0) {
-      const line = pending.slice(0, newline).replace(/\r$/u, "");
-      pending = pending.slice(newline + 1);
-      await onLine(line);
-      newline = pending.indexOf("\n");
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value, { stream: true });
+      chunks.push(text);
+      pending += text;
+      let newline = pending.indexOf("\n");
+      while (newline >= 0) {
+        const line = pending.slice(0, newline).replace(/\r$/u, "");
+        pending = pending.slice(newline + 1);
+        await onLine(line);
+        newline = pending.indexOf("\n");
+      }
     }
+    const final = decoder.decode();
+    if (final) { chunks.push(final); pending += final; }
+    if (pending) await onLine(pending.replace(/\r$/u, ""));
+    return chunks.join("");
+  } finally {
+    drainSignal?.removeEventListener("abort", drain);
+    reader.releaseLock();
   }
-  const final = decoder.decode();
-  if (final) { chunks.push(final); pending += final; }
-  if (pending) await onLine(pending.replace(/\r$/u, ""));
-  return chunks.join("");
+}
+
+interface CommandCompletion {
+  observe(line: string): "completed" | "running" | undefined;
+  outputReady(): boolean;
+}
+
+// This starts only after the protocol has completed and its final artifact is
+// readable. It is a process-drain allowance, never an AI generation deadline.
+const CODEX_COMPLETED_PROCESS_DRAIN_MS = 2_000;
+
+async function stopProviderProcess(proc: Bun.Subprocess): Promise<boolean> {
+  if (proc.exitCode !== null) return false;
+  if (process.platform === "win32") {
+    // npm's .cmd -> node -> Codex chain must be stopped as a tree. Killing only
+    // cmd leaves its descendants holding the output pipes open.
+    return new Promise((resolve, reject) => {
+      execFile("taskkill.exe", ["/PID", String(proc.pid), "/T", "/F"], { windowsHide: true }, error => {
+        if (!error) resolve(true);
+        else if (proc.exitCode !== null) resolve(false);
+        else reject(new Error("Provider process cleanup failed"));
+      });
+    });
+  }
+  proc.kill("SIGTERM");
+  return true;
 }
 
 /** Spawn a command with a hard timeout; resolve stdout/stderr/exit code. */
@@ -2263,12 +2299,14 @@ async function runCmd(
   onStarted?: () => void,
   onStdoutLine?: (line: string) => void | Promise<void>,
   larkProfile?: string,
+  completion?: CommandCompletion,
 ): Promise<{
   code: number | null;
   stdout: string;
   stderr: string;
   timedOut: boolean;
   aborted: boolean;
+  completedProcessStopped: boolean;
 }> {
   if (signal?.aborted) throw signal.reason ?? new Error("provider run cancelled");
   // Core stores commit synchronously. Never yield between final authorization
@@ -2286,11 +2324,16 @@ async function runCmd(
   let timedOut = false;
   let aborted = false;
   let terminating = false;
+  let completedProcessStopped = false;
+  let completionCheck: ReturnType<typeof setInterval> | undefined;
+  let completionReadyAt: number | undefined;
+  let completionStop: Promise<void> | undefined;
+  const outputDrain = completion ? new AbortController() : undefined;
   let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
   const terminate = () => {
     if (terminating) return;
     terminating = true;
-    proc.kill();
+    void stopProviderProcess(proc).catch(() => { proc.kill(9); }).finally(() => outputDrain?.abort());
     forceKillTimer = setTimeout(() => proc.kill(9), 2_000);
   };
   const onAbort = () => { aborted = true; terminate(); };
@@ -2319,15 +2362,46 @@ async function runCmd(
       proc.stdin.write(stdin);
       proc.stdin.end();
     }
-    const stdoutPromise = onStdoutLine
-      ? readTextStream(proc.stdout, onStdoutLine)
+    const observe = async (line: string) => {
+      const state = completion?.observe(line);
+      if (state !== undefined) {
+        if (completionCheck) clearInterval(completionCheck);
+        completionReadyAt = undefined;
+        if (state === "completed") completionCheck = setInterval(() => {
+          if (aborted || timedOut || terminating) return;
+          if (completionReadyAt === undefined) {
+            if (!completion!.outputReady()) return;
+            completionReadyAt = Date.now();
+          }
+          if (Date.now() - completionReadyAt < CODEX_COMPLETED_PROCESS_DRAIN_MS) return;
+          if (!completion!.outputReady()) { completionReadyAt = undefined; return; }
+          clearInterval(completionCheck);
+          terminating = true;
+          completionStop = stopProviderProcess(proc).then(stopped => {
+            completedProcessStopped = stopped;
+            if (stopped) forceKillTimer = setTimeout(() => proc.kill(9), 2_000);
+            // A detached tool can retain these pipes after its parent exits.
+            // The terminal event and artifact, not inherited pipe EOF, finish
+            // this turn. Preserve a naturally returned nonzero exit code.
+            outputDrain?.abort();
+          });
+          // Observe cleanup failures here; the awaited completion below retains
+          // them while the ordinary process timeout remains in force.
+          void completionStop.catch(() => { proc.kill(9); });
+        }, 100);
+      }
+      await onStdoutLine?.(line);
+    };
+    const stdoutPromise = onStdoutLine || completion
+      ? readTextStream(proc.stdout, observe, outputDrain?.signal)
       : new Response(proc.stdout).text();
     const [stdout, stderr, code] = await Promise.all([
       stdoutPromise,
-      new Response(proc.stderr).text(),
+      outputDrain ? readTextStream(proc.stderr, () => {}, outputDrain.signal) : new Response(proc.stderr).text(),
       proc.exited,
     ]);
-    return { code, stdout, stderr, timedOut, aborted };
+    await completionStop;
+    return { code, stdout, stderr, timedOut, aborted, completedProcessStopped };
   } catch (error) {
     // No output wait remains to keep the graceful termination timer alive.
     proc.kill(9);
@@ -2336,6 +2410,7 @@ async function runCmd(
     unregister?.();
     clearTimeout(timer);
     if (forceKillTimer) clearTimeout(forceKillTimer);
+    if (completionCheck) clearInterval(completionCheck);
     signal?.removeEventListener("abort", onAbort);
   }
 }
@@ -2960,7 +3035,7 @@ export async function runProviderDetailed(
     };
     const args = spec.buildRun(providerInput);
     if (policy?.mode === "local-full-access") validateCodexFullAccessWorkdir(prepared);
-    const { code, stdout, stderr, timedOut, aborted } = await runCmd(
+    const { code, stdout, stderr, timedOut, aborted, completedProcessStopped } = await runCmd(
       bin,
       args,
       timeoutMs,
@@ -2988,6 +3063,19 @@ export async function runProviderDetailed(
           : id === "claude" ? claudeProgressObserver(input.onProgress) : undefined
         : undefined,
       prepared.larkProfile,
+      id === "codex" && stagedSchema ? {
+        observe: line => {
+          let event: unknown;
+          try { event = JSON.parse(line); } catch { return; }
+          if (!event || typeof event !== "object" || !("type" in event)) return;
+          if (event.type === "turn.completed") return "completed";
+          if (["turn.started", "turn.failed", "error"].includes(String(event.type))) return "running";
+        },
+        outputReady: () => {
+          try { JSON.parse(readCodexFinalOutput(stagedSchema!.outputPath, prepared.maxTokens)); return true; }
+          catch { return false; }
+        },
+      } : undefined,
     );
     if (id === "codex") {
       collectedEvidence = collectCodexExecutionEvidence(stdout);
@@ -2995,7 +3083,8 @@ export async function runProviderDetailed(
     }
     if (aborted) throw signal?.reason ?? new Error(`provider ${id} cancelled`);
     if (timedOut) throw new Error(`provider ${id} timed out after ${timeoutMs}ms`);
-    if (code !== 0) {
+    if (completedProcessStopped) log.warn("completed Codex process required cleanup after final output");
+    if (code !== 0 && !completedProcessStopped) {
       if (id === "claude") {
         const parsed = parseClaudeResult(stdout);
         if (parsed) {

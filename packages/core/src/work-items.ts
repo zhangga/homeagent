@@ -41,6 +41,8 @@ export interface WorkItem {
   pageSlugs: string[];
   chatRunIds: string[];
   taskRunIds: string[];
+  /** Provenance of a chat-generated plan; local delivery gates automatic execution. */
+  chatPlanRunId?: string;
   /** WorkAction checkpoints already projected into summary/nextActions. */
   completedActionIds?: string[];
   /** Internal idempotency map for blockers projected from failed WorkActions. */
@@ -132,6 +134,8 @@ export function isWorkItem(value: unknown): value is WorkItem {
     && stringList(item.pageSlugs, MAX_REFERENCES)
     && stringList(item.chatRunIds, MAX_REFERENCES)
     && stringList(item.taskRunIds, MAX_REFERENCES)
+    && (item.chatPlanRunId === undefined || (typeof item.chatPlanRunId === "string"
+      && /^chat_run_[a-f0-9-]{36,64}$/i.test(item.chatPlanRunId) && item.chatRunIds.includes(item.chatPlanRunId)))
     && (item.completedActionIds === undefined
       || stringList(item.completedActionIds, MAX_REFERENCES))
     && (item.actionBlockers === undefined || stringRecord(item.actionBlockers))
@@ -271,6 +275,7 @@ export class WorkItemStore {
       pageSlugs: item.pageSlugs,
       chatRunIds: item.chatRunIds,
       taskRunIds: item.taskRunIds,
+      chatPlanRunId: item.chatPlanRunId,
       completedActionIds: item.completedActionIds ?? [],
       actionBlockers: item.actionBlockers ?? {},
       createdAt: item.createdAt,
@@ -413,6 +418,36 @@ export class WorkItemStore {
     return this.select(id);
   }
 
+  /** Commit the complete plan once; a delivery retry must never restore consumed steps. */
+  applyChatPlan(id: string, runId: string, steps: string[], opts: { retryOf?: string } = {}, now = Date.now()): WorkItem {
+    const current = this.get(id);
+    if (!current || !current.chatRunIds.includes(runId)) throw new Error("Unknown planning run");
+    if (current.chatPlanRunId === runId) return current;
+    if (current.chatPlanRunId && current.chatPlanRunId === opts.retryOf && current.taskRunIds.length === 0) {
+      return this.commit(candidate => {
+        const item = candidate.get(id)!;
+        item.chatPlanRunId = runId;
+        item.updatedAt = now;
+        if (!isWorkItem(item)) throw new Error("Invalid planning retry");
+        return clone(item);
+      });
+    }
+    if (current.chatPlanRunId || current.nextActions.length || current.taskRunIds.length) throw new Error("Work item already has a plan");
+    const nextActions = normalizeList(steps);
+    if (!nextActions.length || nextActions.length !== steps.length) throw new Error("Invalid work plan steps");
+    const runbook = trimText(nextActions.join("\n\n"));
+    return this.commit(candidate => {
+      const item = candidate.get(id)!;
+      item.chatPlanRunId = runId;
+      item.nextActions = nextActions;
+      item.runbook = runbook;
+      // Pause/cancel controls may have arrived while the planner was running.
+      item.updatedAt = now;
+      if (!isWorkItem(item)) throw new Error("Invalid chat work plan");
+      return clone(item);
+    });
+  }
+
   private attach(id: string, field: "rawIds" | "chatRunIds" | "taskRunIds", reference: string, now: number): WorkItem {
     const normalized = reference.trim();
     if (!normalized) throw new Error("work item reference is required");
@@ -476,6 +511,10 @@ export class WorkItemStore {
       item.summary = trimText(summary);
       item.completedActionIds.push(actionId);
       if (item.phase === "blocked" && item.blockers.length === 0) item.phase = "active";
+      if (item.chatPlanRunId && item.nextActions.length === 0 && item.blockers.length === 0) {
+        item.phase = "completed";
+        item.active = false;
+      }
       item.updatedAt = now;
       return clone(item);
     });

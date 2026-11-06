@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpaceId } from "@homeagent/shared";
@@ -137,5 +137,33 @@ describe("WorkItemStore", () => {
       blockers: ["用户补充的备注", "更新灰度配置：缺少变更证据"],
       actionBlockers: { action_rejected: "更新灰度配置：缺少变更证据" },
     }));
+  });
+
+  test("chat plans are atomic, detached, idempotent and bounded across reopen", () => {
+    const store = new WorkItemStore(dir);
+    const item = store.create({ space: SPACE, title: "分步工作" });
+    const run = "chat_run_11111111-2222-4333-8444-555555555555";
+    store.attachChatRun(item.id, run);
+    const before = store.get(item.id);
+    for (const steps of [[], ["重复", "重复"], ["x".repeat(2001)], Array.from({ length: 201 }, (_, i) => `${i}`),
+      Array.from({ length: 200 }, (_, i) => `${i}${"x".repeat(1100)}`)]) {
+      expect(() => store.applyChatPlan(item.id, run, steps)).toThrow();
+      expect(store.get(item.id)).toEqual(before);
+    }
+    const path = join(dir, "config", "work-items.json");
+    renameSync(path, `${path}.saved`); mkdirSync(path);
+    expect(() => store.applyChatPlan(item.id, run, ["第一步", "第二步"])).toThrow();
+    expect(store.get(item.id)).toEqual(before);
+    rmdirSync(path); renameSync(`${path}.saved`, path);
+    expect(new WorkItemStore(dir).get(item.id)).toEqual(before);
+    const steps = ["第一步", "第二步"];
+    const planned = store.applyChatPlan(item.id, run, steps);
+    steps[0] = "外部修改"; planned.nextActions[0] = "返回值修改";
+    const restarted = new WorkItemStore(dir);
+    expect(restarted.get(item.id)?.nextActions).toEqual(["第一步", "第二步"]);
+    restarted.applyActionCheckpoint(item.id, "action_1", "第一步", "已完成");
+    expect(restarted.applyChatPlan(item.id, run, ["不应重置"] ).nextActions).toEqual(["第二步"]);
+    restarted.applyActionCheckpoint(item.id, "action_2", "第二步", "已完成");
+    expect(new WorkItemStore(dir).get(item.id)).toEqual(expect.objectContaining({ phase: "completed", active: false }));
   });
 });

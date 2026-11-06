@@ -131,6 +131,17 @@ Chat 文件新写入 v9，读取 v1–v9；Task 文件新写入 v13，读取 v2�
 多个 WorkItem 可以保持 active；选择当前事项不改变其他事项的活动状态。v1 的唯一 active 项迁移为默认焦点，
 不会激活旧 inactive 项，也不会改变已有 WorkAction 的验收和自动续作策略。
 
+明确要求执行的多步骤聊天目标可以生成工作计划。WorkDispatch 的 `work-plan` 响应保存原始目标与冻结的规划指令；
+首次规划既可来自新建事项，也可来自尚无 runbook、nextActions 和 Task Run 的已有事项补充；已有计划不会被后续聊天重置。
+规划调用只生成结构化步骤，使用该 Chat Run 冻结的模型与时限，不携带执行工具或 Provider 会话历史。
+WorkItem 的 `runbook` 保存完整计划，`nextActions` 保存尚待执行的步骤及完成标准，可选 `chatPlanRunId` 记录规划来源。
+步骤沿用 WorkItem 的 200 项、单项 2,000 字符与 runbook 200,000 字符边界；新字段兼容原 WorkItems v2，未规划的旧事项不变。
+只有规划 Run 成功且回执持久确认送达后才自动开启该事项续作；已明确关闭的策略不会被恢复逻辑覆盖。
+开启后的计划独立于有界 Chat 历史，沿用 WorkAction / Task Run 的审批、验收、通知与恢复规则；完整已验收报告传递给后续步骤，
+最后一步验收后自动完成事项。本机 WorkDispatch 保留实际规划消息的投递位置，规划 Run 历史裁剪后也不退回最初创建事项的普通消息；
+Space 归档仅保留计划、来源历史标识及已有续作策略，
+不会从导入的 Chat 历史补造本机输入或自动开启策略。归档内仍存在的规划 Run 必须属于同一事项，已裁剪历史允许保留来源标识。
+
 `config/work-dispatch/input_<sha256>.json` 是本机入站输入和分派计划的权威记录，格式 v1，每条独立原子提交。
 身份由 Connector、App、chat 和 message 确定，记录绑定唯一 Space 和接收时的群绑定 epoch；重复投递不能覆盖正文。
 先持久保存完整标准化消息，再向 Connector 返回接收结果。单条正文最多 20,971,520 字符，超出时明确拒绝，

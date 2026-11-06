@@ -1,10 +1,12 @@
 import type { ChatRun, WorkInputSummary, WorkItem, WorkOperation, LlmClient, WorkRoutingPlan } from "@homeagent/core";
 import type { InboundMessage } from "@homeagent/connectors";
+import { isWorkPlanningCandidate } from "./work-planning.ts";
 
 export interface WorkRoute { operation: WorkOperation; workItemId?: string }
 const normalized = (text: string): string => text.toLowerCase().replace(/调研/gu, "研究").replace(/[\s，。！？、：:《》「」“”]/gu, "");
 const addressedText = (text: string): string => text.trim().replace(/^@\S+\s+/u, "");
-const isWorkRequest = (text: string): boolean => /^(?:请|帮我|帮忙|再|同时|另外|麻烦|为我|先|一下|\s)*(?:研究|调研|整理|编写|撰写|分析|实现|开发|制作|生成|设计|评估|对比|修复)/u.test(text.trim());
+const isWorkRequest = (text: string): boolean => /^(?:请|帮我|帮忙|再|同时|另外|麻烦|为我|先|一下|\s)*(?:研究|调研|整理|编写|撰写|分析|实现|开发|制作|生成|设计|评估|对比|修复)/u.test(text.trim())
+  || isWorkPlanningCandidate(text);
 
 export function workControl(text: string): "status" | "cancel" | "pause" | "resume" | undefined {
   const value = addressedText(text);

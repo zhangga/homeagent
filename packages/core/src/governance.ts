@@ -2188,6 +2188,12 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
   const workItems = version < WORK_CONTEXT_SPACE_ARCHIVE_VERSION
     ? []
     : (root.workItems as unknown[]).map((item, index) => parseWorkItem(item, index, id));
+  for (const item of workItems) {
+    if (!item.chatPlanRunId) continue;
+    const source = chatRuns.find(run => run.id === item.chatPlanRunId);
+    // Completed Chat history is bounded; a remaining source must agree with its owner.
+    if (source && source.workItemId !== item.id) throw new Error("chat work plan source is invalid");
+  }
   const workItemById = new Map(workItems.map((item) => [item.id, item]));
   const workActions = version < WORK_CONTEXT_SPACE_ARCHIVE_VERSION
     ? []
