@@ -63,6 +63,195 @@ const result = (text: string) => JSON.stringify({ version: 1, outcome: "complete
 const blockedResult = (text = "原资料不可读，可使用目标中的备用资料") => JSON.stringify({ version: 1, outcome: "blocked", result: text,
   blockers: [text], checks: [{ name: "读取资料", status: "failed" }] });
 
+test("M3 delegates sequential steps to published workers with frozen revisions and individual approvals", async () => {
+  const workers: string[] = [], called: string[] = [];
+  const planner = new FakeLlm().onJSON(() => ({ kind: "plan", steps: workers.map((agentId, i) => ({
+    instruction: ["调研测试数据", "撰写摘要", "检查摘要"][i], doneWhen: "结果符合测试数据", agentId,
+  })) }));
+  const f = await fixture({ full: true, planner, runner: async (_provider, input) => {
+    const permit = input.acquireExecutionPermit!(); const unregister = permit.register(() => {}); permit.release(); unregister();
+    called.push(input.system ?? ""); return result("总数20，完成率60%，阻塞占比15%");
+  } });
+  try {
+    const workdir = f.engine.agentForSpace(SPACE)!.workdir;
+    for (const name of ["研究", "写作", "审查"]) {
+      const agent = f.engine.agents.create({ name, provider: "codex", visibility: "Team", instruction: `专业${name}初版` });
+      const draft = f.engine.agents.saveDraft(agent.id, { executionMode: "local-full-access", permission: "full", workdir })!;
+      f.engine.localExecution.release(agent.id, draft.id, draft.id, { termsVersion: 1, source: "local-operator",
+        taskExecutionEnabled: true, expectedScopeFingerprint: f.engine.localExecution.preview(agent.id, draft.id).fingerprint });
+      workers.push(agent.id);
+    }
+    await f.send("m3-workers");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    const revisions = workers.map(id => f.engine.agents.get(id)!.publishedRevisionId);
+    await f.reopen();
+    for (let i = 0; i < 3; i++) {
+      await new WorkContinuationScheduler(f.engine).wake(item.id);
+      const run = f.engine.listTaskRuns().find(run => run.status === "awaiting_approval")!;
+      expect(run.agentId).toBe(workers[i]);
+      expect(run.executionPlan?.agentRevisionId).toBe(revisions[i]);
+      expect(called).toHaveLength(i);
+      await f.engine.approveTaskRun(run.id, "local-operator").completion;
+      expect(f.engine.workContinuations.get(run.workActionId!)?.status).toBe("awaiting_acceptance");
+      expect(f.engine.listDueWorkContinuations()).toEqual([]);
+      f.engine.acceptWorkAction(run.workActionId!, run.id, "local-operator");
+    }
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("completed");
+    expect(called).toHaveLength(3);
+  } finally { await f.close(); }
+});
+
+test("M3 runs independent children concurrently and aggregates only after both human acceptances", async () => {
+  const entered: string[] = []; const release = Promise.withResolvers<void>();
+  const planner = new FakeLlm().onJSON(() => ({ kind: "plan", children: [
+    { key: "a", title: "独立研究A", goal: "计算A的总数", steps: [{ instruction: "研究A", doneWhen: "A合计20" }] },
+    { key: "b", title: "独立研究B", goal: "计算B的总数", steps: [{ instruction: "研究B", doneWhen: "B合计10" }] },
+  ], steps: [{ instruction: "比较A与B", doneWhen: "引用两个已验收成果", dependsOn: ["a", "b"] }] }));
+  const f = await fixture({ full: true, planner, runner: async (_provider, input) => {
+    const permit = input.acquireExecutionPermit!(); const unregister = permit.register(() => {}); permit.release();
+    try { entered.push(input.prompt); if (entered.length <= 2) await release.promise;
+      return result(entered.length <= 2 ? input.prompt.includes("研究A") ? "A合计20" : "B合计10" : "A20，B10，相差10");
+    } finally { unregister(); }
+  } });
+  try {
+    await f.send("m3-parallel", "分别研究A、B，独立并行执行，然后比较汇总");
+    const parent = f.engine.workItems.list(SPACE).find(item => !item.parentWorkItemId)!;
+    const children = f.engine.workItems.list(SPACE).filter(item => item.parentWorkItemId === parent.id);
+    expect(children).toHaveLength(2);
+    expect(f.engine.listDueWorkContinuations().map(item => item.id).sort()).toEqual(children.map(item => item.id).sort());
+    await new WorkContinuationScheduler(f.engine).tick("m3-children");
+    const runs = f.engine.listTaskRuns();
+    expect(runs).toHaveLength(2);
+    expect(runs.every(run => run.status === "awaiting_approval")).toBe(true);
+    const pending = runs.map(run => f.engine.approveTaskRun(run.id, "local-operator").completion);
+    for (let i = 0; i < 200 && entered.length < 2; i++) await Bun.sleep(10);
+    expect(entered).toHaveLength(2);
+    expect(f.engine.listTaskRuns().filter(run => run.status === "running")).toHaveLength(2);
+    release.resolve(); await Promise.all(pending);
+    expect(f.engine.listDueWorkContinuations()).toEqual([]);
+    f.engine.acceptWorkAction(runs[0]!.workActionId!, runs[0]!.id, "local-operator");
+    expect(f.engine.listDueWorkContinuations()).toEqual([]);
+    await f.reopen();
+    f.engine.acceptWorkAction(runs[1]!.workActionId!, runs[1]!.id, "local-operator");
+    expect(f.engine.listDueWorkContinuations().map(item => item.id)).toEqual([parent.id]);
+    await new WorkContinuationScheduler(f.engine).wake(parent.id);
+    const aggregate = f.engine.listTaskRuns().find(run => run.workItemId === parent.id)!;
+    expect(aggregate.topic).toContain("A合计20"); expect(aggregate.topic).toContain("B合计10");
+    await f.engine.approveTaskRun(aggregate.id, "local-operator").completion;
+    f.engine.acceptWorkAction(aggregate.workActionId!, aggregate.id, "local-operator");
+    await f.runtime.processWorkEvents();
+    expect(f.engine.workItems.get(parent.id)?.phase).toBe("completed");
+    expect(f.transport.sent.filter(reply => reply.markdown.includes("全部步骤已验收"))).toHaveLength(1);
+    expect(f.transport.sent.at(-1)?.replyToMessageId).toBe("m3-parallel");
+  } finally { release.resolve(); await f.close(); }
+});
+
+test("M3 replans a blocked worker child without repeating an accepted sibling", async () => {
+  let workerId = "", aCalls = 0, bCalls = 0;
+  const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").recoveryContext
+    ? { kind: "plan", reason: "改用授权备用数据", steps: [{ instruction: "读取A备用数据", doneWhen: "A合计20" }] }
+    : { kind: "plan", children: [
+      { key: "a", title: "研究A", goal: "读取A或备用数据", steps: [{ instruction: "读取A主数据", doneWhen: "A合计20", agentId: workerId }] },
+      { key: "b", title: "研究B", goal: "读取B", steps: [{ instruction: "读取B数据", doneWhen: "B合计10" }] },
+    ], steps: [{ instruction: "汇总结果", doneWhen: "有A和B成果", dependsOn: ["a", "b"] }] });
+  const f = await fixture({ planner, runner: async (_provider, input) => {
+    if (input.prompt.includes("# 工作项\n研究A")) return ++aCalls === 1 ? blockedResult("A主数据不可读") : result("A合计20");
+    if (input.prompt.includes("# 工作项\n研究B")) { bCalls++; return result("B合计10"); }
+    return result("合计30");
+  } });
+  try {
+    workerId = f.engine.agents.create({ name: "研究专业Agent", visibility: "Team", provider: "codex" }).id;
+    await f.send("m3-recover", "分别研究A和B，遇阻可用备用数据，最后汇总");
+    const parent = f.engine.workItems.list(SPACE).find(item => !item.parentWorkItemId)!;
+    await new WorkContinuationScheduler(f.engine).tick("m3-children");
+    const b = f.engine.workItems.list(SPACE).find(item => item.title === "研究B")!;
+    const accepted = [...b.completedActionIds!];
+    await f.runtime.processWorkEvents();
+    const a = f.engine.workItems.list(SPACE).find(item => item.title === "研究A")!;
+    expect(f.engine.getWorkPlanView(a.id)?.remaining[0]?.worker?.agentId).toBe(workerId);
+    await f.reopen();
+    await new WorkContinuationScheduler(f.engine).wake(a.id);
+    expect(f.engine.workItems.get(b.id)?.completedActionIds).toEqual(accepted);
+    expect(bCalls).toBe(1); expect(aCalls).toBe(2);
+    await new WorkContinuationScheduler(f.engine).wake(parent.id);
+    await f.runtime.processWorkEvents();
+    expect(f.engine.workItems.get(parent.id)?.phase).toBe("completed");
+    expect(f.transport.sent.filter(reply => reply.markdown.includes("全部步骤已验收"))).toHaveLength(1);
+  } finally { await f.close(); }
+});
+
+test("M3 parent pause and cancellation preserve unrelated work and cancel each child approval", async () => {
+  const planner = new FakeLlm().onJSON(() => ({ kind: "plan", children: ["a", "b"].map(key => ({ key, title: key, goal: key,
+    steps: [{ instruction: `研究${key}`, doneWhen: "标注来源" }] })), steps: [{ instruction: "汇总", doneWhen: "包含两项结果" }] }));
+  const f = await fixture({ full: true, planner });
+  try {
+    await f.send("m3-control", "分别研究A和B，然后汇总");
+    const parent = f.engine.workItems.list(SPACE).find(item => !item.parentWorkItemId)!;
+    f.engine.workItems.update(parent.id, { active: false });
+    expect(f.engine.listDueWorkContinuations()).toEqual([]);
+    f.engine.workItems.update(parent.id, { active: true });
+    await new WorkContinuationScheduler(f.engine).wake(parent.id);
+    expect(f.engine.listTaskRuns().filter(run => run.status === "awaiting_approval")).toHaveLength(2);
+    const unrelated = f.engine.workItems.create({ space: SPACE, title: "其他事项", nextActions: ["自己的工作"] });
+    await f.send("m3-cancel", "取消", { parentMessageId: "m3-control" });
+    expect(f.engine.listTaskRuns().every(run => run.status === "cancelled")).toBe(true);
+    expect(f.engine.workItems.get(unrelated.id)?.active).toBe(true);
+    await f.reopen();
+    expect(f.engine.workItems.get(parent.id)?.childCancellation?.status).toBe("applied");
+    expect(f.engine.listDueWorkContinuations()).toEqual([]);
+  } finally { await f.close(); }
+});
+
+test("M3 an answer in the original topic resumes the child that requested missing facts", async () => {
+  let calls = 0;
+  const planner = new FakeLlm().onJSON(call => {
+    const context = JSON.parse(call.prompt ?? "{}");
+    if (context.recoveryContext) return { kind: "wait", reason: "缺少数量", question: "A已完成多少项？" };
+    if (context.revisionContext) return { kind: "plan", steps: [{ instruction: "采用A已完成12项", doneWhen: "结果包含12项" }] };
+    return { kind: "plan", children: [{ key: "a", title: "统计A", goal: "统计A的完成数量", steps: [{ instruction: "查询A数量", doneWhen: "有真实数量" }] }],
+      steps: [{ instruction: "汇总A", doneWhen: "有数量", dependsOn: ["a"] }] };
+  });
+  const f = await fixture({ planner, runner: async () => ++calls === 1 ? blockedResult("缺少A完成数量") : result("A已完成12项") });
+  try {
+    await f.send("m3-facts", "请新建独立事项「汇总A」，分别分析A，然后汇总");
+    const parent = f.engine.workItems.list(SPACE).find(item => !item.parentWorkItemId)!;
+    await new WorkContinuationScheduler(f.engine).wake(parent.id);
+    await f.runtime.processWorkEvents();
+    const child = f.engine.workItems.list(SPACE).find(item => item.parentWorkItemId === parent.id)!;
+    expect(f.engine.workAwaitsRecoveryInput(child.id)).toBe(true);
+    await f.send("m3-facts-reply", "A已完成12项", { parentMessageId: "m3-facts" });
+    expect(f.engine.workDispatch.list(SPACE).find(input => input.message.messageId === "m3-facts-reply")?.workItemId).toBe(child.id);
+    await new WorkContinuationScheduler(f.engine).wake(child.id);
+    await new WorkContinuationScheduler(f.engine).wake(parent.id);
+    expect(f.engine.workItems.get(parent.id)?.phase).toBe("completed");
+    expect(f.engine.chatWorkPlanSource(child.id)?.message.messageId).toBe("m3-facts");
+  } finally { await f.close(); }
+});
+
+test("M3 child recovery waits for its original-topic receipt before continuing", async () => {
+  let offline = true;
+  const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").recoveryContext
+    ? { kind: "plan", reason: "改用备用资料", steps: [{ instruction: "读取备用资料", doneWhen: "有真实数据" }] }
+    : { kind: "plan", children: [{ key: "a", title: "研究A", goal: "读取A或备用资料", steps: [{ instruction: "读取A", doneWhen: "有真实数据" }] }],
+      steps: [{ instruction: "汇总A", doneWhen: "引用已验收成果" }] });
+  const f = await fixture({ planner, runner: async () => blockedResult(), reply: async reply => {
+    if (offline && reply.markdown.includes("已根据阻塞修订")) throw new Error("fixture offline");
+  } });
+  try {
+    await f.send("m3-receipt", "请新建独立事项「资料汇总」，分别调研A并汇总");
+    const child = f.engine.workItems.list(SPACE).find(item => item.parentWorkItemId)!;
+    await new WorkContinuationScheduler(f.engine).wake(child.id);
+    await f.runtime.processWorkEvents();
+    expect(f.engine.listDueWorkContinuations()).toEqual([]);
+    expect(() => f.engine.startWorkContinuation(child.id)).toThrow("receipt");
+    await f.reopen(); offline = false;
+    const notice = f.engine.workEvents.list().find(notice => notice.kind === "replanned")!;
+    f.engine.workEvents.save({ ...notice, nextAttemptAt: 0 });
+    await f.runtime.processWorkEvents();
+    expect(f.engine.listDueWorkContinuations().map(item => item.id)).toEqual([child.id]);
+  } finally { await f.close(); }
+});
+
 test("M2 replans a business blocker, preserves accepted evidence and completes the original topic", async () => {
   let calls = 0, recoveries = 0;
   const planner = new FakeLlm().onJSON(call => {
@@ -94,7 +283,7 @@ test("M2 replans a business blocker, preserves accepted evidence and completes t
     expect(f.engine.workItems.get(item.id)?.phase).toBe("completed");
     expect(f.transport.sent.filter(reply => reply.markdown.includes("全部步骤已验收"))).toHaveLength(1);
     const archive = await f.engine.exportSpace(SPACE);
-    expect(archive.version).toBe(23);
+    expect(archive.version).toBe(24);
     expect(parseSpaceArchive(archive).workPlans.at(-1)?.source.kind).toBe("recovery");
     expect(() => parseSpaceArchive({ ...archive, version: 22 })).toThrow("v23");
     expect(JSON.stringify(archive)).not.toContain("sourceInputId");
@@ -1238,7 +1427,7 @@ test("v23 archives restore revised plans with accepted evidence and reject broke
     const accepted = f.engine.workContinuations.list(item.id)[0]!;
     await f.send("archive-revised-change", "周报改成100字以内的摘要", { parentMessageId: "archive-revised-goal" });
     const archive = await f.engine.exportSpace(SPACE);
-    expect(archive.version).toBe(23);
+    expect(archive.version).toBe(24);
     expect(archive.workPlans).toHaveLength(2);
     expect(archive.workItems[0]?.planDelivery).toBeUndefined();
     const missing = structuredClone(archive);

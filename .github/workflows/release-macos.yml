@@ -174,9 +174,9 @@ jobs:
           draft: true
           prerelease: true
           body: |
-            本候选使用 Space archive v23 和计划定义 v2，兼容读取旧归档及计划 v1。
-            发布前按 docs/beta-release-runbook.md 核对 M2 真实飞书遇阻重规划、最终验收通知与重启幂等，
-            并保存 v10–v22 十三份真实归档迁移及 24/48 小时 soak 证据。
+            本候选使用 Space archive v24、WorkItems v4 和计划定义 v3，兼容读取旧归档及计划 v1/v2。
+            发布前按 docs/beta-release-runbook.md 核对 M2 遇阻重规划与 M3 真实飞书委派、并行依赖、最终验收通知和重启幂等，
+            并保存 v10–v23 十四份真实归档迁移及 24/48 小时 soak 证据。
             工作流的自动回归不替代上述外部验收；本 Release 保持草稿等待既有发布检查完成。
           files: |
             dist/release/*.dmg

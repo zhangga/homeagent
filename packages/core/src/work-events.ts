@@ -6,12 +6,12 @@ import { assertLocalStatePath, writeAtomicStateFile } from "./durable-file.ts";
 import { isWorkPlanRef, type WorkPlanRef } from "./work-plans.ts";
 import { isResolvedExecutionPlan, type ResolvedExecutionPlan } from "./execution-plan.ts";
 import { parseWorkActionProviderReport, type WorkActionProviderReport } from "./work-continuation.ts";
-import type { WorkPlanPreparation } from "./work-plans.ts";
+import type { WorkPlanPreparation, WorkPlanStepInput } from "./work-plans.ts";
 
-export type WorkRecoveryDecision = { kind: "plan"; reason: string; steps: { instruction: string; doneWhen: string }[] }
+export type WorkRecoveryDecision = { kind: "plan"; reason: string; steps: WorkPlanStepInput[] }
   | { kind: "wait"; reason: string; question: string };
 export interface WorkRecovery {
-  version: 1; kind: "recovery"; id: string; workItemId: string; space: SpaceId; sourceInputId: string;
+  version: 1 | 2; kind: "recovery"; id: string; workItemId: string; space: SpaceId; sourceInputId: string;
   actionId: string; attempt: number; runId: string; factKey: string;
   report: WorkActionProviderReport; rejection?: string;
   prepared: WorkPlanPreparation;
@@ -32,7 +32,12 @@ export function parseWorkRecoveryDecision(value: unknown): WorkRecoveryDecision 
     || decision.steps.some(step => !step || !bounded(step.instruction, 1_900) || !bounded(step.doneWhen, 1_900)
       || step.instruction.length + step.doneWhen.length > 1_900)
     || JSON.stringify(decision.steps).length > 190_000) throw new Error("Invalid work recovery steps");
-  return { kind: "plan", reason: decision.reason, steps: decision.steps.map(step => ({ instruction: step.instruction, doneWhen: step.doneWhen })) };
+  return { kind: "plan", reason: decision.reason, steps: decision.steps.map(step => {
+    // Codex strict output schemas represent omitted optional fields as null.
+    const agentId = step.agentId ?? undefined, dependsOn = step.dependsOn ?? undefined;
+    if ((agentId !== undefined && (typeof agentId !== "string" || !/^[a-zA-Z0-9_-]{1,166}$/.test(agentId))) || !validDependencies(dependsOn)) throw new Error("Invalid recovery delegation");
+    return { instruction: step.instruction, doneWhen: step.doneWhen, ...(agentId ? { agentId } : {}), ...(dependsOn?.length ? { dependsOn: [...dependsOn] } : {}) };
+  }) };
 }
 
 export interface WorkNotice {
@@ -58,11 +63,13 @@ export function workEventId(kind: "notice" | "recovery", values: unknown[]): str
 
 const bounded = (value: unknown, max: number): value is string => typeof value === "string" && value.length > 0 && value.length <= max;
 const fields = (value: object, allowed: string[]) => Object.keys(value).every(key => allowed.includes(key));
+const validDependencies = (value: unknown): value is string[] | undefined => value === undefined || Array.isArray(value) && value.length <= 200
+  && value.every(id => typeof id === "string" && /^work_[a-f0-9-]{36}$/i.test(id)) && new Set(value).size === value.length;
 function parseRecovery(value: unknown): WorkRecovery {
   if (!value || typeof value !== "object") throw new Error("Invalid work recovery");
   const record = structuredClone(value) as Partial<WorkRecovery>;
   const prepared = record.prepared;
-  if (record.version !== 1 || record.kind !== "recovery" || !/^recovery_[a-f0-9]{64}$/.test(record.id ?? "")
+  if (![1, 2].includes(record.version ?? 0) || record.kind !== "recovery" || !/^recovery_[a-f0-9]{64}$/.test(record.id ?? "")
     || !/^work_[a-f0-9-]{36}$/i.test(record.workItemId ?? "") || !isSpaceId(record.space ?? "")
     || !/^input_[a-f0-9]{64}$/.test(record.sourceInputId ?? "") || !/^[a-f0-9]{64}$/.test(record.factKey ?? "")
     || !bounded(record.actionId, 200) || !bounded(record.runId, 200)
@@ -91,15 +98,21 @@ function parseRecovery(value: unknown): WorkRecovery {
     || typeof record.createdAt !== "number" || !Number.isFinite(record.createdAt)) throw new Error("Invalid work recovery");
   if (!fields(record, ["version", "kind", "id", "workItemId", "space", "sourceInputId", "actionId", "attempt", "runId", "factKey",
     "report", "rejection", "prepared", "planner", "status", "decision", "createdAt"])
-    || !fields(prepared, ["workItemId", "space", "fingerprint", "source", "current", "goal", "remaining", "accepted", "blocked"])
+    || !fields(prepared, ["workItemId", "space", "fingerprint", "source", "current", "goal", "remaining", "accepted", "blocked", ...(record.version === 2 ? ["children"] : [])])
     || !fields(prepared.source, ["kind", "id", "actionId"]) || !fields(prepared.current!, ["revision", "digest"])
     || !fields(record.planner, ["execution", "agentId", "instruction", "timeoutMs", "maxTokens"])
-    || prepared.remaining.some(step => !fields(step, ["id", "instruction", "doneWhen", "legacy"]) || (step.legacy !== undefined && step.legacy !== true)
+    || prepared.remaining.some(step => !fields(step, ["id", "instruction", "doneWhen", "legacy", ...(record.version === 2 ? ["worker", "dependsOn"] : [])]) || (step.legacy !== undefined && step.legacy !== true)
+      || !validDependencies(step.dependsOn) || (step.worker !== undefined && (!step.worker || !fields(step.worker, ["agentId", "revisionId"])
+        || !bounded(step.worker.agentId, 166) || !bounded(step.worker.revisionId, 200)))
       || (!step.legacy && step.instruction.length + step.doneWhen!.length > 1_900))
     || new Set(prepared.remaining.map(step => step.id)).size !== prepared.remaining.length
     || prepared.accepted.some(action => !fields(action, ["actionId", "instruction", "result"]))
     || new Set(prepared.accepted.map(action => action.actionId)).size !== prepared.accepted.length
     || (prepared.blocked && !fields(prepared.blocked, ["actionId", "report", "rejection"]))) throw new Error("Invalid work recovery fields");
+  if (prepared.children !== undefined && (!Array.isArray(prepared.children) || prepared.children.length > 200
+    || prepared.children.some(child => !child || !fields(child, ["key", "workItemId", "title", "phase"])
+      || !bounded(child.key, 100) || !bounded(child.title, 200) || !/^work_[a-f0-9-]{36}$/i.test(child.workItemId)
+      || !["planned", "active", "blocked", "completed"].includes(child.phase)))) throw new Error("Invalid recovery children");
   // Store normalized report DTOs, never unknown provider fields.
   record.report = parseWorkActionProviderReport(JSON.stringify(record.report))!;
   if (prepared.blocked) prepared.blocked = { ...prepared.blocked, report: parseWorkActionProviderReport(JSON.stringify(prepared.blocked.report))! };

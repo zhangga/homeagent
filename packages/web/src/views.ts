@@ -1308,7 +1308,7 @@ export function workItemsView(
     <a class="item ${selected?.id === item.id ? "active" : ""}"
       href="/work/${encodeURIComponent(item.id)}">
       <div class="name">${item.active ? html`<span class="dot"></span>` : ""}${item.title}</div>
-      <div class="sub">${WORK_PHASE_LABELS[item.phase]} · ${item.space}</div>
+      <div class="sub">${item.parentWorkItemId ? "子事项 · " : ""}${WORK_PHASE_LABELS[item.phase]} · ${item.space}</div>
     </a>`);
   const newActive = selected ? "" : "active";
   const formAction = selected ? `/work/${encodeURIComponent(selected.id)}` : "/work";
@@ -1377,6 +1377,7 @@ export function workItemsView(
     && selected.blockers.length === 0
     && selected.nextActions.length > 0
     && !activeAction
+    && coordination?.plan?.dependenciesReady !== false
     && !retryAction;
   const controls = selected
     ? html`<section class="card work-continuation">
@@ -1475,13 +1476,22 @@ export function workItemsView(
         ${controls}
         ${coordination?.plan ? html`<section class="card"><h2>计划版本 ${coordination.plan.current.revision}</h2>
           <p>${coordination.plan.current.reason} · 剩余 ${coordination.plan.remaining.length} 步 · 已验收 ${selected?.completedActionIds?.length ?? 0} 步</p>
+          ${coordination.plan.parent ? html`<p>父目标：<a href="/work/${encodeURIComponent(coordination.plan.parent.id)}">${coordination.plan.parent.title}</a></p>` : ""}
+          ${coordination.plan.children.length ? html`<h3>独立子事项</h3><ul>${coordination.plan.children.map(child => html`<li>
+            <a href="/work/${encodeURIComponent(child.workItemId)}">${child.title}</a> · ${child.accepted ? "已验收" : child.actionStatus ? actionStatus[child.actionStatus] : child.item ? WORK_PHASE_LABELS[child.item.phase] : "等待创建"}
+            ${child.item?.summary ? html`<p class="muted">${child.item.summary}</p>` : ""}</li>`)}</ul><p class="muted">独立子事项可以并行；依赖成果全部验收后才进行汇总。</p>` : ""}
           ${coordination.plan.recovery ? html`<p>遇阻处理：${{ queued: "等待重规划", running: "正在重规划", decided: "修订已保存，等待继续",
             applied: "剩余计划已修订", waiting: "等待补充资料", failed: "重规划中断，请补充要求或手动重试", obsolete: "已被新要求替代" }[coordination.plan.recovery.status]}</p>
             ${coordination.plan.recovery.decision?.kind === "wait" ? html`<p>${coordination.plan.recovery.decision.question}</p>` : ""}` : ""}
           ${coordination.plan.notices.filter(notice => notice.kind === "completion").map(notice => html`<p>完成通知：${{
             watching: "等待最终验收", pending: "等待发送", sent: "已发送到原话题", failed: "发送未完成，将自动重试", cancelled: "已被新计划替代",
           }[notice.status]}</p>`)}
-          <ol>${coordination.plan.remaining.map(step => html`<li>${step.instruction}${step.doneWhen ? html`<p class="muted">完成标准：${step.doneWhen}</p>` : ""}</li>`)}</ol>
+          <ol>${coordination.plan.remaining.map(step => html`<li>${step.instruction}${step.doneWhen ? html`<p class="muted">完成标准：${step.doneWhen}</p>` : ""}
+            ${step.worker ? html`<p>执行 Agent：${coordination.plan!.current.workers?.find(worker => worker.revision.id === step.worker!.revisionId)?.agent.name} · 版本 ${coordination.plan!.current.workers?.find(worker => worker.revision.id === step.worker!.revisionId)?.revision.number}</p>` : ""}
+            ${step.dependsOn?.length ? html`<p>依赖：${step.dependsOn.map(id => {
+              const dependency = coordination.plan!.dependencies.find(entry => entry.id === id);
+              return html`<a href="/work/${encodeURIComponent(id)}">${dependency?.title ?? id}（${dependency?.accepted ? "已验收" : "等待验收"}）</a> `;
+            })}</p>` : ""}</li>`)}</ol>
           <details><summary>最近的计划修订</summary>${coordination.plan.history.map(plan => html`<p>版本 ${plan.revision} · ${plan.reason} · ${plan.steps.length} 步</p>`)}</details>
         </section>` : ""}
         <section class="card work-editor">

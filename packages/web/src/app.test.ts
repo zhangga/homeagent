@@ -2580,7 +2580,7 @@ describe("management backend (read-write)", () => {
     expect(JSON.parse(archiveText)).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 23,
+        version: 24,
         sourceFiles: [],
         agentKnowledgeFeedback: [],
         agentRevisions: [],
@@ -5338,6 +5338,20 @@ describe("management backend (read-write)", () => {
     const html = await (await app.request(`/work/${item.id}`)).text();
     expect(html).toContain("计划版本 2");
     expect(html).toContain("人工修订");
+  });
+
+  test("work plan shows professional workers, child goals and pending dependencies", async () => {
+    const worker = engine.agents.create({ name: "研究专员", visibility: "Team", provider: "codex" });
+    const parent = engine.workItems.create({ space: SPACE, title: "独立研究后汇总" });
+    engine.commitWorkPlanRevision(engine.prepareWorkPlanRevision(parent.id, { kind: "manual", id: "m3-view" }), [
+      { instruction: "汇总", doneWhen: "引用子事项成果", dependsOn: ["a"] },
+    ], { children: [{ key: "a", title: "研究A", goal: "完成调研", steps: [{ instruction: "调研A", doneWhen: "注明来源", agentId: worker.id }] }] });
+    const child = engine.getWorkPlanView(parent.id)!.children[0]!;
+    const parentHtml = await (await app.request(`/work/${parent.id}`)).text();
+    expect(parentHtml).toContain("独立子事项"); expect(parentHtml).toContain("等待验收"); expect(parentHtml).toContain(`/work/${child.workItemId}`);
+    expect(parentHtml).not.toContain(`action="/work/${parent.id}/continue"`);
+    const childHtml = await (await app.request(`/work/${child.workItemId}`)).text();
+    expect(childHtml).toContain("父目标"); expect(childHtml).toContain("研究专员"); expect(childHtml).toContain("执行 Agent");
   });
 
   test("work context: focus selection does not pause another item and pending inputs remain visible", async () => {

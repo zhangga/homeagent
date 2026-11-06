@@ -8,6 +8,18 @@ const itemId = "work_00000000-0000-0000-0000-000000000001";
 const sourceId = `input_${"0".repeat(64)}`;
 const notice: WorkNotice = { version: 1, id: workEventId("notice", [itemId, 1, "completion"]), workItemId: itemId,
   space: "team/test", sourceInputId: sourceId, kind: "completion", status: "pending", markdown: "全部完成", attempts: 0, createdAt: 1 };
+
+test("recovery decisions normalize Codex optional nulls without accepting malformed delegation", () => {
+  const step = { instruction: "使用备用数据", doneWhen: "总数正确" };
+  expect(parseWorkRecoveryDecision({ kind: "plan", reason: "原文件缺失", question: null,
+    steps: [{ ...step, agentId: null, dependsOn: null }, { ...step, agentId: "agent_writer", dependsOn: [itemId] }] })).toEqual({
+    kind: "plan", reason: "原文件缺失", steps: [step, { ...step, agentId: "agent_writer", dependsOn: [itemId] }],
+  });
+  for (const invalid of [{ ...step, agentId: 123 }, { ...step, dependsOn: [null] }]) {
+    expect(() => parseWorkRecoveryDecision({ kind: "plan", reason: "重新规划", steps: [invalid] })).toThrow();
+  }
+});
+
 function recovery(): WorkRecovery {
   const id = workEventId("recovery", [itemId, "action_test", 1]);
   return { version: 1, kind: "recovery", id, workItemId: itemId, space: "team/test", sourceInputId: sourceId,
@@ -65,7 +77,7 @@ test("work event parsers reject oversized data, invalid provenance, and unknown 
     store.saveRecovery(input);
     const path = join(root, "config", "work-events", `${input.id}.json`);
     const invalid: unknown[] = [
-      { ...input, version: 2 }, { ...input, space: "bad space" }, { ...input, actionId: "x".repeat(201) },
+      { ...input, version: 3 }, { ...input, space: "bad space" }, { ...input, actionId: "x".repeat(201) },
       { ...input, attempt: 0 }, { ...input, sourceInputId: "../escape" }, { ...input, factKey: "bad" },
       { ...input, rejection: "x".repeat(2001) }, { ...input, extra: "unbounded" },
       { ...input, prepared: { ...input.prepared, remaining: Array(201).fill(input.prepared.remaining[0]) } },

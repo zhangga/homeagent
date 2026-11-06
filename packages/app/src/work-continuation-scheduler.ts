@@ -104,9 +104,12 @@ export class WorkContinuationScheduler {
 
   /** A newly delivered plan need not wait for another item's long-running tick. */
   async wake(workItemId: string): Promise<void> {
-    if (this.stopping || this.inFlight.has(workItemId) || !this.engine.listDueWorkContinuations().some(item => item.id === workItemId)) return;
-    const { completion } = this.submit(workItemId);
-    try { await completion; } finally { this.inFlight.delete(workItemId); }
+    if (this.stopping) return;
+    const due = this.engine.listDueWorkContinuations().filter(item => (item.id === workItemId || item.parentWorkItemId === workItemId) && !this.inFlight.has(item.id));
+    await Promise.all(due.map(async item => {
+      const { completion } = this.submit(item.id);
+      try { await completion; } finally { this.inFlight.delete(item.id); }
+    }));
   }
 
   async tick(reason: string): Promise<string[]> {

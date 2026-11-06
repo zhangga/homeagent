@@ -5,7 +5,7 @@ import type { OutboundReply } from "@homeagent/connectors";
 export function chatWorkNotification(engine: KnowledgeEngine, run: TaskRun): OutboundReply | undefined {
   if (!run.workItemId || !run.workActionId) return undefined;
   const item = engine.workItems.get(run.workItemId);
-  if (!item?.chatPlanRunId) return undefined;
+  if (!item || (!item.chatPlanRunId && !item.parentWorkItemId)) return undefined;
   const source = engine.chatWorkPlanSource(item.id)?.message;
   if (!source) return undefined;
   const action = engine.workContinuations.get(run.workActionId);
@@ -23,10 +23,10 @@ export function chatWorkNotification(engine: KnowledgeEngine, run: TaskRun): Out
     inThread: source.chatType === "group" && engine.feishuBindings.activeByChatId(source.chatId)?.replyInThread === true,
     idempotencyKey: `ha-done-${run.id}`,
     markdown: [
-      `工作计划「${item.title}」${status}`, "", action.instruction, "", report?.result ?? run.summary ?? "",
+      `${item.parentWorkItemId ? "子事项" : "工作计划"}「${item.title}」${status}`, "", action.instruction, "", report?.result ?? run.summary ?? "",
       ...(action.status === "blocked" ? ["", `阻塞：${action.error ?? "请查看工作台详情"}`] : []),
       "", action.status === "awaiting_acceptance" ? "请在工作台验收本步成果，通过后继续下一步。"
-        : item.phase === "completed" ? completionTracked ? "本步已通过验收，完成通知将回复本话题。" : "全部步骤已验收，事项已完成。"
+        : item.phase === "completed" ? item.parentWorkItemId ? "子事项已验收，父目标将等待其他依赖后继续。" : completionTracked ? "本步已通过验收，完成通知将回复本话题。" : "全部步骤已验收，事项已完成。"
         : `剩余 ${item.nextActions.length} 步，可在工作台查看进展。`,
     ].join("\n"),
   };

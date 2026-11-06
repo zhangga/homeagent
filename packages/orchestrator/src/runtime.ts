@@ -575,6 +575,13 @@ export class Orchestrator {
     const route = ordinary || !addressed ? { operation: "chat" as const }
       : routeWork(m, this.engine.workItems.list(input.space), this.engine.chatRuns.list(input.space), this.engine.workDispatch.summaries(input.space));
     let workItemId = route.workItemId;
+    if (route.operation === "followup" && workItemId && isWorkReplanningCandidate(m.text, true)) {
+      const children = this.engine.workItems.list(input.space).filter(item => item.parentWorkItemId === workItemId);
+      const waitingChildren = children.filter(item => this.engine.workAwaitsRecoveryInput(item.id));
+      const named = children.filter(item => m.text.includes(item.title));
+      const target = named.length === 1 ? named[0] : waitingChildren.length === 1 ? waitingChildren[0] : undefined;
+      if (target) workItemId = target.id;
+    }
     if (route.operation === "chat") {
       const current = this.engine.workItems.currentForSpace(input.space);
       if (current?.active) workItemId = current.id;
@@ -701,7 +708,7 @@ export class Orchestrator {
     if (!item || input.operation === "status" || input.operation === "clarify") {
       const page = Math.max(0, Number(input.message.text.match(/第(\d+)页/u)?.[1] ?? 1) - 1);
       const allItems = this.engine.workItems.list(input.space);
-      const items = item ? [item] : allItems.slice(page * 100, page * 100 + 100);
+      const items = item ? [item, ...allItems.filter(child => child.parentWorkItemId === item.id)] : allItems.slice(page * 100, page * 100 + 100);
       const current = this.engine.workDispatch.get(input.id)!;
       this.engine.workDispatch.update(input.id, current.revision, { presentedItemIds: items.map(candidate => candidate.id) });
       const lines = items.map((candidate, index) => {
@@ -743,6 +750,7 @@ export class Orchestrator {
     const wasRunning = ownedRuns.some(run => ["queued", "running"].includes(run.status))
       || taskRuns.some(run => ["queued", "running", "awaiting_approval"].includes(run.status));
     if (input.operation === "cancel") {
+      this.engine.cancelWorkChildren(item.id);
       for (const pending of this.engine.workDispatch.summaries(input.space)) {
         if (pending.id !== input.id && pending.workItemId === item.id && !["settled", "interrupted", "cancelled"].includes(pending.state)) {
           this.engine.workDispatch.update(pending.id, pending.revision, { state: "cancelled" });
@@ -1556,6 +1564,7 @@ export class Orchestrator {
           timeoutMs: run.timeoutMs ?? AI_OPERATION_TIMEOUT_MS,
         }, signal), { ...response, model: run.model, space, agentInstruction: run.executionPlan.instruction,
           workItem: { id: previous.id, title: previous.title },
+          availableAgents: this.engine.listWorkAgents(space).filter(agent => agent.id !== run.agentId),
           ...(response.kind === "work-replan" ? { revisionContext: prepared } : {}) }, signal);
         if (plan.kind === "answer") return this.answer(msg, attribute(msg).readSpaces, space, runId, response.question, signal);
         signal.throwIfAborted();
@@ -1564,6 +1573,7 @@ export class Orchestrator {
           || !this.inputBindingCurrent(input)) throw new ChatRunCancelledError();
         try {
           item = this.engine.commitWorkPlanRevision(prepared, plan.steps, {
+            children: plan.children,
             goal: response.kind === "work-replan" ? `${prepared.goal}\n补充要求：${response.question}` : prepared.goal,
             reason: response.kind === "work-replan" ? response.question.slice(0, 2_000) : undefined,
             reactivate: previous.phase === "completed" && !this.engine.workDispatch.summaries(space).some(later =>
@@ -1584,9 +1594,12 @@ export class Orchestrator {
       || !this.inputBindingCurrent(input)) throw new ChatRunCancelledError();
     const requiresApproval = ["write", "full"].includes(run.executionPlan.execution?.permission ?? "");
     const preview = item.nextActions.slice(0, 10).join("\n\n");
+    const coordination = this.engine.getWorkPlanView(item.id);
     await this.completeChatRunAndSend(msg, runId, [
       response.kind === "work-replan" ? `已修订剩余工作计划（版本 ${item.planRef?.revision}，共 ${item.nextActions.length} 步）：${item.title}\n已验收成果保留。`
         : `已生成工作计划（共 ${item.nextActions.length} 步）：${item.title}`, "", preview,
+      ...(coordination?.children.length ? ["", "独立子事项（可并行，依赖验收后汇总）：", ...coordination.children.map(child => `- ${child.title}`)] : []),
+      ...(coordination?.current.workers?.length ? ["", `专业 Agent：${coordination.current.workers.map(worker => worker.agent.name).join("、")}`] : []),
       ...(item.nextActions.length > 10 ? ["", "以上展示前 10 步，完整计划已保存到工作台。"] : []), "",
       !item.active ? "计划已保存，事项处于暂停状态，恢复后继续。"
         : requiresApproval ? "已接入续作。按当前 Agent 配置，每步执行前需要审批，执行后需要验收；完成后继续下一步。"

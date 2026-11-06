@@ -29,3 +29,28 @@ test("the planner must supply bounded executable steps with verifiable completio
   expect(parseChatWorkPlan({ kind: "answer", steps: [] })).toEqual({ kind: "answer", steps: [] });
   expect(parseChatWorkPlan({ kind: "plan", steps: Array.from({ length: 200 }, () => ({ instruction: "检查", doneWhen: "完成" })) }).steps).toHaveLength(200);
 });
+
+test("parallel plan parsing bounds the whole graph and keeps delegation and dependency references", () => {
+  const step = { instruction: "调研", doneWhen: "注明来源", agentId: "agent_worker" };
+  const child = { key: "a", title: "调研A", goal: "有来源的研究", steps: [step] };
+  const plan = { kind: "plan" as const, steps: [{ instruction: "汇总", doneWhen: "引用A", dependsOn: ["a"] }], children: [child] };
+  expect(parseChatWorkPlan(plan)).toEqual(plan);
+  for (const invalid of [ { ...plan, children: [child, child] }, { ...plan, children: [{ ...child, children: [] }] },
+    { ...plan, children: [{ ...child, key: "x".repeat(101) }] }, { ...plan, children: [{ ...child, title: "x".repeat(201) }] },
+    { ...plan, children: [{ ...child, goal: "x".repeat(200_001) }] }, { ...plan, children: [{ ...child, steps: Array(200).fill(step) }] },
+    { ...plan, steps: [{ ...step, dependsOn: Array(201).fill("a") }] }, { ...plan, steps: [{ ...step, agentId: "../invalid" }] },
+  ]) expect(() => parseChatWorkPlan(invalid)).toThrow();
+});
+
+test("Codex nullable optional fields preserve default workers and independent child steps", () => {
+  const base = { instruction: "核算", doneWhen: "总数正确" };
+  const nullable = { ...base, agentId: null, dependsOn: null };
+  expect(parseChatWorkPlan({ kind: "plan", steps: [nullable], children: null })).toEqual({ kind: "plan", steps: [base] });
+  expect(parseChatWorkPlan({ kind: "plan", steps: [{ ...nullable, agentId: "agent_writer", dependsOn: ["a"] }],
+    children: [{ key: "a", title: "核算A", goal: "核对数据", steps: [nullable] }] })).toEqual({ kind: "plan",
+    steps: [{ ...base, agentId: "agent_writer", dependsOn: ["a"] }],
+    children: [{ key: "a", title: "核算A", goal: "核对数据", steps: [base] }] });
+  for (const step of [{ ...nullable, agentId: false }, { ...nullable, dependsOn: [null] }]) {
+    expect(() => parseChatWorkPlan({ kind: "plan", steps: [step], children: null })).toThrow();
+  }
+});

@@ -139,7 +139,8 @@ export const CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION = 20 as const;
 export const MULTITASK_SPACE_ARCHIVE_VERSION = 21 as const;
 export const WORK_PLAN_SPACE_ARCHIVE_VERSION = 22 as const;
 export const WORK_RECOVERY_SPACE_ARCHIVE_VERSION = 23 as const;
-export const SPACE_ARCHIVE_VERSION = WORK_RECOVERY_SPACE_ARCHIVE_VERSION;
+export const WORK_DELEGATION_SPACE_ARCHIVE_VERSION = 24 as const;
+export const SPACE_ARCHIVE_VERSION = WORK_DELEGATION_SPACE_ARCHIVE_VERSION;
 
 export interface RawSourceFileArchive {
   digest: string;
@@ -271,7 +272,10 @@ export interface SpaceArchiveV22 extends Omit<SpaceArchiveV21, "version"> {
 export interface SpaceArchiveV23 extends Omit<SpaceArchiveV22, "version"> {
   version: typeof WORK_RECOVERY_SPACE_ARCHIVE_VERSION;
 }
-export type SpaceArchive = SpaceArchiveV23;
+export interface SpaceArchiveV24 extends Omit<SpaceArchiveV23, "version"> {
+  version: typeof WORK_DELEGATION_SPACE_ARCHIVE_VERSION;
+}
+export type SpaceArchive = SpaceArchiveV24;
 
 export interface SpaceDeleteResult {
   status: "deleted" | "not_found";
@@ -1280,7 +1284,7 @@ function parseWorkItem(value: unknown, index: number, space: SpaceId): WorkItem 
   if (value.space !== space) {
     throw new Error(`workItems[${index}].space does not match archive space`);
   }
-  const { planDelivery: _localDelivery, ...portable } = value;
+  const { planDelivery: _localDelivery, childCancellation: _localCancellation, ...portable } = value;
   return {
     ...portable,
     ...(value.planRef ? { planRef: { ...value.planRef }, nextStepIds: [...value.nextStepIds!] } : {}),
@@ -2020,6 +2024,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       && version !== MULTITASK_SPACE_ARCHIVE_VERSION
       && version !== WORK_PLAN_SPACE_ARCHIVE_VERSION
       && version !== WORK_RECOVERY_SPACE_ARCHIVE_VERSION
+      && version !== WORK_DELEGATION_SPACE_ARCHIVE_VERSION
     )
   ) {
     throw new Error("unsupported space archive format or version");
@@ -2220,10 +2225,12 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
   const workPlans = version >= WORK_PLAN_SPACE_ARCHIVE_VERSION ? (root.workPlans as unknown[]).map(parseWorkPlanRevision) : [];
   for (const plan of workPlans) {
     if (version < WORK_RECOVERY_SPACE_ARCHIVE_VERSION && plan.version !== 1) throw new Error("work recovery requires archive v23");
+    if (version < WORK_DELEGATION_SPACE_ARCHIVE_VERSION && plan.version === 3) throw new Error("work delegation requires archive v24");
     const source = plan.source.kind === "chat" ? chatRuns.find(run => run.id === plan.source.id) : undefined;
     if (source && (source.workItemId !== plan.workItemId || source.space !== plan.space)) throw new Error("work plan revision source is invalid");
   }
   assertWorkPlanArchive(workPlans, workItems, workActions);
+  if (version < WORK_DELEGATION_SPACE_ARCHIVE_VERSION && workItems.some(item => item.parentWorkItemId)) throw new Error("work delegation requires archive v24");
   const workContinuationPolicies = version < WORK_CONTEXT_SPACE_ARCHIVE_VERSION
     ? []
     : ((root.workContinuationPolicies ?? []) as unknown[]).map((item, index) =>

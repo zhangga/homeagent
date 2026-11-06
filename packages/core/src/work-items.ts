@@ -23,7 +23,7 @@ import {
   type SpaceId,
 } from "@homeagent/shared";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
-import { WorkPlanStore, formatWorkPlanStep, isWorkPlanRef, type WorkPlanRef, type WorkPlanRevision, type WorkPlanStepRef } from "./work-plans.ts";
+import { WorkPlanStore, assertWorkPlanDependencies, formatWorkPlanStep, isWorkPlanRef, type WorkPlanRef, type WorkPlanRevision, type WorkPlanStepRef } from "./work-plans.ts";
 
 export type WorkItemPhase = "planned" | "active" | "blocked" | "completed";
 
@@ -42,6 +42,8 @@ export interface WorkItem {
   pageSlugs: string[];
   chatRunIds: string[];
   taskRunIds: string[];
+  parentWorkItemId?: string;
+  childCancellation?: { childIds: string[]; at: number; status: "pending" | "applied" };
   /** Provenance of a chat-generated plan; local delivery gates automatic execution. */
   chatPlanRunId?: string;
   planRef?: WorkPlanRef;
@@ -85,7 +87,7 @@ export interface WorkPageReference {
 }
 
 interface WorkItemsFile {
-  version: 1 | 2 | 3;
+  version: 1 | 2 | 3 | 4;
   items: Record<string, WorkItem>;
   currentBySpace?: Record<string, string>;
 }
@@ -139,6 +141,11 @@ export function isWorkItem(value: unknown): value is WorkItem {
     && stringList(item.pageSlugs, MAX_REFERENCES)
     && stringList(item.chatRunIds, MAX_REFERENCES)
     && stringList(item.taskRunIds, MAX_REFERENCES)
+    && (item.parentWorkItemId === undefined || (WORK_ITEM_ID_RE.test(item.parentWorkItemId) && item.parentWorkItemId !== item.id))
+    && (item.childCancellation === undefined || (!!item.childCancellation && stringList(item.childCancellation.childIds)
+      && item.childCancellation.childIds.every(id => WORK_ITEM_ID_RE.test(id) && id !== item.id)
+      && new Set(item.childCancellation.childIds).size === item.childCancellation.childIds.length
+      && finite(item.childCancellation.at) && ["pending", "applied"].includes(item.childCancellation.status)))
     && (item.planRef === undefined ? item.nextStepIds === undefined && item.planDelivery === undefined
       : isWorkPlanRef(item.planRef) && stringList(item.nextStepIds) && item.nextStepIds.length === item.nextActions.length
         && new Set(item.nextStepIds).size === item.nextStepIds.length
@@ -152,6 +159,20 @@ export function isWorkItem(value: unknown): value is WorkItem {
     && (item.actionBlockers === undefined || stringRecord(item.actionBlockers))
     && finite(item.createdAt)
     && finite(item.updatedAt);
+}
+
+export function assertWorkItemRelations(items: WorkItem[]): void {
+  const byId = new Map(items.map(item => [item.id, item]));
+  for (const item of items) {
+    const visited = new Set([item.id]);
+    let cursor = item;
+    while (cursor.parentWorkItemId) {
+      const parent = byId.get(cursor.parentWorkItemId);
+      if (!parent || parent.space !== item.space || visited.has(parent.id)) throw new Error("Invalid work item parent");
+      visited.add(parent.id); cursor = parent;
+    }
+    if (item.childCancellation?.childIds.some(id => byId.get(id)?.parentWorkItemId !== item.id)) throw new Error("Invalid child cancellation owner");
+  }
 }
 
 function trimText(value: string | undefined, max = MAX_TEXT_LENGTH): string {
@@ -182,6 +203,7 @@ function clone(item: WorkItem): WorkItem {
     ...item,
     ...(item.planRef ? { planRef: { ...item.planRef }, nextStepIds: [...item.nextStepIds!] } : {}),
     ...(item.planDelivery ? { planDelivery: { ...item.planDelivery } } : {}),
+    ...(item.childCancellation ? { childCancellation: structuredClone(item.childCancellation) } : {}),
     blockers: [...item.blockers],
     nextActions: [...item.nextActions],
     rawIds: [...item.rawIds],
@@ -242,10 +264,11 @@ export class WorkItemStore {
     if (!existsSync(this.configPath)) return items;
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<WorkItemsFile>;
-      if (parsed.version !== 1 && parsed.version !== 2 && parsed.version !== 3) throw new Error("Unsupported WorkItem version");
+      if (![1, 2, 3, 4].includes(parsed.version ?? 0)) throw new Error("Unsupported WorkItem version");
       if (!parsed.items || typeof parsed.items !== "object" || Array.isArray(parsed.items)) throw new Error("Invalid WorkItem collection");
       for (const [id, item] of Object.entries(parsed.items)) {
         if (!isWorkItem(item) || item.id !== id) throw new Error("Invalid WorkItem");
+        if (parsed.version !== 4 && (item.parentWorkItemId || item.childCancellation)) throw new Error("Work relations require v4");
         this.assertPlanProjection(item);
         items.set(id, clone(item));
         if (parsed.version === 1 && item.active) {
@@ -253,7 +276,9 @@ export class WorkItemStore {
           this.currentBySpace.set(item.space, id);
         }
       }
-      if (parsed.version === 2 || parsed.version === 3) {
+      assertWorkItemRelations([...items.values()]);
+      this.assertDependencies(items);
+      if (parsed.version !== 1) {
         if (!parsed.currentBySpace || typeof parsed.currentBySpace !== "object" || Array.isArray(parsed.currentBySpace)) throw new Error("Invalid WorkItem selection");
         for (const [space, id] of Object.entries(parsed.currentBySpace)) {
           if (!isSpaceId(space) || items.get(id)?.space !== space) throw new Error("Invalid WorkItem selection");
@@ -268,7 +293,7 @@ export class WorkItemStore {
 
   private persist(items: Map<string, WorkItem>, currentBySpace: Map<SpaceId, string>): void {
     const file: WorkItemsFile = {
-      version: 3,
+      version: 4,
       currentBySpace: Object.fromEntries(currentBySpace),
       items: Object.fromEntries([...items].map(([id, item]) => [id, clone(item)])),
     };
@@ -319,7 +344,9 @@ export class WorkItemStore {
     const candidate = new Map([...this.items].map(([id, item]) => [id, clone(item)]));
     const current = new Map(this.currentBySpace);
     const result = change(candidate, current);
+    assertWorkItemRelations([...candidate.values()]);
     const changed = [...candidate.values()].filter(item => JSON.stringify(item) !== JSON.stringify(this.items.get(item.id)));
+    if (candidate.size !== this.items.size || changed.some(item => JSON.stringify(item.planRef) !== JSON.stringify(this.items.get(item.id)?.planRef))) this.assertDependencies(candidate);
     for (const item of changed) {
       if (!isWorkItem(item)) throw new Error("Invalid work item state");
       this.assertPlanProjection(item);
@@ -359,6 +386,10 @@ export class WorkItemStore {
       || item.runbook !== (plan.runbook ?? plan.steps.map(formatWorkPlanStep).join("\n\n"))) throw new Error("Work plan projection mismatch");
   }
 
+  private assertDependencies(items: Map<string, WorkItem>): void {
+    assertWorkPlanDependencies([...items.values()].flatMap(item => item.planRef ? [this.plans.get(item.id, item.planRef)] : []), [...items.values()]);
+  }
+
   commitPlan(id: string, plan: WorkPlanRevision, opts: { deliveryRunId?: string; retryOf?: string; reactivate?: boolean; context?: WorkItemUpdate; supersededActionIds?: string[] } = {}): WorkItem {
     const current = this.get(id);
     if (!current || plan.workItemId !== id || plan.space !== current.space
@@ -389,9 +420,53 @@ export class WorkItemStore {
         item.active = opts.reactivate === true;
       }
       item.updatedAt = Date.now();
+      this.addPlannedChildren(candidate, item, plan);
       if (!isWorkItem(item)) throw new Error("Invalid revised work item");
       return clone(item);
     });
+  }
+
+  /** Validate the whole graph before cancelling any superseded Task Run. */
+  validatePlanRelations(id: string, plan: WorkPlanRevision): void {
+    const candidate = new Map(this.list().map(item => [item.id, item]));
+    const item = candidate.get(id);
+    if (!item || plan.workItemId !== id || plan.space !== item.space) throw new Error("Invalid work plan owner");
+    item.planRef = this.plans.save(plan);
+    this.addPlannedChildren(candidate, item, plan);
+    assertWorkItemRelations([...candidate.values()]);
+    this.assertDependencies(candidate);
+  }
+
+  private addPlannedChildren(candidate: Map<string, WorkItem>, item: WorkItem, plan: WorkPlanRevision): void {
+    for (const child of plan.children ?? []) {
+        const existing = candidate.get(child.workItemId);
+        if (existing) {
+          if (existing.parentWorkItemId !== item.id || existing.space !== item.space) throw new Error("Work child ownership mismatch");
+          continue;
+        }
+        const childPlan = this.plans.get(child.workItemId, child.planRef);
+        if (childPlan.space !== item.space || childPlan.previous) throw new Error("Invalid initial child plan");
+        candidate.set(child.workItemId, { id: child.workItemId, space: item.space, parentWorkItemId: item.id,
+          title: child.title, brief: childPlan.goal, phase: "active", active: true, summary: "", blockers: [],
+          planRef: child.planRef, nextStepIds: childPlan.steps.map(step => step.id), nextActions: childPlan.steps.map(formatWorkPlanStep),
+          runbook: childPlan.steps.map(formatWorkPlanStep).join("\n\n"), rawIds: [], pageSlugs: [], chatRunIds: [], taskRunIds: [],
+          completedActionIds: [], actionBlockers: {}, createdAt: item.updatedAt, updatedAt: item.updatedAt });
+    }
+  }
+
+  recordChildCancellation(id: string): WorkItem {
+    return this.commit(candidate => {
+      const item = candidate.get(id);
+      if (!item) throw new Error("Unknown work item");
+      item.active = false;
+      item.childCancellation = { childIds: [...candidate.values()].filter(child => child.parentWorkItemId === id
+        && child.space === item.space && child.phase !== "completed").map(child => child.id), at: Date.now(), status: "pending" };
+      return clone(item);
+    });
+  }
+
+  finishChildCancellation(id: string): void {
+    this.commit(candidate => { const item = candidate.get(id); if (item?.childCancellation) item.childCancellation.status = "applied"; });
   }
 
   setPlanDelivery(id: string, runId: string, status: "pending" | "sent", retryOf?: string): void {

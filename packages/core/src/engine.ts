@@ -24,7 +24,7 @@ import { lstatSync, realpathSync, statSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { WorkDispatchStore, type WorkInput, type WorkRoutingPlan } from "./work-dispatch.ts";
-import { WorkPlanChangedError, formatWorkPlanStep, workPlanStepDigest, type WorkPlanPreparation, type WorkPlanRevision, type WorkPlanStep } from "./work-plans.ts";
+import { WorkPlanChangedError, formatWorkPlanStep, workPlanStepDigest, type WorkPlanPreparation, type WorkPlanRevision, type WorkPlanStep, type WorkPlanStepInput, type WorkPlanWorker, type WorkPlanChildInput } from "./work-plans.ts";
 import { WorkEventStore, workEventId, parseWorkRecoveryDecision, type WorkRecovery, type WorkRecoveryDecision } from "./work-events.ts";
 import {
   AI_GENERATION_MAX_TOKENS,
@@ -2409,7 +2409,8 @@ export class KnowledgeEngine implements Knowledge {
       action.instruction,
       action.checkpoint.summary,
       action.checkpoint.completedAt,
-      { planStep: action.planStep, deferComplete: this.hasPendingWorkInputs(action.workItemId) },
+      { planStep: action.planStep, deferComplete: this.hasPendingWorkInputs(action.workItemId)
+        || !this.workChildrenComplete(this.workItems.get(action.workItemId)!) },
     );
   }
 
@@ -2470,6 +2471,7 @@ export class KnowledgeEngine implements Knowledge {
     if (!item.active || item.phase !== "active" || item.blockers.length > 0) {
       return "work action execution boundary is no longer admissible: WorkItem is inactive or blocked";
     }
+    if (!this.workParentAllows(item) || !this.workDependenciesReady(item)) return "工作事项仍在等待父目标或依赖成果验收";
     if (!this.isCurrentWorkActionBoundary(action)) {
       return WORK_ACTION_BOUNDARY_CHANGED_ERROR;
     }
@@ -3365,8 +3367,9 @@ export class KnowledgeEngine implements Knowledge {
     // no-tools snapshots may still resolve legacy bindings as skipped evidence.
     skillScope: "all" | "bound" = taskExecution ? "all" : "bound",
     invocationKind: "chat" | "task" = "chat",
+    resolvedAgent = this.agentForSpace(space),
   ): AgentRunExecutionSnapshot {
-    const agent = this.agentForSpace(space);
+    const agent = resolvedAgent;
     const cfg = config();
     const selectedProvider = agent?.provider || cfg.defaultProvider;
     const provider = isCliProvider(selectedProvider) ? selectedProvider : undefined;
@@ -3439,8 +3442,7 @@ export class KnowledgeEngine implements Knowledge {
     };
   }
 
-  private async withAgentSkillResolution<T>(space: SpaceId, taskExecution: boolean, run: () => T | Promise<T>): Promise<T> {
-    const agent = this.agentForSpace(space);
+  private async withAgentSkillResolution<T>(space: SpaceId, taskExecution: boolean, run: () => T | Promise<T>, agent = this.agentForSpace(space)): Promise<T> {
     const selected = agent?.provider || config().defaultProvider;
     const provider: ProviderId = isCliProvider(selected) ? selected : "gateway";
     return this.skillCatalog.withResolution({ provider, ...(taskExecution ? {} : { bindings: agent?.skills ?? [] }) }, run);
@@ -5013,7 +5015,7 @@ export class KnowledgeEngine implements Knowledge {
           delivery: (({ liveReply: _localLiveReply, messageId: _localMessageId, ...portableDelivery }) => portableDelivery)(delivery),
           executionPlan: run.executionPlan ? archiveExecutionPlan(run.executionPlan) : undefined,
         })),
-        workItems: workItems.map(({ planDelivery: _localDelivery, ...item }) => item),
+        workItems: workItems.map(({ planDelivery: _localDelivery, childCancellation: _localCancellation, ...item }) => item),
         workPlans: workItems.flatMap(item => item.planRef ? this.workItems.plans.history(item.id, item.planRef) : []),
         currentWorkItemId: this.workItems.currentForSpace(space)?.id,
         workActions: workContinuation.actions,
@@ -5695,7 +5697,7 @@ export class KnowledgeEngine implements Knowledge {
         && event.status !== "obsolete")) continue;
       const id = workEventId("recovery", [item.id, item.planRef, action.id, action.attempt, factKey]);
       const execution = run.executionPlan;
-      this.workEvents.saveRecovery({ version: 1, kind: "recovery", id, workItemId: item.id, space: item.space,
+      this.workEvents.saveRecovery({ version: this.workItems.plans.get(item.id, item.planRef).version === 3 ? 2 : 1, kind: "recovery", id, workItemId: item.id, space: item.space,
         sourceInputId: source.id, actionId: action.id, attempt: action.attempt, runId: run.id, factKey, report, rejection,
         prepared: this.prepareWorkPlanRevision(item.id, { kind: "recovery", id, actionId: action.id }),
         planner: { execution: { version: 2, instruction: execution.instruction, provider: execution.provider,
@@ -5711,7 +5713,7 @@ export class KnowledgeEngine implements Knowledge {
     const source = item && this.chatWorkPlanSource(item.id);
     return !!item && item.space === event.space && item.active && item.phase !== "completed"
       && source?.id === event.sourceInputId && this.workContinuations.policyFor(item.id, item.space).autoContinue
-      && !this.hasPendingWorkInputs(item.id) && !this.workContinuations.activeForWorkItem(item.id);
+      && this.workParentAllows(item, true) && !this.hasPendingWorkInputs(item.id) && !this.workContinuations.activeForWorkItem(item.id);
   }
 
   workRecoveryCurrent(event: WorkRecovery): boolean {
@@ -5766,7 +5768,7 @@ export class KnowledgeEngine implements Knowledge {
     const plan = this.workItems.plans.get(item.id, item.planRef);
     if (plan.source.kind !== "recovery") return true;
     // Imported history carries no local event authority and follows normal manual continuation.
-    if (!item.chatPlanRunId) return true;
+    if (!this.workEvents.getRecovery(plan.source.id) && !this.chatWorkPlanSource(item.id)) return true;
     const notice = this.workEvents.get(workEventId("notice", [item.id, item.planRef, "replanned", plan.source.id]));
     return notice?.status === "sent";
   }
@@ -5797,7 +5799,13 @@ export class KnowledgeEngine implements Knowledge {
     const recovery = this.workEvents.listRecoveries(item.space).filter(event => event.workItemId === item.id).at(-1);
     const notices = this.workEvents.list(item.space).filter(notice => notice.workItemId === item.id
       && JSON.stringify(notice.planRef) === JSON.stringify(item.planRef)).map(notice => ({ kind: notice.kind, status: notice.status }));
-    return { current, remaining, actions: this.workContinuations.list(item.id), history, progressToken,
+    const parent = item.parentWorkItemId ? this.workItems.get(item.parentWorkItemId) : undefined;
+    const children = (current.children ?? []).map(child => ({ ...child, item: this.workItems.get(child.workItemId),
+      actionStatus: this.workContinuations.activeForWorkItem(child.workItemId)?.status, accepted: this.workDependencyAccepted(child.workItemId, item.space) }));
+    const dependencies = [...new Set(remaining.flatMap(step => step.dependsOn ?? []))].map(id => ({ id,
+      title: this.workItems.get(id)?.title ?? id, accepted: this.workDependencyAccepted(id, item.space) }));
+    return { current, remaining, actions: this.workContinuations.list(item.id), history, progressToken, parent, children, dependencies,
+      dependenciesReady: this.workDependenciesReady(item) && this.workParentAllows(item),
       recovery: recovery && this.workRecoveryCurrent(recovery) ? { status: recovery.status, decision: recovery.decision } : undefined, notices };
   }
 
@@ -5834,30 +5842,106 @@ export class KnowledgeEngine implements Knowledge {
       remaining: view?.remaining ?? item.nextActions.map((instruction, index) => ({
         id: `step_${createHash("sha256").update(`${item.id}:legacy:${index}:${instruction}`).digest("hex").slice(0, 32)}`,
         instruction, legacy: true as const,
-      })), accepted, ...(blockedAction && blockedReport ? { blocked: { actionId: blockedAction.id, report: blockedReport,
+      })), accepted, ...(view?.current.children?.length ? { children: view.current.children.map(child => ({ key: child.key,
+        workItemId: child.workItemId, title: child.title, phase: this.workItems.get(child.workItemId)?.phase ?? "planned" })) } : {}),
+      ...(blockedAction && blockedReport ? { blocked: { actionId: blockedAction.id, report: blockedReport,
         rejection: blockedAcceptance?.mode === "human" ? blockedAcceptance.reason : undefined } } : {}) };
   }
 
-  commitWorkPlanRevision(prepared: WorkPlanPreparation, steps: { instruction: string; doneWhen: string }[], opts: { goal?: string; reason?: string; reactivate?: boolean } = {}) {
+  listWorkAgents(space: SpaceId) {
+    const rank = { "read-only": 0, write: 1, full: 2 };
+    const permission = this.agentForSpace(space)?.permission ?? "read-only";
+    return this.agents.list().filter(agent => agent.publishedRevisionId && agentVisibleInSpace(agent, space)
+      && rank[agent.permission] <= rank[permission]
+      && (agent.executionMode !== "local-full-access" || this.localExecution.referenceFor(space, agent.id, agent.publishedRevisionId!, "task")))
+      .map(agent => ({ id: agent.id, name: agent.name, instruction: agent.instruction.slice(0, 2_000),
+        revisionId: agent.publishedRevisionId!, provider: agent.provider, model: agent.model, permission: agent.permission }));
+  }
+
+  private workStepAgent(item: WorkItem, step = this.getWorkPlanView(item.id)?.remaining[0]): Agent | undefined {
+    if (!step?.worker || !item.planRef) return this.agentForSpace(item.space);
+    const plan = this.workItems.plans.get(item.id, item.planRef);
+    const worker = plan.workers?.find(worker => worker.revision.id === step.worker!.revisionId && worker.agent.id === step.worker!.agentId);
+    if (!worker || !agentVisibleInSpace(worker.agent, item.space)) throw new Error("专业 Agent 的冻结版本不可用");
+    const localRevision = this.agents.listRevisions(worker.agent.id).find(revision => revision.id === worker.revision.id);
+    if (localRevision && JSON.stringify(localRevision) !== JSON.stringify(worker.revision)) throw new Error("专业 Agent 的冻结版本与本机记录不一致");
+    return structuredClone(worker.agent);
+  }
+
+  commitWorkPlanRevision(prepared: WorkPlanPreparation, steps: WorkPlanStepInput[], opts: { goal?: string; reason?: string; reactivate?: boolean; children?: WorkPlanChildInput[] } = {}) {
     if (JSON.stringify(prepared) !== JSON.stringify(this.prepareWorkPlanRevision(prepared.workItemId, prepared.source))) throw new WorkPlanChangedError();
     const item = this.workItems.get(prepared.workItemId)!;
     if (item.space !== prepared.space) throw new Error("Work plan boundary changed");
+    const previousPlan = item.planRef ? this.workItems.plans.get(item.id, item.planRef) : undefined;
+    const children = item.phase === "completed" ? [] : [...(previousPlan?.children ?? [])];
+    const childInputs = opts.children ?? [];
+    if (childInputs.length > 200 || new Set(childInputs.map(child => child.key)).size !== childInputs.length
+      || steps.length + childInputs.reduce((n, child) => n + child.steps.length, 0) > 200) throw new Error("Work plan is too large");
+    for (const child of childInputs) {
+      if (children.some(existing => existing.key === child.key)) continue;
+      const hex = createHash("sha256").update(`${item.id}:${prepared.source.id}:${child.key}`).digest("hex");
+      children.push({ key: child.key, title: child.title,
+        workItemId: `work_${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`,
+        planRef: { revision: 1, digest: "0".repeat(64) } });
+    }
+    const dependencies = (step: WorkPlanStepInput) => step.dependsOn?.length
+      ? step.dependsOn.map(key => children.find(child => child.key === key)?.workItemId ?? key) : undefined;
+    const freezeWorker = (agentId: string): WorkPlanWorker => {
+      if (!this.listWorkAgents(item.space).some(agent => agent.id === agentId)) throw new Error("专业 Agent 未发布或当前事项不可使用其执行配置");
+      const agent = this.agents.get(agentId)!;
+      return { agent, revision: this.agents.listRevisions(agent.id).find(revision => revision.id === agent.publishedRevisionId)! };
+    };
+    for (const child of childInputs) {
+      const descriptor = children.find(entry => entry.key === child.key)!;
+      if (previousPlan?.children?.some(entry => entry.workItemId === descriptor.workItemId)) continue;
+      const workers = [...new Set(child.steps.flatMap(step => step.agentId ? [step.agentId] : []))].map(freezeWorker);
+      const childPlan: WorkPlanRevision = { version: 3, workItemId: descriptor.workItemId, space: item.space,
+        revision: this.workItems.plans.nextRevision(descriptor.workItemId), goal: child.goal, reason: "父目标拆分独立子事项",
+        source: { kind: "manual", id: `parent:${item.id}` }, acceptedActionIds: [], createdAt: Date.now(),
+        steps: child.steps.map((step, index) => {
+          const worker = workers.find(worker => worker.agent.id === step.agentId);
+          return { id: `step_${createHash("sha256").update(`${descriptor.workItemId}:${index}`).digest("hex").slice(0, 32)}`,
+            instruction: step.instruction, doneWhen: step.doneWhen,
+            ...(worker ? { worker: { agentId: worker.agent.id, revisionId: worker.revision.id } } : {}),
+            ...(dependencies(step) ? { dependsOn: dependencies(step) } : {}) };
+        }), ...(workers.length ? { workers } : {}) };
+      if (!childPlan.steps.length) throw new Error("Child plan needs executable steps");
+      descriptor.planRef = this.workItems.plans.save(childPlan);
+    }
     const superseded = this.workContinuations.list(item.id).filter(action => action.status === "blocked"
       && action.planStep?.stepId === item.nextStepIds?.[0]);
     const unused = prepared.remaining.filter(step => !superseded.some(action => action.planStep?.stepId === step.id));
+    const workers: WorkPlanWorker[] = [];
+    const priorWorkers = previousPlan?.workers ?? [];
     const definitions: WorkPlanStep[] = steps.map((step, index) => {
-      const match = unused.findIndex(previous => !previous.legacy && previous.instruction === step.instruction && previous.doneWhen === step.doneWhen);
+      const prior = prepared.remaining.find(previous => previous.instruction === step.instruction && previous.doneWhen === step.doneWhen)
+        ?? (prepared.source.kind === "recovery" ? prepared.remaining[index] : undefined);
+      const selectedAgentId = step.agentId ?? prior?.worker?.agentId;
+      let dependsOn = dependencies(step) ?? prior?.dependsOn;
+      if (children.length && index === steps.length - 1) dependsOn = [...new Set([...(dependsOn ?? []), ...children.map(child => child.workItemId)])];
+      const match = unused.findIndex(previous => !previous.legacy && previous.instruction === step.instruction && previous.doneWhen === step.doneWhen
+        && previous.worker?.agentId === selectedAgentId && JSON.stringify(previous.dependsOn) === JSON.stringify(dependsOn));
+      const preserved = match >= 0 ? unused[match] : undefined;
+      const retainedWorker = preserved?.worker ?? (prior?.worker?.agentId === selectedAgentId ? prior?.worker : undefined);
+      let worker = retainedWorker ? priorWorkers.find(worker => worker.revision.id === retainedWorker.revisionId) : undefined;
+      if (selectedAgentId && !worker) {
+        worker = freezeWorker(selectedAgentId);
+      }
+      if (worker && !workers.some(existing => existing.revision.id === worker!.revision.id)) workers.push(worker);
       const id = match >= 0 ? unused.splice(match, 1)[0]!.id
-        : `step_${createHash("sha256").update(JSON.stringify([item.id, prepared.source, index, step])).digest("hex").slice(0, 32)}`;
-      return { id, instruction: step.instruction, doneWhen: step.doneWhen };
+        : `step_${createHash("sha256").update(JSON.stringify([item.id, prepared.source, index, step, worker?.revision.id, dependsOn])).digest("hex").slice(0, 32)}`;
+      return { id, instruction: step.instruction, doneWhen: step.doneWhen,
+        ...(worker ? { worker: { agentId: worker.agent.id, revisionId: worker.revision.id } } : {}), ...(dependsOn ? { dependsOn } : {}) };
     });
-    const revision: WorkPlanRevision = { version: 2, workItemId: item.id, space: item.space,
+    const revision: WorkPlanRevision = { version: workers.length || children.length || definitions.some(step => step.dependsOn) ? 3 : 2, workItemId: item.id, space: item.space,
       revision: this.workItems.plans.nextRevision(item.id), ...(item.planRef ? { previous: item.planRef } : {}),
       goal: opts.goal ?? prepared.goal, reason: opts.reason ?? (item.chatPlanRunId || item.planRef ? "根据补充要求修订剩余计划" : "首次规划"),
-      source: prepared.source, steps: definitions, acceptedActionIds: prepared.accepted.map(action => action.actionId), createdAt: Date.now() };
+      source: prepared.source, steps: definitions, ...(workers.length ? { workers } : {}), ...(children.length ? { children } : {}),
+      acceptedActionIds: prepared.accepted.map(action => action.actionId), createdAt: Date.now() };
     // Validate and stage before cancelling an obsolete, unstarted execution.
     // Both cancellation and the pointer switch are synchronous durable commands.
     this.workItems.plans.save(revision);
+    this.workItems.validatePlanRelations(item.id, revision);
     const active = this.workContinuations.activeForWorkItem(item.id);
     if (active && (!active.planStep || active.planStep.stepId !== definitions[0]?.id)) {
       if (!["queued", "awaiting_approval"].includes(active.status)
@@ -5886,13 +5970,17 @@ export class KnowledgeEngine implements Knowledge {
     const steps = (nextActions ?? item.nextActions).map((instruction, index): WorkPlanStep => {
       const match = unused.findIndex(step => formatWorkPlanStep(step, current.current.steps.findIndex(entry => entry.id === step.id)) === instruction);
       if (match >= 0) return unused.splice(match, 1)[0]!;
+      const previous = current.remaining[index];
       return { id: `step_${createHash("sha256").update(`${source.id}:${index}`).digest("hex").slice(0, 32)}`,
-        instruction, legacy: true };
+        instruction, legacy: true, ...(previous?.worker ? { worker: previous.worker } : {}),
+        ...(previous?.dependsOn ? { dependsOn: previous.dependsOn } : {}) };
     });
-    const revision: WorkPlanRevision = { version: 1, workItemId, space: item.space,
+    const revision: WorkPlanRevision = { version: current.current.version === 3 ? 3 : 1, workItemId, space: item.space,
       revision: this.workItems.plans.nextRevision(item.id), previous: item.planRef, goal: context.brief ?? prepared.goal,
       runbook: runbook !== undefined && runbook !== item.runbook ? runbook : current.current.runbook,
-      reason: "人工修订", source, steps, acceptedActionIds: prepared.accepted.map(action => action.actionId), createdAt: Date.now() };
+      reason: "人工修订", source, steps, ...(current.current.workers ? { workers: current.current.workers } : {}),
+      ...(current.current.children ? { children: current.current.children } : {}),
+      acceptedActionIds: prepared.accepted.map(action => action.actionId), createdAt: Date.now() };
     const active = this.workContinuations.activeForWorkItem(item.id);
     if (active && active.planStep?.stepId !== steps[0]?.id && !["queued", "awaiting_approval"].includes(active.status)) {
       throw new Error("当前步骤正在执行或等待验收，可以修改后续步骤");
@@ -5906,6 +5994,10 @@ export class KnowledgeEngine implements Knowledge {
   /** Local message identity outlives the bounded Chat Run history. */
   chatWorkPlanSource(workItemId: string): WorkInput | undefined {
     const item = this.workItems.get(workItemId);
+    if (item?.parentWorkItemId) {
+      const parent = this.workItems.get(item.parentWorkItemId);
+      return parent?.space === item.space ? this.chatWorkPlanSource(parent.id) : undefined;
+    }
     if (!item?.chatPlanRunId) return undefined;
     const run = item?.chatPlanRunId ? this.chatRuns.get(item.chatPlanRunId) : undefined;
     const sourceId = run?.sourceInputId ?? run?.dispatchKey ?? this.workDispatch.summaries(item.space)
@@ -5934,6 +6026,7 @@ export class KnowledgeEngine implements Knowledge {
 
   /** Repair a crash between receipt delivery and opting into continuation; never replay planning. */
   reconcileChatWorkPlans(): void {
+    this.reconcileChildCancellations();
     const configured = new Set(this.workContinuations.listPolicies().map(policy => policy.workItemId));
     for (const item of this.workItems.list()) {
       if (item.planDelivery?.status === "pending") {
@@ -5944,10 +6037,67 @@ export class KnowledgeEngine implements Knowledge {
         this.configureWorkContinuation(item.id, true);
       }
       if (item.planRef && item.phase === "active" && item.nextActions.length === 0 && item.blockers.length === 0
-        && !this.hasPendingWorkInputs(item.id) && !this.workContinuations.activeForWorkItem(item.id)) {
+        && !this.hasPendingWorkInputs(item.id) && !this.workContinuations.activeForWorkItem(item.id) && this.workChildrenComplete(item)) {
         this.workItems.update(item.id, { phase: "completed" });
       }
     }
+    for (const child of this.workItems.list()) if (child.parentWorkItemId && !configured.has(child.id)) {
+      const parent = this.workItems.get(child.parentWorkItemId);
+      if (parent && this.workContinuations.policyFor(parent.id, parent.space).autoContinue) this.configureWorkContinuation(child.id, true);
+    }
+  }
+
+  private workDependencyAccepted(id: string, space: SpaceId): boolean {
+    const item = this.workItems.get(id);
+    return !!item && item.space === space && item.phase === "completed" && !item.nextActions.length && !item.blockers.length
+      && !this.hasPendingWorkInputs(id) && !this.workContinuations.activeForWorkItem(id) && !!item.completedActionIds?.length
+      && item.completedActionIds.every(actionId => {
+        const action = this.workContinuations.get(actionId);
+        return action?.workItemId === id && action.space === space && action.status === "succeeded"
+          && action.acceptances?.at(-1)?.status === "accepted" && !!action.checkpoint;
+      });
+  }
+
+  private workChildrenComplete(item: WorkItem): boolean {
+    const plan = item.planRef && this.workItems.plans.get(item.id, item.planRef);
+    return !plan || (plan.children ?? []).every(child => this.workDependencyAccepted(child.workItemId, item.space));
+  }
+
+  private workDependenciesReady(item: WorkItem): boolean {
+    const plan = item.planRef && this.workItems.plans.get(item.id, item.planRef);
+    const step = plan && plan.steps.find(step => step.id === item.nextStepIds?.[0]);
+    return !step || (step.dependsOn ?? []).every(id => this.workDependencyAccepted(id, item.space));
+  }
+
+  private workParentAllows(item: WorkItem, automatic = false): boolean {
+    if (!item.parentWorkItemId) return true;
+    const parent = this.workItems.get(item.parentWorkItemId);
+    return !!parent && parent.space === item.space && parent.active && parent.phase !== "completed"
+      && parent.planDelivery?.status !== "pending" && this.workRecoveryDelivered(parent.id) && !this.hasPendingWorkInputs(parent.id)
+      && parent.childCancellation?.status !== "pending"
+      && (!automatic || this.workContinuations.policyFor(parent.id, parent.space).autoContinue) && this.workParentAllows(parent, automatic);
+  }
+
+  cancelWorkChildren(workItemId: string): void {
+    this.workItems.recordChildCancellation(workItemId);
+    this.reconcileChildCancellations();
+  }
+
+  private reconcileChildCancellations(): void {
+    const apply = (parent: WorkItem): void => {
+      if (parent.childCancellation?.status !== "pending") return;
+      for (const id of parent.childCancellation.childIds) {
+        const child = this.workItems.get(id);
+        if (!child || child.space !== parent.space || child.parentWorkItemId !== parent.id) throw new Error("Child cancellation ownership changed");
+        if (this.workItems.list(child.space).some(item => item.parentWorkItemId === child.id)) {
+          apply(this.workItems.recordChildCancellation(child.id));
+        }
+        if (child.active) this.workItems.update(id, { active: false });
+        for (const action of this.workContinuations.list(id)) this.cancelWorkAction(action.id);
+      }
+      this.workItems.finishChildCancellation(parent.id);
+    };
+    for (const parent of this.workItems.list()) if (this.workItems.get(parent.id)?.childCancellation?.status === "pending") apply(parent);
   }
 
   listDueWorkContinuations(): WorkItem[] {
@@ -5966,6 +6116,7 @@ export class KnowledgeEngine implements Knowledge {
         && (!item.chatPlanRunId || !waiting.has(item.id))
         && item.planDelivery?.status !== "pending"
         && this.workRecoveryDelivered(item.id)
+        && this.workParentAllows(item, true) && this.workDependenciesReady(item)
         && this.workContinuations.activeForWorkItem(item.id) === undefined
       ));
   }
@@ -6004,6 +6155,7 @@ export class KnowledgeEngine implements Knowledge {
     const item = this.workItems.get(workItemId);
     if (!item) throw new Error(`work item not found: ${workItemId}`);
     if (item.planDelivery?.status === "pending") throw new Error("Work plan receipt has not been delivered");
+    if (!this.workParentAllows(item, opts.trigger === "scheduled") || !this.workDependenciesReady(item)) throw new Error("工作事项仍在等待父目标或依赖成果验收");
     if (!this.workRecoveryDelivered(item.id)) throw new Error("Work recovery receipt has not been delivered");
     if (item.planRef && this.hasPendingWorkInputs(item.id)) throw new Error("Work plan has pending user input");
     const step = this.getWorkPlanView(item.id)?.remaining[0];
@@ -6036,7 +6188,7 @@ export class KnowledgeEngine implements Knowledge {
   async startWorkContinuationAsync(workItemId: string, opts: { trigger?: "manual" | "scheduled" } = {}): Promise<StartedTaskRun> {
     const item = this.workItems.get(workItemId);
     if (!item) throw new Error(`work item not found: ${workItemId}`);
-    return this.withAgentSkillResolution(item.space, true, () => this.startWorkContinuation(workItemId, opts));
+    return this.withAgentSkillResolution(item.space, true, () => this.startWorkContinuation(workItemId, opts), this.workStepAgent(item));
   }
 
   retryWorkAction(
@@ -6118,7 +6270,7 @@ export class KnowledgeEngine implements Knowledge {
     const source = item && this.chatWorkPlanSource(item.id);
     // Persist intent before acceptance. Reopening old accepted actions never enrolls
     // historical completed items into a new outbound delivery.
-    if (action?.status === "awaiting_acceptance" && item && source) {
+    if (action?.status === "awaiting_acceptance" && item && !item.parentWorkItemId && source) {
       const id = workEventId("notice", [item.id, item.planRef ?? item.chatPlanRunId, "completion"]);
       if (!this.workEvents.get(id)) this.workEvents.save({ version: 1, id, workItemId: item.id,
         space: item.space, planRef: item.planRef, sourceInputId: source.id, kind: "completion",
@@ -6137,7 +6289,7 @@ export class KnowledgeEngine implements Knowledge {
         continue;
       }
       if (item.phase !== "completed" || item.nextActions.length || item.blockers.length
-        || this.hasPendingWorkInputs(item.id) || this.workContinuations.activeForWorkItem(item.id)) continue;
+        || this.hasPendingWorkInputs(item.id) || this.workContinuations.activeForWorkItem(item.id) || !this.workChildrenComplete(item)) continue;
       const accepted = this.workContinuations.list(item.id).filter(action => action.status === "succeeded"
         && item.completedActionIds?.includes(action.id));
       if (!accepted.length) continue;
@@ -6232,7 +6384,7 @@ export class KnowledgeEngine implements Knowledge {
     const trigger = plan?.source.kind === "recovery" ? this.workContinuations.get(plan.source.actionId!) : undefined;
     const triggerRun = trigger?.workItemId === item.id && trigger.space === item.space ? this.taskRuns.get(trigger.taskRunIds.at(-1) ?? "") : undefined;
     const blockedReport = triggerRun && parseWorkActionProviderReport(triggerRun.output ?? "");
-    const accepted = item.chatPlanRunId ? this.workContinuations.list(item.id)
+    const accepted = item.planRef || item.chatPlanRunId ? this.workContinuations.list(item.id)
       .filter(previous => previous.status === "succeeded" && item.completedActionIds?.includes(previous.id))
       .sort((left, right) => left.createdAt - right.createdAt)
       .map(previous => {
@@ -6243,6 +6395,19 @@ export class KnowledgeEngine implements Knowledge {
         return { instruction: previous.instruction, result: report?.result ?? previous.checkpoint?.summary,
           rawId: previous.checkpoint?.rawId, taskRunId: previous.checkpoint?.taskRunId };
       }) : [];
+    const step = plan?.steps.find(step => step.id === action.planStep?.stepId);
+    // Later parent steps also need the accepted child evidence used by the summary.
+    const dependencyIds = [...new Set([...(step?.dependsOn ?? []), ...(plan?.children ?? [])
+      .filter(child => this.workDependencyAccepted(child.workItemId, item.space)).map(child => child.workItemId)])];
+    const dependencies = dependencyIds.map(id => {
+      if (!this.workDependencyAccepted(id, item.space)) throw new Error("依赖成果尚未验收");
+      const dependency = this.workItems.get(id)!;
+      const accepted = this.workContinuations.list(id).find(action => action.status === "succeeded" && dependency.completedActionIds?.includes(action.id))!;
+      const run = this.taskRuns.get(accepted.checkpoint!.taskRunId ?? "");
+      const report = run?.space === item.space && run.workActionId === accepted.id ? parseWorkActionProviderReport(run.output ?? "") : undefined;
+      return { workItemId: id, title: dependency.title, result: report?.result ?? accepted.checkpoint!.summary,
+        evidence: { actionId: accepted.id, taskRunId: accepted.checkpoint!.taskRunId, rawId: accepted.checkpoint!.rawId } };
+    });
     const topic = [
       "你正在继续一个已持久化的 HomeAgent 工作项。只执行本次动作，不要擅自展开后续动作。",
       "",
@@ -6252,6 +6417,7 @@ export class KnowledgeEngine implements Knowledge {
       item.runbook ? `\n## Runbook\n${item.runbook}` : "",
       item.summary ? `\n## 当前进展\n${item.summary}` : "",
       accepted.length ? `\n## 已验收的前序成果\n${JSON.stringify(accepted)}` : "",
+      dependencies.length ? `\n## 已验收的依赖成果\n${JSON.stringify(dependencies)}` : "",
       item.blockers.length > 0 ? `\n## 已知阻塞\n${item.blockers.join("\n")}` : "",
       blockedReport ? `\n## 本次修订依据（未通过验收，不代表操作成功）\n${JSON.stringify({ report: blockedReport, rejection: trigger?.acceptances?.at(-1)?.reason })}` : "",
       `\n## 本次动作\n${action.instruction}`,
@@ -6617,6 +6783,11 @@ export class KnowledgeEngine implements Knowledge {
         workActionId === undefined,
         "all",
         "task",
+        workActionId && !previous ? (() => {
+          const action = this.workContinuations.get(workActionId);
+          const item = action && this.workItems.get(action.workItemId);
+          return item ? this.workStepAgent(item) : undefined;
+        })() : undefined,
       );
     } catch (error) {
       const resolutionError = executionResolutionError(error);

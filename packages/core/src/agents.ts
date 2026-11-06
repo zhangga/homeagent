@@ -307,7 +307,7 @@ function isPersistedSkillBindings(value: unknown): value is AgentSkillBinding[] 
   return JSON.stringify(normalizeSkills(value)) === JSON.stringify(value);
 }
 
-function isCurrentAgentRecord(value: unknown, id: string): value is Agent {
+export function isCurrentAgentRecord(value: unknown, id: string): value is Agent {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Partial<Agent>;
   return candidate.id === id

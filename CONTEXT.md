@@ -123,18 +123,18 @@ Codex 话题隔离预检失败必须停止；不得自动替换为无状态调�
 模型回答事件。`not-applicable` 表示未使用沙箱，不是隔离通过；只有 CLI 启动或普通文本输出时，不推断模型调用已验证。
 Chat 文件新写入 v9，读取 v1–v9；Task 文件新写入 v13，读取 v2–v13。新格式无效记录、损坏文件与未来版本拒绝启动，不能按空历史覆盖。
 旧 v1 计划仍使用 topic compatibility v1，v6/v7 已送达会话可继续；新 v2 计划使用 compatibility v2，模式、确认引用及 scope 都参与摘要。
-当前 Space 归档为 v23，仍不包含本机执行证据；历史 v1 计划按其原形保留。
+当前 Space 归档为 v24，仍不包含本机执行证据；历史 v1 计划按其原形保留。
 
 ## WorkItem 与持久消息分派
 
-`config/work-items.json` v3 同时保存 WorkItem 和每个 Space 的 `currentBySpace` 默认焦点，继续读取 v1/v2。
+`config/work-items.json` v4 同时保存 WorkItem 和每个 Space 的 `currentBySpace` 默认焦点，继续读取 v1/v2/v3。
 多个 WorkItem 可以保持 active；选择当前事项不改变其他事项的活动状态。v1 的唯一 active 项迁移为默认焦点，
 不会激活旧 inactive 项，也不会改变已有 WorkAction 的验收和自动续作策略。
 
 明确要求执行的多步骤聊天目标可以生成工作计划。WorkDispatch 的 `work-plan` 响应保存原始目标与冻结的规划指令；
 首次规划既可来自新建事项，也可来自尚无 runbook、nextActions 和 Task Run 的已有事项补充；普通聊天不重置已有计划。
 规划调用只生成结构化步骤，使用该 Chat Run 冻结的模型与时限，不携带执行工具或 Provider 会话历史。
-`config/work-plans/<workItemId>/revision_<n>.json` v2 是不可变计划定义的权威文件，兼容读取 v1 并保持旧摘要。每个版本保存目标、步骤 ID/指令/完成标准、前版摘要、来源与已验收 Action 引用；v2 的 `recovery` 来源关联触发事件与 Action。它不是 Raw 或 Knowledge page，也不由 SQLite projection 独占。
+`config/work-plans/<workItemId>/revision_<n>.json` v3 是不可变计划定义的权威文件，兼容读取 v1/v2 并保持旧摘要。每个版本保存目标、步骤 ID/指令/完成标准、前版摘要、来源与已验收 Action 引用；v2 的 `recovery` 来源关联触发事件与 Action。v3 增加已发布 Worker 快照、步骤依赖和子计划引用。它不是 Raw 或 Knowledge page，也不由 SQLite projection 独占。
 WorkItem 的 `planRef` 与 `nextStepIds` 选择当前版本和剩余步骤，和 `runbook`/`nextActions` 展示投影同次原子保存。先 fsync 计划定义，再原子切换引用；孤立的未提交版本不参与执行或 Space 导出。人工 runbook 可保留，手工修订走同一版本提交边界。
 `config/work-continuation.json` v2 的 WorkAction 可选 `planStep` 冻结版本、步骤 ID、步骤摘要和计划摘要；旧 v1 动作继续按冻结文本完成。验收、checkpoint、Raw 准入的权威归属不变。已验收步骤不能被计划改写成未完成，改变执行内容的步骤取得新 ID。
 步骤沿用 WorkItem 的 200 项、单项 2,000 字符与 runbook 200,000 字符边界，单份计划文件有界，历史独立保存。未规划的旧事项继续原路径；旧自动计划到允许修订的边界才转换，无法可靠拆分的旧文字标记 legacy。
@@ -145,12 +145,17 @@ Space 归档仅保留计划、来源历史标识及已有续作策略，
 不会从导入的 Chat 历史补造本机输入或自动开启策略。归档内仍存在的规划 Run 必须属于同一事项，已裁剪历史允许保留来源标识。
 
 明确补充保存为 WorkDispatch `work-replan`。运行中/待验收动作不改写，补充在动作边界按序修订剩余计划；待审批或排队动作只有内容变化才取消旧 Run，审批不转移。规划快照过期时用最新事实重算，取消意图优先。每版 `planDelivery` 是本机回执门禁，重试复用已提交版本，送达前不领取新版步骤。`chatPlanRunId` 保持首次规划来源，修订不能改变原成果投递位置；暂停和关闭续作继续有效。
-Space archive v23 携带完整已提交版本链和动作关联，校验所有权、摘要、剩余投影及已验收证据；不携带 `planDelivery`、本机输入或本机权限。恢复先验证，再写定义和 WorkItem，失败回滚新增定义；删除 Space 同时处理所归属计划文件。
+Space archive v24 携带完整已提交版本链和动作关联，校验所有权、摘要、剩余投影及已验收证据；不携带 `planDelivery`、本机输入或本机权限。恢复先验证，再写定义和 WorkItem，失败回滚新增定义；删除 Space 同时处理所归属计划文件。
 
-`config/work-events/recovery_<sha256>.json` v1 保存本机遇阻事件：触发 Action/attempt/Task Run、当前计划快照及 fingerprint、已验收成果、结构化阻塞或人工驳回、冻结的无工具规划配置和决策。只有成功结束的 Task Run 所报告的业务阻塞或人工驳回触发自动规划；Provider 故障不触发。相同目标版本、验收成果、阻塞事实及尝试次数只处理一次，自动修订自身不制造新事实；明确补充、手动修订或显式重试可重新评估。
+M3 的 Worker 复用已发布 Agent。计划 v3 的 `workers` 保存发布快照及 revision，步骤的 `worker` 固定引用它；新的 Task Run 从该版本冻结执行配置与 Skill 证据，不能替换为随后编辑的 Agent。Worker 不拥有另一套 Space 或聊天身份；权限、可见性和本机 Task 执行确认沿用既有边界，审批与验收仍属于每个 Task Run / WorkAction。归档携带发布快照，不导入本机确认。
+计划的 `children` 保存 key、同 Space 子 WorkItem、标题及初始子计划引用；WorkItem 的 `parentWorkItemId` 记录归属。先写不可变子计划，再将父指针及新子事项一次原子提交；失败仅留下不能执行的孤立定义，不改变默认事项。依赖 `dependsOn` 使用稳定 WorkItem ID，校验同 Space、存在性与无环，包括父目标等待子事项的完成边。每个子事项仍一次一个 WorkAction，并发使用原有调度额度。
+依赖只有在事项完成、没有待处理补充、所有 checkpoint 均已验收时满足。汇总输入为每个依赖最后一份已验收报告及其 Action/Run/Raw 引用；父目标后续步骤同样携带已完成且验收通过的所属子事项成果，不要求逐步重复依赖声明。不会把其他未验收输出当作结果，尚未完成的子事项也不进入该上下文。父目标完成还要求全部所属子事项完成。子事项通知通过父链取得本机原消息来源，Task 不推进 Provider-native Chat 会话链；最终完成 watch 只登记父目标。
+父目标暂停和关闭续作会阻止子事项后续领取；取消先在 WorkItem 的本机 `childCancellation` 持久记录所属子事项，再调用既有取消接口，恢复补齐未完成取消。该记录不导出，不能用于取消独立创建或仅被引用的其他事项。
+
+`config/work-events/recovery_<sha256>.json` v2 兼容 v1，新增 Worker、依赖和子事项快照，未使用 M3 字段的事件仍写 v1。它保存本机遇阻事件：触发 Action/attempt/Task Run、当前计划快照及 fingerprint、已验收成果、结构化阻塞或人工驳回、冻结的无工具规划配置和决策。只有成功结束的 Task Run 所报告的业务阻塞或人工驳回触发自动规划；Provider 故障不触发。相同目标版本、验收成果、阻塞事实及尝试次数只处理一次，自动修订自身不制造新事实；明确补充、手动修订或显式重试可重新评估。
 状态为 queued/running/decided/applied/waiting/failed/obsolete。queued 可恢复；running 重启转 failed，不重放模型；decided 复用已保存结果提交。新计划指针与旧 Action 所有的阻塞投影同次提交，旧动作随后取消并保留 excluded 证据；恢复补齐取消，不能把旧阻塞重新投影到新计划。运行中收到新要求时，过期决策不能覆盖新计划；暂停或关闭续作保留已生成决策直到继续。
 `notice_<sha256>.json` v1 保存原本机输入定位、计划引用、类别、冻结正文、尝试和投递回执。完成 watch 在验收前持久登记，最后验收与事项完成后变为 pending；不会给升级前的历史完成事项补发通知。重规划回执送达前不领取新步骤。通知使用稳定幂等键和既有 Task 通知退避间隔，保留进程内已知远端回执以应对本地保存失败；终态 sent 不再发送。新数据到达前等待问题只发送一次。
-事件逐文件校验、深拷贝、fsync 和原子替换，复用已有目标 200,000 字、最多 200 步、最多 2,000 条验收引用及报告边界，使用中央 AI 时限与输出限制。它们是本机协调状态，不是 Raw；Space v23 只携带计划的遇阻来源和历史动作，不携带事件、问题投递权限或回执。治理操作阻止活动事件和正在外发，删除失败恢复这些本机记录。
+事件逐文件校验、深拷贝、fsync 和原子替换，复用已有目标 200,000 字、最多 200 步、最多 2,000 条验收引用及报告边界，使用中央 AI 时限与输出限制。它们是本机协调状态，不是 Raw；Space v24 只携带计划的遇阻来源和历史动作，不携带事件、问题投递权限或回执。治理操作阻止活动事件和正在外发，删除失败恢复这些本机记录。
 
 `config/work-dispatch/input_<sha256>.json` 是本机入站输入和分派计划的权威记录，格式 v1，每条独立原子提交。
 身份由 Connector、App、chat 和 message 确定，记录绑定唯一 Space 和接收时的群绑定 epoch；重复投递不能覆盖正文。
