@@ -4,13 +4,13 @@ import { join } from "node:path";
 import { isSpaceId, type SpaceId } from "@homeagent/shared";
 import { assertLocalStatePath, writeAtomicStateFile } from "./durable-file.ts";
 import type { WorkItem } from "./work-items.ts";
-import type { WorkAction } from "./work-continuation.ts";
+import type { WorkAction, WorkActionProviderReport } from "./work-continuation.ts";
 
 export interface WorkPlanRef { revision: number; digest: string }
 export interface WorkPlanStep { id: string; instruction: string; doneWhen?: string; legacy?: true }
 export interface WorkPlanStepRef { revision: number; stepId: string; digest: string; planDigest: string }
 export interface WorkPlanRevision {
-  version: 1;
+  version: 1 | 2;
   workItemId: string;
   space: SpaceId;
   revision: number;
@@ -18,7 +18,7 @@ export interface WorkPlanRevision {
   goal: string;
   runbook?: string;
   reason: string;
-  source: { kind: "chat" | "manual"; id: string };
+  source: { kind: "chat" | "manual" | "recovery"; id: string; actionId?: string };
   steps: WorkPlanStep[];
   acceptedActionIds: string[];
   createdAt: number;
@@ -33,6 +33,7 @@ export interface WorkPlanPreparation {
   goal: string;
   remaining: WorkPlanStep[];
   accepted: { actionId: string; instruction: string; result: string }[];
+  blocked?: { actionId: string; report: WorkActionProviderReport; rejection?: string };
 }
 
 export class WorkPlanChangedError extends Error {
@@ -63,13 +64,15 @@ export function isWorkPlanStepRef(value: unknown): value is WorkPlanStepRef {
 export function parseWorkPlanRevision(value: unknown): WorkPlanRevision {
   if (!value || typeof value !== "object") throw new Error("Invalid work plan revision");
   const plan = value as Partial<WorkPlanRevision>;
-  if (plan.version !== 1 || typeof plan.workItemId !== "string" || !ITEM.test(plan.workItemId)
+  if (![1, 2].includes(plan.version ?? 0) || typeof plan.workItemId !== "string" || !ITEM.test(plan.workItemId)
     || typeof plan.space !== "string" || !isSpaceId(plan.space) || !revisionNumber(plan.revision)
     || (plan.previous !== undefined && (!isWorkPlanRef(plan.previous) || plan.previous.revision >= plan.revision))
     || !text(plan.goal, 200_000, true) || !text(plan.reason, 2_000)
     || (plan.runbook !== undefined && !text(plan.runbook, 200_000, true))
-    || !plan.source || !["chat", "manual"].includes(plan.source.kind) || !text(plan.source.id, 200)
+    || !plan.source || !["chat", "manual", ...(plan.version === 2 ? ["recovery"] : [])].includes(plan.source.kind) || !text(plan.source.id, 200)
     || (plan.source.kind === "chat" && !/^chat_run_[a-f0-9-]{36,64}$/i.test(plan.source.id))
+    || (plan.source.kind === "recovery" && (!/^recovery_[a-f0-9]{64}$/.test(plan.source.id) || !text(plan.source.actionId, 200)))
+    || (plan.source.kind !== "recovery" && plan.source.actionId !== undefined)
     || !Array.isArray(plan.steps) || plan.steps.length > 200
     || !Array.isArray(plan.acceptedActionIds) || plan.acceptedActionIds.length > 2_000
     || !plan.acceptedActionIds.every(id => text(id, 200)) || new Set(plan.acceptedActionIds).size !== plan.acceptedActionIds.length
@@ -84,9 +87,9 @@ export function parseWorkPlanRevision(value: unknown): WorkPlanRevision {
     return { id: step.id, instruction: step.instruction, ...(step.legacy ? { legacy: true as const } : { doneWhen: step.doneWhen! }) };
   });
   if (steps.map(formatWorkPlanStep).join("\n\n").length > 200_000) throw new Error("Work plan is too large");
-  return { version: 1, workItemId: plan.workItemId, space: plan.space, revision: plan.revision,
+  return { version: plan.version!, workItemId: plan.workItemId, space: plan.space, revision: plan.revision,
     ...(plan.previous ? { previous: { revision: plan.previous.revision, digest: plan.previous.digest } } : {}),
-    goal: plan.goal, ...(plan.runbook !== undefined ? { runbook: plan.runbook } : {}), reason: plan.reason, source: { kind: plan.source.kind, id: plan.source.id },
+    goal: plan.goal, ...(plan.runbook !== undefined ? { runbook: plan.runbook } : {}), reason: plan.reason, source: { kind: plan.source.kind, id: plan.source.id, ...(plan.source.actionId ? { actionId: plan.source.actionId } : {}) },
     steps, acceptedActionIds: [...plan.acceptedActionIds], createdAt: plan.createdAt };
 }
 
@@ -112,6 +115,12 @@ export function assertWorkPlanArchive(plans: WorkPlanRevision[], items: WorkItem
     const key = `${plan.workItemId}:${plan.revision}`;
     if (byKey.has(key) || byItem.get(plan.workItemId)?.space !== plan.space) throw new Error("Invalid work plan archive owner");
     byKey.set(key, plan);
+    if (plan.source.kind === "recovery") {
+      const trigger = byAction.get(plan.source.actionId!);
+      if (trigger?.workItemId !== plan.workItemId || trigger.space !== plan.space
+        || !["blocked", "cancelled"].includes(trigger.status) || !trigger.planStep || trigger.planStep.revision >= plan.revision
+        || trigger.acceptances?.at(-1)?.status !== "rejected") throw new Error("Invalid work plan recovery evidence");
+    }
     for (const step of plan.steps) {
       const id = `${plan.workItemId}:${step.id}`, digest = workPlanStepDigest(step);
       if (definitions.has(id) && definitions.get(id) !== digest) throw new Error("Work plan step identity changed");

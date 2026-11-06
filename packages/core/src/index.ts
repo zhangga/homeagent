@@ -19,6 +19,7 @@ export * from "./run-scheduler.ts";
 export * from "./reminders.ts";
 export * from "./work-items.ts";
 export * from "./work-plans.ts";
+export * from "./work-events.ts";
 export * from "./work-continuation.ts";
 export * from "./space.ts";
 export * from "./raw-source-files.ts";

@@ -57,7 +57,7 @@ Task 后 Dream 使用冻结 Provider/model 的独立无工具调用，完全访�
 Core 从完整的非终态 Chat/Task Run 元数据读取引用，并对原生预检、整轮普通问答和独立客户端调用临时计数；当前/候选发布版本与新确认也不能被清理。
 引用读取未知、Engine 已关闭或全部记录受保护时拒绝超限发布，失败落盘不替换内存、不发送提交通知。临时引用只阻止淘汰，不产生授权，也不阻止显式撤销。
 终态 Run 与 Agent revision 不因清理而改写，旧历史不能用已淘汰确认恢复执行；没有可信引用读取器的独立 AgentStore 保持超限拒绝，不自行猜测引用。
-空间归档 v22 保留执行模式意图与版本历史，但不携带本机确认、确认 ID 或范围。整份数据目录复制不等于 Space 归档，首版不能识别所有跨机复制或目录回退，应重新确认。
+空间归档 v23 保留执行模式意图与版本历史，但不携带本机确认、确认 ID 或范围。整份数据目录复制不等于 Space 归档，首版不能识别所有跨机复制或目录回退，应重新确认。
 
 `config/spaces.json` v1 的 `agentBindingEpoch` 与 Space 的 Agent/回复策略绑定一起原子保存；
 `config/feishu-group-bindings.json` v3 的 `executionScopeEpoch` 与 Bot、群、连接状态和响应策略一起原子保存。
@@ -123,7 +123,7 @@ Codex 话题隔离预检失败必须停止；不得自动替换为无状态调�
 模型回答事件。`not-applicable` 表示未使用沙箱，不是隔离通过；只有 CLI 启动或普通文本输出时，不推断模型调用已验证。
 Chat 文件新写入 v9，读取 v1–v9；Task 文件新写入 v13，读取 v2–v13。新格式无效记录、损坏文件与未来版本拒绝启动，不能按空历史覆盖。
 旧 v1 计划仍使用 topic compatibility v1，v6/v7 已送达会话可继续；新 v2 计划使用 compatibility v2，模式、确认引用及 scope 都参与摘要。
-当前 Space 归档为 v22，仍不包含本机执行证据；历史 v1 计划按其原形保留。
+当前 Space 归档为 v23，仍不包含本机执行证据；历史 v1 计划按其原形保留。
 
 ## WorkItem 与持久消息分派
 
@@ -134,7 +134,7 @@ Chat 文件新写入 v9，读取 v1–v9；Task 文件新写入 v13，读取 v2�
 明确要求执行的多步骤聊天目标可以生成工作计划。WorkDispatch 的 `work-plan` 响应保存原始目标与冻结的规划指令；
 首次规划既可来自新建事项，也可来自尚无 runbook、nextActions 和 Task Run 的已有事项补充；普通聊天不重置已有计划。
 规划调用只生成结构化步骤，使用该 Chat Run 冻结的模型与时限，不携带执行工具或 Provider 会话历史。
-`config/work-plans/<workItemId>/revision_<n>.json` v1 是不可变计划定义的权威文件。每个版本保存目标、步骤 ID/指令/完成标准、前版摘要、来源与已验收 Action 引用；它不是 Raw 或 Knowledge page，也不由 SQLite projection 独占。
+`config/work-plans/<workItemId>/revision_<n>.json` v2 是不可变计划定义的权威文件，兼容读取 v1 并保持旧摘要。每个版本保存目标、步骤 ID/指令/完成标准、前版摘要、来源与已验收 Action 引用；v2 的 `recovery` 来源关联触发事件与 Action。它不是 Raw 或 Knowledge page，也不由 SQLite projection 独占。
 WorkItem 的 `planRef` 与 `nextStepIds` 选择当前版本和剩余步骤，和 `runbook`/`nextActions` 展示投影同次原子保存。先 fsync 计划定义，再原子切换引用；孤立的未提交版本不参与执行或 Space 导出。人工 runbook 可保留，手工修订走同一版本提交边界。
 `config/work-continuation.json` v2 的 WorkAction 可选 `planStep` 冻结版本、步骤 ID、步骤摘要和计划摘要；旧 v1 动作继续按冻结文本完成。验收、checkpoint、Raw 准入的权威归属不变。已验收步骤不能被计划改写成未完成，改变执行内容的步骤取得新 ID。
 步骤沿用 WorkItem 的 200 项、单项 2,000 字符与 runbook 200,000 字符边界，单份计划文件有界，历史独立保存。未规划的旧事项继续原路径；旧自动计划到允许修订的边界才转换，无法可靠拆分的旧文字标记 legacy。
@@ -145,7 +145,12 @@ Space 归档仅保留计划、来源历史标识及已有续作策略，
 不会从导入的 Chat 历史补造本机输入或自动开启策略。归档内仍存在的规划 Run 必须属于同一事项，已裁剪历史允许保留来源标识。
 
 明确补充保存为 WorkDispatch `work-replan`。运行中/待验收动作不改写，补充在动作边界按序修订剩余计划；待审批或排队动作只有内容变化才取消旧 Run，审批不转移。规划快照过期时用最新事实重算，取消意图优先。每版 `planDelivery` 是本机回执门禁，重试复用已提交版本，送达前不领取新版步骤。`chatPlanRunId` 保持首次规划来源，修订不能改变原成果投递位置；暂停和关闭续作继续有效。
-Space archive v22 携带完整已提交版本链和动作关联，校验所有权、摘要、剩余投影及已验收证据；不携带 `planDelivery`、本机输入或本机权限。恢复先验证，再写定义和 WorkItem，失败回滚新增定义；删除 Space 同时处理所归属计划文件。
+Space archive v23 携带完整已提交版本链和动作关联，校验所有权、摘要、剩余投影及已验收证据；不携带 `planDelivery`、本机输入或本机权限。恢复先验证，再写定义和 WorkItem，失败回滚新增定义；删除 Space 同时处理所归属计划文件。
+
+`config/work-events/recovery_<sha256>.json` v1 保存本机遇阻事件：触发 Action/attempt/Task Run、当前计划快照及 fingerprint、已验收成果、结构化阻塞或人工驳回、冻结的无工具规划配置和决策。只有成功结束的 Task Run 所报告的业务阻塞或人工驳回触发自动规划；Provider 故障不触发。相同目标版本、验收成果、阻塞事实及尝试次数只处理一次，自动修订自身不制造新事实；明确补充、手动修订或显式重试可重新评估。
+状态为 queued/running/decided/applied/waiting/failed/obsolete。queued 可恢复；running 重启转 failed，不重放模型；decided 复用已保存结果提交。新计划指针与旧 Action 所有的阻塞投影同次提交，旧动作随后取消并保留 excluded 证据；恢复补齐取消，不能把旧阻塞重新投影到新计划。运行中收到新要求时，过期决策不能覆盖新计划；暂停或关闭续作保留已生成决策直到继续。
+`notice_<sha256>.json` v1 保存原本机输入定位、计划引用、类别、冻结正文、尝试和投递回执。完成 watch 在验收前持久登记，最后验收与事项完成后变为 pending；不会给升级前的历史完成事项补发通知。重规划回执送达前不领取新步骤。通知使用稳定幂等键和既有 Task 通知退避间隔，保留进程内已知远端回执以应对本地保存失败；终态 sent 不再发送。新数据到达前等待问题只发送一次。
+事件逐文件校验、深拷贝、fsync 和原子替换，复用已有目标 200,000 字、最多 200 步、最多 2,000 条验收引用及报告边界，使用中央 AI 时限与输出限制。它们是本机协调状态，不是 Raw；Space v23 只携带计划的遇阻来源和历史动作，不携带事件、问题投递权限或回执。治理操作阻止活动事件和正在外发，删除失败恢复这些本机记录。
 
 `config/work-dispatch/input_<sha256>.json` 是本机入站输入和分派计划的权威记录，格式 v1，每条独立原子提交。
 身份由 Connector、App、chat 和 message 确定，记录绑定唯一 Space 和接收时的群绑定 epoch；重复投递不能覆盖正文。
@@ -164,7 +169,7 @@ Chat Run、保存事项/输入关联，最后持久化 launch admission。任一
 
 独立事项（包括已授权的可写与完全访问事项）复用全局与 Provider／模型配额；同事项、同原生话题保持串行。共享 Agent 配置不再使不同事项互相排队，未关联事项的运行仍使用原有 Agent 配额；可写与完全访问 Task 的逐次审批保持不变。
 普通 Chat 仍是 Chat Run；Task 和 WorkAction 沿用原有审批、冻结计划、通知与验收。
-Space 归档 v22 保存多活动事项和默认焦点，剥离本机分派身份、admission、取消意图及真实回复消息 ID。
+Space 归档 v23 保存多活动事项和默认焦点，剥离本机分派身份、admission、取消意图及真实回复消息 ID。
 未处理输入会阻止 Space 导出、删除及数据目录迁移；终态本机输入不随 Space 归档恢复执行。
 
 ## Raw
@@ -242,7 +247,7 @@ Raw attachment 保存摘要、字节数和文件名。提炼文本可以有独�
 飞书文档后台同步将可取得的配图原件与正文绑定到同一条 `source=doc` Raw，保留正文中的图片引用；未取得原件的图片仅保留 attachment 引用，不伪造文件摘要。批量原件先校验后写入；SQLite projection 写入失败时，已由 Raw journal 引用的原件必须保留以供恢复。此路径复用现有 Raw attachment 与 Space 归档格式，不改变存储所有权。
 后台上传和飞书附件的已解析长正文按每段最多 200,000 字符完整登记为多个 Raw；各段在正文标明顺序，
 共享同一 SHA-256 原件，保留原消息归属、撤回与下载语义，不增加 archive schema。
-原文件随 `homeagent.space v22` 归档导出和恢复，Wiki 只保留指向 Raw 的 provenance，不复制文件正文。
+原文件随 `homeagent.space v23` 归档导出和恢复，Wiki 只保留指向 Raw 的 provenance，不复制文件正文。
 
 ## Knowledge page
 

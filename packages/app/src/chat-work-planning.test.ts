@@ -60,6 +60,434 @@ const planResult = { kind: "plan", steps: [
 ] };
 const result = (text: string) => JSON.stringify({ version: 1, outcome: "completed", result: text,
   blockers: [], checks: [{ name: "本步完成标准", status: "passed" }] });
+const blockedResult = (text = "原资料不可读，可使用目标中的备用资料") => JSON.stringify({ version: 1, outcome: "blocked", result: text,
+  blockers: [text], checks: [{ name: "读取资料", status: "failed" }] });
+
+test("M2 replans a business blocker, preserves accepted evidence and completes the original topic", async () => {
+  let calls = 0, recoveries = 0;
+  const planner = new FakeLlm().onJSON(call => {
+    const context = JSON.parse(call.prompt ?? "{}");
+    if (!context.recoveryContext) return planResult;
+    recoveries++;
+    expect(context.recoveryContext.prepared.accepted[0]?.result).toBe("已汇总20项");
+    return { kind: "plan", reason: "改用用户已指定的备用资料", steps: [
+      { instruction: "根据备用资料和已验收汇总生成摘要", doneWhen: "摘要包含完成率60%和阻塞占比15%" },
+    ] };
+  });
+  const f = await fixture({ planner, runner: async () => ++calls === 1 ? result("已汇总20项")
+    : calls === 2 ? blockedResult() : result("完成率60%，阻塞占比15%") });
+  try {
+    await f.send("m2-recovery");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    const scheduler = new WorkContinuationScheduler(f.engine);
+    await scheduler.wake(item.id);
+    const accepted = f.engine.workContinuations.list(item.id)[0]!;
+    await scheduler.wake(item.id);
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("blocked");
+    await f.runtime.processWorkEvents();
+    expect(recoveries).toBe(1);
+    expect(f.engine.getWorkPlanView(item.id)?.current.source.kind).toBe("recovery");
+    expect(f.engine.workContinuations.get(accepted.id)?.checkpoint).toEqual(accepted.checkpoint);
+    await scheduler.wake(item.id);
+    await f.runtime.processWorkEvents();
+    expect(calls).toBe(3);
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("completed");
+    expect(f.transport.sent.filter(reply => reply.markdown.includes("全部步骤已验收"))).toHaveLength(1);
+    const archive = await f.engine.exportSpace(SPACE);
+    expect(archive.version).toBe(23);
+    expect(parseSpaceArchive(archive).workPlans.at(-1)?.source.kind).toBe("recovery");
+    expect(() => parseSpaceArchive({ ...archive, version: 22 })).toThrow("v23");
+    expect(JSON.stringify(archive)).not.toContain("sourceInputId");
+    expect(JSON.stringify(archive)).not.toContain("workEvents");
+    const targetRoot = mkdtempSync(join(tmpdir(), "ha-m2-archive-"));
+    const target = new KnowledgeEngine({ dataDir: targetRoot, skillCatalog: new SkillCatalog({ roots: [] }) });
+    try {
+      await target.restoreSpace(archive);
+      expect(target.getWorkPlanView(item.id)?.current.source.kind).toBe("recovery");
+      expect(target.workEvents.list()).toEqual([]);
+      expect(target.workEvents.listRecoveries()).toEqual([]);
+    } finally { target.close(); rmSync(targetRoot, { recursive: true, force: true }); }
+    await f.reopen();
+    await f.runtime.processWorkEvents();
+    expect(recoveries).toBe(1);
+  } finally { await f.close(); }
+});
+
+test("M2 sends completion to the original topic only after final human acceptance and never repeats after restart", async () => {
+  const f = await fixture({ full: true, runner: async (_provider, input) => {
+    const permit = input.acquireExecutionPermit!();
+    const unregister = permit.register(() => {}); permit.release(); unregister();
+    return result("总数20，完成率60%，阻塞占比15%。");
+  } });
+  try {
+    await f.send("m2-completion");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    for (let index = 0; index < 2; index++) {
+      await new WorkContinuationScheduler(f.engine).wake(item.id);
+      const run = f.engine.listTaskRuns().find(run => run.status === "awaiting_approval")!;
+      await f.engine.approveTaskRun(run.id, "local-operator").completion;
+      await f.runtime.processWorkEvents();
+      expect(f.transport.sent.filter(reply => reply.markdown.includes("全部步骤已验收"))).toHaveLength(0);
+      f.engine.acceptWorkAction(run.workActionId!, run.id, "local-operator");
+    }
+    await f.runtime.processWorkEvents();
+    await f.runtime.processWorkEvents();
+    const notices = f.transport.sent.filter(reply => reply.markdown.includes("全部步骤已验收"));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.replyToMessageId).toBe("m2-completion");
+    expect(notices[0]?.markdown).toContain("完成率60%");
+    await f.reopen();
+    await f.runtime.processWorkEvents();
+    expect(f.transport.sent.filter(reply => reply.markdown.includes("全部步骤已验收"))).toHaveLength(1);
+  } finally { await f.close(); }
+});
+
+test("M2 asks once for missing facts, waits across restart and resumes with a plain factual reply", async () => {
+  let recoveries = 0, calls = 0;
+  const planner = new FakeLlm().onJSON(call => {
+    const context = JSON.parse(call.prompt ?? "{}");
+    if (context.recoveryContext) { recoveries++; return { kind: "wait", reason: "缺少完成项目数量", question: "本周已完成多少项？" }; }
+    if (context.revisionContext) {
+      expect(context.revisionContext.blocked.report.blockers).toEqual(["缺少完成项目数量"]);
+      return { kind: "plan", steps: [{ instruction: "使用已完成12项生成摘要", doneWhen: "包含12项" }] };
+    }
+    return planResult;
+  });
+  const f = await fixture({ planner, runner: async () => ++calls === 1 ? blockedResult("缺少完成项目数量") : result("已完成12项") });
+  try {
+    await f.send("m2-wait");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    await f.runtime.processWorkEvents();
+    await f.runtime.processWorkEvents();
+    await f.reopen();
+    await f.runtime.processWorkEvents();
+    expect(recoveries).toBe(1);
+    expect(f.transport.sent.filter(reply => reply.markdown.includes("本周已完成多少项？"))).toHaveLength(1);
+    expect(f.engine.listDueWorkContinuations()).toEqual([]);
+    await f.send("m2-facts", "已完成12项", { parentMessageId: "m2-wait" });
+    expect(f.engine.getWorkPlanView(item.id)?.remaining[0]?.instruction).toBe("使用已完成12项生成摘要");
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    await f.runtime.processWorkEvents();
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("completed");
+    expect(calls).toBe(2);
+  } finally { await f.close(); }
+});
+
+test("M2 repeated blocker facts do not create a planning loop or re-admit failed evidence", async () => {
+  let recoveries = 0;
+  const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").recoveryContext
+    ? (recoveries++, { kind: "plan", reason: "尝试目标中已有的备用资料", steps: [{ instruction: "读取备用资料", doneWhen: "取得真实数据" }] }) : planResult);
+  const f = await fixture({ planner, runner: async () => blockedResult("两个授权来源均无数据") });
+  try {
+    await f.send("m2-repeat");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    for (let i = 0; i < 2; i++) {
+      await new WorkContinuationScheduler(f.engine).wake(item.id);
+      await f.runtime.processWorkEvents();
+    }
+    await f.reopen();
+    await f.runtime.processWorkEvents();
+    expect(recoveries).toBe(1);
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("blocked");
+    expect(f.engine.workContinuations.list(item.id).filter(action => action.status === "succeeded")).toEqual([]);
+    for (const run of f.engine.listTaskRuns()) {
+      expect(f.engine.registry.store(SPACE).index().getRaw(run.rawId!)?.admission).toBe("excluded");
+    }
+  } finally { await f.close(); }
+});
+
+test("M2 provider failures are left for explicit retry and never trigger recovery planning", async () => {
+  let calls = 0, recoveries = 0;
+  const planner = new FakeLlm().onJSON(call => {
+    if (JSON.parse(call.prompt ?? "{}").recoveryContext) recoveries++;
+    return planResult;
+  });
+  const f = await fixture({ planner, runner: async () => { calls++; throw new Error("provider fixture failure"); } });
+  try {
+    await f.send("m2-provider-fail");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    await f.runtime.processWorkEvents();
+    await f.reopen();
+    await f.runtime.processWorkEvents();
+    expect(recoveries).toBe(0);
+    expect(calls).toBe(1);
+    expect(f.engine.workEvents.listRecoveries()).toEqual([]);
+  } finally { await f.close(); }
+});
+
+test("M2 human rejection produces a correction with its own full-access approval", async () => {
+  let executions = 0;
+  const planner = new FakeLlm().onJSON(call => {
+    const context = JSON.parse(call.prompt ?? "{}");
+    if (!context.recoveryContext) return planResult;
+    expect(context.recoveryContext.rejection).toBe("摘要缺少阻塞占比");
+    return { kind: "plan", reason: "根据验收意见补齐占比", steps: [{ instruction: "修正摘要", doneWhen: "包含阻塞占比15%" }] };
+  });
+  const f = await fixture({ full: true, planner, runner: async (_provider, input) => {
+    const permit = input.acquireExecutionPermit!(); const unregister = permit.register(() => {}); permit.release(); unregister();
+    executions++; return result("总数20，完成率60%，阻塞占比15%");
+  } });
+  try {
+    await f.send("m2-reject");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    const first = f.engine.listTaskRuns()[0]!;
+    await f.engine.approveTaskRun(first.id, "local-operator").completion;
+    f.engine.rejectWorkAction(first.workActionId!, first.id, "local-operator", "摘要缺少阻塞占比");
+    await f.runtime.processWorkEvents();
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    const next = f.engine.listTaskRuns().find(run => run.id !== first.id)!;
+    expect(next.status).toBe("awaiting_approval");
+    expect(next.approval?.status).toBe("pending");
+    expect(executions).toBe(1);
+    expect(f.engine.registry.store(SPACE).index().getRaw(first.rawId ?? f.engine.taskRuns.get(first.id)!.rawId!)?.admission).toBe("excluded");
+    await f.engine.approveTaskRun(next.id, "local-operator").completion;
+    await f.runtime.processWorkEvents();
+    expect(f.transport.sent.some(reply => reply.markdown.includes("全部步骤已验收"))).toBe(false);
+    f.engine.acceptWorkAction(next.workActionId!, next.id, "local-operator");
+    await f.runtime.processWorkEvents();
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("completed");
+  } finally { await f.close(); }
+});
+
+test("M2 saves a paused planner decision and commits it after resume without another model call", async () => {
+  let resolve!: () => void, began!: () => void, recoveries = 0;
+  const gate = new Promise<void>(r => { resolve = r; });
+  const started = new Promise<void>(r => { began = r; });
+  const fake = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").recoveryContext
+    ? { kind: "plan", reason: "改用备用资料", steps: [{ instruction: "读取备用资料", doneWhen: "核对数据" }] } : planResult);
+  const planner: LlmClient = { complete: opts => fake.complete(opts), async completeJSON(opts) {
+    if (JSON.parse(opts.prompt ?? "{}").recoveryContext) { recoveries++; began(); await gate; }
+    return fake.completeJSON(opts);
+  } };
+  const f = await fixture({ planner, runner: async () => blockedResult() });
+  try {
+    await f.send("m2-pause");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    const processing = f.runtime.processWorkEvents();
+    await started;
+    f.engine.workItems.update(item.id, { active: false });
+    resolve();
+    await processing;
+    expect(f.engine.getWorkPlanView(item.id)?.current.revision).toBe(1);
+    expect(f.engine.workEvents.listRecoveries()[0]?.status).toBe("decided");
+    await f.reopen();
+    f.engine.workItems.update(item.id, { active: true });
+    await f.runtime.processWorkEvents();
+    expect(f.engine.getWorkPlanView(item.id)?.current.revision).toBe(2);
+    expect(recoveries).toBe(1);
+  } finally { resolve(); await f.close(); }
+});
+
+test("M2 recovers the committed plan when retiring the old blocked action fails", async () => {
+  let recoveries = 0;
+  const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").recoveryContext
+    ? (recoveries++, { kind: "plan", reason: "改用备用资料", steps: [{ instruction: "读取备用资料", doneWhen: "取得真实数据" }] }) : planResult);
+  const f = await fixture({ planner, runner: async () => blockedResult() });
+  try {
+    await f.send("m2-commit-crash");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    const old = f.engine.workContinuations.list(item.id)[0]!;
+    const fail = spyOn(f.engine, "abandonWorkAction").mockImplementationOnce(() => { throw new Error("injected retirement failure"); });
+    await f.runtime.processWorkEvents();
+    fail.mockRestore();
+    expect(f.engine.getWorkPlanView(item.id)?.current.revision).toBe(2);
+    expect(f.engine.workEvents.listRecoveries()[0]?.status).toBe("decided");
+    expect(f.engine.listDueWorkContinuations()).toEqual([]);
+    await f.reopen();
+    await f.runtime.processWorkEvents();
+    expect(f.engine.workContinuations.get(old.id)?.status).toBe("cancelled");
+    expect(f.engine.workItems.get(item.id)?.blockers).toEqual([]);
+    expect(f.engine.listDueWorkContinuations().map(item => item.id)).toContain(item.id);
+    expect(recoveries).toBe(1);
+  } finally { await f.close(); }
+});
+
+test("M2 retains a remote completion receipt through local persistence failure", async () => {
+  let sends = 0;
+  const f = await fixture({ reply: async reply => { if (reply.markdown.includes("全部步骤已验收")) sends++; return { messageId: "remote-receipt" }; } });
+  try {
+    await f.send("m2-receipt");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    const scheduler = new WorkContinuationScheduler(f.engine);
+    await scheduler.wake(item.id); await scheduler.wake(item.id);
+    const save = f.engine.workEvents.save.bind(f.engine.workEvents);
+    let failed = false;
+    const fail = spyOn(f.engine.workEvents, "save").mockImplementation(notice => {
+      if (notice.kind === "completion" && notice.status === "sent" && !failed) { failed = true; throw new Error("injected receipt failure"); }
+      return save(notice);
+    });
+    await f.runtime.processWorkEvents();
+    expect(f.engine.workEvents.list().find(notice => notice.kind === "completion")?.status).toBe("failed");
+    await f.runtime.processWorkEvents();
+    fail.mockRestore();
+    expect(sends).toBe(1);
+    expect(f.engine.workEvents.list().find(notice => notice.kind === "completion")?.messageId).toBe("remote-receipt");
+  } finally { await f.close(); }
+});
+
+test("M2 leaves an interrupted planner failed and does not replay it after restart", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let recoveries = 0;
+  const fake = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").recoveryContext
+    ? { kind: "wait", reason: "缺数据", question: "数据在哪？" } : planResult);
+  const planner: LlmClient = { complete: opts => fake.complete(opts), async completeJSON(opts) {
+    if (JSON.parse(opts.prompt ?? "{}").recoveryContext) { recoveries++; entered.resolve(); await release.promise; }
+    return fake.completeJSON(opts);
+  } };
+  const f = await fixture({ planner, runner: async () => blockedResult() });
+  try {
+    await f.send("m2-stop");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    const processing = f.runtime.processWorkEvents();
+    await entered.promise;
+    await f.runtime.stop();
+    await processing;
+    release.resolve();
+    await f.reopen();
+    await f.runtime.processWorkEvents();
+    expect(recoveries).toBe(1);
+    expect(f.engine.workEvents.listRecoveries()[0]?.status).toBe("failed");
+    expect(f.engine.getWorkPlanView(item.id)?.current.revision).toBe(1);
+  } finally { release.resolve(); await f.close(); }
+});
+
+test("M2 a late recovery decision cannot replace a user's newer plan", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const fake = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").recoveryContext
+    ? { kind: "plan", reason: "使用备用资料", steps: [{ instruction: "旧的自动修订", doneWhen: "旧标准" }] } : planResult);
+  const planner: LlmClient = { complete: opts => fake.complete(opts), async completeJSON(opts) {
+    if (JSON.parse(opts.prompt ?? "{}").recoveryContext) { entered.resolve(); await release.promise; }
+    return fake.completeJSON(opts);
+  } };
+  const f = await fixture({ planner, runner: async () => blockedResult() });
+  try {
+    await f.send("m2-stale");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    const processing = f.runtime.processWorkEvents(); await entered.promise;
+    const prepared = f.engine.prepareWorkPlanRevision(item.id, { kind: "manual", id: "manual_new_facts" });
+    f.engine.commitWorkPlanRevision(prepared, [{ instruction: "用户已确认的新方案", doneWhen: "按新资料完成" }]);
+    release.resolve(); await processing;
+    expect(f.engine.getWorkPlanView(item.id)?.remaining[0]?.instruction).toBe("用户已确认的新方案");
+    expect(f.engine.workEvents.listRecoveries()[0]?.status).toBe("obsolete");
+  } finally { release.resolve(); await f.close(); }
+});
+
+test("M2 does not block an independent item while another item is replanning", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const fake = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").recoveryContext
+    ? { kind: "wait", reason: "缺数据", question: "数据在哪？" } : planResult);
+  const planner: LlmClient = { complete: opts => fake.complete(opts), async completeJSON(opts) {
+    if (JSON.parse(opts.prompt ?? "{}").recoveryContext) { entered.resolve(); await release.promise; }
+    return fake.completeJSON(opts);
+  } };
+  let executions = 0;
+  const f = await fixture({ planner, runner: async () => ++executions === 1 ? blockedResult() : result("第二个事项的独立成果") });
+  try {
+    await f.send("m2-parallel-a", "新建独立事项「A」，分步整理资料并生成摘要");
+    const first = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(first.id);
+    const processing = f.runtime.processWorkEvents(); await entered.promise;
+    await f.send("m2-parallel-b", "新建独立事项「B」，分步汇总测试数据并生成周报");
+    const second = f.engine.workItems.list(SPACE).find(item => item.id !== first.id)!;
+    await new WorkContinuationScheduler(f.engine).wake(second.id);
+    expect(f.engine.workItems.get(second.id)?.completedActionIds).toHaveLength(1);
+    expect(f.engine.workItems.get(first.id)?.phase).toBe("blocked");
+    release.resolve(); await processing;
+  } finally { release.resolve(); await f.close(); }
+});
+
+test("M2 pending recovery receipts gate continuation and retry the same delivery identity after restart", async () => {
+  let offline = true, calls = 0;
+  const keys: string[] = [];
+  const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").recoveryContext
+    ? { kind: "plan", reason: "改用备用资料", steps: [{ instruction: "读取备用资料", doneWhen: "取得真实数据" }] } : planResult);
+  const f = await fixture({ planner, runner: async () => { calls++; return blockedResult(); }, reply: async reply => {
+    if (reply.markdown.includes("已根据阻塞修订")) { keys.push(reply.idempotencyKey!); if (offline) throw new Error("fixture offline"); }
+  } });
+  try {
+    await f.send("m2-delivery");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    await f.runtime.processWorkEvents();
+    expect(f.engine.listDueWorkContinuations()).toEqual([]);
+    expect(() => f.engine.startWorkContinuation(item.id)).toThrow("receipt");
+    await f.reopen(); offline = false;
+    const retryAt = f.engine.workEvents.list().find(notice => notice.kind === "replanned")!.nextAttemptAt!;
+    const clock = spyOn(Date, "now").mockReturnValue(retryAt);
+    try { await f.runtime.processWorkEvents(); } finally { clock.mockRestore(); }
+    expect(new Set(keys).size).toBe(1);
+    expect(keys).toHaveLength(2);
+    expect(f.engine.listDueWorkContinuations().map(item => item.id)).toContain(item.id);
+    expect(calls).toBe(1);
+  } finally { await f.close(); }
+});
+
+test("M2 a planner cannot disguise unchanged failed work as an automatic retry", async () => {
+  let executions = 0;
+  const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").recoveryContext
+    ? { ...planResult, reason: "再试一次原步骤" } : planResult);
+  const f = await fixture({ planner, runner: async () => { executions++; return blockedResult(); } });
+  try {
+    await f.send("m2-unchanged");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    await f.runtime.processWorkEvents();
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    await f.runtime.processWorkEvents();
+    expect(executions).toBe(1);
+    expect(f.engine.getWorkPlanView(item.id)?.current.revision).toBe(1);
+    expect(f.engine.workEvents.listRecoveries()[0]?.status).toBe("failed");
+  } finally { await f.close(); }
+});
+
+test("M2 uncertain external effects are available to a verification step as unaccepted evidence", async () => {
+  let executions = 0;
+  const prompts: string[] = [];
+  const planner = new FakeLlm().onJSON(call => {
+    if (!JSON.parse(call.prompt ?? "{}").recoveryContext) return planResult;
+    expect(call.system).toContain("首步必须使用该系统实际查询能力核对已有结果");
+    expect(call.prompt).toContain("提交回执丢失，单号fixture-42是否已生效未知");
+    return { kind: "plan", reason: "先核对提交结果", steps: [{ instruction: "查询单号fixture-42的实际状态，不重新提交", doneWhen: "确认已有提交的状态" }] };
+  });
+  const f = await fixture({ planner, runner: async (_provider, input) => {
+    prompts.push(input.prompt);
+    return ++executions === 1 ? blockedResult("提交回执丢失，单号fixture-42是否已生效未知") : result("已查询，fixture-42已生效，没有重复提交");
+  } });
+  try {
+    await f.send("m2-uncertain");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    await f.runtime.processWorkEvents();
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    expect(prompts[1]).toContain("未通过验收，不代表操作成功");
+    expect(prompts[1]).toContain("单号fixture-42是否已生效未知");
+    expect(prompts[1]).toContain("查询单号fixture-42的实际状态，不重新提交");
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("completed");
+  } finally { await f.close(); }
+});
+
+test("M2 retracting the original source retires queued recovery without leaving a governance blocker", async () => {
+  const f = await fixture({ runner: async () => blockedResult() });
+  try {
+    await f.send("m2-retracted");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    const [event] = f.engine.prepareWorkRecoveries("冻结的规划指令");
+    expect(event?.status).toBe("queued");
+    f.engine.workDispatch.removeByMessage(SPACE, "oc_planning", "m2-retracted");
+    await f.runtime.processWorkEvents();
+    expect(f.engine.workEvents.getRecovery(event!.id)?.status).toBe("obsolete");
+    expect(f.engine.workEvents.hasActive(SPACE)).toBe(false);
+    expect(f.engine.getWorkPlanView(item.id)?.current.revision).toBe(1);
+  } finally { await f.close(); }
+});
 
 test("an in-flight supplement revises only remaining work after the current result is accepted", async () => {
   let release!: () => void;
@@ -718,7 +1146,10 @@ test("accepted step results return to the original chat with durable notificatio
     });
     expect(keys[0]).toBe(keys[1]);
     await scheduler.tick("last");
+    expect(f.transport.sent.at(-1)?.markdown).toContain("本步已通过验收");
+    await f.runtime.processWorkEvents();
     expect(f.transport.sent.at(-1)?.markdown).toContain("全部步骤已验收，事项已完成");
+    expect(f.transport.sent.filter(reply => reply.markdown.includes("全部步骤已验收"))).toHaveLength(1);
     expect(f.engine.listTaskRuns().every(run => run.notification?.status === "sent")).toBe(true);
   } finally { await f.close(); }
 });
@@ -794,7 +1225,7 @@ test("archive restore retains plans and explicit continuation choices without re
   } finally { restored.close(); rmSync(restoredDir, { recursive: true, force: true }); await f.close(); }
 });
 
-test("v22 archives restore revised plans with accepted evidence and reject broken graphs before mutation", async () => {
+test("v23 archives restore revised plans with accepted evidence and reject broken graphs before mutation", async () => {
   const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").revisionContext
     ? { kind: "plan", steps: [{ instruction: "生成短摘要", doneWhen: "100字以内" }] } : planResult);
   const f = await fixture({ planner });
@@ -807,7 +1238,7 @@ test("v22 archives restore revised plans with accepted evidence and reject broke
     const accepted = f.engine.workContinuations.list(item.id)[0]!;
     await f.send("archive-revised-change", "周报改成100字以内的摘要", { parentMessageId: "archive-revised-goal" });
     const archive = await f.engine.exportSpace(SPACE);
-    expect(archive.version).toBe(22);
+    expect(archive.version).toBe(23);
     expect(archive.workPlans).toHaveLength(2);
     expect(archive.workItems[0]?.planDelivery).toBeUndefined();
     const missing = structuredClone(archive);

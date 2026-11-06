@@ -138,7 +138,8 @@ export const RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION = 19 as const;
 export const CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION = 20 as const;
 export const MULTITASK_SPACE_ARCHIVE_VERSION = 21 as const;
 export const WORK_PLAN_SPACE_ARCHIVE_VERSION = 22 as const;
-export const SPACE_ARCHIVE_VERSION = WORK_PLAN_SPACE_ARCHIVE_VERSION;
+export const WORK_RECOVERY_SPACE_ARCHIVE_VERSION = 23 as const;
+export const SPACE_ARCHIVE_VERSION = WORK_RECOVERY_SPACE_ARCHIVE_VERSION;
 
 export interface RawSourceFileArchive {
   digest: string;
@@ -267,7 +268,10 @@ export interface SpaceArchiveV22 extends Omit<SpaceArchiveV21, "version"> {
   version: typeof WORK_PLAN_SPACE_ARCHIVE_VERSION;
   workPlans: WorkPlanRevision[];
 }
-export type SpaceArchive = SpaceArchiveV22;
+export interface SpaceArchiveV23 extends Omit<SpaceArchiveV22, "version"> {
+  version: typeof WORK_RECOVERY_SPACE_ARCHIVE_VERSION;
+}
+export type SpaceArchive = SpaceArchiveV23;
 
 export interface SpaceDeleteResult {
   status: "deleted" | "not_found";
@@ -2015,6 +2019,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       && version !== CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION
       && version !== MULTITASK_SPACE_ARCHIVE_VERSION
       && version !== WORK_PLAN_SPACE_ARCHIVE_VERSION
+      && version !== WORK_RECOVERY_SPACE_ARCHIVE_VERSION
     )
   ) {
     throw new Error("unsupported space archive format or version");
@@ -2214,6 +2219,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
   const workActionById = new Map(workActions.map((action) => [action.id, action]));
   const workPlans = version >= WORK_PLAN_SPACE_ARCHIVE_VERSION ? (root.workPlans as unknown[]).map(parseWorkPlanRevision) : [];
   for (const plan of workPlans) {
+    if (version < WORK_RECOVERY_SPACE_ARCHIVE_VERSION && plan.version !== 1) throw new Error("work recovery requires archive v23");
     const source = plan.source.kind === "chat" ? chatRuns.find(run => run.id === plan.source.id) : undefined;
     if (source && (source.workItemId !== plan.workItemId || source.space !== plan.space)) throw new Error("work plan revision source is invalid");
   }

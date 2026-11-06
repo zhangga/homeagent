@@ -2566,7 +2566,7 @@ describe("management backend (read-write)", () => {
     const governanceBody = await governance.text();
     expect(governanceBody).toContain("数据治理");
     expect(governanceBody).toContain("原始消息保留");
-    expect(governanceBody).toContain("homeagent.space v1–v22");
+    expect(governanceBody).toContain("homeagent.space v1–v23");
     expect(governanceBody).toContain("v17 包含系统生成的分层知识地图");
     expect(governanceBody).toContain("v18 包含本地 Agent 知识消费反馈及处置记录");
     expect(governanceBody).toContain("v19 包含按 SHA-256 校验的完整原文件");
@@ -2580,7 +2580,7 @@ describe("management backend (read-write)", () => {
     expect(JSON.parse(archiveText)).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 22,
+        version: 23,
         sourceFiles: [],
         agentKnowledgeFeedback: [],
         agentRevisions: [],

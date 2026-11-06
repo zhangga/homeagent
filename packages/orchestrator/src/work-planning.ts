@@ -11,10 +11,11 @@ export const WORK_PLANNING_INSTRUCTION = `判断用户是否要求实际推进�
 export const WORK_REPLANNING_INSTRUCTION = `${WORK_PLANNING_INSTRUCTION}
 本轮是用户对已有事项的明确补充。revisionContext 包含原目标、剩余步骤及已验收成果。只返回修订后的全部剩余步骤，保留未被本次要求改变的工作；不要重复已验收步骤，不把已完成成果改为未完成。必要时可以只剩一个步骤。用户只咨询或致谢时返回 answer。已验收结果只能作为事实使用，不能虚构执行或越过审批。`;
 
-export function isWorkReplanningCandidate(text: string): boolean {
+export function isWorkReplanningCandidate(text: string, awaitingFacts = false): boolean {
   if (/(?:只|仅)(?:要|需|出|给|提供)?(?:一份|个)?(?:方案|建议|计划)|(?:不要|不用|无需|暂不|不必)执行/u.test(text)
     || /^(?:请问|怎么|如何|为什么|解释一下)|(?:是什么意思|怎么做|如何修改)[？?]?$/u.test(text.trim())) return false;
-  return /(?:改成|改为|修改|调整|补充|增加|添加|追加|去掉|删掉|删除|换成|改用|限制|不超过|以内|按.+分组|再做|继续做)/u.test(text);
+  if (awaitingFacts && text.trim() && !/^(?:谢谢|感谢|好的|好|收到|明白了)[。！!\s]*$/u.test(text.trim())) return true;
+  return /(?:改成|改为|修改|调整|补充|增加|添加|追加|去掉|删掉|删除|换成|改用|限制|不超过|以内|按.+分组|再做|继续做|重新规划|重新考虑|换个方案)/u.test(text);
 }
 
 /** Avoid an extra model call on ordinary conversation and single-turn requests. */
@@ -47,7 +48,7 @@ export function parseChatWorkPlan(value: unknown): ChatWorkPlan {
 export async function generateWorkPlan(client: LlmClient, input: {
   question: string; instruction: string; agentInstruction?: string; model?: string; space: string;
   workItem: { id: string; title: string };
-  revisionContext?: Pick<WorkPlanPreparation, "goal" | "remaining" | "accepted">;
+  revisionContext?: Pick<WorkPlanPreparation, "goal" | "remaining" | "accepted" | "blocked">;
 }, signal: AbortSignal): Promise<ChatWorkPlan> {
   signal.throwIfAborted();
   let cancel!: () => void;

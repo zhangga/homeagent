@@ -25,6 +25,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { WorkDispatchStore, type WorkInput, type WorkRoutingPlan } from "./work-dispatch.ts";
 import { WorkPlanChangedError, formatWorkPlanStep, workPlanStepDigest, type WorkPlanPreparation, type WorkPlanRevision, type WorkPlanStep } from "./work-plans.ts";
+import { WorkEventStore, workEventId, parseWorkRecoveryDecision, type WorkRecovery, type WorkRecoveryDecision } from "./work-events.ts";
 import {
   AI_GENERATION_MAX_TOKENS,
   AI_MAX_CONFIGURABLE_TIMEOUT_MINUTES,
@@ -1477,6 +1478,7 @@ export class KnowledgeEngine implements Knowledge {
   readonly reminders: ReminderStore;
   readonly workItems: WorkItemStore;
   readonly workContinuations: WorkContinuationStore;
+  readonly workEvents: WorkEventStore;
   readonly learning: LearningPlanStore;
   readonly quality: QualityStore;
   readonly serializer: Serializer;
@@ -1508,6 +1510,7 @@ export class KnowledgeEngine implements Knowledge {
     this.workItems = new WorkItemStore(this.dataDir);
     this.workDispatch = new WorkDispatchStore(this.dataDir);
     this.workContinuations = new WorkContinuationStore(this.dataDir);
+    this.workEvents = new WorkEventStore(this.dataDir);
     this.feishuBindings = new FeishuGroupBindingStore(this.dataDir);
     this.skillCatalog = opts.skillCatalog ?? new SkillCatalog({
       roots: defaultSkillRoots(),
@@ -1940,6 +1943,12 @@ export class KnowledgeEngine implements Knowledge {
     for (const action of this.workContinuations.list()) {
       this.reconcileWorkActionRawAdmissions(action);
       if (action.status === "blocked" && action.error) {
+        const item = this.workItems.get(action.workItemId);
+        if (action.planStep && item?.planRef && item.planRef.revision > action.planStep.revision
+          && !item.nextStepIds?.includes(action.planStep.stepId) && !item.actionBlockers?.[action.id]) {
+          this.abandonWorkAction(action.id);
+          continue;
+        }
         const latestRunId = action.taskRunIds.at(-1);
         this.excludeWorkActionRaws(
           action,
@@ -2566,7 +2575,7 @@ export class KnowledgeEngine implements Knowledge {
         && this.canAutomaticallyAcceptWorkAction(run, action, latestAcceptance)
         && this.isCurrentWorkActionBoundary(action)
       ) {
-        const accepted = this.workContinuations.accept(action.id, {
+        const accepted = this.acceptTrackedWorkAction(action.id, {
           runId: run.id,
           decidedAt: Math.max(Date.now(), latestAcceptance.requestedAt),
           decidedBy: "homeagent.auto-accept",
@@ -2597,7 +2606,7 @@ export class KnowledgeEngine implements Knowledge {
         && this.canAutomaticallyAcceptWorkAction(run, pending, acceptance)
         && this.isCurrentWorkActionBoundary(pending)
       ) {
-        const accepted = this.workContinuations.accept(action.id, {
+        const accepted = this.acceptTrackedWorkAction(action.id, {
           runId: run.id,
           decidedAt: Math.max(Date.now(), acceptance.requestedAt),
           decidedBy: "homeagent.auto-accept",
@@ -4949,6 +4958,7 @@ export class KnowledgeEngine implements Knowledge {
       }
       const taskIds = new Set(tasks.map((task) => task.id));
       if (this.workDispatch.hasPending(space)) throw new Error("Space has pending work inputs");
+      if (this.workEvents.hasActive(space)) throw new Error("Space has active work events");
       const workActionIds = new Set(workContinuation.actions.map((action) => action.id));
       const raw = index.listRaw({});
       const sourceDigests = [...new Set(raw.flatMap((entry) =>
@@ -5260,6 +5270,7 @@ export class KnowledgeEngine implements Knowledge {
       const index = this.registry.store(space).index();
       const pagesDeleted = index.countPages();
       if (this.workDispatch.hasPending(space)) throw new Error("Space has pending work inputs");
+      if (this.workEvents.hasActive(space)) throw new Error("Space has active work events");
       const rawDeleted = index.countRaw();
       let tasksDeleted = 0;
       let remindersDeleted = 0;
@@ -5268,6 +5279,8 @@ export class KnowledgeEngine implements Knowledge {
       const learningArchive = this.learning.exportBySpace(space);
       const chatRunSnapshot = this.chatRuns.snapshotLocalBySpace(space);
       const workInputSnapshot = this.workDispatch.list(space);
+      const workNoticeSnapshot = this.workEvents.list(space);
+      const workRecoverySnapshot = this.workEvents.listRecoveries(space);
       const workPlanSnapshot = workItems.flatMap(item => this.workItems.plans.snapshot(item.id));
       const currentWorkItemId = this.workItems.currentForSpace(space)?.id;
       let chatRunStateRemoved = false;
@@ -5282,6 +5295,7 @@ export class KnowledgeEngine implements Knowledge {
         workItemsDeleted = this.workItems.removeBySpace(space).length;
         for (const item of workItems) this.workItems.plans.removeItem(item.id);
         this.workDispatch.removeBySpace(space);
+        this.workEvents.removeSpace(space);
         this.registry.remove(space);
       } catch (err) {
         const missingTaskRuns = taskRuns.filter((run) => !this.taskRuns.has(run.id));
@@ -5302,6 +5316,8 @@ export class KnowledgeEngine implements Knowledge {
         if (missingWorkItems.length > 0) this.workItems.restore(missingWorkItems);
         if (currentWorkItemId) this.workItems.select(currentWorkItemId);
         if (workInputSnapshot.length > 0) this.workDispatch.restoreLocalSnapshot(workInputSnapshot);
+        for (const notice of workNoticeSnapshot) this.workEvents.save(notice);
+        for (const event of workRecoverySnapshot) this.workEvents.saveRecovery(event);
         if (
           workContinuation.actions.some((action) => !this.workContinuations.get(action.id))
           || workContinuation.policies.some((policy) =>
@@ -5656,6 +5672,105 @@ export class KnowledgeEngine implements Knowledge {
     return this.workContinuations.configure(item, { autoContinue });
   }
 
+  /** Only a completed provider report or human rejection is a planning event. */
+  prepareWorkRecoveries(instruction: string): WorkRecovery[] {
+    for (const action of this.workContinuations.list()) {
+      const item = this.workItems.get(action.workItemId), acceptance = action.acceptances?.at(-1);
+      if (action.status !== "blocked" || !item?.planRef || !item.active || item.phase !== "blocked"
+        || !this.workContinuations.policyFor(item.id, item.space).autoContinue || this.hasPendingWorkInputs(item.id)
+        || action.planStep?.stepId !== item.nextStepIds?.[0] || this.workContinuations.activeForWorkItem(item.id)) continue;
+      const run = this.taskRuns.get(action.taskRunIds.at(-1) ?? "");
+      if (!run || run.status !== "succeeded" || run.launchAdmission !== "admitted" || acceptance?.status !== "rejected"
+        || acceptance.taskRunId !== run.id || !isResolvedExecutionPlan(run.executionPlan)) continue;
+      const report = parseWorkActionProviderReport(run.output ?? "");
+      if (!report || (report.outcome !== "blocked" && acceptance.mode !== "human")) continue;
+      const source = this.chatWorkPlanSource(item.id);
+      if (!source) continue;
+      let anchor = this.workItems.plans.get(item.id, item.planRef);
+      while (anchor.source.kind === "recovery" && anchor.previous) anchor = this.workItems.plans.get(item.id, anchor.previous);
+      const rejection = acceptance.mode === "human" ? acceptance.reason : undefined;
+      const factKey = createHash("sha256").update(JSON.stringify([item.id, anchor.revision,
+        item.completedActionIds ?? [], report.result, report.blockers, rejection, action.attempt])).digest("hex");
+      if (this.workEvents.listRecoveries(item.space).some(event => event.workItemId === item.id && event.factKey === factKey
+        && event.status !== "obsolete")) continue;
+      const id = workEventId("recovery", [item.id, item.planRef, action.id, action.attempt, factKey]);
+      const execution = run.executionPlan;
+      this.workEvents.saveRecovery({ version: 1, kind: "recovery", id, workItemId: item.id, space: item.space,
+        sourceInputId: source.id, actionId: action.id, attempt: action.attempt, runId: run.id, factKey, report, rejection,
+        prepared: this.prepareWorkPlanRevision(item.id, { kind: "recovery", id, actionId: action.id }),
+        planner: { execution: { version: 2, instruction: execution.instruction, provider: execution.provider,
+          model: execution.model, reasoningEffort: execution.reasoningEffort, agentRevisionId: execution.agentRevisionId },
+          agentId: run.agentId, instruction, timeoutMs: run.timeoutMs ?? AI_OPERATION_TIMEOUT_MS, maxTokens: AI_GENERATION_MAX_TOKENS },
+        status: "queued", createdAt: Date.now() });
+    }
+    return this.workEvents.listRecoveries().filter(event => ["queued", "decided"].includes(event.status));
+  }
+
+  workRecoveryReady(event: WorkRecovery): boolean {
+    const item = this.workItems.get(event.workItemId);
+    const source = item && this.chatWorkPlanSource(item.id);
+    return !!item && item.space === event.space && item.active && item.phase !== "completed"
+      && source?.id === event.sourceInputId && this.workContinuations.policyFor(item.id, item.space).autoContinue
+      && !this.hasPendingWorkInputs(item.id) && !this.workContinuations.activeForWorkItem(item.id);
+  }
+
+  workRecoveryCurrent(event: WorkRecovery): boolean {
+    const item = this.workItems.get(event.workItemId);
+    if (!item?.planRef || this.chatWorkPlanSource(item.id)?.id !== event.sourceInputId) return false;
+    if (this.workItems.plans.get(item.id, item.planRef).source.id === event.id) return true;
+    const action = this.workContinuations.get(event.actionId);
+    return action?.status === "blocked" && action.attempt === event.attempt && action.taskRunIds.at(-1) === event.runId
+      && this.workPlanFingerprint(item.id) === event.prepared.fingerprint;
+  }
+
+  workAwaitsRecoveryInput(workItemId: string): boolean {
+    return this.workEvents.listRecoveries().some(event => event.workItemId === workItemId
+      && event.status === "waiting" && this.workRecoveryCurrent(event));
+  }
+
+  decideWorkRecovery(id: string, decision: WorkRecoveryDecision): void {
+    const event = this.workEvents.getRecovery(id);
+    if (!event || event.status !== "running") throw new Error("Work recovery is not running");
+    const parsed = parseWorkRecoveryDecision(decision);
+    if (parsed.kind === "plan" && parsed.steps[0]?.instruction === event.prepared.remaining[0]?.instruction
+      && parsed.steps[0]?.doneWhen === event.prepared.remaining[0]?.doneWhen) throw new Error("工作重规划没有改变当前阻塞步骤");
+    this.workEvents.saveRecovery({ ...event, status: "decided", decision: parsed });
+  }
+
+  applyWorkRecovery(id: string): void {
+    const event = this.workEvents.getRecovery(id);
+    if (!event || event.status !== "decided" || !event.decision) return;
+    if (!this.workRecoveryCurrent(event)) { this.workEvents.saveRecovery({ ...event, status: "obsolete" }); return; }
+    if (!this.workRecoveryReady(event)) return;
+    let item = this.workItems.get(event.workItemId)!;
+    if (event.decision.kind === "plan") {
+      if (this.workItems.plans.get(item.id, item.planRef!).source.id !== event.id) {
+        item = this.commitWorkPlanRevision(event.prepared, event.decision.steps, { reason: event.decision.reason });
+      } else if (this.workContinuations.get(event.actionId)?.status === "blocked") {
+        this.abandonWorkAction(event.actionId);
+      }
+    }
+    const kind = event.decision.kind === "plan" ? "replanned" : "waiting";
+    const noticeId = workEventId("notice", [item.id, item.planRef, kind, event.id]);
+    if (!this.workEvents.get(noticeId)) this.workEvents.save({ version: 1, id: noticeId, workItemId: item.id, space: item.space,
+      planRef: item.planRef, sourceInputId: event.sourceInputId, kind, status: "pending", attempts: 0, createdAt: Date.now(),
+      markdown: event.decision.kind === "wait"
+        ? `工作计划「${item.title}」等待补充资料\n\n${event.decision.reason}\n\n${event.decision.question}\n\n请在本话题回复，收到新信息后修订剩余计划。`
+        : `工作计划「${item.title}」已根据阻塞修订\n\n${event.decision.reason}\n\n保留 ${event.prepared.accepted.length} 项已验收成果，剩余 ${item.nextActions.length} 步：\n\n${item.nextActions.join("\n\n")}` });
+    this.workEvents.saveRecovery({ ...event, status: event.decision.kind === "plan" ? "applied" : "waiting" });
+  }
+
+  private workRecoveryDelivered(workItemId: string): boolean {
+    const item = this.workItems.get(workItemId);
+    if (!item?.planRef) return true;
+    const plan = this.workItems.plans.get(item.id, item.planRef);
+    if (plan.source.kind !== "recovery") return true;
+    // Imported history carries no local event authority and follows normal manual continuation.
+    if (!item.chatPlanRunId) return true;
+    const notice = this.workEvents.get(workEventId("notice", [item.id, item.planRef, "replanned", plan.source.id]));
+    return notice?.status === "sent";
+  }
+
   private hasPendingWorkInputs(workItemId: string): boolean {
     return this.workDispatch.summaries().some(input => input.workItemId === workItemId
       && !["settled", "interrupted", "cancelled"].includes(input.state)
@@ -5679,7 +5794,11 @@ export class KnowledgeEngine implements Knowledge {
       cursor = cursor.previous ? this.workItems.plans.get(item.id, cursor.previous) : undefined;
     }
     const progressToken = createHash("sha256").update(JSON.stringify([item.planRef, item.nextStepIds])).digest("hex");
-    return { current, remaining, actions: this.workContinuations.list(item.id), history, progressToken };
+    const recovery = this.workEvents.listRecoveries(item.space).filter(event => event.workItemId === item.id).at(-1);
+    const notices = this.workEvents.list(item.space).filter(notice => notice.workItemId === item.id
+      && JSON.stringify(notice.planRef) === JSON.stringify(item.planRef)).map(notice => ({ kind: notice.kind, status: notice.status }));
+    return { current, remaining, actions: this.workContinuations.list(item.id), history, progressToken,
+      recovery: recovery && this.workRecoveryCurrent(recovery) ? { status: recovery.status, decision: recovery.decision } : undefined, notices };
   }
 
   private workPlanFingerprint(workItemId: string): string {
@@ -5693,12 +5812,17 @@ export class KnowledgeEngine implements Knowledge {
   prepareWorkPlanRevision(workItemId: string, source: WorkPlanRevision["source"]): WorkPlanPreparation {
     const item = this.workItems.get(workItemId);
     const active = this.workContinuations.activeForWorkItem(workItemId);
-    if (!item || (source.kind === "chat" && active && !["queued", "awaiting_approval"].includes(active.status))) throw new Error("Work plan is waiting for the current action");
+    if (!item || (source.kind !== "manual" && active && !["queued", "awaiting_approval"].includes(active.status))) throw new Error("Work plan is waiting for the current action");
     if (source.kind === "chat") {
       const run = this.chatRuns.get(source.id);
       if (!run || run.workItemId !== item.id || run.space !== item.space || run.status !== "running") throw new Error("Invalid planning run");
     }
     const view = this.getWorkPlanView(item.id);
+    const blockedAction = this.workContinuations.list(item.id).find(action => action.status === "blocked"
+      && action.planStep?.stepId === item.nextStepIds?.[0]);
+    const blockedRun = blockedAction && this.taskRuns.get(blockedAction.taskRunIds.at(-1) ?? "");
+    const blockedReport = blockedRun && parseWorkActionProviderReport(blockedRun.output ?? "");
+    const blockedAcceptance = blockedAction?.acceptances?.at(-1);
     const accepted = this.workContinuations.list(item.id).filter(action => action.status === "succeeded"
       && item.completedActionIds?.includes(action.id)).reverse().map(action => {
         const run = action.checkpoint?.taskRunId ? this.taskRuns.get(action.checkpoint.taskRunId) : undefined;
@@ -5710,21 +5834,24 @@ export class KnowledgeEngine implements Knowledge {
       remaining: view?.remaining ?? item.nextActions.map((instruction, index) => ({
         id: `step_${createHash("sha256").update(`${item.id}:legacy:${index}:${instruction}`).digest("hex").slice(0, 32)}`,
         instruction, legacy: true as const,
-      })), accepted };
+      })), accepted, ...(blockedAction && blockedReport ? { blocked: { actionId: blockedAction.id, report: blockedReport,
+        rejection: blockedAcceptance?.mode === "human" ? blockedAcceptance.reason : undefined } } : {}) };
   }
 
   commitWorkPlanRevision(prepared: WorkPlanPreparation, steps: { instruction: string; doneWhen: string }[], opts: { goal?: string; reason?: string; reactivate?: boolean } = {}) {
     if (JSON.stringify(prepared) !== JSON.stringify(this.prepareWorkPlanRevision(prepared.workItemId, prepared.source))) throw new WorkPlanChangedError();
     const item = this.workItems.get(prepared.workItemId)!;
     if (item.space !== prepared.space) throw new Error("Work plan boundary changed");
-    const unused = [...prepared.remaining];
+    const superseded = this.workContinuations.list(item.id).filter(action => action.status === "blocked"
+      && action.planStep?.stepId === item.nextStepIds?.[0]);
+    const unused = prepared.remaining.filter(step => !superseded.some(action => action.planStep?.stepId === step.id));
     const definitions: WorkPlanStep[] = steps.map((step, index) => {
       const match = unused.findIndex(previous => !previous.legacy && previous.instruction === step.instruction && previous.doneWhen === step.doneWhen);
       const id = match >= 0 ? unused.splice(match, 1)[0]!.id
         : `step_${createHash("sha256").update(JSON.stringify([item.id, prepared.source, index, step])).digest("hex").slice(0, 32)}`;
       return { id, instruction: step.instruction, doneWhen: step.doneWhen };
     });
-    const revision: WorkPlanRevision = { version: 1, workItemId: item.id, space: item.space,
+    const revision: WorkPlanRevision = { version: 2, workItemId: item.id, space: item.space,
       revision: this.workItems.plans.nextRevision(item.id), ...(item.planRef ? { previous: item.planRef } : {}),
       goal: opts.goal ?? prepared.goal, reason: opts.reason ?? (item.chatPlanRunId || item.planRef ? "根据补充要求修订剩余计划" : "首次规划"),
       source: prepared.source, steps: definitions, acceptedActionIds: prepared.accepted.map(action => action.actionId), createdAt: Date.now() };
@@ -5736,8 +5863,10 @@ export class KnowledgeEngine implements Knowledge {
       if (!["queued", "awaiting_approval"].includes(active.status)
         || !this.cancelWorkAction(active.id, { runId: active.taskRunIds.at(-1), attempt: active.attempt })) throw new Error("Work plan boundary changed");
     }
-    return this.workItems.commitPlan(item.id, revision, { deliveryRunId: prepared.source.kind === "chat" ? prepared.source.id : undefined,
-      reactivate: opts.reactivate });
+    const committed = this.workItems.commitPlan(item.id, revision, { deliveryRunId: prepared.source.kind === "chat" ? prepared.source.id : undefined,
+      reactivate: opts.reactivate, supersededActionIds: superseded.map(action => action.id) });
+    for (const action of superseded) this.abandonWorkAction(action.id);
+    return committed;
   }
 
   updateWorkItem(workItemId: string, update: WorkItemUpdate, expectedRevision?: number, expectedProgress?: string) {
@@ -5836,6 +5965,7 @@ export class KnowledgeEngine implements Knowledge {
         && item.nextActions.length > 0
         && (!item.chatPlanRunId || !waiting.has(item.id))
         && item.planDelivery?.status !== "pending"
+        && this.workRecoveryDelivered(item.id)
         && this.workContinuations.activeForWorkItem(item.id) === undefined
       ));
   }
@@ -5874,6 +6004,7 @@ export class KnowledgeEngine implements Knowledge {
     const item = this.workItems.get(workItemId);
     if (!item) throw new Error(`work item not found: ${workItemId}`);
     if (item.planDelivery?.status === "pending") throw new Error("Work plan receipt has not been delivered");
+    if (!this.workRecoveryDelivered(item.id)) throw new Error("Work recovery receipt has not been delivered");
     if (item.planRef && this.hasPendingWorkInputs(item.id)) throw new Error("Work plan has pending user input");
     const step = this.getWorkPlanView(item.id)?.remaining[0];
     const action = this.workContinuations.claimNext(item, Date.now(), step && item.planRef
@@ -5970,7 +6101,7 @@ export class KnowledgeEngine implements Knowledge {
     }
     const acceptance = pending.acceptances?.at(-1);
     this.assertWorkActionAcceptanceRaw(pending, acceptance);
-    const accepted = this.workContinuations.accept(actionId, {
+    const accepted = this.acceptTrackedWorkAction(actionId, {
       runId,
       decidedAt: Math.max(Date.now(), acceptance?.requestedAt ?? pending.updatedAt),
       decidedBy,
@@ -5979,6 +6110,45 @@ export class KnowledgeEngine implements Knowledge {
     });
     this.projectAcceptedWorkAction(accepted);
     return accepted;
+  }
+
+  private acceptTrackedWorkAction(actionId: string, input: Parameters<WorkContinuationStore["accept"]>[1]): WorkAction {
+    const action = this.workContinuations.get(actionId);
+    const item = action && this.workItems.get(action.workItemId);
+    const source = item && this.chatWorkPlanSource(item.id);
+    // Persist intent before acceptance. Reopening old accepted actions never enrolls
+    // historical completed items into a new outbound delivery.
+    if (action?.status === "awaiting_acceptance" && item && source) {
+      const id = workEventId("notice", [item.id, item.planRef ?? item.chatPlanRunId, "completion"]);
+      if (!this.workEvents.get(id)) this.workEvents.save({ version: 1, id, workItemId: item.id,
+        space: item.space, planRef: item.planRef, sourceInputId: source.id, kind: "completion",
+        status: "watching", attempts: 0, createdAt: Date.now() });
+    }
+    return this.workContinuations.accept(actionId, input);
+  }
+
+  reconcileWorkNotices(): void {
+    this.reconcileChatWorkPlans();
+    for (const notice of this.workEvents.list()) {
+      if (notice.status !== "watching") continue;
+      const item = this.workItems.get(notice.workItemId);
+      if (!item || item.space !== notice.space || JSON.stringify(item.planRef) !== JSON.stringify(notice.planRef)) {
+        this.workEvents.save({ ...notice, status: "cancelled" });
+        continue;
+      }
+      if (item.phase !== "completed" || item.nextActions.length || item.blockers.length
+        || this.hasPendingWorkInputs(item.id) || this.workContinuations.activeForWorkItem(item.id)) continue;
+      const accepted = this.workContinuations.list(item.id).filter(action => action.status === "succeeded"
+        && item.completedActionIds?.includes(action.id));
+      if (!accepted.length) continue;
+      const latest = accepted[0]!;
+      const run = latest.checkpoint?.taskRunId ? this.taskRuns.get(latest.checkpoint.taskRunId) : undefined;
+      const report = parseWorkActionProviderReport(run?.output ?? "");
+      this.workEvents.save({ ...notice, status: "pending", markdown: [
+        `工作计划「${item.title}」已完成`, "", "全部步骤已验收，事项已完成。",
+        `共验收 ${accepted.length} 项成果。`, "", report?.result ?? latest.checkpoint?.summary ?? "",
+      ].join("\n") });
+    }
   }
 
   rejectWorkAction(
@@ -6058,6 +6228,10 @@ export class KnowledgeEngine implements Knowledge {
   }
 
   private workActionTask(item: WorkItem, action: WorkAction): Task {
+    const plan = action.planStep ? this.workItems.plans.get(item.id, { revision: action.planStep.revision, digest: action.planStep.planDigest }) : undefined;
+    const trigger = plan?.source.kind === "recovery" ? this.workContinuations.get(plan.source.actionId!) : undefined;
+    const triggerRun = trigger?.workItemId === item.id && trigger.space === item.space ? this.taskRuns.get(trigger.taskRunIds.at(-1) ?? "") : undefined;
+    const blockedReport = triggerRun && parseWorkActionProviderReport(triggerRun.output ?? "");
     const accepted = item.chatPlanRunId ? this.workContinuations.list(item.id)
       .filter(previous => previous.status === "succeeded" && item.completedActionIds?.includes(previous.id))
       .sort((left, right) => left.createdAt - right.createdAt)
@@ -6074,10 +6248,12 @@ export class KnowledgeEngine implements Knowledge {
       "",
       `# 工作项\n${item.title}`,
       item.brief ? `\n## Brief\n${item.brief}` : "",
+      plan?.goal ? `\n## 当前计划目标\n${plan.goal}` : "",
       item.runbook ? `\n## Runbook\n${item.runbook}` : "",
       item.summary ? `\n## 当前进展\n${item.summary}` : "",
       accepted.length ? `\n## 已验收的前序成果\n${JSON.stringify(accepted)}` : "",
       item.blockers.length > 0 ? `\n## 已知阻塞\n${item.blockers.join("\n")}` : "",
+      blockedReport ? `\n## 本次修订依据（未通过验收，不代表操作成功）\n${JSON.stringify({ report: blockedReport, rejection: trigger?.acceptances?.at(-1)?.reason })}` : "",
       `\n## 本次动作\n${action.instruction}`,
       "",
       "只输出一个 JSON 对象，不要使用 Markdown 代码块或附加说明。格式：",

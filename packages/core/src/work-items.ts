@@ -359,7 +359,7 @@ export class WorkItemStore {
       || item.runbook !== (plan.runbook ?? plan.steps.map(formatWorkPlanStep).join("\n\n"))) throw new Error("Work plan projection mismatch");
   }
 
-  commitPlan(id: string, plan: WorkPlanRevision, opts: { deliveryRunId?: string; retryOf?: string; reactivate?: boolean; context?: WorkItemUpdate } = {}): WorkItem {
+  commitPlan(id: string, plan: WorkPlanRevision, opts: { deliveryRunId?: string; retryOf?: string; reactivate?: boolean; context?: WorkItemUpdate; supersededActionIds?: string[] } = {}): WorkItem {
     const current = this.get(id);
     if (!current || plan.workItemId !== id || plan.space !== current.space
       || JSON.stringify(plan.previous) !== JSON.stringify(current.planRef)) throw new Error("Work plan revision conflict");
@@ -373,6 +373,13 @@ export class WorkItemStore {
       item.nextStepIds = plan.steps.map(step => step.id);
       item.nextActions = plan.steps.map(formatWorkPlanStep);
       item.runbook = plan.runbook ?? item.nextActions.join("\n\n");
+      for (const actionId of opts.supersededActionIds ?? []) {
+        const blocker = item.actionBlockers?.[actionId];
+        if (!blocker) continue;
+        delete item.actionBlockers![actionId];
+        item.blockers = item.blockers.filter(value => value !== blocker);
+      }
+      if (item.phase === "blocked" && !item.blockers.length) item.phase = "active";
       if (opts.deliveryRunId) {
         item.chatPlanRunId ??= opts.deliveryRunId;
         item.planDelivery = { runId: opts.deliveryRunId, status: "pending" };

@@ -69,6 +69,7 @@ import type {
   LiveReplyHandle,
 } from "@homeagent/connectors";
 import { extractAttachmentText } from "./attachment-extractor.ts";
+import { WorkAutomation } from "./work-automation.ts";
 import { newWorkTitle, routeWork, workControl, resolveSupplement, WORK_ROUTING_INSTRUCTION } from "./work-routing.ts";
 import { generateWorkPlan, isWorkPlanningCandidate, isWorkReplanningCandidate, WORK_PLANNING_INSTRUCTION, WORK_REPLANNING_INSTRUCTION } from "./work-planning.ts";
 import { splitMaterialText } from "@homeagent/shared";
@@ -311,6 +312,7 @@ export interface RuntimeOptions {
 export class Orchestrator {
   private onCardAction?: RuntimeOptions["onCardAction"];
   private engine: KnowledgeEngine;
+  private workAutomation: WorkAutomation;
   private connector: Connector;
   private activeFeishuAppId?: string;
   private groupOnboarding: FeishuGroupOnboardingService;
@@ -367,6 +369,7 @@ export class Orchestrator {
   constructor(opts: RuntimeOptions) {
     this.onCardAction = opts.onCardAction;
     this.engine = opts.engine;
+    this.workAutomation = new WorkAutomation(opts.engine, opts.connector, opts.activeFeishuAppId, opts.llm, opts.onWorkPlanReady);
     this.connector = opts.connector;
     this.activeFeishuAppId = opts.activeFeishuAppId;
     this.groupOnboarding = new FeishuGroupOnboardingService({
@@ -396,6 +399,7 @@ export class Orchestrator {
 
   async start(): Promise<void> {
     this.stopping = false;
+    this.workAutomation.start();
     for (const input of this.engine.workDispatch.summaries()) {
       if (input.connector !== this.connector.name || input.appId !== (this.activeFeishuAppId ?? "")) continue;
       if (input.state === "cancelled" && input.runId) {
@@ -408,7 +412,10 @@ export class Orchestrator {
       }
     }
     this.resumeQueuedChatRuns();
-    this.dispatchTimer = setInterval(() => this.flushWorkInputs(), 1_000);
+    this.dispatchTimer = setInterval(() => {
+      this.flushWorkInputs();
+      void this.processWorkEvents().catch(() => log.warn("工作事件处理暂未完成"));
+    }, 1_000);
     try {
       await this.connector.start(event => event.kind !== "message" || (event.chatType === "group" && !this.activeGroupBinding(event.chatId))
         ? this.processEvent(event) : this.receive(event));
@@ -421,6 +428,7 @@ export class Orchestrator {
   async stop(): Promise<void> {
     this.stopping = true;
     clearInterval(this.dispatchTimer);
+    await this.workAutomation.stop();
     await this.connector.stop();
     for (const controller of this.routingControllers.values()) controller.abort(new ChatRunCancelledError());
     for (const [id, controller] of this.chatRunControllers) {
@@ -433,6 +441,10 @@ export class Orchestrator {
     ]);
     // An accepted event may enter withThinking while shutdown drains its work.
     await Promise.allSettled([...this.pendingReactions]);
+  }
+
+  processWorkEvents(): Promise<void> {
+    return this.stopping ? Promise.resolve() : this.workAutomation.process();
   }
 
   private inputFor(msg: InboundMessage): WorkInput | undefined {
@@ -583,7 +595,7 @@ export class Orchestrator {
   private workBusy(workItemId: string, exceptInput?: string): boolean {
     const item = this.engine.workItems.get(workItemId);
     const input = exceptInput ? this.engine.workDispatch.get(exceptInput) : undefined;
-    const revising = !!(item?.planRef || item?.chatPlanRunId) && !!input && isWorkReplanningCandidate(input.message.text);
+    const revising = !!(item?.planRef || item?.chatPlanRunId) && !!input && isWorkReplanningCandidate(input.message.text, this.engine.workAwaitsRecoveryInput(workItemId));
     if (!item || ((!item.active || item.phase === "completed") && !revising)) return true;
     const action = this.engine.workContinuations.activeForWorkItem(workItemId);
     const amendable = revising && action && ["queued", "awaiting_approval"].includes(action.status);
@@ -1484,7 +1496,7 @@ export class Orchestrator {
         && !!item && !item.chatPlanRunId && !item.runbook && item.nextActions.length === 0 && item.taskRunIds.length === 0
         && isWorkPlanningCandidate(interpretation.text);
       const shouldRevise = interpretation.disposition === "conversation" && input?.operation === "followup"
-        && !!item && !!(item.planRef || item.chatPlanRunId) && isWorkReplanningCandidate(interpretation.text);
+        && !!item && !!(item.planRef || item.chatPlanRunId) && isWorkReplanningCandidate(interpretation.text, this.engine.workAwaitsRecoveryInput(item.id));
       const response: NonNullable<WorkInput["response"]> = sourceSync.attempted > 0 && sourceSync.succeeded === 0
         ? { kind: "static", text: "我已收录这条消息，但未能读取链接正文，因此不能确认已经理解或完整收录文章内容。请确认该资料在 HomeAgent 运行环境中可访问后重试。" }
         : shouldPlan ? { kind: "work-plan", question: interpretation.text, instruction: WORK_PLANNING_INSTRUCTION }

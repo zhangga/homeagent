@@ -193,6 +193,16 @@ M2 在 M1 之后新增由实际动作结果驱动的规划请求。它属于计�
 “已执行待验收”“已验收完成”“遇到阻塞”在聊天和工作台保持一致，恢复与重复回调不重复通知；投递失败不重新运行工作。
 涉及自动事件的准备记录及恢复契约需在 M2 实施前补齐字段设计；M1 不为尚未接入的事件源预建队列。
 
+### 6.1 M2 字段与提交顺序
+
+本机 `config/work-events/` 使用独立原子文件。`recovery_<sha256>.json` v1 保存 `workItemId/space/sourceInputId/actionId/attempt/runId/factKey`，冻结 `prepared`（目标、计划引用、剩余步骤、已验收成果、fingerprint）和 `planner`（Agent revision、Provider/model/reasoning、指令、中央时限与输出限制），以及结构化报告、驳回原因、状态和决策。事件不能携带执行工具权限或 Provider 会话。
+
+`queued → running → decided → applied/waiting`；失败为 `failed`，快照过期为 `obsolete`。重启保留 queued 与 decided，running 转 failed；保存决策后才提交新计划。WorkItem 同次提交新引用和该触发动作的阻塞移除，再取消旧 Action；若取消写入失败，恢复通过新计划及步骤身份补齐，不能重跑动作。新计划使用定义 v2 的 recovery 来源（事件 ID、Action ID），旧 v1 文件摘要保持不变。
+
+`notice_<sha256>.json` v1 保存来源输入、计划引用、completion/replanned/waiting 类别、冻结正文、尝试时间和远端 receipt。验收前先登记 completion watch，全部验收后转 pending；已经完成的旧事项不补发历史通知。修订回执送达才放行续作；投递失败沿用 Task 通知退避间隔，进程内保留已知远端 receipt，重启使用同一幂等键。完成键包含事项、计划版本与类别。
+
+Space archive v23 携带已提交计划和触发 Action 的可移植历史，严格验证 recovery 关联；兼容 v1–v22，不导出本机事件或通知权限。WorkItems v3、WorkContinuation v2、WorkDispatch v1 保持格式不变。
+
 ## 7. M3 / M4 的后续范围
 
 ### M3：专业能力委派与独立子事项依赖

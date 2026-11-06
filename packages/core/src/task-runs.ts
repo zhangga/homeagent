@@ -198,6 +198,9 @@ const TASK_NOTIFICATION_RETRY_DELAYS_MS = [
   2 * 60 * 60_000,
   6 * 60 * 60_000,
 ] as const;
+export function taskNotificationRetryDelay(attempts: number): number {
+  return TASK_NOTIFICATION_RETRY_DELAYS_MS[Math.min(Math.max(attempts - 1, 0), TASK_NOTIFICATION_RETRY_DELAYS_MS.length - 1)]!;
+}
 const LEGACY_UNAPPROVED_RUN_ERROR =
   "Legacy queued write/full Task Run had no durable approval; execution was refused.";
 const INTERRUPTED_RUN_ERROR = "应用在任务完成前停止，运行已标记为失败";
@@ -1116,9 +1119,7 @@ export class TaskRunStore {
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
       const attempts = run.approvalNotification!.attempts + 1;
-      const retryDelay = TASK_NOTIFICATION_RETRY_DELAYS_MS[
-        Math.min(attempts - 1, TASK_NOTIFICATION_RETRY_DELAYS_MS.length - 1)
-      ]!;
+      const retryDelay = taskNotificationRetryDelay(attempts);
       run.approvalNotification = {
         status: "pending",
         attempts,
@@ -1167,9 +1168,7 @@ export class TaskRunStore {
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
       const attempts = run.notification!.attempts + 1;
-      const retryDelay = TASK_NOTIFICATION_RETRY_DELAYS_MS[
-        Math.min(attempts - 1, TASK_NOTIFICATION_RETRY_DELAYS_MS.length - 1)
-      ]!;
+      const retryDelay = taskNotificationRetryDelay(attempts);
       run.notification = {
         status: "pending",
         attempts,

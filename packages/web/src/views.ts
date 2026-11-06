@@ -984,7 +984,7 @@ export function governanceView(
     </div>
     <div class="card">
       <h2 style="margin-top:0">恢复空间</h2>
-      <p class="muted">接受 homeagent.space v1–v22 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录，v19 包含按 SHA-256 校验的完整原文件，v20 保留 Agent 执行模式意图但不包含本机完全访问确认，v21 保留多事项及默认焦点，v22 增加不可变计划版本、步骤身份及动作关联，不恢复本机分派队列、计划回执门禁和执行准入；已有同名空间不会被覆盖。</p>
+      <p class="muted">接受 homeagent.space v1–v23 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录，v19 包含按 SHA-256 校验的完整原文件，v20 保留 Agent 执行模式意图但不包含本机完全访问确认，v21 保留多事项及默认焦点，v22 增加不可变计划版本、步骤身份及动作关联，v23 保留遇阻修订来源，不恢复本机分派队列、计划回执门禁和执行准入；已有同名空间不会被覆盖。</p>
       <form method="post" action="/governance/restore" enctype="multipart/form-data" class="actions">
         <input type="file" name="archive" accept="application/json,.json" required />
         <button type="submit">上传并恢复</button>
@@ -1475,6 +1475,12 @@ export function workItemsView(
         ${controls}
         ${coordination?.plan ? html`<section class="card"><h2>计划版本 ${coordination.plan.current.revision}</h2>
           <p>${coordination.plan.current.reason} · 剩余 ${coordination.plan.remaining.length} 步 · 已验收 ${selected?.completedActionIds?.length ?? 0} 步</p>
+          ${coordination.plan.recovery ? html`<p>遇阻处理：${{ queued: "等待重规划", running: "正在重规划", decided: "修订已保存，等待继续",
+            applied: "剩余计划已修订", waiting: "等待补充资料", failed: "重规划中断，请补充要求或手动重试", obsolete: "已被新要求替代" }[coordination.plan.recovery.status]}</p>
+            ${coordination.plan.recovery.decision?.kind === "wait" ? html`<p>${coordination.plan.recovery.decision.question}</p>` : ""}` : ""}
+          ${coordination.plan.notices.filter(notice => notice.kind === "completion").map(notice => html`<p>完成通知：${{
+            watching: "等待最终验收", pending: "等待发送", sent: "已发送到原话题", failed: "发送未完成，将自动重试", cancelled: "已被新计划替代",
+          }[notice.status]}</p>`)}
           <ol>${coordination.plan.remaining.map(step => html`<li>${step.instruction}${step.doneWhen ? html`<p class="muted">完成标准：${step.doneWhen}</p>` : ""}</li>`)}</ol>
           <details><summary>最近的计划修订</summary>${coordination.plan.history.map(plan => html`<p>版本 ${plan.revision} · ${plan.reason} · ${plan.steps.length} 步</p>`)}</details>
         </section>` : ""}
