@@ -2,6 +2,8 @@
 
 日期：2026-11-06（Asia/Shanghai）。
 
+实施进度更新：M1 已完成实现和本轮功能验收，当前代码行为以 README / CONTEXT 为准；验证范围见 [M1 计划修订验收](../../research/2026-11-06-m1-plan-revision-verification.md)。下文保留原规划时的基线与 M1–M4 分期，M2–M4 尚未实施。
+
 状态：规划稿；本次交付包含本轮开发收尾提交和本文，不包含下面 M1–M4 的实现。
 已验收代码基线：`2e41364`。当前支持行为以 [README](../../../README.md)、[CONTEXT](../../../CONTEXT.md) 和源码为准。
 本方案接续 [多事项协调方案](2026-11-03-homeagent-multitask-coordination-design.md)，不改变其中“一个群绑定一个 Agent、独立事项并行、同事项与同原生话题顺序执行”的产品约定。

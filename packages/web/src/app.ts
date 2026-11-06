@@ -2632,7 +2632,7 @@ export function createWebApp(opts: WebOptions): Hono {
             const current = engine.workItems.currentForSpace(space.id); return current ? [current.id] : [];
           }), inputs: engine.workDispatch.list(item.space).filter(input => input.workItemId === item.id
             && !["settled", "cancelled"].includes(input.state)),
-          chatRuns: engine.chatRuns.list(item.space).filter(run => run.workItemId === item.id) },
+          chatRuns: engine.chatRuns.list(item.space).filter(run => run.workItemId === item.id), plan: engine.getWorkPlanView(item.id) },
       ),
       "work",
     ));
@@ -2661,18 +2661,21 @@ export function createWebApp(opts: WebOptions): Hono {
 
   app.post("/work/:id", async (c) => {
     const id = decodeURIComponent(c.req.param("id"));
-    if (!engine.workItems.get(id)) return c.notFound();
+    const item = engine.workItems.get(id);
+    if (!item) return c.notFound();
     const body = await c.req.parseBody();
     try {
-      engine.workItems.update(id, {
+      engine.updateWorkItem(id, {
         title: str(body, "title"),
         brief: str(body, "brief"),
         runbook: str(body, "runbook"),
         phase: str(body, "phase") as WorkItemPhase,
         summary: str(body, "summary"),
         blockers: workList(str(body, "blockers")),
-        nextActions: workList(str(body, "nextActions")),
-      });
+        nextActions: item.planRef ? str(body, "nextActions").split(/\r?\n\s*\r?\n/u).map(value => value.trim()).filter(Boolean)
+          : workList(str(body, "nextActions")),
+      }, item.planRef ? Number(str(body, "planRevision")) : undefined,
+      item.planRef ? str(body, "planProgress") : undefined);
       return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent("工作上下文已保存")}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "保存失败";

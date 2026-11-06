@@ -112,6 +112,7 @@ import {
   type AgentKnowledgeFeedback,
 } from "./knowledge-consumption-feedback.ts";
 import { MAX_RAW_SOURCE_BYTES, RAW_SOURCE_DIGEST_PATTERN } from "./raw-source-files.ts";
+import { assertWorkPlanArchive, parseWorkPlanRevision, type WorkPlanRevision } from "./work-plans.ts";
 
 export const SPACE_ARCHIVE_FORMAT = "homeagent.space" as const;
 export const LEGACY_SPACE_ARCHIVE_FORMAT = "homebrain.space" as const;
@@ -136,7 +137,8 @@ export const AGENT_KNOWLEDGE_FEEDBACK_SPACE_ARCHIVE_VERSION = 18 as const;
 export const RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION = 19 as const;
 export const CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION = 20 as const;
 export const MULTITASK_SPACE_ARCHIVE_VERSION = 21 as const;
-export const SPACE_ARCHIVE_VERSION = MULTITASK_SPACE_ARCHIVE_VERSION;
+export const WORK_PLAN_SPACE_ARCHIVE_VERSION = 22 as const;
+export const SPACE_ARCHIVE_VERSION = WORK_PLAN_SPACE_ARCHIVE_VERSION;
 
 export interface RawSourceFileArchive {
   digest: string;
@@ -261,7 +263,11 @@ export interface SpaceArchiveV21 extends Omit<SpaceArchiveV20, "version"> {
   version: typeof MULTITASK_SPACE_ARCHIVE_VERSION;
   currentWorkItemId?: string;
 }
-export type SpaceArchive = SpaceArchiveV21;
+export interface SpaceArchiveV22 extends Omit<SpaceArchiveV21, "version"> {
+  version: typeof WORK_PLAN_SPACE_ARCHIVE_VERSION;
+  workPlans: WorkPlanRevision[];
+}
+export type SpaceArchive = SpaceArchiveV22;
 
 export interface SpaceDeleteResult {
   status: "deleted" | "not_found";
@@ -1270,8 +1276,10 @@ function parseWorkItem(value: unknown, index: number, space: SpaceId): WorkItem 
   if (value.space !== space) {
     throw new Error(`workItems[${index}].space does not match archive space`);
   }
+  const { planDelivery: _localDelivery, ...portable } = value;
   return {
-    ...value,
+    ...portable,
+    ...(value.planRef ? { planRef: { ...value.planRef }, nextStepIds: [...value.nextStepIds!] } : {}),
     blockers: [...value.blockers],
     nextActions: [...value.nextActions],
     rawIds: [...value.rawIds],
@@ -1299,6 +1307,7 @@ function parseWorkAction(value: unknown, index: number, space: SpaceId): WorkAct
   }
   return {
     ...value,
+    ...(value.planStep ? { planStep: { ...value.planStep } } : {}),
     taskRunIds: [...value.taskRunIds],
     acceptances: value.acceptances?.map((acceptance) => ({
       ...acceptance,
@@ -2005,6 +2014,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       && version !== RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION
       && version !== CODEX_EXECUTION_MODE_SPACE_ARCHIVE_VERSION
       && version !== MULTITASK_SPACE_ARCHIVE_VERSION
+      && version !== WORK_PLAN_SPACE_ARCHIVE_VERSION
     )
   ) {
     throw new Error("unsupported space archive format or version");
@@ -2084,6 +2094,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       version >= RAW_SOURCE_FILES_SPACE_ARCHIVE_VERSION
       && !Array.isArray(root.sourceFiles)
     )
+    || (version >= WORK_PLAN_SPACE_ARCHIVE_VERSION && !Array.isArray(root.workPlans))
   ) {
     throw new Error("archive collections must be arrays");
   }
@@ -2201,6 +2212,12 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
         parseWorkAction(item, index, id)
       );
   const workActionById = new Map(workActions.map((action) => [action.id, action]));
+  const workPlans = version >= WORK_PLAN_SPACE_ARCHIVE_VERSION ? (root.workPlans as unknown[]).map(parseWorkPlanRevision) : [];
+  for (const plan of workPlans) {
+    const source = plan.source.kind === "chat" ? chatRuns.find(run => run.id === plan.source.id) : undefined;
+    if (source && (source.workItemId !== plan.workItemId || source.space !== plan.space)) throw new Error("work plan revision source is invalid");
+  }
+  assertWorkPlanArchive(workPlans, workItems, workActions);
   const workContinuationPolicies = version < WORK_CONTEXT_SPACE_ARCHIVE_VERSION
     ? []
     : ((root.workContinuationPolicies ?? []) as unknown[]).map((item, index) =>
@@ -2556,6 +2573,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
     taskRuns,
     chatRuns,
     workItems,
+    workPlans,
     ...(typeof currentWorkItemId === "string" ? { currentWorkItemId } : {}),
     workActions,
     workContinuationPolicies,

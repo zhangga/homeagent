@@ -21,9 +21,10 @@ import type {
   SpaceId,
 } from "@homeagent/shared";
 import { lstatSync, realpathSync, statSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { WorkDispatchStore, type WorkInput, type WorkRoutingPlan } from "./work-dispatch.ts";
+import { WorkPlanChangedError, formatWorkPlanStep, workPlanStepDigest, type WorkPlanPreparation, type WorkPlanRevision, type WorkPlanStep } from "./work-plans.ts";
 import {
   AI_GENERATION_MAX_TOKENS,
   AI_MAX_CONFIGURABLE_TIMEOUT_MINUTES,
@@ -154,6 +155,7 @@ import {
   WorkItemStore,
   workActionBlockerMessage,
   type WorkItem,
+  type WorkItemUpdate,
 } from "./work-items.ts";
 import {
   MAX_WORK_ACTION_RUNS,
@@ -2398,6 +2400,7 @@ export class KnowledgeEngine implements Knowledge {
       action.instruction,
       action.checkpoint.summary,
       action.checkpoint.completedAt,
+      { planStep: action.planStep, deferComplete: this.hasPendingWorkInputs(action.workItemId) },
     );
   }
 
@@ -2422,7 +2425,15 @@ export class KnowledgeEngine implements Knowledge {
 
   private isCurrentWorkActionBoundary(action: WorkAction): boolean {
     const item = this.workItems.get(action.workItemId);
-    return item?.space === action.space && item.nextActions[0] === action.instruction;
+    if (!item || item.space !== action.space) return false;
+    if (!item.planRef) return !action.planStep && item.nextActions[0] === action.instruction;
+    if (!action.planStep) return false;
+    const frozen = this.workItems.plans.get(item.id, { revision: action.planStep.revision, digest: action.planStep.planDigest });
+    const index = frozen.steps.findIndex(step => step.id === action.planStep!.stepId);
+    if (frozen.space !== item.space || index < 0 || formatWorkPlanStep(frozen.steps[index]!, index) !== action.instruction) return false;
+    const step = this.getWorkPlanView(item.id)?.remaining[0];
+    return !!step && !!action.planStep && step.id === action.planStep.stepId
+      && workPlanStepDigest(step) === action.planStep.digest;
   }
 
   private workActionExecutionBoundaryError(run: TaskRun): string | undefined {
@@ -4992,7 +5003,8 @@ export class KnowledgeEngine implements Knowledge {
           delivery: (({ liveReply: _localLiveReply, messageId: _localMessageId, ...portableDelivery }) => portableDelivery)(delivery),
           executionPlan: run.executionPlan ? archiveExecutionPlan(run.executionPlan) : undefined,
         })),
-        workItems,
+        workItems: workItems.map(({ planDelivery: _localDelivery, ...item }) => item),
+        workPlans: workItems.flatMap(item => item.planRef ? this.workItems.plans.history(item.id, item.planRef) : []),
         currentWorkItemId: this.workItems.currentForSpace(space)?.id,
         workActions: workContinuation.actions,
         workContinuationPolicies: workContinuation.policies,
@@ -5032,11 +5044,13 @@ export class KnowledgeEngine implements Knowledge {
       }
       this.learning.assertCanRestore(archive.learning);
       this.workItems.assertCanRestore(archive.workItems);
+      this.workItems.plans.assertCanRestore(archive.workPlans);
       this.workContinuations.assertCanRestore({
         actions: archive.workActions,
         policies: archive.workContinuationPolicies,
       });
       this.quality.assertCanRestoreArchive(archive.quality);
+      let restoredPlanFiles: { workItemId: string; revision: number }[] = [];
       const existingAgent = archive.agent ? this.agents.get(archive.agent.id) : undefined;
       const existingAgentRevisions = existingAgent
         ? this.agents.listRevisions(existingAgent.id)
@@ -5116,6 +5130,7 @@ export class KnowledgeEngine implements Knowledge {
         this.reminders.restore(archive.reminders);
         this.learning.restore(archive.learning);
         learningRestored = archive.learning.plans.length > 0;
+        restoredPlanFiles = this.workItems.plans.restore(archive.workPlans);
         this.workItems.restore(archive.workItems);
         workItemsRestored = archive.workItems.length > 0;
         if (archive.currentWorkItemId) this.workItems.select(archive.currentWorkItemId);
@@ -5158,6 +5173,7 @@ export class KnowledgeEngine implements Knowledge {
         if (learningRestored) this.learning.removeBySpace(space);
         if (workContinuationRestored) this.workContinuations.removeBySpace(space);
         if (workItemsRestored) this.workItems.removeBySpace(space);
+        this.workItems.plans.rollbackRestore(restoredPlanFiles);
         if (this.registry.has(space)) this.registry.remove(space);
         if (
           archive.agent
@@ -5252,6 +5268,7 @@ export class KnowledgeEngine implements Knowledge {
       const learningArchive = this.learning.exportBySpace(space);
       const chatRunSnapshot = this.chatRuns.snapshotLocalBySpace(space);
       const workInputSnapshot = this.workDispatch.list(space);
+      const workPlanSnapshot = workItems.flatMap(item => this.workItems.plans.snapshot(item.id));
       const currentWorkItemId = this.workItems.currentForSpace(space)?.id;
       let chatRunStateRemoved = false;
       try {
@@ -5263,6 +5280,7 @@ export class KnowledgeEngine implements Knowledge {
         learningPlansDeleted = this.learning.removeBySpace(space);
         this.workContinuations.removeBySpace(space);
         workItemsDeleted = this.workItems.removeBySpace(space).length;
+        for (const item of workItems) this.workItems.plans.removeItem(item.id);
         this.workDispatch.removeBySpace(space);
         this.registry.remove(space);
       } catch (err) {
@@ -5280,6 +5298,7 @@ export class KnowledgeEngine implements Knowledge {
           this.learning.restore(learningArchive);
         }
         const missingWorkItems = workItems.filter((item) => !this.workItems.get(item.id));
+        this.workItems.plans.restore(workPlanSnapshot);
         if (missingWorkItems.length > 0) this.workItems.restore(missingWorkItems);
         if (currentWorkItemId) this.workItems.select(currentWorkItemId);
         if (workInputSnapshot.length > 0) this.workDispatch.restoreLocalSnapshot(workInputSnapshot);
@@ -5637,6 +5656,124 @@ export class KnowledgeEngine implements Knowledge {
     return this.workContinuations.configure(item, { autoContinue });
   }
 
+  private hasPendingWorkInputs(workItemId: string): boolean {
+    return this.workDispatch.summaries().some(input => input.workItemId === workItemId
+      && !["settled", "interrupted", "cancelled"].includes(input.state)
+      && !["status", "pause", "resume", "cancel"].includes(input.operation ?? ""));
+  }
+
+  getWorkPlanView(workItemId: string) {
+    const item = this.workItems.get(workItemId);
+    if (!item?.planRef) return undefined;
+    const current = this.workItems.plans.get(item.id, item.planRef);
+    if (current.space !== item.space) throw new Error("Work plan ownership mismatch");
+    const remaining = item.nextStepIds!.map(id => {
+      const step = current.steps.find(step => step.id === id);
+      if (!step) throw new Error("Work plan step is missing");
+      return step;
+    });
+    const history: WorkPlanRevision[] = [];
+    let cursor: WorkPlanRevision | undefined = current;
+    while (cursor && history.length < 20) {
+      history.push(cursor);
+      cursor = cursor.previous ? this.workItems.plans.get(item.id, cursor.previous) : undefined;
+    }
+    const progressToken = createHash("sha256").update(JSON.stringify([item.planRef, item.nextStepIds])).digest("hex");
+    return { current, remaining, actions: this.workContinuations.list(item.id), history, progressToken };
+  }
+
+  private workPlanFingerprint(workItemId: string): string {
+    const item = this.workItems.get(workItemId);
+    if (!item) throw new Error("Unknown work item");
+    return createHash("sha256").update(JSON.stringify([item.space, item.planRef, item.nextStepIds,
+      item.nextActions, item.runbook, item.brief, item.phase, item.blockers, item.completedActionIds,
+      this.workContinuations.list(item.id).map(action => [action.id, action.status, action.attempt, action.taskRunIds.at(-1)])])).digest("hex");
+  }
+
+  prepareWorkPlanRevision(workItemId: string, source: WorkPlanRevision["source"]): WorkPlanPreparation {
+    const item = this.workItems.get(workItemId);
+    const active = this.workContinuations.activeForWorkItem(workItemId);
+    if (!item || (source.kind === "chat" && active && !["queued", "awaiting_approval"].includes(active.status))) throw new Error("Work plan is waiting for the current action");
+    if (source.kind === "chat") {
+      const run = this.chatRuns.get(source.id);
+      if (!run || run.workItemId !== item.id || run.space !== item.space || run.status !== "running") throw new Error("Invalid planning run");
+    }
+    const view = this.getWorkPlanView(item.id);
+    const accepted = this.workContinuations.list(item.id).filter(action => action.status === "succeeded"
+      && item.completedActionIds?.includes(action.id)).reverse().map(action => {
+        const run = action.checkpoint?.taskRunId ? this.taskRuns.get(action.checkpoint.taskRunId) : undefined;
+        const report = run?.workActionId === action.id ? parseWorkActionProviderReport(run.output ?? "") : undefined;
+        return { actionId: action.id, instruction: action.instruction, result: report?.result ?? action.checkpoint?.summary ?? "" };
+      });
+    return { workItemId, space: item.space, fingerprint: this.workPlanFingerprint(workItemId), source: { ...source },
+      current: item.planRef, goal: view?.current.goal ?? item.brief,
+      remaining: view?.remaining ?? item.nextActions.map((instruction, index) => ({
+        id: `step_${createHash("sha256").update(`${item.id}:legacy:${index}:${instruction}`).digest("hex").slice(0, 32)}`,
+        instruction, legacy: true as const,
+      })), accepted };
+  }
+
+  commitWorkPlanRevision(prepared: WorkPlanPreparation, steps: { instruction: string; doneWhen: string }[], opts: { goal?: string; reason?: string; reactivate?: boolean } = {}) {
+    if (JSON.stringify(prepared) !== JSON.stringify(this.prepareWorkPlanRevision(prepared.workItemId, prepared.source))) throw new WorkPlanChangedError();
+    const item = this.workItems.get(prepared.workItemId)!;
+    if (item.space !== prepared.space) throw new Error("Work plan boundary changed");
+    const unused = [...prepared.remaining];
+    const definitions: WorkPlanStep[] = steps.map((step, index) => {
+      const match = unused.findIndex(previous => !previous.legacy && previous.instruction === step.instruction && previous.doneWhen === step.doneWhen);
+      const id = match >= 0 ? unused.splice(match, 1)[0]!.id
+        : `step_${createHash("sha256").update(JSON.stringify([item.id, prepared.source, index, step])).digest("hex").slice(0, 32)}`;
+      return { id, instruction: step.instruction, doneWhen: step.doneWhen };
+    });
+    const revision: WorkPlanRevision = { version: 1, workItemId: item.id, space: item.space,
+      revision: this.workItems.plans.nextRevision(item.id), ...(item.planRef ? { previous: item.planRef } : {}),
+      goal: opts.goal ?? prepared.goal, reason: opts.reason ?? (item.chatPlanRunId || item.planRef ? "根据补充要求修订剩余计划" : "首次规划"),
+      source: prepared.source, steps: definitions, acceptedActionIds: prepared.accepted.map(action => action.actionId), createdAt: Date.now() };
+    // Validate and stage before cancelling an obsolete, unstarted execution.
+    // Both cancellation and the pointer switch are synchronous durable commands.
+    this.workItems.plans.save(revision);
+    const active = this.workContinuations.activeForWorkItem(item.id);
+    if (active && (!active.planStep || active.planStep.stepId !== definitions[0]?.id)) {
+      if (!["queued", "awaiting_approval"].includes(active.status)
+        || !this.cancelWorkAction(active.id, { runId: active.taskRunIds.at(-1), attempt: active.attempt })) throw new Error("Work plan boundary changed");
+    }
+    return this.workItems.commitPlan(item.id, revision, { deliveryRunId: prepared.source.kind === "chat" ? prepared.source.id : undefined,
+      reactivate: opts.reactivate });
+  }
+
+  updateWorkItem(workItemId: string, update: WorkItemUpdate, expectedRevision?: number, expectedProgress?: string) {
+    const item = this.workItems.get(workItemId);
+    if (!item?.planRef) return this.workItems.update(workItemId, update);
+    if (expectedRevision !== undefined && item.planRef.revision !== expectedRevision) throw new Error("计划已更新，请刷新后保存");
+    if (expectedProgress !== undefined && this.getWorkPlanView(item.id)?.progressToken !== expectedProgress) throw new Error("事项进展已更新，请刷新后保存");
+    const { nextActions, runbook, ...context } = update;
+    const changed = (nextActions !== undefined && JSON.stringify(nextActions) !== JSON.stringify(item.nextActions))
+      || (runbook !== undefined && runbook !== item.runbook) || (context.brief !== undefined && context.brief !== item.brief);
+    if (!changed) return this.workItems.update(workItemId, update);
+    this.workItems.validateUpdate(workItemId, context);
+    const source = { kind: "manual" as const, id: `manual_${randomUUID()}` };
+    const prepared = this.prepareWorkPlanRevision(workItemId, source);
+    const current = this.getWorkPlanView(item.id)!;
+    const unused = [...current.remaining];
+    const steps = (nextActions ?? item.nextActions).map((instruction, index): WorkPlanStep => {
+      const match = unused.findIndex(step => formatWorkPlanStep(step, current.current.steps.findIndex(entry => entry.id === step.id)) === instruction);
+      if (match >= 0) return unused.splice(match, 1)[0]!;
+      return { id: `step_${createHash("sha256").update(`${source.id}:${index}`).digest("hex").slice(0, 32)}`,
+        instruction, legacy: true };
+    });
+    const revision: WorkPlanRevision = { version: 1, workItemId, space: item.space,
+      revision: this.workItems.plans.nextRevision(item.id), previous: item.planRef, goal: context.brief ?? prepared.goal,
+      runbook: runbook !== undefined && runbook !== item.runbook ? runbook : current.current.runbook,
+      reason: "人工修订", source, steps, acceptedActionIds: prepared.accepted.map(action => action.actionId), createdAt: Date.now() };
+    const active = this.workContinuations.activeForWorkItem(item.id);
+    if (active && active.planStep?.stepId !== steps[0]?.id && !["queued", "awaiting_approval"].includes(active.status)) {
+      throw new Error("当前步骤正在执行或等待验收，可以修改后续步骤");
+    }
+    this.workItems.plans.save(revision);
+    if (active && active.planStep?.stepId !== steps[0]?.id
+      && !this.cancelWorkAction(active.id, { runId: active.taskRunIds.at(-1), attempt: active.attempt })) throw new Error("Work plan boundary changed");
+    return this.workItems.commitPlan(item.id, revision, { context, reactivate: false });
+  }
+
   /** Local message identity outlives the bounded Chat Run history. */
   chatWorkPlanSource(workItemId: string): WorkInput | undefined {
     const item = this.workItems.get(workItemId);
@@ -5670,8 +5807,16 @@ export class KnowledgeEngine implements Knowledge {
   reconcileChatWorkPlans(): void {
     const configured = new Set(this.workContinuations.listPolicies().map(policy => policy.workItemId));
     for (const item of this.workItems.list()) {
+      if (item.planDelivery?.status === "pending") {
+        const run = this.chatRuns.get(item.planDelivery.runId);
+        if (run?.status === "succeeded" && run.delivery.status === "sent") this.workItems.setPlanDelivery(item.id, run.id, "sent");
+      }
       if (item.chatPlanRunId && !configured.has(item.id) && this.deliveredChatWorkPlan(item.id)) {
         this.configureWorkContinuation(item.id, true);
+      }
+      if (item.planRef && item.phase === "active" && item.nextActions.length === 0 && item.blockers.length === 0
+        && !this.hasPendingWorkInputs(item.id) && !this.workContinuations.activeForWorkItem(item.id)) {
+        this.workItems.update(item.id, { phase: "completed" });
       }
     }
   }
@@ -5690,6 +5835,7 @@ export class KnowledgeEngine implements Knowledge {
         && item.blockers.length === 0
         && item.nextActions.length > 0
         && (!item.chatPlanRunId || !waiting.has(item.id))
+        && item.planDelivery?.status !== "pending"
         && this.workContinuations.activeForWorkItem(item.id) === undefined
       ));
   }
@@ -5727,7 +5873,11 @@ export class KnowledgeEngine implements Knowledge {
   ): StartedTaskRun {
     const item = this.workItems.get(workItemId);
     if (!item) throw new Error(`work item not found: ${workItemId}`);
-    const action = this.workContinuations.claimNext(item);
+    if (item.planDelivery?.status === "pending") throw new Error("Work plan receipt has not been delivered");
+    if (item.planRef && this.hasPendingWorkInputs(item.id)) throw new Error("Work plan has pending user input");
+    const step = this.getWorkPlanView(item.id)?.remaining[0];
+    const action = this.workContinuations.claimNext(item, Date.now(), step && item.planRef
+      ? { revision: item.planRef.revision, stepId: step.id, digest: workPlanStepDigest(step), planDigest: item.planRef.digest } : undefined);
     if (action.taskRunIds.length > 0) {
       throw new Error(`work action is already active: ${action.id}`);
     }

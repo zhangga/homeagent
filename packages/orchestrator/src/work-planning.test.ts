@@ -1,5 +1,14 @@
 import { expect, test } from "bun:test";
-import { isWorkPlanningCandidate, parseChatWorkPlan } from "./work-planning.ts";
+import { isWorkPlanningCandidate, isWorkReplanningCandidate, parseChatWorkPlan } from "./work-planning.ts";
+
+test("explicit amendments include progress content without treating advice or status as work", () => {
+  for (const text of ["汇总进度时增加风险", "摘要增加解释阻塞原因", "谢谢，周报改成100字以内", "第一步改成按部门分组"]) {
+    expect(isWorkReplanningCandidate(text)).toBe(true);
+  }
+  for (const text of ["当前进度如何？", "谢谢", "为什么增加成本比较？", "修改方案只要建议，不要执行", "限制100字是什么意思？"]) {
+    expect(isWorkReplanningCandidate(text)).toBe(false);
+  }
+});
 
 test("multi-step execution goals are candidates while advice stays conversational", () => {
   expect(isWorkPlanningCandidate("整理本周项目进展，找出阻塞项，生成周报")).toBe(true);

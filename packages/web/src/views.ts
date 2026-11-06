@@ -984,7 +984,7 @@ export function governanceView(
     </div>
     <div class="card">
       <h2 style="margin-top:0">恢复空间</h2>
-      <p class="muted">接受 homeagent.space v1–v21 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录，v19 包含按 SHA-256 校验的完整原文件，v20 保留 Agent 执行模式意图但不包含本机完全访问确认，v21 保留多事项及默认焦点，不恢复本机分派队列和执行准入；已有同名空间不会被覆盖。</p>
+      <p class="muted">接受 homeagent.space v1–v22 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录，v19 包含按 SHA-256 校验的完整原文件，v20 保留 Agent 执行模式意图但不包含本机完全访问确认，v21 保留多事项及默认焦点，v22 增加不可变计划版本、步骤身份及动作关联，不恢复本机分派队列、计划回执门禁和执行准入；已有同名空间不会被覆盖。</p>
       <form method="post" action="/governance/restore" enctype="multipart/form-data" class="actions">
         <input type="file" name="archive" accept="application/json,.json" required />
         <button type="submit">上传并恢复</button>
@@ -1301,7 +1301,8 @@ export function workItemsView(
   actions: WorkAction[] = [],
   continuationPolicy?: WorkContinuationPolicy,
   flashMsg?: string,
-  coordination?: { currentIds: string[]; inputs: WorkInput[]; chatRuns: ChatRun[] },
+  coordination?: { currentIds: string[]; inputs: WorkInput[]; chatRuns: ChatRun[];
+    plan?: ReturnType<import("@homeagent/core").KnowledgeEngine["getWorkPlanView"]> },
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const listItems = items.map((item) => html`
     <a class="item ${selected?.id === item.id ? "active" : ""}"
@@ -1472,6 +1473,11 @@ export function workItemsView(
           }[input.state]}</span></p>`) : html`<p class="muted">暂无待处理输入。</p>`}
         </section>` : ""}
         ${controls}
+        ${coordination?.plan ? html`<section class="card"><h2>计划版本 ${coordination.plan.current.revision}</h2>
+          <p>${coordination.plan.current.reason} · 剩余 ${coordination.plan.remaining.length} 步 · 已验收 ${selected?.completedActionIds?.length ?? 0} 步</p>
+          <ol>${coordination.plan.remaining.map(step => html`<li>${step.instruction}${step.doneWhen ? html`<p class="muted">完成标准：${step.doneWhen}</p>` : ""}</li>`)}</ol>
+          <details><summary>最近的计划修订</summary>${coordination.plan.history.map(plan => html`<p>版本 ${plan.revision} · ${plan.reason} · ${plan.steps.length} 步</p>`)}</details>
+        </section>` : ""}
         <section class="card work-editor">
           <p class="work-kicker">Operational context</p>
           <div class="work-head">
@@ -1481,6 +1487,7 @@ export function workItemsView(
             ${activation}
           </div>
           <form method="post" action="${formAction}" class="stack">
+            ${selected?.planRef ? html`<input type="hidden" name="planRevision" value="${selected.planRef.revision}" /><input type="hidden" name="planProgress" value="${coordination?.plan?.progressToken}" />` : ""}
             <div class="field"><label>标题</label>
               <input type="text" name="title" value="${selected?.title ?? ""}" placeholder="例如：完成知识治理灰度" required maxlength="200" />
             </div>
@@ -1501,8 +1508,8 @@ export function workItemsView(
               <div class="field"><label>阻塞项 <span class="hint">每行一项</span></label>
                 <textarea name="blockers" placeholder="暂无">${selected?.blockers.join("\n") ?? ""}</textarea>
               </div>
-              <div class="field"><label>下一步 <span class="hint">每行一项</span></label>
-                <textarea name="nextActions" placeholder="下一件可执行的事">${selected?.nextActions.join("\n") ?? ""}</textarea>
+              <div class="field"><label>下一步 <span class="hint">${selected?.planRef ? "每段一步，空行分隔" : "每行一项"}</span></label>
+                <textarea name="nextActions" placeholder="下一件可执行的事">${selected?.nextActions.join(selected.planRef ? "\n\n" : "\n") ?? ""}</textarea>
               </div>
             </div>
             <div class="field"><label>Runbook <span class="hint">已验证的操作步骤</span></label>

@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FakeLlm, KnowledgeEngine, SkillCatalog, type LlmClient } from "@homeagent/core";
+import { FakeLlm, KnowledgeEngine, SkillCatalog, parseSpaceArchive, type LlmClient } from "@homeagent/core";
 import { CliConnector, type Connector, type InboundMessage } from "@homeagent/connectors";
 import { Orchestrator } from "@homeagent/orchestrator";
 import { WorkContinuationScheduler } from "./work-continuation-scheduler.ts";
@@ -61,6 +61,46 @@ const planResult = { kind: "plan", steps: [
 const result = (text: string) => JSON.stringify({ version: 1, outcome: "completed", result: text,
   blockers: [], checks: [{ name: "本步完成标准", status: "passed" }] });
 
+test("an in-flight supplement revises only remaining work after the current result is accepted", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let began!: () => void;
+  const started = new Promise<void>(resolve => { began = resolve; });
+  const prompts: string[] = [];
+  const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").revisionContext
+    ? { kind: "plan", steps: [{ instruction: "生成包含阻塞原因的周报", doneWhen: "摘要不超过100字" }] }
+    : planResult);
+  const f = await fixture({ planner, runner: async (_provider, input) => {
+    prompts.push(input.prompt);
+    if (prompts.length === 1) { began(); await gate; }
+    return result(prompts.length === 1 ? "已完成12项、进行中5项、阻塞3项，总数20" : "总数20，阻塞原因是资料待补齐。");
+  } });
+  try {
+    await f.send("m1-goal");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    const scheduler = new WorkContinuationScheduler(f.engine);
+    const first = scheduler.tick("m1-first");
+    await started;
+    await f.send("m1-supplement", "周报请增加阻塞原因，摘要限制100字", { parentMessageId: "m1-goal" });
+    expect(prompts).toHaveLength(1);
+    release();
+    await first;
+    const accepted = f.engine.workContinuations.list(item.id).find(action => action.status === "succeeded")!;
+    f.runtime.flushWorkInputs();
+    await f.send("m1-supplement", "周报请增加阻塞原因，摘要限制100字", { parentMessageId: "m1-goal" });
+    const view = f.engine.getWorkPlanView(item.id)!;
+    expect(view.current.revision).toBe(2);
+    expect(view.remaining.map(step => step.instruction)).toEqual(["生成包含阻塞原因的周报"]);
+    expect(f.engine.workContinuations.get(accepted.id)?.checkpoint).toEqual(accepted.checkpoint);
+    await scheduler.tick("m1-second");
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain("摘要不超过100字");
+    expect(prompts[1]).toContain("总数20");
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("completed");
+    expect(chatWorkNotification(f.engine, f.engine.listTaskRuns().find(run => run.id !== accepted.checkpoint?.taskRunId)!)?.replyToMessageId).toBe("m1-goal");
+  } finally { release(); await f.close(); }
+});
+
 async function fixture(options: { planner?: LlmClient; full?: boolean;
   runner?: NonNullable<ConstructorParameters<typeof KnowledgeEngine>[0]>["runProvider"];
   reply?: Connector["reply"] } = {}) {
@@ -88,6 +128,7 @@ async function fixture(options: { planner?: LlmClient; full?: boolean;
   const planner = options.planner ?? new FakeLlm().onJSON(() => planResult);
   const transport = new CliConnector();
   const connector: Connector = { name: "feishu", start: h => transport.start(h), stop: () => transport.stop(),
+    isChatAdministrator: async () => true,
     reply: options.reply ?? (r => transport.reply(r)), notice: (chat, text, opts) => transport.notice(chat, text, opts) };
   let runtime = new Orchestrator({ engine, connector, llm: planner });
   await runtime.start();
@@ -257,6 +298,294 @@ function delayedPlanner() {
     async completeJSON(opts) { entered.resolve(); await release.promise; return fake.completeJSON(opts); } };
   return { entered, release, client };
 }
+
+test.each([false, true])("a revision preserves an unchanged approval or replaces only the changed pending step (%s)", async changedFirst => {
+  const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").revisionContext
+    ? { kind: "plan", steps: [changedFirst ? { instruction: "收集各部门进展", doneWhen: "按部门分组" } : planResult.steps[0],
+      { instruction: "生成短周报", doneWhen: "100字以内" }] } : planResult);
+  const f = await fixture({ planner, full: true });
+  try {
+    await f.send("pending-plan");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    const scheduler = new WorkContinuationScheduler(f.engine);
+    await scheduler.wake(item.id);
+    const original = f.engine.listTaskRuns()[0]!;
+    await f.send("pending-change", changedFirst ? "第一步改成按部门收集进展，周报限制100字" : "周报限制100字，第一步保持原样", { parentMessageId: "pending-plan" });
+    expect(f.engine.getWorkPlanView(item.id)?.current.revision).toBe(2);
+    expect(f.engine.getTaskRun(original.id)?.status).toBe(changedFirst ? "cancelled" : "awaiting_approval");
+    if (changedFirst) {
+      await scheduler.wake(item.id);
+      const next = f.engine.listTaskRuns().find(run => run.id !== original.id)!;
+      expect(next.status).toBe("awaiting_approval");
+      expect(next.approval?.status).toBe("pending");
+      expect(next.workActionId).not.toBe(original.workActionId);
+    } else expect(f.engine.listTaskRuns()).toHaveLength(1);
+    expect(f.prompts).toHaveLength(0);
+  } finally { await f.close(); }
+});
+
+test("approval during replanning refreshes the snapshot without losing the supplement", async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let revisions = 0;
+  const fake = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").revisionContext
+    ? { kind: "plan", steps: [planResult.steps[0], { instruction: "生成短周报", doneWhen: "100字以内" }] } : planResult);
+  const planner: LlmClient = { complete: opts => fake.complete(opts), async completeJSON(opts) {
+    if (JSON.parse(opts.prompt ?? "{}").revisionContext && ++revisions === 1) { entered.resolve(); await release.promise; }
+    return fake.completeJSON(opts);
+  } };
+  const f = await fixture({ planner, full: true, runner: async (_provider, input) => {
+    const permit = input.acquireExecutionPermit!();
+    const unregister = permit.register(() => {}); permit.release(); unregister();
+    return result("20项真实测试数据");
+  } });
+  try {
+    await f.send("racing-plan");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    const run = f.engine.listTaskRuns()[0]!;
+    const revised = f.send("racing-change", "周报改成100字以内", { parentMessageId: "racing-plan" });
+    await entered.promise;
+    const approved = f.engine.approveTaskRun(run.id, "local-operator");
+    release.resolve();
+    await revised;
+    await approved.completion;
+    expect(f.engine.workContinuations.get(run.workActionId!)?.status).toBe("awaiting_acceptance");
+    f.engine.acceptWorkAction(run.workActionId!, run.id, "local-operator");
+    expect(f.engine.getWorkPlanView(item.id)?.remaining.map(step => step.instruction)).toEqual(["生成短周报"]);
+    expect(f.engine.workItems.get(item.id)?.completedActionIds).toEqual([run.workActionId!]);
+    expect(f.engine.listTaskRuns()).toHaveLength(1);
+  } finally { release.resolve(); await f.close(); }
+});
+
+test("a concurrent manual plan edit cannot be overwritten by a late model revision", async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let revisions = 0;
+  const fake = new FakeLlm().onJSON(call => {
+    const context = JSON.parse(call.prompt ?? "{}").revisionContext;
+    return context ? { kind: "plan", steps: [{ instruction: context.goal.includes("风险") ? "生成包含风险的短周报" : "生成短周报", doneWhen: "100字以内" }] } : planResult;
+  });
+  const planner: LlmClient = { complete: opts => fake.complete(opts), async completeJSON(opts) {
+    if (JSON.parse(opts.prompt ?? "{}").revisionContext && ++revisions === 1) { entered.resolve(); await release.promise; }
+    return fake.completeJSON(opts);
+  } };
+  const f = await fixture({ planner });
+  try {
+    await f.send("manual-race");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    const revised = f.send("manual-race-change", "摘要限制100字", { parentMessageId: "manual-race" });
+    void revised.catch(() => {});
+    await entered.promise;
+    f.engine.updateWorkItem(item.id, { brief: "周报必须包含风险" }, item.planRef!.revision);
+    release.resolve();
+    await revised;
+    expect(f.engine.getWorkPlanView(item.id)?.remaining[0]?.instruction).toBe("生成包含风险的短周报");
+    expect(f.engine.getWorkPlanView(item.id)?.current.revision).toBe(3);
+  } finally { release.resolve(); await f.close(); }
+});
+
+test("held final results and queued supplements survive restart without completing or replaying accepted work", async () => {
+  const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").revisionContext
+    ? { kind: "plan", steps: [{ instruction: "生成短摘要", doneWhen: "100字以内" }] }
+    : { kind: "plan", steps: [planResult.steps[0]] });
+  let executions = 0;
+  const f = await fixture({ planner, full: true, runner: async (_provider, input) => {
+    const permit = input.acquireExecutionPermit!();
+    const unregister = permit.register(() => {}); permit.release(); unregister();
+    executions++;
+    return result("已完成12项，进行中5项，阻塞3项，总数20");
+  } });
+  try {
+    await f.send("held-goal");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    const first = f.engine.listTaskRuns()[0]!;
+    await f.engine.approveTaskRun(first.id, "local-operator").completion;
+    await f.send("held-change", "增加100字以内的摘要", { parentMessageId: "held-goal" });
+    expect(f.engine.workDispatch.list(SPACE).find(input => input.message.messageId === "held-change")?.state).toBe("waiting");
+    await f.reopen();
+    expect(executions).toBe(1);
+    expect(f.engine.workContinuations.get(first.workActionId!)?.status).toBe("awaiting_acceptance");
+    f.engine.acceptWorkAction(first.workActionId!, first.id, "local-operator");
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("active");
+    f.runtime.flushWorkInputs();
+    await f.send("held-change", "增加100字以内的摘要", { parentMessageId: "held-goal" });
+    expect(f.engine.getWorkPlanView(item.id)?.current.acceptedActionIds).toEqual([first.workActionId!]);
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    const second = f.engine.listTaskRuns().find(run => run.id !== first.id)!;
+    expect(second.status).toBe("awaiting_approval");
+    await f.engine.approveTaskRun(second.id, "local-operator").completion;
+    f.engine.acceptWorkAction(second.workActionId!, second.id, "local-operator");
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("completed");
+    expect(executions).toBe(2);
+    await f.reopen();
+    expect(f.engine.workItems.get(item.id)?.completedActionIds).toHaveLength(2);
+    expect(await new WorkContinuationScheduler(f.engine).tick("already-complete")).toEqual([]);
+    expect(executions).toBe(2);
+  } finally { await f.close(); }
+});
+
+test.each(["paused", "disabled"])("revisions preserve the user's continuation choice: %s", async mode => {
+  const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").revisionContext
+    ? { kind: "plan", steps: [{ instruction: "生成短摘要", doneWhen: "100字以内" }] } : planResult);
+  const f = await fixture({ planner });
+  try {
+    await f.send("choice-goal");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    if (mode === "paused") await f.send("choice-pause", "暂停", { parentMessageId: "choice-goal" });
+    else f.engine.configureWorkContinuation(item.id, false);
+    await f.send("choice-change", "周报改成100字以内的摘要", { parentMessageId: "choice-goal" });
+    expect(f.engine.getWorkPlanView(item.id)?.current.revision).toBe(2);
+    await f.reopen();
+    expect(f.engine.listDueWorkContinuations()).toEqual([]);
+    expect(f.prompts).toHaveLength(1);
+    expect(f.engine.workItems.get(item.id)?.completedActionIds).toHaveLength(1);
+  } finally { await f.close(); }
+});
+
+test.each([false, true])("a completed item accepts new work while respecting a later pause (%s)", async paused => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const fake = new FakeLlm().onJSON(call => ({ kind: "plan", steps: JSON.parse(call.prompt ?? "{}").revisionContext
+    ? [{ instruction: "生成短摘要", doneWhen: "100字以内" }] : [planResult.steps[0]] }));
+  const planner: LlmClient = { complete: opts => fake.complete(opts), async completeJSON(opts) {
+    if (JSON.parse(opts.prompt ?? "{}").revisionContext) { entered.resolve(); await release.promise; }
+    return fake.completeJSON(opts);
+  } };
+  const f = await fixture({ planner });
+  try {
+    await f.send("completed-goal");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("completed");
+    const pending = f.send("completed-change", "再做一份摘要，限制100字", { parentMessageId: "completed-goal" });
+    await entered.promise;
+    if (paused) await f.send("completed-pause", "暂停", { parentMessageId: "completed-goal" });
+    release.resolve(); await pending;
+    expect(f.engine.getWorkPlanView(item.id)?.remaining).toHaveLength(1);
+    expect(f.engine.workItems.get(item.id)?.active).toBe(!paused);
+    expect(f.engine.listDueWorkContinuations().length).toBe(paused ? 0 : 1);
+  } finally { release.resolve(); await f.close(); }
+});
+
+test("failed revision delivery reuses its revision after restart and keeps the original result destination", async () => {
+  let deliveries = 0;
+  const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").revisionContext
+    ? { kind: "plan", steps: [{ instruction: "生成短摘要", doneWhen: "100字以内" }] } : planResult);
+  const f = await fixture({ planner, reply: async () => { if (++deliveries === 2) throw new Error("offline receipt"); } });
+  try {
+    await f.send("revised-receipt-goal");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    await f.send("revised-receipt-change", "周报改成100字以内摘要", { parentMessageId: "revised-receipt-goal" }).catch(() => {});
+    const revised = f.engine.workItems.get(item.id)!;
+    expect(revised.planRef?.revision).toBe(2);
+    expect(f.engine.listDueWorkContinuations()).toEqual([]);
+    await f.reopen();
+    await f.runtime.retryChatRun(revised.planDelivery!.runId);
+    expect(f.engine.workItems.get(item.id)?.planRef).toEqual(revised.planRef);
+    expect(planner.calls).toHaveLength(2);
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    expect(f.prompts).toHaveLength(2);
+    expect(chatWorkNotification(f.engine, f.engine.listTaskRuns()[0]!)?.replyToMessageId).toBe("revised-receipt-goal");
+  } finally { await f.close(); }
+});
+
+test("two queued amendments compose in source order and keep accepted work", async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const contexts: string[] = [];
+  const planner = new FakeLlm().onJSON(call => {
+    const input = JSON.parse(call.prompt ?? "{}");
+    if (!input.revisionContext) return planResult;
+    contexts.push(input.revisionContext.goal);
+    return { kind: "plan", steps: [{ instruction: input.goal.includes("风险") ? "生成包含风险的摘要" : "生成摘要", doneWhen: "100字以内" }] };
+  });
+  const f = await fixture({ planner, runner: async () => { entered.resolve(); await release.promise; return result("总数20"); } });
+  let execution: Promise<void> | undefined;
+  try {
+    await f.send("ordered-goal");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    execution = new WorkContinuationScheduler(f.engine).wake(item.id);
+    await entered.promise;
+    await f.send("ordered-first", "摘要限制100字", { parentMessageId: "ordered-goal" });
+    await f.send("ordered-second", "摘要增加风险", { parentMessageId: "ordered-goal" });
+    release.resolve(); await execution;
+    f.runtime.flushWorkInputs();
+    await f.send("ordered-first", "摘要限制100字", { parentMessageId: "ordered-goal" });
+    f.runtime.flushWorkInputs();
+    await f.send("ordered-second", "摘要增加风险", { parentMessageId: "ordered-goal" });
+    expect(contexts).toHaveLength(2);
+    expect(contexts[1]).toContain("摘要限制100字");
+    expect(f.engine.getWorkPlanView(item.id)?.current.revision).toBe(3);
+    expect(f.engine.getWorkPlanView(item.id)?.remaining[0]?.instruction).toBe("生成包含风险的摘要");
+    expect(f.engine.workItems.get(item.id)?.completedActionIds).toHaveLength(1);
+    expect(f.engine.listTaskRuns()).toHaveLength(1);
+  } finally { release.resolve(); await execution; await f.close(); }
+});
+
+test("identically worded steps keep separate identities and are each consumed once", async () => {
+  const f = await fixture({ planner: new FakeLlm().onJSON(() => ({ kind: "plan", steps: [planResult.steps[0], planResult.steps[0]] })) });
+  try {
+    await f.send("identical-goal");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    expect(new Set(item.nextStepIds).size).toBe(2);
+    const scheduler = new WorkContinuationScheduler(f.engine);
+    await scheduler.wake(item.id);
+    await f.reopen();
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    expect(f.prompts).toHaveLength(2);
+    expect(new Set(f.engine.workContinuations.list(item.id).map(action => action.planStep?.stepId)).size).toBe(2);
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("completed");
+  } finally { await f.close(); }
+});
+
+test("restart repairs an accepted structured step after projection failure without running it again", async () => {
+  const f = await fixture();
+  try {
+    await f.send("projection-goal");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    const projection = spyOn(f.engine.workItems, "applyActionCheckpoint").mockImplementation(() => { throw new Error("injected projection failure"); });
+    let failed: unknown;
+    try { await new WorkContinuationScheduler(f.engine).wake(item.id); }
+    catch (error) { failed = error; }
+    finally { projection.mockRestore(); }
+    expect(String(failed)).toContain("projection failure");
+    expect(f.engine.workContinuations.list(item.id)[0]?.status).toBe("succeeded");
+    expect(f.engine.workItems.get(item.id)?.nextActions).toHaveLength(2);
+    await f.reopen();
+    expect(f.engine.workItems.get(item.id)?.nextActions).toHaveLength(1);
+    expect(f.engine.workItems.get(item.id)?.completedActionIds).toHaveLength(1);
+    expect(f.prompts).toHaveLength(1);
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    expect(f.prompts).toHaveLength(2);
+    expect(f.engine.workItems.get(item.id)?.phase).toBe("completed");
+  } finally { await f.close(); }
+});
+
+test("manual edits preserve an in-flight step and stale forms cannot restore accepted steps", async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const f = await fixture({ runner: async () => { entered.resolve(); await release.promise; return result("汇总已完成"); } });
+  let execution: Promise<string[]> | undefined;
+  try {
+    await f.send("manual-running");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    execution = new WorkContinuationScheduler(f.engine).tick("manual-running");
+    await entered.promise;
+    f.engine.updateWorkItem(item.id, { nextActions: [item.nextActions[0]!, "生成100字摘要"] });
+    const editing = f.engine.getWorkPlanView(item.id)!;
+    const displayed = f.engine.workItems.get(item.id)!;
+    expect(editing.current.revision).toBe(2);
+    release.resolve(); await execution;
+    expect(f.engine.workItems.get(item.id)?.nextActions).toEqual(["生成100字摘要"]);
+    expect(() => f.engine.updateWorkItem(item.id, { nextActions: displayed.nextActions }, editing.current.revision,
+      editing.progressToken)).toThrow("进展已更新");
+    expect(f.engine.workItems.get(item.id)?.completedActionIds).toHaveLength(1);
+  } finally { release.resolve(); await execution; await f.close(); }
+});
 
 test("cancelling a planning turn ignores a late model result and does not execute any steps", async () => {
   const delayed = delayedPlanner();
@@ -463,6 +792,46 @@ test("archive restore retains plans and explicit continuation choices without re
     expect(restored.workItems.get(item.id)?.nextActions).toHaveLength(1);
     expect(chatWorkNotification(restored, restored.listTaskRuns()[0]!)).toBeUndefined();
   } finally { restored.close(); rmSync(restoredDir, { recursive: true, force: true }); await f.close(); }
+});
+
+test("v22 archives restore revised plans with accepted evidence and reject broken graphs before mutation", async () => {
+  const planner = new FakeLlm().onJSON(call => JSON.parse(call.prompt ?? "{}").revisionContext
+    ? { kind: "plan", steps: [{ instruction: "生成短摘要", doneWhen: "100字以内" }] } : planResult);
+  const f = await fixture({ planner });
+  const targetDir = mkdtempSync(join(tmpdir(), "ha-revised-archive-"));
+  const target = new KnowledgeEngine({ dataDir: targetDir, skillCatalog: new SkillCatalog({ roots: [] }) });
+  try {
+    await f.send("archive-revised-goal");
+    const item = f.engine.workItems.list(SPACE)[0]!;
+    await new WorkContinuationScheduler(f.engine).wake(item.id);
+    const accepted = f.engine.workContinuations.list(item.id)[0]!;
+    await f.send("archive-revised-change", "周报改成100字以内的摘要", { parentMessageId: "archive-revised-goal" });
+    const archive = await f.engine.exportSpace(SPACE);
+    expect(archive.version).toBe(22);
+    expect(archive.workPlans).toHaveLength(2);
+    expect(archive.workItems[0]?.planDelivery).toBeUndefined();
+    const missing = structuredClone(archive);
+    missing.workPlans.shift();
+    await expect(target.restoreSpace(missing)).rejects.toThrow();
+    expect(target.registry.has(SPACE)).toBe(false);
+    expect(target.workItems.list()).toEqual([]);
+    const forged = structuredClone(archive);
+    forged.workActions[0]!.planStep!.stepId = "step_00000000000000000000000000000000";
+    expect(() => parseSpaceArchive(forged)).toThrow();
+    const wrongSource = structuredClone(archive);
+    const revisionSource = wrongSource.chatRuns.find(run => run.id === wrongSource.workPlans[1]!.source.id)!;
+    delete revisionSource.workItemId;
+    expect(() => parseSpaceArchive(wrongSource)).toThrow("revision source");
+    await target.restoreSpace(archive);
+    expect(target.getWorkPlanView(item.id)?.history.map(plan => plan.revision)).toEqual([2, 1]);
+    expect(target.workItems.get(item.id)?.completedActionIds).toEqual([accepted.id]);
+    expect(target.workContinuations.get(accepted.id)?.checkpoint).toEqual(accepted.checkpoint);
+    expect(target.getWorkPlanView(item.id)?.remaining.map(step => step.instruction)).toEqual(["生成短摘要"]);
+    await target.deleteSpace(SPACE);
+    expect(target.workItems.plans.snapshot(item.id)).toEqual([]);
+    await target.restoreSpace(archive);
+    expect(target.getWorkPlanView(item.id)?.history).toHaveLength(2);
+  } finally { target.close(); rmSync(targetDir, { recursive: true, force: true }); await f.close(); }
 });
 
 test("a queued planning turn recovers its frozen instructions and model after Agent edits", async () => {

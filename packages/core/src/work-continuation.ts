@@ -19,6 +19,7 @@ import { dirname, join } from "node:path";
 import { isSpaceId, type SpaceId } from "@homeagent/shared";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 import type { WorkItem } from "./work-items.ts";
+import { isWorkPlanStepRef, type WorkPlanStepRef } from "./work-plans.ts";
 
 export type WorkActionStatus =
   | "queued"
@@ -89,6 +90,7 @@ export interface WorkAction {
   workItemId: string;
   space: SpaceId;
   instruction: string;
+  planStep?: WorkPlanStepRef;
   status: WorkActionStatus;
   attempt: number;
   taskRunIds: string[];
@@ -138,7 +140,7 @@ export interface DecideWorkActionAcceptanceInput {
 }
 
 interface WorkContinuationFile {
-  version: 1;
+  version: 1 | 2;
   actions: Record<string, WorkAction>;
   policies?: Record<string, WorkContinuationPolicy>;
 }
@@ -358,6 +360,7 @@ export function isWorkAction(value: unknown): value is WorkAction {
     && typeof action.instruction === "string"
     && action.instruction.length > 0
     && action.instruction.length <= MAX_INSTRUCTION_CHARACTERS
+    && (action.planStep === undefined || isWorkPlanStepRef(action.planStep))
     && typeof action.status === "string"
     && ["queued", "awaiting_approval", "running", "awaiting_acceptance", "succeeded", "blocked", "cancelled"]
       .includes(action.status)
@@ -434,6 +437,7 @@ export function isWorkContinuationPolicy(value: unknown): value is WorkContinuat
 function clone(action: WorkAction): WorkAction {
   return {
     ...action,
+    ...(action.planStep ? { planStep: { ...action.planStep } } : {}),
     taskRunIds: [...action.taskRunIds],
     acceptances: action.acceptances?.map((acceptance) => ({
       ...acceptance,
@@ -497,7 +501,7 @@ export class WorkContinuationStore {
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<WorkContinuationFile>;
       if (
-        parsed.version !== 1
+        (parsed.version !== 1 && parsed.version !== 2)
         || !parsed.actions
         || typeof parsed.actions !== "object"
         || Array.isArray(parsed.actions)
@@ -536,7 +540,7 @@ export class WorkContinuationStore {
     policies = this.policies,
   ): void {
     const file: WorkContinuationFile = {
-      version: 1,
+      version: 2,
       actions: Object.fromEntries([...actions].map(([id, action]) => [id, clone(action)])),
       policies: Object.fromEntries(
         [...policies].map(([id, policy]) => [id, { ...policy }]),
@@ -623,7 +627,7 @@ export class WorkContinuationStore {
     return action ? clone(action) : undefined;
   }
 
-  claimNext(item: WorkItem, now = Date.now()): WorkAction {
+  claimNext(item: WorkItem, now = Date.now(), planStep?: WorkPlanStepRef): WorkAction {
     this.assertHealthy();
     const active = this.activeForWorkItem(item.id);
     if (active) return active;
@@ -635,13 +639,15 @@ export class WorkContinuationStore {
     }
     const instruction = item.nextActions[0]?.trim();
     if (!instruction) throw new Error("work item has no next action");
+    if (item.planRef && (!isWorkPlanStepRef(planStep) || planStep.stepId !== item.nextStepIds?.[0]
+      || planStep.revision !== item.planRef.revision || planStep.planDigest !== item.planRef.digest)) throw new Error("Work plan step reference is missing");
     const latest = [...this.actions.values()]
       .filter((action) => action.workItemId === item.id)
       .sort((left, right) => (
         right.createdAt - left.createdAt || right.id.localeCompare(left.id)
       ))[0];
     if (
-      latest?.instruction === instruction
+      latest && (planStep ? latest.planStep?.stepId === planStep.stepId : latest.instruction === instruction)
       && (latest.status === "blocked" || latest.status === "cancelled")
     ) {
       throw new Error(`work action requires retry: ${latest.id}`);
@@ -654,6 +660,7 @@ export class WorkContinuationStore {
       workItemId: item.id,
       space: item.space,
       instruction,
+      ...(planStep ? { planStep: { ...planStep } } : {}),
       status: "queued",
       attempt: 1,
       taskRunIds: [],

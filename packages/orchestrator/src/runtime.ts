@@ -55,6 +55,7 @@ import {
   type LlmClient,
   RunQueueCancelledError,
   RunQueueTimeoutError,
+  WorkPlanChangedError,
   topicNativeSessionCompatibilityKey,
   type RunSchedulerSnapshot,
 } from "@homeagent/core";
@@ -69,7 +70,7 @@ import type {
 } from "@homeagent/connectors";
 import { extractAttachmentText } from "./attachment-extractor.ts";
 import { newWorkTitle, routeWork, workControl, resolveSupplement, WORK_ROUTING_INSTRUCTION } from "./work-routing.ts";
-import { generateWorkPlan, isWorkPlanningCandidate, WORK_PLANNING_INSTRUCTION } from "./work-planning.ts";
+import { generateWorkPlan, isWorkPlanningCandidate, isWorkReplanningCandidate, WORK_PLANNING_INSTRUCTION, WORK_REPLANNING_INSTRUCTION } from "./work-planning.ts";
 import { splitMaterialText } from "@homeagent/shared";
 import { isLiveReplyTerminal, liveReplySnapshot } from "@homeagent/connectors";
 import { attribute } from "./attribution.ts";
@@ -510,7 +511,8 @@ export class Orchestrator {
         }
         const done = this.engine.workDispatch.get(input.id);
         if (done && done.state !== "cancelled") this.engine.workDispatch.update(done.id, done.revision, { state: "settled" });
-        if (done?.workItemId && this.engine.deliveredChatWorkPlan(done.workItemId)) {
+        if (done?.workItemId && (this.engine.deliveredChatWorkPlan(done.workItemId)
+          || (done.response?.kind === "work-replan" && this.engine.workItems.get(done.workItemId)?.planDelivery?.status === "sent"))) {
           this.engine.reconcileChatWorkPlans();
           this.onWorkPlanReady?.(done.workItemId);
         }
@@ -580,10 +582,15 @@ export class Orchestrator {
 
   private workBusy(workItemId: string, exceptInput?: string): boolean {
     const item = this.engine.workItems.get(workItemId);
-    if (!item?.active || item.phase === "completed") return true;
-    if (this.engine.workContinuations.activeForWorkItem(workItemId)) return true;
+    const input = exceptInput ? this.engine.workDispatch.get(exceptInput) : undefined;
+    const revising = !!(item?.planRef || item?.chatPlanRunId) && !!input && isWorkReplanningCandidate(input.message.text);
+    if (!item || ((!item.active || item.phase === "completed") && !revising)) return true;
+    const action = this.engine.workContinuations.activeForWorkItem(workItemId);
+    const amendable = revising && action && ["queued", "awaiting_approval"].includes(action.status);
+    if (action && !amendable) return true;
     if (this.engine.chatRuns.list(item.space).some(run => run.workItemId === workItemId && ["queued", "running"].includes(run.status))) return true;
-    if (this.engine.taskRuns.list().some(run => run.workItemId === workItemId && ["queued", "running", "awaiting_approval"].includes(run.status))) return true;
+    if (this.engine.taskRuns.list().some(run => run.workItemId === workItemId && ["queued", "running", "awaiting_approval"].includes(run.status)
+      && !(amendable && run.workActionId === action.id && ["queued", "awaiting_approval"].includes(run.status)))) return true;
     return this.engine.workDispatch.summaries(item.space).some(input => input.id !== exceptInput && input.workItemId === workItemId
       && ["received", "preparing", "planned", "dispatched"].includes(input.state));
   }
@@ -1476,9 +1483,12 @@ export class Orchestrator {
         && (input?.operation === "new" || input?.operation === "followup")
         && !!item && !item.chatPlanRunId && !item.runbook && item.nextActions.length === 0 && item.taskRunIds.length === 0
         && isWorkPlanningCandidate(interpretation.text);
+      const shouldRevise = interpretation.disposition === "conversation" && input?.operation === "followup"
+        && !!item && !!(item.planRef || item.chatPlanRunId) && isWorkReplanningCandidate(interpretation.text);
       const response: NonNullable<WorkInput["response"]> = sourceSync.attempted > 0 && sourceSync.succeeded === 0
         ? { kind: "static", text: "我已收录这条消息，但未能读取链接正文，因此不能确认已经理解或完整收录文章内容。请确认该资料在 HomeAgent 运行环境中可访问后重试。" }
         : shouldPlan ? { kind: "work-plan", question: interpretation.text, instruction: WORK_PLANNING_INSTRUCTION }
+        : shouldRevise ? { kind: "work-replan", question: interpretation.text, instruction: WORK_REPLANNING_INSTRUCTION }
         : interpretation.disposition === "conversation" ? { kind: "answer", question: interpretation.text }
         : interpretation.disposition === "remember" ? { kind: "remember", text: sourceSync.succeeded > 0 ? "好的，我已读取并记下来源正文。" : "好的，我记下了。" }
         : { kind: "static", text: "👋 我在。有需要随时问我，或把要记住的事告诉我。" };
@@ -1506,45 +1516,71 @@ export class Orchestrator {
     if (signal.aborted) return Promise.reject(signal.reason);
     if (response?.kind === "static") return this.completeChatRunAndSend(msg, runId, response.text);
     if (response?.kind === "remember") return this.completeRememberChatRun(msg, space, runId, response.text, signal);
-    if (response?.kind === "work-plan") return this.planChatWork(msg, space, runId, response, signal);
+    if (response?.kind === "work-plan" || response?.kind === "work-replan") return this.planChatWork(msg, space, runId, response, signal);
     return this.answer(msg, attribute(msg).readSpaces, space, runId,
       response?.kind === "answer" ? response.question : interpretConversation(msg.text).text, signal);
   }
 
   private async planChatWork(msg: InboundMessage, space: SpaceId, runId: string,
-    response: Extract<NonNullable<WorkInput["response"]>, { kind: "work-plan" }>, signal: AbortSignal): Promise<void> {
+    response: Extract<NonNullable<WorkInput["response"]>, { kind: "work-plan" | "work-replan" }>, signal: AbortSignal): Promise<void> {
     const run = this.engine.chatRuns.get(runId)!;
     if (!run.workItemId || !run.executionPlan) throw new Error("Missing work plan context");
     const previous = this.engine.workItems.get(run.workItemId);
     if (!previous) throw new Error("Missing work plan item");
-    let steps: string[];
-    if (previous?.chatPlanRunId) {
+    let item = previous;
+    const saved = this.engine.getWorkPlanView(previous.id)?.current;
+    const reused = !!saved && ([run.id, run.retryOf].includes(saved.source.id)
+      || (!!previous.planDelivery && [run.id, run.retryOf].includes(previous.planDelivery.runId)));
+    if (reused) {
+      if (previous.planDelivery?.runId !== run.id) this.engine.workItems.setPlanDelivery(previous.id, run.id, "pending", run.retryOf);
+    } else if (!previous.planRef && previous.chatPlanRunId && response.kind === "work-plan") {
       if (previous.chatPlanRunId !== run.id && previous.chatPlanRunId !== run.retryOf) throw new Error("Planning retry conflicts with saved plan");
-      steps = previous.nextActions;
+      item = this.engine.workItems.applyChatPlan(previous.id, runId, previous.nextActions, { retryOf: run.retryOf });
     } else {
-      const plan = await generateWorkPlan(this.llm ?? this.engine.workRoutingClient({
-        provider: run.provider, model: run.model, reasoningEffort: run.reasoningEffort,
-        timeoutMs: run.timeoutMs ?? AI_OPERATION_TIMEOUT_MS,
-      }, signal), { ...response, model: run.model, space, agentInstruction: run.executionPlan.instruction,
-        workItem: { id: previous.id, title: previous.title } }, signal);
-      if (plan.kind === "answer") return this.answer(msg, attribute(msg).readSpaces, space, runId, response.question, signal);
-      steps = plan.steps.map((step, index) => `${index + 1}. ${step.instruction}\n完成标准：${step.doneWhen}`);
+      for (;;) {
+        const prepared = this.engine.prepareWorkPlanRevision(previous.id, { kind: "chat", id: run.id });
+        const plan = await generateWorkPlan(this.llm ?? this.engine.workRoutingClient({
+          provider: run.provider, model: run.model, reasoningEffort: run.reasoningEffort,
+          timeoutMs: run.timeoutMs ?? AI_OPERATION_TIMEOUT_MS,
+        }, signal), { ...response, model: run.model, space, agentInstruction: run.executionPlan.instruction,
+          workItem: { id: previous.id, title: previous.title },
+          ...(response.kind === "work-replan" ? { revisionContext: prepared } : {}) }, signal);
+        if (plan.kind === "answer") return this.answer(msg, attribute(msg).readSpaces, space, runId, response.question, signal);
+        signal.throwIfAborted();
+        const input = this.inputFor(msg);
+        if (this.engine.chatRuns.get(runId)?.status !== "running" || !input || input.state === "cancelled"
+          || !this.inputBindingCurrent(input)) throw new ChatRunCancelledError();
+        try {
+          item = this.engine.commitWorkPlanRevision(prepared, plan.steps, {
+            goal: response.kind === "work-replan" ? `${prepared.goal}\n补充要求：${response.question}` : prepared.goal,
+            reason: response.kind === "work-replan" ? response.question.slice(0, 2_000) : undefined,
+            reactivate: previous.phase === "completed" && !this.engine.workDispatch.summaries(space).some(later =>
+              later.workItemId === previous.id && later.sequence > input.sequence && later.operation === "pause"
+              && this.engine.workItems.get(previous.id)?.updatedAt !== previous.updatedAt),
+          });
+          break;
+        } catch (error) {
+          if (!(error instanceof WorkPlanChangedError)) throw error;
+          // Recompute against newer durable facts within this same frozen Run.
+          // No execution action is replayed and cancellation still wins.
+        }
+      }
     }
     signal.throwIfAborted();
     const input = this.inputFor(msg);
     if (this.engine.chatRuns.get(runId)?.status !== "running" || !input || input.state === "cancelled"
       || !this.inputBindingCurrent(input)) throw new ChatRunCancelledError();
-    const item = this.engine.workItems.applyChatPlan(run.workItemId, runId, steps, { retryOf: run.retryOf });
     const requiresApproval = ["write", "full"].includes(run.executionPlan.execution?.permission ?? "");
     const preview = item.nextActions.slice(0, 10).join("\n\n");
     await this.completeChatRunAndSend(msg, runId, [
-      `已生成工作计划（共 ${item.nextActions.length} 步）：${item.title}`, "", preview,
+      response.kind === "work-replan" ? `已修订剩余工作计划（版本 ${item.planRef?.revision}，共 ${item.nextActions.length} 步）：${item.title}\n已验收成果保留。`
+        : `已生成工作计划（共 ${item.nextActions.length} 步）：${item.title}`, "", preview,
       ...(item.nextActions.length > 10 ? ["", "以上展示前 10 步，完整计划已保存到工作台。"] : []), "",
       !item.active ? "计划已保存，事项处于暂停状态，恢复后继续。"
         : requiresApproval ? "已接入续作。按当前 Agent 配置，每步执行前需要审批，执行后需要验收；完成后继续下一步。"
         : "已接入续作，将按顺序执行；每步通过现有验收后继续，遇到阻塞会停下。",
       "可在工作台查看进展，也可回复本条消息查询进度、暂停或取消。",
-    ].join("\n"), previous?.chatPlanRunId ? "static" : "model");
+    ].join("\n"), reused ? "static" : "model");
     this.engine.reconcileChatWorkPlans();
   }
 

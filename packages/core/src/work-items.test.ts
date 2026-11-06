@@ -72,13 +72,13 @@ describe("WorkItemStore", () => {
     const again = new WorkItemStore(dir);
     expect(again.currentForSpace(SPACE)?.id).toBe(item.id);
     expect(again.get(another.id)?.active).toBe(true);
-    expect(JSON.parse(readFileSync(join(dir, "config", "work-items.json"), "utf8")).version).toBe(2);
+    expect(JSON.parse(readFileSync(join(dir, "config", "work-items.json"), "utf8")).version).toBe(3);
   });
 
   test("refuses malformed or future WorkItem files instead of treating them as empty", () => {
     new WorkItemStore(dir).create({ space: SPACE, title: "保留工作" });
     const path = join(dir, "config", "work-items.json");
-    for (const value of [{ version: 2, currentBySpace: {} }, { version: 2, items: [], currentBySpace: {} }, { version: 3, items: {}, currentBySpace: {} }]) {
+    for (const value of [{ version: 2, currentBySpace: {} }, { version: 2, items: [], currentBySpace: {} }, { version: 4, items: {}, currentBySpace: {} }]) {
       writeFileSync(path, JSON.stringify(value));
       expect(() => new WorkItemStore(dir)).toThrow("WorkItem state is invalid");
       expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(value);

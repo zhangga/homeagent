@@ -23,6 +23,7 @@ import {
   type SpaceId,
 } from "@homeagent/shared";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
+import { WorkPlanStore, formatWorkPlanStep, isWorkPlanRef, type WorkPlanRef, type WorkPlanRevision, type WorkPlanStepRef } from "./work-plans.ts";
 
 export type WorkItemPhase = "planned" | "active" | "blocked" | "completed";
 
@@ -43,6 +44,10 @@ export interface WorkItem {
   taskRunIds: string[];
   /** Provenance of a chat-generated plan; local delivery gates automatic execution. */
   chatPlanRunId?: string;
+  planRef?: WorkPlanRef;
+  nextStepIds?: string[];
+  /** Local delivery gate; omitted from Space archives. */
+  planDelivery?: { runId: string; status: "pending" | "sent" };
   /** WorkAction checkpoints already projected into summary/nextActions. */
   completedActionIds?: string[];
   /** Internal idempotency map for blockers projected from failed WorkActions. */
@@ -80,7 +85,7 @@ export interface WorkPageReference {
 }
 
 interface WorkItemsFile {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   items: Record<string, WorkItem>;
   currentBySpace?: Record<string, string>;
 }
@@ -134,6 +139,12 @@ export function isWorkItem(value: unknown): value is WorkItem {
     && stringList(item.pageSlugs, MAX_REFERENCES)
     && stringList(item.chatRunIds, MAX_REFERENCES)
     && stringList(item.taskRunIds, MAX_REFERENCES)
+    && (item.planRef === undefined ? item.nextStepIds === undefined && item.planDelivery === undefined
+      : isWorkPlanRef(item.planRef) && stringList(item.nextStepIds) && item.nextStepIds.length === item.nextActions.length
+        && new Set(item.nextStepIds).size === item.nextStepIds.length
+        && item.nextStepIds.every(id => /^step_[a-f0-9]{32}$/.test(id))
+        && (item.planDelivery === undefined || (!!item.planDelivery && typeof item.planDelivery.runId === "string"
+          && item.chatRunIds.includes(item.planDelivery.runId) && ["pending", "sent"].includes(item.planDelivery.status))))
     && (item.chatPlanRunId === undefined || (typeof item.chatPlanRunId === "string"
       && /^chat_run_[a-f0-9-]{36,64}$/i.test(item.chatPlanRunId) && item.chatRunIds.includes(item.chatPlanRunId)))
     && (item.completedActionIds === undefined
@@ -169,6 +180,8 @@ function normalizeList(value: string[] | undefined): string[] {
 function clone(item: WorkItem): WorkItem {
   return {
     ...item,
+    ...(item.planRef ? { planRef: { ...item.planRef }, nextStepIds: [...item.nextStepIds!] } : {}),
+    ...(item.planDelivery ? { planDelivery: { ...item.planDelivery } } : {}),
     blockers: [...item.blockers],
     nextActions: [...item.nextActions],
     rawIds: [...item.rawIds],
@@ -210,12 +223,14 @@ function atomicWrite(path: string, content: string): void {
 }
 
 export class WorkItemStore {
+  readonly plans: WorkPlanStore;
   private readonly configPath: string;
   private readonly workspaceRoot: string;
   private items: Map<string, WorkItem>;
   private currentBySpace = new Map<SpaceId, string>();
 
   constructor(dataDir: string) {
+    this.plans = new WorkPlanStore(dataDir);
     this.configPath = join(dataDir, "config", "work-items.json");
     this.workspaceRoot = join(dataDir, "workspaces");
     this.items = this.load();
@@ -227,17 +242,18 @@ export class WorkItemStore {
     if (!existsSync(this.configPath)) return items;
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<WorkItemsFile>;
-      if (parsed.version !== 1 && parsed.version !== 2) throw new Error("Unsupported WorkItem version");
+      if (parsed.version !== 1 && parsed.version !== 2 && parsed.version !== 3) throw new Error("Unsupported WorkItem version");
       if (!parsed.items || typeof parsed.items !== "object" || Array.isArray(parsed.items)) throw new Error("Invalid WorkItem collection");
       for (const [id, item] of Object.entries(parsed.items)) {
         if (!isWorkItem(item) || item.id !== id) throw new Error("Invalid WorkItem");
+        this.assertPlanProjection(item);
         items.set(id, clone(item));
         if (parsed.version === 1 && item.active) {
           if (this.currentBySpace.has(item.space)) throw new Error("Invalid legacy WorkItem selection");
           this.currentBySpace.set(item.space, id);
         }
       }
-      if (parsed.version === 2) {
+      if (parsed.version === 2 || parsed.version === 3) {
         if (!parsed.currentBySpace || typeof parsed.currentBySpace !== "object" || Array.isArray(parsed.currentBySpace)) throw new Error("Invalid WorkItem selection");
         for (const [space, id] of Object.entries(parsed.currentBySpace)) {
           if (!isSpaceId(space) || items.get(id)?.space !== space) throw new Error("Invalid WorkItem selection");
@@ -252,7 +268,7 @@ export class WorkItemStore {
 
   private persist(items: Map<string, WorkItem>, currentBySpace: Map<SpaceId, string>): void {
     const file: WorkItemsFile = {
-      version: 2,
+      version: 3,
       currentBySpace: Object.fromEntries(currentBySpace),
       items: Object.fromEntries([...items].map(([id, item]) => [id, clone(item)])),
     };
@@ -276,6 +292,8 @@ export class WorkItemStore {
       chatRunIds: item.chatRunIds,
       taskRunIds: item.taskRunIds,
       chatPlanRunId: item.chatPlanRunId,
+      planRef: item.planRef,
+      nextStepIds: item.nextStepIds,
       completedActionIds: item.completedActionIds ?? [],
       actionBlockers: item.actionBlockers ?? {},
       createdAt: item.createdAt,
@@ -302,6 +320,10 @@ export class WorkItemStore {
     const current = new Map(this.currentBySpace);
     const result = change(candidate, current);
     const changed = [...candidate.values()].filter(item => JSON.stringify(item) !== JSON.stringify(this.items.get(item.id)));
+    for (const item of changed) {
+      if (!isWorkItem(item)) throw new Error("Invalid work item state");
+      this.assertPlanProjection(item);
+    }
     for (const [space, id] of current) if (candidate.get(id)?.space !== space) current.delete(space);
     this.persist(candidate, current);
     this.items = candidate;
@@ -323,6 +345,58 @@ export class WorkItemStore {
   get(id: string): WorkItem | undefined {
     const item = this.items.get(id);
     return item ? clone(item) : undefined;
+  }
+
+  private assertPlanProjection(item: WorkItem): void {
+    if (!item.planRef) return;
+    const plan = this.plans.get(item.id, item.planRef);
+    const texts = item.nextStepIds!.map(id => {
+      const index = plan.steps.findIndex(step => step.id === id);
+      if (index < 0) throw new Error("Work plan step is missing");
+      return formatWorkPlanStep(plan.steps[index]!, index);
+    });
+    if (plan.space !== item.space || JSON.stringify(texts) !== JSON.stringify(item.nextActions)
+      || item.runbook !== (plan.runbook ?? plan.steps.map(formatWorkPlanStep).join("\n\n"))) throw new Error("Work plan projection mismatch");
+  }
+
+  commitPlan(id: string, plan: WorkPlanRevision, opts: { deliveryRunId?: string; retryOf?: string; reactivate?: boolean; context?: WorkItemUpdate } = {}): WorkItem {
+    const current = this.get(id);
+    if (!current || plan.workItemId !== id || plan.space !== current.space
+      || JSON.stringify(plan.previous) !== JSON.stringify(current.planRef)) throw new Error("Work plan revision conflict");
+    if (opts.deliveryRunId && !current.chatRunIds.includes(opts.deliveryRunId)) throw new Error("Unknown planning run");
+    this.validateUpdate(id, opts.context ?? {});
+    const ref = this.plans.save(plan);
+    return this.commit(candidate => {
+      const item = candidate.get(id)!;
+      this.applyContextUpdate(item, opts.context ?? {}, Date.now());
+      item.planRef = ref;
+      item.nextStepIds = plan.steps.map(step => step.id);
+      item.nextActions = plan.steps.map(formatWorkPlanStep);
+      item.runbook = plan.runbook ?? item.nextActions.join("\n\n");
+      if (opts.deliveryRunId) {
+        item.chatPlanRunId ??= opts.deliveryRunId;
+        item.planDelivery = { runId: opts.deliveryRunId, status: "pending" };
+      } else delete item.planDelivery;
+      if (item.phase === "completed" && item.nextActions.length) {
+        item.phase = "active";
+        item.active = opts.reactivate === true;
+      }
+      item.updatedAt = Date.now();
+      if (!isWorkItem(item)) throw new Error("Invalid revised work item");
+      return clone(item);
+    });
+  }
+
+  setPlanDelivery(id: string, runId: string, status: "pending" | "sent", retryOf?: string): void {
+    const item = this.get(id);
+    if (!item?.planRef || !item.planDelivery || !item.chatRunIds.includes(runId)
+      || ![runId, retryOf].includes(item.planDelivery.runId)) throw new Error("Unknown plan delivery");
+    if (item.planDelivery.runId === runId && item.planDelivery.status === status) return;
+    this.commit(candidate => {
+      const changed = candidate.get(id)!;
+      if (changed.chatPlanRunId === retryOf && changed.taskRunIds.length === 0) changed.chatPlanRunId = runId;
+      changed.planDelivery = { runId, status };
+    });
   }
 
   activeForSpace(space: SpaceId): WorkItem | undefined {
@@ -385,8 +459,24 @@ export class WorkItemStore {
   update(id: string, update: WorkItemUpdate, now = Date.now()): WorkItem {
     const current = this.items.get(id);
     if (!current) throw new Error(`work item not found: ${id}`);
+    if (current.planRef && ((update.nextActions !== undefined && JSON.stringify(update.nextActions) !== JSON.stringify(current.nextActions))
+      || (update.runbook !== undefined && update.runbook !== current.runbook))) throw new Error("Structured work plans must be revised through the Engine");
     return this.commit((candidate) => {
       const item = candidate.get(id)!;
+      this.applyContextUpdate(item, update, now);
+      return clone(item);
+    });
+  }
+
+  validateUpdate(id: string, update: WorkItemUpdate): WorkItem {
+    const item = this.get(id);
+    if (!item) throw new Error("Unknown work item");
+    this.applyContextUpdate(item, update, Date.now());
+    if (!isWorkItem(item)) throw new Error("Invalid work item update");
+    return item;
+  }
+
+  private applyContextUpdate(item: WorkItem, update: WorkItemUpdate, now: number): void {
       if (update.title !== undefined) {
         const title = trimText(update.title, MAX_TITLE_LENGTH);
         if (!title) throw new Error("work item title is required");
@@ -396,7 +486,8 @@ export class WorkItemStore {
       if (update.runbook !== undefined) item.runbook = trimText(update.runbook);
       if (update.summary !== undefined) item.summary = trimText(update.summary);
       if (update.blockers !== undefined) item.blockers = normalizeList(update.blockers);
-      if (update.nextActions !== undefined) item.nextActions = normalizeList(update.nextActions);
+      if (update.nextActions !== undefined) item.nextActions = item.planRef
+        ? update.nextActions.map(value => value.trim()).filter(Boolean) : normalizeList(update.nextActions);
       if (update.phase !== undefined) {
         if (!PHASES.has(update.phase)) throw new Error("invalid work item phase");
         item.phase = update.phase;
@@ -409,8 +500,6 @@ export class WorkItemStore {
       const wantsActive = update.active ?? item.active;
       item.active = item.phase !== "completed" && wantsActive;
       item.updatedAt = now;
-      return clone(item);
-    });
   }
 
   activate(id: string, now = Date.now()): WorkItem {
@@ -481,6 +570,7 @@ export class WorkItemStore {
     instruction: string,
     summary: string,
     now = Date.now(),
+    opts: { planStep?: WorkPlanStepRef; deferComplete?: boolean } = {},
   ): WorkItem {
     const current = this.items.get(id);
     if (!current) throw new Error(`work item not found: ${id}`);
@@ -490,7 +580,7 @@ export class WorkItemStore {
       item.completedActionIds ??= [];
       if (item.completedActionIds.includes(actionId)) return clone(item);
       const conflict = workActionProjectionConflictMessage(actionId, instruction);
-      if (item.nextActions[0] !== instruction) {
+      if (item.planRef ? !opts.planStep || item.nextStepIds?.[0] !== opts.planStep.stepId : item.nextActions[0] !== instruction) {
         if (!item.blockers.includes(conflict)) item.blockers.push(conflict);
         item.phase = "blocked";
         item.updatedAt = now;
@@ -500,6 +590,7 @@ export class WorkItemStore {
         throw new Error("work item has too many completed actions");
       }
       item.nextActions.splice(0, 1);
+      item.nextStepIds?.splice(0, 1);
       const conflictIndex = item.blockers.indexOf(conflict);
       if (conflictIndex >= 0) item.blockers.splice(conflictIndex, 1);
       const previousBlocker = item.actionBlockers?.[actionId];
@@ -511,7 +602,7 @@ export class WorkItemStore {
       item.summary = trimText(summary);
       item.completedActionIds.push(actionId);
       if (item.phase === "blocked" && item.blockers.length === 0) item.phase = "active";
-      if (item.chatPlanRunId && item.nextActions.length === 0 && item.blockers.length === 0) {
+      if ((item.chatPlanRunId || item.planRef) && item.nextActions.length === 0 && item.blockers.length === 0 && !opts.deferComplete) {
         item.phase = "completed";
         item.active = false;
       }

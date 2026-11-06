@@ -38,6 +38,7 @@ export interface WorkInput {
   plan?: StartChatRunInput;
   response?: { kind: "answer"; question: string }
     | { kind: "work-plan"; question: string; instruction: string }
+    | { kind: "work-replan"; question: string; instruction: string }
     | { kind: "remember" | "static"; text: string };
   runId?: string;
   /** Stable list shown to this actor, for subsequent ordinal controls. */
@@ -98,7 +99,7 @@ function valid(input: WorkInput): boolean {
     && (input.presentedItemIds === undefined || (Array.isArray(input.presentedItemIds) && input.presentedItemIds.length <= 200 && input.presentedItemIds.every(id => bounded(id))))
     && (!input.receipt || (bounded(input.receipt.text, 100_000) && ["pending", "sent"].includes(input.receipt.status) && optional(input.receipt.messageId)))
     && (!input.response || (input.response.kind === "answer" ? bounded(input.response.question, MAX_WORK_INPUT_CHARACTERS)
-      : input.response.kind === "work-plan" ? bounded(input.response.question, MAX_WORK_INPUT_CHARACTERS) && bounded(input.response.instruction, 20_000)
+      : input.response.kind === "work-plan" || input.response.kind === "work-replan" ? bounded(input.response.question, MAX_WORK_INPUT_CHARACTERS) && bounded(input.response.instruction, 20_000)
       : ["remember", "static"].includes(input.response.kind) && bounded(input.response.text, 100_000)))
     && (!input.plan || (input.plan.space === input.space && input.plan.chatId === m.chatId
       && input.plan.messageId === m.messageId && input.plan.author === m.senderId

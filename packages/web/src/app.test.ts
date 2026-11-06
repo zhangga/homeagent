@@ -2566,7 +2566,7 @@ describe("management backend (read-write)", () => {
     const governanceBody = await governance.text();
     expect(governanceBody).toContain("数据治理");
     expect(governanceBody).toContain("原始消息保留");
-    expect(governanceBody).toContain("homeagent.space v1–v21");
+    expect(governanceBody).toContain("homeagent.space v1–v22");
     expect(governanceBody).toContain("v17 包含系统生成的分层知识地图");
     expect(governanceBody).toContain("v18 包含本地 Agent 知识消费反馈及处置记录");
     expect(governanceBody).toContain("v19 包含按 SHA-256 校验的完整原文件");
@@ -2580,7 +2580,7 @@ describe("management backend (read-write)", () => {
     expect(JSON.parse(archiveText)).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 21,
+        version: 22,
         sourceFiles: [],
         agentKnowledgeFeedback: [],
         agentRevisions: [],
@@ -5316,6 +5316,28 @@ describe("management backend (read-write)", () => {
     expect(view).toContain("回归完成，等待审批");
     expect(view).toContain("生产审批");
     expect(view).toContain("当前工作项");
+  });
+
+  test("work plan editing preserves multiline steps and records a visible revision", async () => {
+    const item = engine.workItems.create({ space: SPACE, title: "计划编辑" });
+    engine.commitWorkPlanRevision(engine.prepareWorkPlanRevision(item.id, { kind: "manual", id: "manual-test" }), [
+      { instruction: "汇总进展", doneWhen: "包含来源" }, { instruction: "生成周报", doneWhen: "包含阻塞" },
+    ]);
+    const original = engine.getWorkPlanView(item.id)!;
+    const current = engine.workItems.get(item.id)!;
+    const response = await app.request(`/work/${item.id}`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ title: current.title, brief: current.brief, phase: current.phase, summary: current.summary,
+        blockers: "", runbook: "手工补充的执行说明", nextActions: `${current.nextActions[0]}\n\n生成摘要\n完成标准：100字以内`,
+        planRevision: String(current.planRef!.revision), planProgress: original.progressToken }).toString() });
+    expect(response.status).toBe(302);
+    const revised = engine.getWorkPlanView(item.id)!;
+    expect(revised.current.revision).toBe(2);
+    expect(revised.remaining).toHaveLength(2);
+    expect(revised.remaining[0]?.id).toBe(original.remaining[0]?.id);
+    expect(engine.workItems.get(item.id)?.runbook).toBe("手工补充的执行说明");
+    const html = await (await app.request(`/work/${item.id}`)).text();
+    expect(html).toContain("计划版本 2");
+    expect(html).toContain("人工修订");
   });
 
   test("work context: focus selection does not pause another item and pending inputs remain visible", async () => {
