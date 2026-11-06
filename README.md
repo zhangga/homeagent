@@ -608,6 +608,8 @@ Task 后的提炼使用独立无工具调用，不继承完全访问。完全访
 WorkItems v2 新增可选规划来源标识，WorkDispatch v1 新增冻结的 `work-plan` 响应类别；新版本继续读取旧数据。
 Space v21 备份保留工作计划和已有续作策略，不携带本机聊天投递来源，也不会根据导入的聊天历史重新开启已关闭的续作。
 
+后续的计划修订、遇阻重规划、专业 Worker 与可选 Harness 试点见 [Super-agent 演进方案](docs/superpowers/specs/2026-11-06-homeagent-super-agent-evolution-design.md)；这些阶段为规划内容，尚未实现。
+
 ### 数据目录迁移与 Git
 
 在「设置 → 数据目录」输入绝对路径，确认后安排迁移。目标可以不存在、为空，或仅包含受支持的仓库元数据：
