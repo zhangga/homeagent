@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProviderRunError, ProviderPreparationError, codexProgressEventFromLine, type JSONOptions } from "@homeagent/llm";
@@ -4863,6 +4863,113 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(engine.registry.store("personal/ou_me").index().listRaw({})).toEqual([
       expect.objectContaining({ source: "message", messageId: "om_bytetech_failed" }),
     ]);
+  });
+
+  test("recording an inline screenshot saves searchable text and the original in its Space", async () => {
+    const localPath = join(dir, "screenshot.png");
+    const original = new Uint8Array([1, 2, 3]);
+    writeFileSync(localPath, original);
+    const messageId = "om_ga_screenshot";
+    const createdAt = Date.parse("2026-11-10T12:04:00+08:00");
+    const downloads: string[] = [];
+    let modelCalls = 0;
+    engine.askWithExecutionPlan = async () => {
+      modelCalls++;
+      return { answer: "请上传截图。", source: "general", citations: [] };
+    };
+    orch = new Orchestrator({
+      engine, connector, llm: fake,
+      attachmentDownloader: async (id) => {
+        downloads.push(id);
+        return [{
+          attachment: { kind: "image", ref: "img_ga_fixture" },
+          localPath, sizeBytes: original.length, cleanup() {},
+        }];
+      },
+      attachmentExtractor: async () => "战场 GA 线上数据：selected_ping 67.05",
+    });
+    await orch.start();
+    await connector.inject({
+      kind: "message", eventId: "ga-post", chatType: "p2p", chatId: "oc_dm",
+      senderId: "ou_me", messageId, mentionsBot: true, createdAt, messageType: "post",
+      text: "@HomeAgent 记录下面的战场GA开启后的线上数据\n![Image](img_ga_fixture)",
+    });
+    const space = "personal/ou_me";
+    const results = engine.registry.store(space).index().searchRaw("selected_ping 67.05");
+    expect(results).toEqual([expect.objectContaining({
+      messageId, chatId: "oc_dm", author: "ou_me", createdAt, admission: "ready",
+      attachments: [expect.objectContaining({ ref: "img_ga_fixture", sourceDigest: expect.any(String) })],
+    })]);
+    const stored = engine.getRawSource(space, results[0]!.id, 0);
+    expect(stored).not.toBeNull();
+    expect(new Uint8Array(readFileSync(stored!.path))).toEqual(original);
+    expect(engine.registry.store(space).index().searchRaw("战场GA开启").map(raw => raw.id)).toContain(results[0]!.id);
+    expect(downloads).toEqual([messageId]);
+    expect(modelCalls).toBe(0);
+    expect(connector.sent.at(-1)?.markdown).toContain("已收录 1 张图片的原件和识别文字");
+  });
+
+  test.each(["missing", "no-text"] as const)("image recording reports the durable result when extraction is %s", async (mode) => {
+    const localPath = join(dir, "image.png");
+    writeFileSync(localPath, "image");
+    orch = new Orchestrator({
+      engine, connector, llm: fake,
+      attachmentDownloader: async () => mode === "missing" ? [] : [{
+        attachment: { kind: "image", ref: "img_unreadable" },
+        localPath, sizeBytes: 5, cleanup() {},
+      }],
+      attachmentExtractor: async () => null,
+    });
+    await orch.start();
+    await connector.inject({
+      kind: "message", eventId: "record-image", chatType: "p2p", chatId: "oc_dm",
+      senderId: "ou_me", messageId: "om_image", mentionsBot: true, createdAt: Date.now(), messageType: "post",
+      text: "记录下面的线上数据\n![Image](img_unreadable)",
+    });
+    expect(connector.sent.at(-1)?.markdown).toContain(mode === "missing" ? "未收录图片原件" : "已保存 1 张图片原件，未能提取可检索的文字");
+  });
+
+  test("replying to an older rich-text message recovers missing screenshots without duplicate Raw", async () => {
+    const localPath = join(dir, "screenshot.png");
+    writeFileSync(localPath, "image");
+    const space = "personal/ou_me";
+    const target = {
+      messageId: "om_old_screenshot", messageType: "post", senderId: "ou_me",
+      createdAt: Date.parse("2026-11-10T12:04:00+08:00"),
+      text: "记录下面的战场GA开启后的线上数据\n【图片】\n【图片】",
+    };
+    await engine.remember({
+      space, source: "message", chatId: "oc_dm", messageId: target.messageId, author: target.senderId,
+      createdAt: target.createdAt, content: `@HomeAgent ${target.text.replaceAll("【图片】", "![Image](img_fixture)")}`,
+    });
+    (connector as CliConnector & Connector).resolveReplyTarget = async () => target;
+    let downloadAttempts = 0;
+    orch = new Orchestrator({
+      engine, connector, llm: fake,
+      attachmentDownloader: async id => {
+        expect(id).toBe(target.messageId);
+        const refs = ++downloadAttempts === 1 ? ["img_first"] : ["img_first", "img_second"];
+        return refs.map(ref => ({
+          attachment: { kind: "image", ref },
+          localPath, sizeBytes: 5, cleanup() {},
+        }));
+      },
+      attachmentExtractor: async download => `线上数据 ${download.attachment.ref}`,
+    });
+    await orch.start();
+    for (const index of [1, 2]) {
+      await connector.inject({
+        kind: "message", eventId: `ga-reply-${index}`, chatType: "p2p", chatId: "oc_dm",
+        senderId: "ou_me", messageId: `om_ga_reply_${index}`, parentMessageId: target.messageId,
+        mentionsBot: true, createdAt: Date.now(), messageType: "text", text: "记录这张图",
+      });
+      expect(connector.sent.at(-1)?.markdown).toContain(`已收录 ${index} 张图片的原件和识别文字`);
+    }
+    const raws = engine.registry.store(space).index().findRawsByMessageId(target.messageId, "oc_dm")
+      .filter(raw => raw.attachments?.length);
+    expect(raws).toHaveLength(2);
+    expect(raws.every(raw => raw.createdAt === target.createdAt && raw.author === target.senderId)).toBe(true);
+    expect(raws.map(raw => raw.attachments?.[0]?.ref).sort()).toEqual(["img_first", "img_second"]);
   });
 
   test("attachment text follows message provenance and retraction lifecycle", async () => {

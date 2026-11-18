@@ -1,6 +1,6 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { extname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
 import type { DownloadedAttachment } from "@homeagent/connectors";
 import { extractMaterialText, isExtractableMaterial, MAX_MATERIAL_BYTES, MAX_MATERIAL_EXPANDED_BYTES } from "@homeagent/shared";
 const NATIVE_TIMEOUT_MS = 60_000;
@@ -90,8 +90,15 @@ export function createNativeExtractor(runtime: NativeExtractorRuntime = {}): Nat
   const runProcess = runtime.runProcess ?? runBoundedProcess;
 
   return async (mode, path) => {
+    if (platform === "win32" && mode === "image") {
+      const powershell = win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      return runProcess([
+        powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", join(import.meta.dir, "attachment-extract-windows.ps1"), resolve(path),
+      ], NATIVE_TIMEOUT_MS);
+    }
     if (platform !== "darwin") {
-      return { code: null, stdout: "", stderr: "native extraction requires macOS" };
+      return { code: null, stdout: "", stderr: "native extraction is unavailable for this platform and format" };
     }
 
     const bundledHelper = resolveBundledHelper(execPath, runtime.attachmentHelper);

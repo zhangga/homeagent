@@ -78,6 +78,8 @@ import { attribute } from "./attribution.ts";
 import { gate } from "./gateway.ts";
 import { decideGroupParticipation } from "./group-participation.ts";
 import {
+  containsInlineImage,
+  inlineImageCaption,
   interpretConversation,
   normalizeConversationText,
   parseKnowledgeControl,
@@ -119,6 +121,7 @@ const REMINDER_CONFIRMATION_TTL_MS = 15 * 60_000;
 const GROUP_PARTICIPATION_TIMEOUT_MS = AI_OPERATION_TIMEOUT_MS;
 const MAX_VISION_IMAGES = 4;
 const MAX_VISION_BYTES = 20 * 1024 * 1024;
+const ATTACHMENT_WITHOUT_TEXT = "未提取到可供提炼的正文；原文件已完整保存，可从原始记录详情下载。";
 const MAX_REPLY_SOURCE_CHARS = 50_000;
 const RECENT_CONTEXT_LOOKBACK_MS = 24 * 60 * 60_000;
 const RECENT_CONTEXT_SCAN_LIMIT = 50;
@@ -276,6 +279,10 @@ function discloseUnavailableVision(text: string): string {
     "",
     "【图片未能下载，当前没有可分析的视觉内容；不要假设已经看到了图片。】",
   ].join("\n");
+}
+
+function hasMessageImages(messageType: string | undefined, text: string | undefined): boolean {
+  return messageType === "image" || (messageType === "post" && text !== undefined && containsInlineImage(text));
 }
 
 export interface RuntimeOptions {
@@ -811,6 +818,7 @@ export class Orchestrator {
             : "unknown"),
         text: retryText,
         messageId: previous.messageId,
+        messageType: sourceInput?.message.messageType,
         mentionsBot: true,
         createdAt: previous.startedAt,
         ...this.topicMessageIdentity(previous.id),
@@ -1289,12 +1297,11 @@ export class Orchestrator {
 
       if (
         decision.capture
-        && msg.messageType
-        && ["image", "file", "audio", "media"].includes(msg.messageType)
+        && (hasMessageImages(msg.messageType, msg.text) || ["file", "audio", "media"].includes(msg.messageType ?? ""))
         && this.attachmentDownloader
-        && !existingMessageRaws.some((raw) =>
+        && (msg.messageType === "post" || !existingMessageRaws.some((raw) =>
           raw.attachments?.some((attachment) => attachment.sourceDigest)
-        )
+        ))
       ) {
         markDurableMutation();
         await this.syncAttachments(msg, writeSpace);
@@ -1309,19 +1316,21 @@ export class Orchestrator {
         try {
           const target = await this.connector.resolveReplyTarget(msg.messageId);
           if (
-            target?.messageType
-            && ["image", "file", "audio", "media"].includes(target.messageType)
+            target && (hasMessageImages(target.messageType, target.text) || ["file", "audio", "media"].includes(target.messageType ?? ""))
+            && !this.messageWasRetracted(writeSpace, msg.chatId, target.messageId)
           ) {
-            const alreadyStored = this.engine.registry.store(writeSpace).index().listRaw({})
+            const alreadyStored = this.engine.registry.store(writeSpace).index()
+              .findRawsByMessageId(target.messageId, msg.chatId)
               .some((raw) =>
-                raw.messageId === target.messageId
-                && raw.attachments?.some((attachment) => attachment.sourceDigest)
+                raw.attachments?.some((attachment) => attachment.sourceDigest)
             );
-            if (!alreadyStored) {
+            if (!alreadyStored || target.messageType === "post") {
               markDurableMutation();
               await this.syncAttachments(msg, writeSpace, {
                 messageId: target.messageId,
                 author: target.senderId ?? msg.senderId,
+                createdAt: target.createdAt,
+                text: target.text,
               });
             }
           }
@@ -2004,18 +2013,23 @@ export class Orchestrator {
     notice: string,
     signal: AbortSignal,
   ): Promise<void> {
-    let target;
-    try {
-      target = await this.connector.resolveReplyTarget?.(msg.messageId, { fullText: true });
-    } catch {
-      log.warn("remember reply target lookup failed", { runId });
-    }
     const assertActive = (): void => {
       if (signal.aborted || this.engine.chatRuns.get(runId)?.status !== "running"
         || (msg.chatType === "group" && this.connector.name === "feishu" && !this.activeGroupBinding(msg.chatId))) {
         throw new ChatRunCancelledError();
       }
     };
+    assertActive();
+    if (hasMessageImages(msg.messageType, msg.text) || (!msg.messageType && containsInlineImage(msg.text))) {
+      await this.completeChatRunAndSend(msg, runId, this.imageCaptureNotice(space, msg.chatId, msg.messageId));
+      return;
+    }
+    let target;
+    try {
+      target = await this.connector.resolveReplyTarget?.(msg.messageId, { fullText: true });
+    } catch {
+      log.warn("remember reply target lookup failed", { runId });
+    }
     assertActive();
     const targetId = target?.messageId ?? msg.parentMessageId;
     if (targetId && targetId !== msg.messageId) {
@@ -2067,9 +2081,30 @@ export class Orchestrator {
         } else if (!target?.messageType || !["image", "file", "audio", "media"].includes(target.messageType) || target.textTruncated) {
           notice = "未取得被回复消息的完整正文，尚未收录该正文。";
         }
+        if (hasMessageImages(target?.messageType, target?.text)) {
+          const imageNotice = this.imageCaptureNotice(space, msg.chatId, targetId);
+          notice = target?.messageType === "image" ? imageNotice : `${notice}\n\n${imageNotice}`;
+        }
       }
     }
     await this.completeChatRunAndSend(msg, runId, notice);
+  }
+
+  private imageCaptureNotice(space: SpaceId, chatId: string, messageId: string): string {
+    const originals = new Set<string>();
+    const extracted = new Set<string>();
+    for (const raw of this.engine.registry.store(space).index().findRawsByMessageId(messageId, chatId)) {
+      if (raw.admission !== "ready") continue;
+      for (const attachment of raw.attachments ?? []) {
+        if (attachment.kind !== "image" || !attachment.sourceDigest) continue;
+        originals.add(attachment.ref);
+        if (!raw.content.endsWith(`\n\n${ATTACHMENT_WITHOUT_TEXT}`)) extracted.add(attachment.ref);
+      }
+    }
+    if (originals.size === 0) return "未收录图片原件，也未提取到图片文字。";
+    if (extracted.size === 0) return `已保存 ${originals.size} 张图片原件，未能提取可检索的文字。`;
+    if (extracted.size === originals.size) return `已收录 ${originals.size} 张图片的原件和识别文字，可查询已入库原文。`;
+    return `已保存 ${originals.size} 张图片原件，其中 ${extracted.size} 张提取到了可检索的文字。`;
   }
 
   private async completeChatRunAndSend(
@@ -2807,9 +2842,17 @@ export class Orchestrator {
   private async syncAttachments(
     msg: InboundMessage,
     writeSpace: SpaceId,
-    source: { messageId?: string; author?: string } = {},
+    source: { messageId?: string; author?: string; createdAt?: number; text?: string } = {},
   ): Promise<void> {
     const sourceMessageId = source.messageId ?? msg.messageId;
+    const existing = this.engine.registry.has(writeSpace)
+      ? this.engine.registry.store(writeSpace).index().findRawsByMessageId(sourceMessageId, msg.chatId)
+      : [];
+    const sourceText = existing.find(raw => raw.source === "message" && !raw.attachments?.length)?.content
+      ?? (source.messageId ? source.text : msg.text);
+    const caption = sourceText && containsInlineImage(sourceText)
+      ? inlineImageCaption(sourceText).slice(0, MAX_REPLY_SOURCE_CHARS)
+      : "";
     let downloads: DownloadedAttachment[];
     try {
       downloads = await this.attachmentDownloader!(sourceMessageId);
@@ -2830,27 +2873,35 @@ export class Orchestrator {
             err: String(err),
           });
         }
-        const parts = extracted?.trim() ? splitMaterialText(extracted.trim()) : [];
+        const text = extracted?.trim();
+        // Keep the caption searchable with the OCR result even if it never appeared in the pixels.
+        const prefix = caption && download.attachment.kind === "image" ? `来源消息：${caption}\n\n` : "";
+        const parts = text ? splitMaterialText(prefix + text) : [];
         const contents = parts.length > 0
           ? parts.map((part, index) => `# 附件：${name}\n\n${parts.length > 1 ? `正文分段：${index + 1}/${parts.length}\n\n` : ""}${part}`)
-          : [`# 附件：${name}\n\n未提取到可供提炼的正文；原文件已完整保存，可从原始记录详情下载。`];
-        for (const content of contents) await this.engine.rememberFile(
-          {
-            space: writeSpace,
-            source: "message",
-            author: source.author ?? msg.senderId,
-            workItemId: this.inputFor(msg)?.workItemId,
-            chatId: msg.chatId,
-            messageId: sourceMessageId,
-            content,
-            createdAt: msg.createdAt,
-          },
-          {
-            attachment: download.attachment,
-            localPath: download.localPath,
-          },
-          { useCurrentWorkItem: false },
-        );
+          : [`# 附件：${name}\n\n${prefix}${ATTACHMENT_WITHOUT_TEXT}`];
+        for (const content of contents) {
+          if (existing.some(raw => raw.content === content && raw.attachments?.some(attachment =>
+            attachment.ref === download.attachment.ref && attachment.sourceDigest
+          ))) continue;
+          await this.engine.rememberFile(
+            {
+              space: writeSpace,
+              source: "message",
+              author: source.author ?? msg.senderId,
+              workItemId: this.inputFor(msg)?.workItemId,
+              chatId: msg.chatId,
+              messageId: sourceMessageId,
+              content,
+              createdAt: source.createdAt ?? msg.createdAt,
+            },
+            {
+              attachment: download.attachment,
+              localPath: download.localPath,
+            },
+            { useCurrentWorkItem: false },
+          );
+        }
       } catch (err) {
         log.warn("attachment preservation failed", {
           messageId: sourceMessageId,

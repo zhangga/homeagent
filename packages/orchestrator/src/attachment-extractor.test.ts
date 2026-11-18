@@ -89,6 +89,28 @@ test("bundled native extraction recognizes the separately embedded Bun runtime",
   expect(commands.some((command) => command.includes("swiftc"))).toBeFalse();
 });
 
+test("Windows runs the local OCR helper for images and leaves PDF unsupported", async () => {
+  const calls: Array<{ command: string[]; timeoutMs: number }> = [];
+  const extractor = createNativeExtractor({
+    platform: "win32",
+    runProcess: async (command, timeoutMs) => {
+      calls.push({ command, timeoutMs });
+      return { code: 0, stdout: "recognized text", stderr: "" };
+    },
+  });
+  const path = resolve("chart with spaces.png");
+  expect((await extractor("image", path)).stdout).toBe("recognized text");
+  expect((await extractor("pdf", resolve("brief.pdf"))).code).toBeNull();
+  expect(calls).toEqual([{
+    command: [
+      expect.stringMatching(/\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe$/iu),
+      "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+      "-File", join(import.meta.dir, "attachment-extract-windows.ps1"), path,
+    ],
+    timeoutMs: 60_000,
+  }]);
+});
+
 test("bundled native extraction rejects a helper outside Resources/bin", async () => {
   let invoked = false;
   const extractor = createNativeExtractor({

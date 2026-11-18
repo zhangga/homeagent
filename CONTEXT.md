@@ -252,6 +252,8 @@ Raw attachment 保存摘要、字节数和文件名。提炼文本可以有独�
 飞书文档后台同步将可取得的配图原件与正文绑定到同一条 `source=doc` Raw，保留正文中的图片引用；未取得原件的图片仅保留 attachment 引用，不伪造文件摘要。批量原件先校验后写入；SQLite projection 写入失败时，已由 Raw journal 引用的原件必须保留以供恢复。此路径复用现有 Raw attachment 与 Space 归档格式，不改变存储所有权。
 后台上传和飞书附件的已解析长正文按每段最多 200,000 字符完整登记为多个 Raw；各段在正文标明顺序，
 共享同一 SHA-256 原件，保留原消息归属、撤回与下载语义，不增加 archive schema。
+飞书富文本中的图片沿用附件 Raw，保留原消息身份、时间及消息说明，识别文字进入同一 Space 的 Raw 全文索引。
+显式收录图片时，回执根据已提交且可用的 Raw 分别确认原件和识别文字。
 原文件随 `homeagent.space v23` 归档导出和恢复，Wiki 只保留指向 Raw 的 provenance，不复制文件正文。
 
 ## Knowledge page

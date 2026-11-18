@@ -85,6 +85,16 @@ export function prefilterChitchat(text: string): boolean {
   return false;
 }
 
+const INLINE_IMAGE = /!\[[^\]\r\n]*\]\(img_[\w-]+\)|【图片】/u;
+
+export function containsInlineImage(text: string): boolean {
+  return INLINE_IMAGE.test(text);
+}
+
+export function inlineImageCaption(text: string): string {
+  return normalizeConversationText(text.replace(new RegExp(INLINE_IMAGE, "gu"), ""));
+}
+
 function isExplicitRememberRequest(text: string): boolean {
   const compact = text.replace(/[。.!！]+$/u, "").trim();
   // A quoted report is often named before the memory verb. Keep compound
@@ -93,6 +103,8 @@ function isExplicitRememberRequest(text: string): boolean {
     return true;
   }
   return /^(?:(?:请|帮我)\s*)?(?:记住|记下|记录下来)/u.test(compact)
+    || (containsInlineImage(compact) && /^(?:(?:请|帮我)\s*)?记录(?:下面|下方|以下)/u.test(compact))
+    || /^(?:(?:请|帮我)\s*)?(?:记录|收录|保存)(?:这张|这幅|该)?(?:图片|截图|照片|图)(?:一下|下来|吧)?$/u.test(compact)
     || /^(?:(?:请|帮我)\s*)?(?:记录|收录|保存)(?:这个|这份|该)?(?:原)?(?:文件|附件|资料)/u.test(compact)
     || /^(?:请\s*)?(?:把\s*)?(?:这个|这份|该)?(?:原)?(?:文件|附件|资料)(?:帮我)?(?:记录|收录|保存)(?:下来)?$/u.test(compact)
     || /(?:^|[，,\s])(?:记住|记下|记录下来|收录|保存)$/u.test(compact)
