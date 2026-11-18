@@ -38,6 +38,11 @@ const STYLE = `
   nav.rail .ico { width:18px; text-align:center; opacity:.9; }
   nav.rail .spacer { flex:1; }
   nav.rail .foot { font-size:12px; color:#6b7280; padding:8px 12px; }
+  .nav-group + .nav-group { margin-top:10px; border-top:1px solid #30343b; }
+  .nav-group-label { margin:10px 12px 4px; color:#a0a7b1; font-size:12px; font-weight:500; }
+  @media (min-width:901px) and (max-width:1179px) {
+    body:has(main.agent-page) .nav-group-label { display:none; }
+  }
   .mobile-bar, .nav-close, .nav-scrim { display:none; }
 
   /* content */
@@ -144,6 +149,15 @@ const STYLE = `
   .listcol .item.active { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-soft); }
   .listcol .item .name { font-weight:600; font-size:14px; color:var(--fg); }
   .listcol .item .sub { font-size:12px; color:var(--muted); }
+  .collection-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px; }
+  .collection-heading h1 { margin:0; }
+  .collection-list { list-style:none; padding:0; margin:0; border-top:1px solid var(--border); }
+  .collection-list li { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap;
+    gap:8px 24px; padding:14px 0; border-bottom:1px solid var(--border); overflow-wrap:anywhere; }
+  .collection-list li > div { flex:1 1 180px; min-width:0; }
+  .collection-list li > div a { font-weight:600; }
+  .collection-meta, .collection-next { display:block; color:var(--muted); font-size:13px; }
+  .collection-next { max-width:min(100%,36ch); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
   /* work context: an operations field journal, not another dashboard */
   .work-editor { position:relative; overflow:hidden; border-left:4px solid var(--accent); }
@@ -249,8 +263,8 @@ const STYLE = `
     .mobile-nav-toggle { min-height:40px; padding:7px 12px; border:1px solid #374151; background:#1f232b; }
     html.js nav.rail { position:fixed; inset:0 auto 0 0; z-index:80; width:min(280px, 86vw); min-width:0;
                        min-height:100dvh; transform:translateX(-100%); transition:transform .2s ease-out;
-                       box-shadow:12px 0 32px rgba(0,0,0,.22); }
-    html.js body.nav-open nav.rail { transform:translateX(0); }
+                       overflow-y:auto; overscroll-behavior:contain; }
+    html.js body.nav-open nav.rail { transform:translateX(0); box-shadow:12px 0 32px rgba(0,0,0,.22); }
     html.js .nav-close { min-height:40px; display:block; margin:0 12px 12px; border:1px solid #374151; background:#1f232b; }
     html.js .nav-scrim { position:fixed; inset:0; z-index:70; width:100%; height:100%; padding:0; border:0;
                          border-radius:0; background:rgba(15,23,42,.52); }
@@ -261,7 +275,12 @@ const STYLE = `
   }
   @media (max-width:720px) {
     main { padding:20px 16px 48px; }
-    .grid2 { grid-template-columns:1fr; gap:16px; }
+    .split, .grid2 { grid-template-columns:minmax(0,1fr); gap:16px; }
+    .split > * { min-width:0; }
+    .split .listcol { display:flex; gap:8px; overflow-x:auto; padding:3px 2px; }
+    .listcol .item { flex:0 0 auto; max-width:80%; margin:0; overflow-wrap:anywhere; }
+    .actions, .row { flex-wrap:wrap; }
+    .actions > *, .row > * { min-width:0; max-width:100%; }
     input[type=text], input[type=password], input[type=number], select, textarea, button, .btn { min-height:44px; }
     .settings-section { padding:16px; }
     .settings-actions { display:grid; grid-template-columns:1fr 1fr; }
@@ -289,21 +308,26 @@ export interface Crumb {
   href?: string;
 }
 
-/** The nav sections; `active` matches one of these keys. */
-const NAV: { key: string; label: string; href: string; ico: string }[] = [
-  { key: "spaces", label: "空间 / 知识", href: "/", ico: "🗂" },
-  { key: "agents", label: "Agents", href: "/agents", ico: "🤖" },
-  { key: "skills", label: "Skills", href: "/skills", ico: "🧩" },
-  { key: "tasks", label: "任务", href: "/tasks", ico: "⏰" },
-  { key: "work", label: "工作上下文", href: "/work", ico: "🧭" },
-  { key: "learning", label: "学习", href: "/learning", ico: "📖" },
-  { key: "reminders", label: "提醒", href: "/reminders", ico: "🔔" },
-  { key: "integrations", label: "飞书连接", href: "/integrations", ico: "🔌" },
-  { key: "governance", label: "数据治理", href: "/governance", ico: "🛡" },
-  { key: "quality", label: "AI 质量", href: "/quality", ico: "🎯" },
-  { key: "health", label: "运行状态", href: "/health", ico: "🩺" },
-  { key: "logs", label: "调用日志", href: "/logs", ico: "📋" },
-  { key: "settings", label: "设置", href: "/settings", ico: "⚙️" },
+const NAV = [
+  { label: "日常工作", links: [
+    { key: "spaces", label: "首页与空间", href: "/", ico: "🗂" },
+    { key: "tasks", label: "研究任务", href: "/tasks", ico: "⏰" },
+    { key: "work", label: "工作事项", href: "/work", ico: "🧭" },
+    { key: "learning", label: "学习", href: "/learning", ico: "📖" },
+    { key: "reminders", label: "提醒", href: "/reminders", ico: "🔔" },
+  ] },
+  { label: "助手与连接", links: [
+    { key: "agents", label: "Agent 助手", href: "/agents", ico: "🤖" },
+    { key: "skills", label: "技能目录", href: "/skills", ico: "🧩" },
+    { key: "integrations", label: "飞书连接", href: "/integrations", ico: "🔌" },
+  ] },
+  { label: "系统管理", links: [
+    { key: "health", label: "运行状态", href: "/health", ico: "🩺" },
+    { key: "quality", label: "AI 质量", href: "/quality", ico: "🎯" },
+    { key: "governance", label: "数据治理", href: "/governance", ico: "🛡" },
+    { key: "logs", label: "调用日志", href: "/logs", ico: "📋" },
+    { key: "settings", label: "设置", href: "/settings", ico: "⚙️" },
+  ] },
 ];
 
 /** Page shell with the dark left nav rail and a breadcrumb trail. */
@@ -319,11 +343,12 @@ export function layout(
       ? html`${raw(sep)}<a href="${c.href}">${c.label}</a>`
       : html`${raw(sep)}<span>${c.label}</span>`;
   });
-  const navLinks = NAV.map(
-    (n) => html`<a href="${n.href}" class="${n.key === active ? "active" : ""}"
-      ><span class="ico">${raw(n.ico)}</span>${n.label}</a
-    >`,
-  );
+  const navLinks = NAV.map((group) => html`<div class="nav-group" role="group" aria-label="${group.label}">
+    <div class="nav-group-label" aria-hidden="true">${group.label}</div>
+    ${group.links.map((link) => html`<a href="${link.href}" title="${link.label}"
+      class="${link.key === active ? "active" : ""}"${link.key === active ? html` aria-current="true"` : ""}
+      ><span class="ico" aria-hidden="true">${link.ico}</span>${link.label}</a>`)}
+  </div>`);
   return html`<!doctype html>
 <html lang="zh-CN">
   <head>
@@ -357,7 +382,7 @@ export function layout(
     <button type="button" class="nav-scrim" data-nav-scrim hidden aria-label="关闭主导航"></button>
     <div class="content">
       <main class="${active === "agents" ? "agent-page" : ""}">
-        <div class="crumbs">${trail}</div>
+        ${crumbs.length > 1 || crumbs[0]?.href ? html`<div class="crumbs">${trail}</div>` : ""}
         <div id="runtime-health-alert" class="health-alert" hidden>
           运行状态异常，部分能力可能不可用。<a href="/health">查看详情</a>
         </div>

@@ -2633,12 +2633,19 @@ describe("management backend (read-write)", () => {
     expect(engine.registry.has("team/unsafe")).toBe(false);
   });
 
-  test("nav rail exposes the mew-style sections", async () => {
+  test("navigation groups all management destinations and marks the current section", async () => {
     const body = await (await app.request("/")).text();
-    expect(body).toContain("Agents");
-    expect(body).toContain('href="/skills"');
-    expect(body).toContain("飞书连接");
-    expect(body).toContain("设置");
+    const nav = body.match(/<nav\b[^>]*>[\s\S]*?<\/nav>/u)?.[0] ?? "";
+    for (const group of ["日常工作", "助手与连接", "系统管理"]) {
+      expect(nav).toContain(`role="group" aria-label="${group}"`);
+    }
+    expect([...nav.matchAll(/<a href="([^"]+)"/gu)].map((link) => link[1])).toEqual([
+      "/", "/tasks", "/work", "/learning", "/reminders", "/agents", "/skills", "/integrations",
+      "/health", "/quality", "/governance", "/logs", "/settings",
+    ]);
+    expect(nav).toMatch(/<a href="\/"[^>]*aria-current="true"/u);
+    expect(nav).toContain("Agent 助手");
+    expect(nav).toContain("技能目录");
   });
 
   test("Skills inventory shows local metadata and reverse Agent usage without leaking files", async () => {
@@ -5323,6 +5330,11 @@ describe("management backend (read-write)", () => {
     expect([302, 303]).toContain(createdResponse.status);
     const item = engine.workItems.list(SPACE)[0]!;
     expect(item.active).toBe(true);
+    const index = await (await app.request("/work")).text();
+    expect(index).toContain(`href="/work/${item.id}"`);
+    expect(index).toContain('href="/work?new=1"');
+    expect(index).not.toContain('name="brief"');
+    expect(await (await app.request("/work?new=1")).text()).toContain('name="brief"');
 
     const update = new URLSearchParams({
       title: item.title,
@@ -5806,6 +5818,11 @@ describe("management backend (read-write)", () => {
     expect(created?.enabled).toBe(true);
     expect(created?.distillOnRun).toBe(false); // omitted checkbox
     expect(created?.timeoutMinutes).toBe(420);
+    const index = await (await app.request("/tasks")).text();
+    expect(index).toContain(`href="/tasks/${created!.id}"`);
+    expect(index).toContain('href="/tasks?new=1"');
+    expect(index).not.toContain('name="topic"');
+    expect(await (await app.request("/tasks?new=1")).text()).toContain('name="topic"');
 
     // editor renders the task + the distill toggle
     const editor = await (await app.request(`/tasks/${encodeURIComponent(created!.id)}`)).text();
@@ -5961,6 +5978,9 @@ describe("management backend (read-write)", () => {
     const run = isolatedEngine.listTaskRuns(task.id)[0]!;
     expect(run.status).toBe("awaiting_approval");
     expect(providerCalls).toBe(0);
+    const index = await (await isolatedApp.request("/tasks")).text();
+    expect(index).toContain(`href="/tasks/runs/${run.id}"`);
+    expect(index).toContain("待审批");
     expect(decodeURIComponent(startResponse.headers.get("location") ?? ""))
       .toContain("已提交审批");
     const otherSpace: SpaceId = "team/oc_web_approval_other";

@@ -41,6 +41,25 @@ afterEach(() => {
 });
 
 describe("TaskRunStore", () => {
+  test("lists current status snapshots and one latest run per task without exposing stored outputs", () => {
+    const store = new TaskRunStore(dir);
+    const first = store.start({ task: TASK, trigger: "manual", distill: false, startedAt: 100 });
+    store.begin(first.id, 101);
+    const completed = store.succeed(first.id, { output: "完整研究结果", finishedAt: 102 })!;
+    const next = store.start({ task: TASK, trigger: "manual", distill: false, startedAt: 200 });
+    const importedTask = "task_imported";
+    store.restore(["run_b", "run_a"].map((id) => ({ ...completed, id, taskId: importedTask })));
+    const latest = store.listLatestByTask();
+    expect(latest.size).toBe(2);
+    expect(latest.get(TASK.id)).toEqual({ taskId: TASK.id, id: next.id, status: "queued" });
+    expect(latest.get(importedTask)).toEqual({ taskId: importedTask, id: "run_a", status: "succeeded" });
+    latest.get(TASK.id)!.status = "failed";
+    expect(store.get(next.id)?.status).toBe("queued");
+    expect(store.list(undefined, ["queued"]).map((run) => run.id)).toEqual([next.id]);
+    expect(store.list(TASK.id, ["succeeded"]).map((run) => run.id)).toEqual([first.id]);
+    expect(store.list(importedTask)).toHaveLength(2);
+  });
+
   test("atomically claims one due read-only provider retry with its frozen plan", () => {
     const store = new TaskRunStore(dir);
     const executionPlan: ResolvedExecutionPlan = {

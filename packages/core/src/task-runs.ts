@@ -1286,11 +1286,23 @@ export class TaskRunStore {
     return this.runs.has(id);
   }
 
-  list(taskId?: string): TaskRun[] {
+  list(taskId?: string, statuses?: readonly TaskRunStatus[]): TaskRun[] {
     return [...this.runs.values()]
-      .filter((run) => !taskId || run.taskId === taskId)
+      .filter((run) => (!taskId || run.taskId === taskId) && (!statuses || statuses.includes(run.status)))
       .sort((a, b) => b.startedAt - a.startedAt)
       .map(clone);
+  }
+
+  listLatestByTask(): Map<string, Pick<TaskRun, "id" | "taskId" | "status">> {
+    const latest = new Map<string, TaskRun>();
+    for (const run of this.runs.values()) {
+      const previous = latest.get(run.taskId);
+      if (!previous || run.startedAt > previous.startedAt
+        || (run.startedAt === previous.startedAt && run.id < previous.id)) {
+        latest.set(run.taskId, run);
+      }
+    }
+    return new Map([...latest.values()].map(({ id, taskId, status }) => [taskId, { id, taskId, status }]));
   }
 
   /** Include pending approvals and queued work; do not clone large outputs or paginate references. */

@@ -69,6 +69,7 @@ import {
   type DetectedProvider,
 } from "@homeagent/llm";
 import type { FeishuRuntimeStatus } from "./integrations.ts";
+import type { AgentActivityEntry } from "./agent-activity.ts";
 import type {
   FeishuGroupIntegrationView,
   FeishuIntegrationSnapshot,
@@ -186,33 +187,58 @@ function spaceLabel(meta: SpaceMeta): string {
 
 export function spaceListView(
   spaces: { meta: SpaceMeta; pages: number; pending: number }[],
+  activeRuns: AgentActivityEntry[],
+  botName: string,
+  pendingGroups: number,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
-  if (spaces.length === 0) {
-    return html`<h1>空间 / 知识</h1>
-      <div class="empty">还没有任何空间。把机器人加入飞书群或私聊它即可创建。</div>`;
-  }
-  const rows = spaces.map(
-    (s) => html`<tr>
-      <td><a href="/spaces/${encodeURIComponent(s.meta.id)}">${spaceLabel(s.meta)}</a>
-        <div class="muted">${s.meta.id}</div></td>
-      <td>${s.pages}</td>
-      <td>${s.pending}</td>
-      <td class="muted">${fmtTime(s.meta.lastDreamAt)}</td>
-    </tr>`,
-  );
-  return html`<h1>空间 / 知识</h1>
-    <p class="subtitle">每个飞书群或私聊对应一个知识空间。</p>
-    <table>
-      <tr><th>空间</th><th>知识页</th><th>待提炼</th><th>上次提炼</th></tr>
-      ${rows}
-    </table>`;
+  const pending = pendingGroups > 0 ? html`<p class="home-pending">
+    <strong>${pendingGroups} 个群等待管理员确认</strong> · <a href="/integrations">查看群连接</a>
+  </p>` : "";
+  const groupInstruction = html`请群主或管理员在群内发送 <strong>@${botName} 启用群聊</strong>。`;
+  const names = new Map<string, string>(spaces.map(({ meta }) => [meta.id, spaceLabel(meta)]));
+  const runRows = [...activeRuns].sort((left, right) =>
+    Number(right.status === "awaiting_approval") - Number(left.status === "awaiting_approval")
+  ).map((run) => html`<li><a class="home-item" href="${run.href}">
+    <strong>${run.title || (run.kind === "chat" ? "飞书对话" : "研究任务")}</strong>
+    <span>${run.status === "awaiting_approval" ? html`<span class="badge general">待审批</span>` : run.status === "running" ? "运行中" : "排队中"}
+      · ${names.get(run.space) ?? run.space}</span></a>
+  </li>`);
+  return html`<style>
+    .home-list { list-style:none; margin:0; padding:0; }
+    .home-item { padding:12px 0; display:flex; align-items:baseline; flex-wrap:wrap; gap:4px 16px;
+      justify-content:space-between; border-bottom:1px solid var(--border); overflow-wrap:anywhere; }
+    .home-item:hover { text-decoration:none; }
+    .home-item:hover strong { text-decoration:underline; }
+    .home-item > span { color:var(--muted); font-size:13px; }
+    .home-more summary { cursor:pointer; padding:12px 0; }
+    .home-pending { overflow-wrap:anywhere; }
+    .home-start h3 { margin:16px 0 4px; font-size:15px; }
+    .home-start p { margin:4px 0 12px; overflow-wrap:anywhere; }
+    @media(max-width:720px) { .home-item { align-items:flex-start; flex-direction:column; } }
+  </style>
+  <h1>首页</h1>
+  ${runRows.length ? html`<section aria-labelledby="home-runs"><h2 id="home-runs">运行动态</h2>
+    <ul class="home-list">${runRows.slice(0, 3)}</ul>
+    ${runRows.length > 3 ? html`<details class="home-more"><summary>查看其余 ${runRows.length - 3} 项</summary>
+      <ul class="home-list">${runRows.slice(3)}</ul></details>` : ""}
+  </section>` : ""}
+  ${spaces.length ? html`<section aria-labelledby="home-spaces"><h2 id="home-spaces">知识空间</h2>
+    <ul class="home-list">${spaces.map(({ meta, pages, pending: pendingRaw }) => html`<li>
+      <a class="home-item" href="/spaces/${encodeURIComponent(meta.id)}" aria-label="${spaceLabel(meta)}"><strong>${spaceLabel(meta)}</strong>
+      <span>${meta.id.startsWith("team/") ? "群聊" : "私聊"} · ${pages} 个知识页 · ${pendingRaw} 条待提炼
+        · 上次提炼 ${fmtTime(meta.lastDreamAt)}</span></a>
+    </li>`)}</ul>${pending}
+  </section>` : html`<section class="home-start" aria-labelledby="home-start"><h2 id="home-start">建立第一个知识空间</h2>
+    <h3>个人空间</h3><p>在飞书里私聊 ${botName}，发送第一条消息即可建立个人空间。</p>
+    <h3>群聊空间</h3><p>把 ${botName} 加入飞书群。${groupInstruction}确认后，群聊会显示在这里。</p>
+    ${pending || html`<a href="/integrations">查看飞书连接</a>`}
+  </section>`}`;
 }
 
 export function spaceDetailView(
   space: SpaceId,
   pages: PageRef[],
-  rawCount: number,
-  quarantineCount: number,
+  counts: { raw: number; pending: number; failed: number },
   meta?: SpaceMeta,
   agents: Agent[] = [],
   flashMsg?: string,
@@ -225,106 +251,116 @@ export function spaceDetailView(
   const content = pages.filter((page) => page.type !== "map" && !SINGLETON.has(page.slug));
   const enc = encodeURIComponent(space);
   const isTeam = space.startsWith("team/");
-  const pageRows = content.length
-    ? content.map(
-        (p) => html`<tr>
-          <td><a href="/spaces/${enc}/pages/${encodeURIComponent(p.slug)}">${p.title}</a></td>
-          <td><span class="tag">${p.type}</span></td>
-          <td class="muted">${p.summary}</td>
-        </tr>`,
-      )
-    : [html`<tr><td colspan="3" class="empty">暂无知识页，运行提炼后生成。</td></tr>`];
-  const mapRows = maps.map((page) => html`<tr>
-    <td><a href="/spaces/${enc}/pages/${encodeURIComponent(page.slug)}">${page.title}</a>
-      <div class="muted">${page.slug}</div></td>
-    <td class="muted">${page.summary}</td>
-  </tr>`);
-
-  const groupSettingsLink = isTeam
-    ? html` · <a href="/integrations">群设置</a>`
-    : "";
+  const typeLabels: Record<PageRef["type"], string> = {
+    index: "索引", overview: "概览", log: "日志", glossary: "术语", map: "知识地图",
+    entity: "实体", concept: "概念", source: "来源", analysis: "分析",
+  };
+  const catalogRow = (page: PageRef) => html`<li>
+    <div><a href="/spaces/${enc}/pages/${encodeURIComponent(page.slug)}">${page.title}</a>
+      ${page.summary ? html`<p>${page.summary}</p>` : ""}</div>
+    <span class="space-page-kind">${page.type === "map" ? page.slug : typeLabels[page.type]}</span>
+  </li>`;
   const personalAgentSettings = !isTeam
-    ? html`<div class="card">
-        <h2 style="margin-top:0">个人空间 Agent</h2>
-        <p class="muted">这里只显示 Visibility 为 Personal 的 Agent；留空时使用全局默认 Provider。</p>
-        <form method="post" action="/spaces/${enc}/agent" class="row">
-          <select name="agentId">
-            <option value="" ${!meta?.agentId ? "selected" : ""}>默认（全局）</option>
+    ? html`<form method="post" action="/spaces/${enc}/agent" class="space-agent-picker">
+          <label for="space-agent">个人空间 Agent</label>
+          <select name="agentId" id="space-agent">
+            <option value="" ${!meta?.agentId ? "selected" : ""}>使用全局默认设置</option>
             ${agents
               .filter((agent) => agent.visibility === "Personal")
               .map((agent) => html`<option value="${agent.id}" ${agent.id === meta?.agentId ? "selected" : ""}>${agent.name}</option>`)}
           </select>
           <button type="submit">保存 Agent</button>
-        </form>
-      </div>`
+        </form>`
     : "";
 
-  return html`<h1>${meta ? spaceLabel(meta) : space}</h1>
-    <p class="subtitle">${space}</p>
-    ${flash(flashMsg)}
-    <div class="card">
-      <div class="muted">绑定群：${meta?.chatId ?? "—"} · 上次提炼：${fmtTime(meta?.lastDreamAt)}
-        · 上次 Wiki 维护：${fmtTime(meta?.lastMaintenanceAt)}
-        ${meta?.lastMaintenanceIssueCount === undefined
-          ? ""
-          : `（${meta.lastMaintenanceIssueCount} 项问题${meta.lastMaintenanceTruncated ? "，报告已截断" : ""}）`}</div>
-      <div style="margin-top:10px" class="actions">
-        <a href="/spaces/${enc}/raw">原始条目（${rawCount}）</a> ·
-        <a href="/spaces/${enc}/quarantine">提炼失败（${quarantineCount}）</a> ·
-        <a href="/spaces/${enc}/governance">空间规则与治理记录</a> ·
-        <a href="/spaces/${enc}/ask">问答测试</a>${groupSettingsLink} ·
-        <form method="post" action="/spaces/${enc}/dream" class="inline-form">
-          <button type="submit">手动触发提炼</button>
-        </form> ·
-        <form method="post" action="/spaces/${enc}/maintenance" class="inline-form">
-          <button type="submit" class="secondary">运行 Wiki 维护检查</button>
-        </form>
-      </div>
+  return html`<style>
+    .space-detail { overflow-wrap:anywhere; }
+    .space-status, .space-controls, .space-related, .space-agent-picker { display:flex; gap:8px 16px; align-items:center; flex-wrap:wrap; }
+    .space-status { color:var(--muted); font-size:13px; margin:4px 0 16px; }
+    .space-status .has-failures { color:var(--warn); font-weight:600; }
+    .space-controls { gap:8px; align-items:flex-start; }
+    .space-controls .btn { display:inline-flex; align-items:center; min-height:42px; }
+    .space-controls > details[open] { flex:1 0 100%; min-width:0; }
+    .space-controls summary, .space-maintenance > summary, .space-file-help > summary { cursor:pointer; }
+    .space-controls > details > summary::after { content:"▾"; margin-left:10px; }
+    .space-controls > details[open] > summary::after { content:"▴"; }
+    .space-controls > details > summary::-webkit-details-marker { display:none; }
+    .space-upload { margin:10px 0 0; }
+    .space-file-help { margin:8px 0 0; color:var(--muted); font-size:13px; }
+    .space-file-help p { margin:6px 0; }
+    .space-catalog { padding:0; margin:0; list-style:none; border:1px solid var(--border); background:var(--card); border-radius:10px; }
+    .space-catalog li { display:flex; align-items:baseline; justify-content:space-between; gap:12px; padding:12px 16px; }
+    .space-catalog li + li { border-top:1px solid var(--border); }
+    .space-catalog a { font-weight:600; }
+    .space-catalog p { color:var(--muted); font-size:13px; margin:2px 0 0; }
+    .space-page-kind { min-width:4em; max-width:35%; text-align:end; color:var(--muted); font-size:12px; }
+    .space-maintenance { margin:24px 0 0; padding-top:14px; border-top:1px solid var(--border); }
+    .space-maintenance > summary { font-weight:600; padding:6px 0; }
+    .space-related, .space-agent-picker { margin:12px 0; }
+    .space-agent-picker select { width:auto; max-width:100%; }
+  </style><article class="space-detail">
+    <h1>${meta ? spaceLabel(meta) : space}</h1>
+    <div class="space-status">
+      <span>${isTeam ? "群聊空间" : "个人空间"}</span>
+      <span>待提炼 ${counts.pending} 条</span>
+      <a href="/spaces/${enc}/quarantine" class="${counts.failed ? "has-failures" : "muted"}">提炼失败（${counts.failed}）</a>
     </div>
-    ${personalAgentSettings}
-    <section class="card material-import" aria-labelledby="material-import-title">
-      <div class="material-import-head">
-        <div>
-          <div class="material-kicker">INGEST / LOCAL</div>
-          <h2 id="material-import-title">导入本地资料</h2>
-          <p>原文件会按字节完整保存在本 Space，Raw 提炼文本再由 Dream Cycle 判断如何整理进 Wiki。</p>
-        </div>
-        <ol class="material-flow" aria-label="导入流程">
-          <li><span>1</span>选择资料</li>
-          <li><span>2</span>登记 Raw</li>
-          <li><span>3</span>提炼 Wiki</li>
-        </ol>
-      </div>
-      <form method="post" action="/spaces/${enc}/materials" enctype="multipart/form-data" class="material-import-form">
-        <div class="field">
-          <label for="local-material-${enc}">资料文件</label>
-          <input class="material-file-input" id="local-material-${enc}" name="material" type="file"
-            multiple required />
-          <p class="field-help">可一次选择最多 20 份任意类型文件；单个文件不超过 20 MiB。支持文本、Word（DOCX）、Excel（XLSX）、PowerPoint（PPTX）和 ZIP；macOS 另支持 PDF 文本层与图片文字。长正文会完整分段提炼，原文件可从 Raw 详情页下载；无法解析的资料会明确提示。</p>
-          <p class="field-help">ZIP 会自动展开其中的 UTF-8 文本（TXT、Markdown、CSV、JSON、JSONL、LOG），保留内部路径，长文本分段提炼。未识别或无法解压的文件会在压缩包原始条目中说明，原 ZIP 仍可下载。</p>
-        </div>
-        <div class="material-import-actions">
-          <label class="checkbox-row">
-            <input type="checkbox" name="distillNow" />
-            <span>导入后立即提炼 <small>未勾选时由夜间提炼兜底</small></span>
-          </label>
-          <button type="submit">导入资料</button>
-          <a href="/health#dream-runs">查看提炼任务</a>
-        </div>
-      </form>
-    </section>
+    ${flash(flashMsg)}
+    <div class="space-controls">
+      <a class="btn" href="/spaces/${enc}/ask">向空间提问</a>
+      <details>
+        <summary class="btn secondary">导入本地资料</summary>
+        <form method="post" action="/spaces/${enc}/materials" enctype="multipart/form-data" class="card space-upload">
+          <div class="field">
+            <label for="local-material-${enc}">资料文件</label>
+            <input class="material-file-input" id="local-material-${enc}" name="material" type="file"
+              multiple required />
+            <p class="field-help">每次最多 20 份，单个文件不超过 20 MiB。原文件保存在当前空间，可从原始条目下载。</p>
+            <details class="space-file-help"><summary>支持哪些文件？</summary>
+              <p>可以保存任意格式的文件。支持提取文本、Word（DOCX）、Excel（XLSX）、PowerPoint（PPTX）和 ZIP 中的正文。macOS 支持提取 PDF 文本层，macOS 和 Windows 支持识别图片中的文字。长文会分段提炼。</p>
+              <p>ZIP 内的 UTF-8 文本（TXT、Markdown、CSV、JSON、JSONL、LOG）会按原路径展开。无法解析的文件会在原始条目中说明。</p>
+            </details>
+          </div>
+          <div class="material-import-actions">
+            <label class="checkbox-row">
+              <input type="checkbox" name="distillNow" />
+              <span>导入后立即提炼 <small>未勾选时由夜间提炼兜底</small></span>
+            </label>
+            <button type="submit">导入资料</button>
+            <a href="/health#dream-runs">查看提炼任务</a>
+          </div>
+        </form>
+      </details>
+    </div>
     ${maps.length > 0
       ? html`<h2>知识地图（${maps.length}）</h2>
-        <table>
-          <tr><th>主题</th><th>范围</th></tr>
-          ${mapRows}
-        </table>`
+        <ul class="space-catalog">${maps.map(catalogRow)}</ul>`
       : ""}
     <h2>知识页（${content.length}）</h2>
-    <table>
-      <tr><th>标题</th><th>类型</th><th>摘要</th></tr>
-      ${pageRows}
-    </table>`;
+    ${content.length
+      ? html`<ul class="space-catalog">${content.map(catalogRow)}</ul>`
+      : html`<p class="card muted">${counts.pending
+          ? "已有资料待提炼，生成的知识页会显示在这里。"
+          : "还没有知识页。可以导入资料，也可以在飞书中让机器人收录消息。"} </p>`}
+    <details class="space-maintenance">
+      <summary>空间设置与维护</summary>
+      <p class="muted">空间标识：${space}${meta?.chatId ? ` · 绑定群：${meta.chatId}` : ""}</p>
+      <div class="space-related">
+        <a href="/spaces/${enc}/raw">原始条目（${counts.raw}）</a>
+        <a href="/spaces/${enc}/governance">空间规则与治理记录</a>
+        ${isTeam ? html`<a href="/integrations">群设置</a>` : ""}
+      </div>
+      ${personalAgentSettings}
+      <p class="muted">上次提炼：${fmtTime(meta?.lastDreamAt)} · 上次 Wiki 维护：${fmtTime(meta?.lastMaintenanceAt)}
+        ${meta?.lastMaintenanceIssueCount === undefined
+          ? ""
+          : `（${meta.lastMaintenanceIssueCount} 项问题${meta.lastMaintenanceTruncated ? "，报告已截断" : ""}）`}</p>
+      <div class="space-related">
+        <form method="post" action="/spaces/${enc}/dream"><button type="submit" class="secondary">手动触发提炼</button></form>
+        <form method="post" action="/spaces/${enc}/maintenance"><button type="submit" class="secondary">运行 Wiki 维护检查</button></form>
+      </div>
+    </details>
+  </article>`;
 }
 
 export function spaceGovernanceView(
@@ -640,10 +676,10 @@ export function askView(
       ${feedback}
     </div>`;
   }
-  return html`<h1>问答测试 · ${space}</h1>
+  return html`<h1>向空间提问</h1>
     ${flash(flashMsg)}
     <form method="get" action="/spaces/${enc}/ask" class="actions">
-      <input type="text" name="q" placeholder="问一个问题…" value="${question ?? ""}" />
+      <input type="text" name="q" aria-label="问题" placeholder="问一个问题…" value="${question ?? ""}" />
       <button type="submit">提问</button>
     </form>
     ${answer}`;
@@ -1293,6 +1329,23 @@ function workAcceptanceView(
   </section>`;
 }
 
+function collectionIndex(
+  title: string, createHref: string, createLabel: string, flashMsg: string | undefined,
+  rows: (HtmlEscapedString | Promise<HtmlEscapedString>)[],
+) {
+  return html`<div class="collection-heading"><h1>${title}</h1><a class="btn" href="${createHref}">${createLabel}</a></div>
+    ${flash(flashMsg)}<ul class="collection-list">${rows}</ul>`;
+}
+
+export function workIndexView(items: WorkItem[], spaces: SpaceMeta[], flashMsg?: string) {
+  const names = new Map(spaces.map((space) => [space.id, spaceLabel(space)]));
+  return collectionIndex("工作事项", "/work?new=1", "新建工作项", flashMsg, items.map((item) => html`
+    <li><div><a href="/work/${encodeURIComponent(item.id)}">${item.title}</a>
+      <span class="collection-meta">${names.get(item.space) ?? item.space} · ${WORK_PHASE_LABELS[item.phase]}</span></div>
+      ${item.nextActions[0] ? html`<span class="collection-next">下一步 · ${item.nextActions[0]}</span>` : ""}
+    </li>`));
+}
+
 /** Work context page: a compact operational journal with traceable evidence. */
 export function workItemsView(
   items: WorkItem[],
@@ -1449,11 +1502,11 @@ export function workItemsView(
       </section>`
     : "";
 
-  return html`<h1>工作上下文</h1>
+  return html`<h1>工作事项</h1>
     <p class="subtitle">多个事项可以同时推进。回复结果或说出事项名称即可补充要求；选择当前事项仅改变默认焦点。</p>
     <div class="split">
       <div class="listcol">
-        <a class="item ${newActive}" href="/work"><div class="name">＋ 新建工作项</div>
+        <a class="item ${newActive}" href="/work?new=1"><div class="name">＋ 新建工作项</div>
           <div class="sub">开始一条新的工作线</div></a>
         ${listItems}
       </div>
@@ -1565,6 +1618,21 @@ function taskCadenceLabel(task: Task): string {
 }
 
 /** Tasks page: list column + right editor. `selected` is the task being edited (or null = new). */
+export function tasksIndexView(
+  tasks: Task[], latest: ReadonlyMap<string, Pick<TaskRun, "id" | "status">>,
+  spaces: SpaceMeta[], flashMsg?: string,
+) {
+  const names = new Map(spaces.map((space) => [space.id, spaceLabel(space)]));
+  return collectionIndex("研究任务", "/tasks?new=1", "新建任务", flashMsg, tasks.map((task) => {
+    const run = latest.get(task.id);
+    return html`<li><div><a href="/tasks/${encodeURIComponent(task.id)}">${task.name}</a>
+      <span class="collection-meta">${names.get(task.space) ?? task.space} · ${taskCadenceLabel(task)}${task.enabled ? "" : " · 已停用"}</span></div>
+      ${run ? html`<a href="/tasks/runs/${encodeURIComponent(run.id)}">${taskRunStatus(run.status)} 查看运行</a>`
+        : html`<span class="collection-meta">${task.lastStatus === "ok" ? "上次成功" : task.lastStatus === "error" ? "上次失败" : "未运行"}</span>`}
+    </li>`;
+  }));
+}
+
 export function tasksView(
   tasks: Task[],
   selected: Task | null,
@@ -1603,7 +1671,7 @@ export function tasksView(
 
   const spaceOptions = spaces.length
     ? spaces.map((s) => html`<option value="${s.id}" ${s.id === spaceVal ? "selected" : ""}>${s.name?.trim() || s.id}</option>`)
-    : [html`<option value="">（还没有空间，先让机器人进群或私聊）</option>`];
+    : [html`<option value="">还没有知识空间</option>`];
 
   const deleteControl = editing
     ? html`<button type="submit" class="danger"
@@ -1648,11 +1716,11 @@ export function tasksView(
       </div>`
     : "";
 
-  return html`<h1>任务</h1>
+  return html`<h1>研究任务</h1>
     <p class="subtitle">让空间的 Agent 定期研究一个主题，结果写入该空间知识库（夜间提炼成页）并可推送到飞书。</p>
     <div class="split">
       <div class="listcol">
-        <a class="item ${newActive}" href="/tasks"><div class="name">＋ 新建任务</div>
+        <a class="item ${newActive}" href="/tasks?new=1"><div class="name">＋ 新建任务</div>
           <div class="sub">创建一个研究任务</div></a>
         ${listItems}
       </div>
@@ -1671,6 +1739,7 @@ export function tasksView(
             <div class="field">
               <label>目标空间 <span class="hint">结果写入这里，用其 Agent</span></label>
               <select name="space">${spaceOptions}</select>
+              ${spaces.length ? "" : html`<a href="/">查看首次连接指引</a>`}
             </div>
             <div class="field">
               <label>周期</label>
@@ -2793,32 +2862,32 @@ function feishuAvatarControl(
 
 export function feishuGroupConnectView(input: {
   candidates: LarkChatSummary[];
+  botName: string;
   flashMsg?: string;
 }): HtmlEscapedString | Promise<HtmlEscapedString> {
   return html`<div class="integration-shell">
     <div class="integration-page-head">
       <div>
-        <div class="eyebrow">FEISHU GROUPS</div>
         <h1>请求群管理员确认</h1>
-        <p class="subtitle">选择当前 Bot 已加入的群。HomeAgent 会向群内发送一次确认提示；群主或管理员确认前不会读取或记录群消息。</p>
+        <p class="subtitle">选择 ${input.botName} 已加入的飞书群，机器人会在群里发出确认提示。群主或管理员确认前不会读取或记录群消息。</p>
       </div>
-      <a class="btn secondary" href="/integrations">返回 Integrations</a>
+      <a class="btn secondary" href="/integrations">返回飞书连接</a>
     </div>
     ${flash(input.flashMsg)}
     ${input.candidates.length > 0
       ? html`<form method="post" action="/integrations/groups/connect" class="card stack integration-connect-card">
           <div class="field">
-            <label>飞书群</label>
-            <select name="chatId" required>
+            <label for="connect-feishu-group">飞书群</label>
+            <select id="connect-feishu-group" name="chatId" required>
               ${input.candidates.map((chat) =>
                 html`<option value="${chat.chatId}">${chat.name || chat.chatId}${chat.external ? " · 外部群" : ""}</option>`
               )}
             </select>
-            <div class="hint">提交时会再次校验 Bot 是否仍在群内。</div>
+            <div class="hint">发送前会再次确认机器人仍在群内。</div>
           </div>
           <div class="callout">
             <strong>群内确认后才启用</strong>
-            <div class="hint">群主或管理员发送“@HomeAgent 启用群聊”后，群聊将以“仅 @ 回复 + Topic reply”的安全默认值启用；之后可以在 Integrations 调整。</div>
+            <div class="hint">请群主或管理员在群里发送 <strong>@${input.botName} 启用群聊</strong>。启用后，机器人默认只在被 @ 时回复，并使用话题回复。可以在「飞书连接」里调整。</div>
           </div>
           <div class="actions">
             <button type="submit">发送确认提示</button>
@@ -2827,7 +2896,7 @@ export function feishuGroupConnectView(input: {
         </form>`
       : html`<div class="empty">
           <strong>没有需要发起确认的群</strong>
-          <p>请先把当前 Bot 加入飞书群。待确认和已启用的群不会重复出现。</p>
+          <p>请先把 ${input.botName} 加入飞书群。待确认和已启用的群不会重复出现。</p>
         </div>`}
   </div>`;
 }

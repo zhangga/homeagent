@@ -122,7 +122,9 @@ import {
   chatRunView,
   taskRunView,
   tasksView,
+  tasksIndexView,
   workItemsView,
+  workIndexView,
 } from "./views.ts";
 
 const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
@@ -1472,14 +1474,16 @@ export function createWebApp(opts: WebOptions): Hono {
   // ---- spaces / knowledge --------------------------------------------------
 
   app.get("/", async (c) => {
-    if (!config().onboardingCompletedAt) {
-      const emptyInstall = engine.registry.list().length === 0 && engine.agents.list().length === 0;
+    const cfg = config();
+    const metas = engine.registry.list();
+    if (!cfg.onboardingCompletedAt) {
+      const emptyInstall = metas.length === 0 && engine.agents.list().length === 0;
       const larkUnconfigured = opts.larkSetup
         ? !verifiedBotIdentity(await getLarkStatus())
         : false;
       if (emptyInstall || larkUnconfigured) return c.redirect("/setup");
     }
-    const spaces = engine.registry.list().map((meta) => {
+    const spaces = metas.map((meta) => {
       const idx = engine.registry.store(meta.id).index();
       return {
         meta,
@@ -1487,26 +1491,38 @@ export function createWebApp(opts: WebOptions): Hono {
         pending: idx.countRaw(true),
       };
     });
-    return c.html(await layout("空间", [{ label: "空间 / 知识" }], await spaceListView(spaces), "spaces"));
+    const pendingGroups = cfg.feishuAppId && cfg.feishuAppId !== cfg.feishuConnectionDisabledAppId
+      ? engine.feishuBindings.list().filter((binding) =>
+          binding.state === "pending_confirmation" && binding.boundAppId === cfg.feishuAppId
+        ).length
+      : 0;
+    const activity = buildAgentActivity(
+      engine.agents.list(),
+      engine.taskRuns.list(undefined, ["awaiting_approval", "queued", "running"]),
+      engine.chatRuns.list(undefined, ["queued", "running"]),
+    );
+    return c.html(await layout("首页", [{ label: "首页" }], await spaceListView(
+      spaces, activity.activeRuns, cfg.feishuBotName || "HomeAgent", pendingGroups,
+    ), "spaces"));
   });
 
   app.get("/spaces/:space", async (c) => {
     const space = parseSpace(c.req.param("space"));
     if (!space || !engine.registry.has(space)) return c.notFound();
     const pages = await engine.listPages(space);
-    const rawCount = engine.registry.store(space).index().countRaw();
+    const index = engine.registry.store(space).index();
     const quarantineCount = (await engine.listQuarantines(space)).length;
     const meta = engine.registry.get(space);
+    const title = meta?.name?.trim() || space;
     const topLevelMapLinks = (await engine.getPage(space, "index"))?.links;
     return c.html(
       await layout(
-        space,
-        [{ label: "空间 / 知识", href: "/" }, { label: space }],
+        title,
+        [{ label: "首页", href: "/" }, { label: title }],
         await spaceDetailView(
           space,
           pages,
-          rawCount,
-          quarantineCount,
+          { raw: index.countRaw(), pending: index.countRaw(true), failed: quarantineCount },
           meta,
           engine.agents.list(),
           c.req.query("ok") ?? undefined,
@@ -1613,7 +1629,7 @@ export function createWebApp(opts: WebOptions): Hono {
       await layout(
         `空间规则与治理记录 · ${space}`,
         [
-          { label: "空间 / 知识", href: "/" },
+          { label: "首页", href: "/" },
           { label: space, href: `/spaces/${encodeURIComponent(space)}` },
           { label: "空间规则与治理记录" },
         ],
@@ -1756,7 +1772,7 @@ export function createWebApp(opts: WebOptions): Hono {
     return c.html(
       await layout(
         page.title,
-        [{ label: "空间 / 知识", href: "/" }, { label: space, href: `/spaces/${encodeURIComponent(space)}` }, { label: page.title }],
+        [{ label: "首页", href: "/" }, { label: space, href: `/spaces/${encodeURIComponent(space)}` }, { label: page.title }],
         await pageView(space, page, c.req.query("ok") ?? undefined, trace),
         "spaces",
       ),
@@ -1770,7 +1786,7 @@ export function createWebApp(opts: WebOptions): Hono {
     return c.html(
       await layout(
         `原始条目 · ${space}`,
-        [{ label: "空间 / 知识", href: "/" }, { label: space, href: `/spaces/${encodeURIComponent(space)}` }, { label: "原始条目" }],
+        [{ label: "首页", href: "/" }, { label: space, href: `/spaces/${encodeURIComponent(space)}` }, { label: "原始条目" }],
         await rawListView(space, raws.reverse()),
         "spaces",
       ),
@@ -1786,7 +1802,7 @@ export function createWebApp(opts: WebOptions): Hono {
       await layout(
         `原始记录 · ${space}`,
         [
-          { label: "空间 / 知识", href: "/" },
+          { label: "首页", href: "/" },
           { label: space, href: `/spaces/${encodeURIComponent(space)}` },
           { label: "原始条目", href: `/spaces/${encodeURIComponent(space)}/raw` },
           { label: detail.raw.id },
@@ -1862,7 +1878,7 @@ export function createWebApp(opts: WebOptions): Hono {
     return c.html(
       await layout(
         `提炼失败恢复 · ${space}`,
-        [{ label: "空间 / 知识", href: "/" }, { label: space, href: `/spaces/${encodeURIComponent(space)}` }, { label: "提炼失败恢复" }],
+        [{ label: "首页", href: "/" }, { label: space, href: `/spaces/${encodeURIComponent(space)}` }, { label: "提炼失败恢复" }],
         await quarantineView(space, await engine.listQuarantines(space), c.req.query("ok") ?? undefined),
         "spaces",
       ),
@@ -1896,6 +1912,7 @@ export function createWebApp(opts: WebOptions): Hono {
   app.get("/spaces/:space/ask", async (c) => {
     const space = parseSpace(c.req.param("space"));
     if (!space || !engine.registry.has(space)) return c.notFound();
+    const spaceName = engine.registry.get(space)?.name?.trim() || space;
     let q = c.req.query("q") ?? null;
     const traceId = c.req.query("traceId");
     // The engine routes to the space's agent CLI (or the default). We pass
@@ -1936,8 +1953,8 @@ export function createWebApp(opts: WebOptions): Hono {
     }
     return c.html(
       await layout(
-        `问答测试 · ${space}`,
-        [{ label: "空间 / 知识", href: "/" }, { label: space, href: `/spaces/${encodeURIComponent(space)}` }, { label: "问答测试" }],
+        `向空间提问 · ${spaceName}`,
+        [{ label: "首页", href: "/" }, { label: spaceName, href: `/spaces/${encodeURIComponent(space)}` }, { label: "向空间提问" }],
         await askView(
           space,
           q,
@@ -2606,10 +2623,16 @@ export function createWebApp(opts: WebOptions): Hono {
 
   app.get("/work", async (c) => {
     const ok = c.req.query("ok") ?? undefined;
+    const items = engine.workItems.list();
+    const spaces = engine.registry.list();
+    const creating = c.req.query("new") === "1";
+    const view = items.length && !creating
+      ? workIndexView(items, spaces, ok)
+      : workItemsView(items, null, spaces, [], undefined, ok);
     return c.html(await layout(
-      "工作上下文",
-      [{ label: "工作上下文" }],
-      await workItemsView(engine.workItems.list(), null, engine.registry.list(), [], undefined, ok),
+      "工作事项",
+      creating ? [{ label: "工作事项", href: "/work" }, { label: "新建" }] : [{ label: "工作事项" }],
+      await view,
       "work",
     ));
   });
@@ -2621,7 +2644,7 @@ export function createWebApp(opts: WebOptions): Hono {
     const ok = c.req.query("ok") ?? undefined;
     return c.html(await layout(
       item.title,
-      [{ label: "工作上下文", href: "/work" }, { label: item.title }],
+      [{ label: "工作事项", href: "/work" }, { label: item.title }],
       await workItemsView(
         engine.workItems.list(),
         item,
@@ -2643,7 +2666,7 @@ export function createWebApp(opts: WebOptions): Hono {
     const body = await c.req.parseBody();
     const space = str(body, "space").trim();
     if (!isSpaceId(space) || !engine.registry.has(space)) {
-      return c.redirect(`/work?ok=${encodeURIComponent("创建失败：请选择有效空间")}`);
+      return c.redirect(`/work?new=1&ok=${encodeURIComponent("创建失败：请选择有效空间")}`);
     }
     try {
       const item = engine.workItems.create({
@@ -2656,7 +2679,7 @@ export function createWebApp(opts: WebOptions): Hono {
       return c.redirect(`/work/${encodeURIComponent(item.id)}?ok=${encodeURIComponent("已创建并设为当前工作项")}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "创建失败";
-      return c.redirect(`/work?ok=${encodeURIComponent(`创建失败：${message}`)}`);
+      return c.redirect(`/work?new=1&ok=${encodeURIComponent(`创建失败：${message}`)}`);
     }
   });
 
@@ -2865,9 +2888,14 @@ export function createWebApp(opts: WebOptions): Hono {
 
   app.get("/tasks", async (c) => {
     const ok = c.req.query("ok") ?? undefined;
-    return c.html(
-      await layout("任务", [{ label: "任务" }], await tasksView(engine.tasks.list(), null, engine.registry.list(), [], ok), "tasks"),
-    );
+    const tasks = engine.tasks.list();
+    const spaces = engine.registry.list();
+    const creating = c.req.query("new") === "1";
+    const view = tasks.length && !creating
+      ? tasksIndexView(tasks, engine.taskRuns.listLatestByTask(), spaces, ok)
+      : tasksView(tasks, null, spaces, [], ok);
+    const crumbs = creating ? [{ label: "研究任务", href: "/tasks" }, { label: "新建" }] : [{ label: "研究任务" }];
+    return c.html(await layout("研究任务", crumbs, await view, "tasks"));
   });
 
   app.get("/tasks/runs/:runId", async (c) => {
@@ -2890,12 +2918,12 @@ export function createWebApp(opts: WebOptions): Hono {
         "运行详情",
         workContext
           ? [
-              { label: "工作上下文", href: "/work" },
+              { label: "工作事项", href: "/work" },
               { label: workContext.item.title, href: `/work/${encodeURIComponent(workContext.item.id)}` },
               { label: "运行详情" },
             ]
           : [
-              { label: "任务", href: "/tasks" },
+              { label: "研究任务", href: "/tasks" },
               { label: run.taskName, href: `/tasks/${encodeURIComponent(run.taskId)}` },
               { label: "运行详情" },
             ],
@@ -2920,7 +2948,7 @@ export function createWebApp(opts: WebOptions): Hono {
     return c.html(
       await layout(
         task.name,
-        [{ label: "任务", href: "/tasks" }, { label: task.name }],
+        [{ label: "研究任务", href: "/tasks" }, { label: task.name }],
         await tasksView(engine.tasks.list(), task, engine.registry.list(), engine.listTaskRuns(task.id), ok),
         "tasks",
       ),
@@ -2931,7 +2959,7 @@ export function createWebApp(opts: WebOptions): Hono {
     const body = await c.req.parseBody();
     const space = str(body, "space").trim();
     if (!isSpaceId(space) || !engine.registry.has(space)) {
-      return c.redirect(`/tasks?ok=${encodeURIComponent("创建失败：请选择有效空间")}`);
+      return c.redirect(`/tasks?new=1&ok=${encodeURIComponent("创建失败：请选择有效空间")}`);
     }
     const timeoutMinutes = str(body, "timeoutMinutes");
     const task = engine.tasks.create({
@@ -2946,7 +2974,7 @@ export function createWebApp(opts: WebOptions): Hono {
       distillOnRun: checkbox(body, "distillOnRun"),
       timeoutMinutes: timeoutMinutes ? Number(timeoutMinutes) : undefined,
     });
-    if (!task) return c.redirect(`/tasks?ok=${encodeURIComponent("创建失败：请选择有效空间")}`);
+    if (!task) return c.redirect(`/tasks?new=1&ok=${encodeURIComponent("创建失败：请选择有效空间")}`);
     return c.redirect(`/tasks/${encodeURIComponent(task.id)}?ok=${encodeURIComponent("已创建")}`);
   });
 
@@ -3246,8 +3274,8 @@ export function createWebApp(opts: WebOptions): Hono {
     }
     return c.html(
       await layout(
-        "Integrations",
-        [{ label: "Integrations" }],
+        "飞书连接",
+        [{ label: "飞书连接" }],
         await integrationsView({
           botName: cfg.feishuBotName ?? "",
           botOpenId: cfg.feishuBotOpenId ?? "",
@@ -3337,13 +3365,14 @@ export function createWebApp(opts: WebOptions): Hono {
         await opts.feishuIntegration.listConnectionCandidates();
       return c.html(
         await layout(
-          "连接飞书群",
+          "请求群管理员确认",
           [
-            { label: "Integrations", href: "/integrations" },
-            { label: "连接飞书群" },
+            { label: "飞书连接", href: "/integrations" },
+            { label: "请求群管理员确认" },
           ],
           await feishuGroupConnectView({
             candidates,
+            botName: config().feishuBotName || opts.activeFeishuIdentity?.botName || "HomeAgent",
             flashMsg: c.req.query("ok") ?? undefined,
           }),
           "integrations",

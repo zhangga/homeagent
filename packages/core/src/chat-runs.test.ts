@@ -24,6 +24,19 @@ afterEach(() => {
 });
 
 describe("ChatRunStore", () => {
+  test("status filtering preserves the requested space and leaves full history available", () => {
+    const store = new ChatRunStore(dir);
+    const done = store.start({ space: SPACE, input: "已处理", trigger: "message" });
+    store.begin(done.id);
+    store.succeed(done.id, { output: "回答", finishedAt: Date.now() });
+    const queued = store.start({ space: SPACE, input: "等待处理", trigger: "message" });
+    const other = store.start({ space: "team/oc_other", input: "其他群", trigger: "message" });
+    store.begin(other.id);
+    expect(store.list(SPACE, ["queued", "running"]).map((run) => run.id)).toEqual([queued.id]);
+    expect(store.list(undefined, ["running"]).map((run) => run.id)).toEqual([other.id]);
+    expect(store.list(SPACE)).toHaveLength(2);
+  });
+
   test("dispatch admission and cancellation survive reopen and reject stale success", () => {
     let store = new ChatRunStore(dir);
     const plan = { space: SPACE, input: "frozen", trigger: "message" as const,

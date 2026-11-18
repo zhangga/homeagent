@@ -1408,9 +1408,9 @@ export class ChatRunStore {
     return this.runs.has(id);
   }
 
-  list(space?: SpaceId): ChatRun[] {
+  list(space?: SpaceId, statuses?: readonly ChatRunStatus[]): ChatRun[] {
     return [...this.runs.values()]
-      .filter((run) => !space || run.space === space)
+      .filter((run) => (!space || run.space === space) && (!statuses || statuses.includes(run.status)))
       .sort((a, b) => b.startedAt - a.startedAt || a.id.localeCompare(b.id))
       .map(clone);
   }
