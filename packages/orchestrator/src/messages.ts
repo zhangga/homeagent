@@ -86,6 +86,12 @@ export function providerNotice(error: unknown): string {
   if (preparation?.stage === "skill-staging") {
     return "⚠️ 冻结 Skill 目录超过本轮准备预算，已停止执行，没有使用删减后的目录。请在管理后台查看执行证据；缩减本机 Skill 资源体积后重新发起请求，重试旧运行不会更换冻结目录。";
   }
+  if (error instanceof Error && (
+    error.message === "provider Skill input changed after frozen validation"
+    || error.message === "staged Skill bundle failed verification"
+  )) {
+    return "⚠️ 本次回答未能完成 Skill 校验。请重试本次运行。若刚更新了本机 Skill，请重新发送请求，让 HomeAgent 冻结最新版本。";
+  }
   if (preparation?.stage === "native-session") {
     const detail = NATIVE_SESSION_ISSUE_LABELS[preparation.reason];
     const code = preparation.exitCode === undefined ? "" : `（检查退出码 ${preparation.exitCode}）`;

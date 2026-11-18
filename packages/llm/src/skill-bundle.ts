@@ -21,6 +21,12 @@ interface BundleManifest {
   proof: FileIdentity[];
 }
 
+class SkillBundleChangedError extends Error {
+  constructor() {
+    super("Skill bundle changed while it was being captured");
+  }
+}
+
 // Content reads can be slow on a cold filesystem. Bound simultaneous I/O without
 // reducing the existing bundle size, entry limits, or installed dependencies.
 const CONTENT_READ_CONCURRENCY = 16;
@@ -71,7 +77,7 @@ function scanBundle(skillFile: string, maxEntries = 50_000, maxTotalBytes = SKIL
 
 function checkReadPath(manifest: BundleManifest, file: BundleManifest["files"][number]): void {
   // Queued reads must not follow an entry replaced after traversal.
-  if (!fileIdentitiesMatch([file.identity])) throw new Error("Skill bundle changed while it was being captured");
+  if (!fileIdentitiesMatch([file.identity])) throw new SkillBundleChangedError();
   const fromRoot = relative(manifest.canonicalRoot, realpathSync(file.fullPath));
   if (fromRoot === ".." || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
     throw new Error("Skill bundle entry escapes its root");
@@ -81,7 +87,7 @@ function checkReadPath(manifest: BundleManifest, file: BundleManifest["files"][n
 function finishBundle(manifest: BundleManifest, contents: Buffer[]): ProviderSkillBundleSnapshot {
   if (!fileIdentitiesMatch(manifest.proof)
     || manifest.files.some((file, index) => contents[index]?.length !== file.identity.size)) {
-    throw new Error("Skill bundle changed while it was being captured");
+    throw new SkillBundleChangedError();
   }
   const files = manifest.files.map((file, index) => ({ path: file.path, mode: file.mode, content: contents[index]! }));
   const hash = createHash("sha256");
@@ -126,6 +132,29 @@ export async function captureProviderSkillBundleAsync(
   }));
   if (failure) throw failure.error;
   return finishBundle(manifest, contents);
+}
+
+/** Re-read a fresh private copy if its filesystem metadata settles during verification. */
+export async function verifyNewProviderSkillBundle(
+  skillFile: string, expectedHash: string, read?: (path: string) => Promise<Buffer>,
+): Promise<ProviderSkillBundleSnapshot> {
+  const verify = async () => {
+    const captured = await captureProviderSkillBundleAsync(skillFile, undefined, undefined, read);
+    if (!fileIdentitiesMatch(captured.proof)) throw new SkillBundleChangedError();
+    if (captured.hash !== expectedHash) throw new Error("staged Skill bundle failed verification");
+    return captured;
+  };
+  // Windows may update change times after both writing and closing the copy.
+  const retryDelaysMs = process.platform === "win32" ? [50, 150] : [0];
+  for (const delayMs of retryDelaysMs) {
+    try {
+      return await verify();
+    } catch (error) {
+      if (!(error instanceof SkillBundleChangedError)) throw error;
+      if (delayMs > 0) await Bun.sleep(delayMs);
+    }
+  }
+  return verify();
 }
 
 /** The sync and async paths retain the same complete, frozen v1 manifest. */

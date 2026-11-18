@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { captureProviderSkillBundleAsync, hashProviderSkillBundle } from "./skill-bundle.ts";
+import { captureProviderSkillBundleAsync, hashProviderSkillBundle, verifyNewProviderSkillBundle } from "./skill-bundle.ts";
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "ha-bundle-io-"));
@@ -64,6 +64,63 @@ test("parallel capture rejects writes during reading and drains in-flight reads 
       finally { active--; }
     })).rejects.toThrow("read failed");
     expect(active).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a freshly staged bundle survives a transient file timestamp change", async () => {
+  const { root, skillFile } = fixture();
+  const expectedHash = hashProviderSkillBundle(skillFile);
+  const dependency = join(root, "scripts", "node_modules", "runtime", "index.js");
+  let dependencyReads = 0;
+  try {
+    const captured = await verifyNewProviderSkillBundle(skillFile, expectedHash, async path => {
+      const content = await readFile(path);
+      if (path === dependency && ++dependencyReads === 1) {
+        const { atime, mtimeMs } = lstatSync(path);
+        utimesSync(path, atime, new Date(mtimeMs + 2_000));
+      }
+      return content;
+    });
+    expect(dependencyReads).toBe(2);
+    expect(captured.hash).toBe(expectedHash);
+    expect(captured.proof.find(file => file.path === dependency)?.mtimeMs).toBe(lstatSync(dependency).mtimeMs);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test.skipIf(process.platform !== "win32")("a fresh Windows bundle can stabilize after two changing captures", async () => {
+  const { root, skillFile } = fixture();
+  const expectedHash = hashProviderSkillBundle(skillFile);
+  const dependency = join(root, "scripts", "node_modules", "runtime", "index.js");
+  let dependencyReads = 0;
+  try {
+    const captured = await verifyNewProviderSkillBundle(skillFile, expectedHash, async path => {
+      const content = await readFile(path);
+      if (path === dependency && ++dependencyReads <= 2) {
+        const { atime, mtimeMs } = lstatSync(path);
+        utimesSync(path, atime, new Date(mtimeMs + 2_000));
+      }
+      return content;
+    });
+    expect(dependencyReads).toBe(3);
+    expect(captured.hash).toBe(expectedHash);
+    expect(captured.proof.find(file => file.path === dependency)?.mtimeMs).toBe(lstatSync(dependency).mtimeMs);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a staged bundle whose dependency bytes changed still fails after recapture", async () => {
+  const { root, skillFile } = fixture();
+  const expectedHash = hashProviderSkillBundle(skillFile);
+  const dependency = join(root, "scripts", "node_modules", "runtime", "index.js");
+  let dependencyReads = 0;
+  try {
+    await expect(verifyNewProviderSkillBundle(skillFile, expectedHash, async path => {
+      const content = await readFile(path);
+      if (path === dependency && ++dependencyReads === 1) {
+        writeFileSync(path, Buffer.alloc(content.length, "x"));
+      }
+      return content;
+    })).rejects.toThrow("staged Skill bundle failed verification");
+    expect(dependencyReads).toBe(2);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

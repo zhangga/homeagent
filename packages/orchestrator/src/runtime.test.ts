@@ -5376,6 +5376,28 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(cliConnector.sent[0]!.markdown).toContain("本机 CLI 在控制台可用");
   });
 
+  test("CLI-only runtime reports a failed Skill preparation in a private chat", async () => {
+    const cliEngine = new KnowledgeEngine({
+      dataDir: dir,
+      skillCatalog: new SkillCatalog({ roots: [] }),
+      runProvider: async () => {
+        throw new Error("provider Skill input changed after frozen validation");
+      },
+    });
+    const { connector: cliConnector, orchestrator: cliOrch } = makeCliOnlyRuntime(
+      cliEngine,
+      "personal/ou_me",
+      { name: "本机助手", provider: "codex" },
+    );
+
+    await cliOrch.start();
+    await cliConnector.sendP2P("谁负责后端服务");
+
+    expect(cliConnector.sent[0]!.markdown).toContain("本次回答未能完成 Skill 校验");
+    expect(cliConnector.sent[0]!.markdown).not.toContain("Provider 连接状态");
+    expect(cliEngine.chatRuns.list("personal/ou_me")[0]?.status).toBe("failed");
+  });
+
   test("CLI-only runtime reports an allowlisted model-capacity error without blaming CLI setup", async () => {
     const cliEngine = new KnowledgeEngine({
       dataDir: dir,

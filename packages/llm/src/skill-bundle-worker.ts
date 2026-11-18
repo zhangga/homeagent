@@ -2,7 +2,8 @@ import { parentPort } from "node:worker_threads";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileIdentitiesMatch, type FileIdentity } from "@homeagent/shared";
-import { captureProviderSkillBundleAsync, type ProviderSkillInput } from "./providers.ts";
+import type { ProviderSkillInput } from "./providers.ts";
+import { captureProviderSkillBundleAsync, verifyNewProviderSkillBundle } from "./skill-bundle.ts";
 import type { SkillBundleReply } from "./skill-bundle-client.ts";
 import { SkillStagingBudget, providerPreparationFailure } from "./provider-preparation.ts";
 
@@ -35,8 +36,7 @@ parentPort!.on("message", (message: { id: number; operation: "stage" | "verify" 
         writeFileSync(path, file.content, { flag: "wx", mode: file.mode });
         chmodSync(path, file.mode);
       }
-      captured = await captureProviderSkillBundleAsync(join(directory, "SKILL.md"));
-      if (captured.hash !== input.bundleHash || !fileIdentitiesMatch(captured.proof)) throw new Error("changed");
+      captured = await verifyNewProviderSkillBundle(join(directory, "SKILL.md"), input.bundleHash);
     }
     const reply = { proof: captured.proof, entries: captured.entries, totalBytes: captured.totalBytes };
     if (operation === "verify") verified.set(key, reply);
