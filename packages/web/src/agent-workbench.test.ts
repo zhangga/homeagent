@@ -499,9 +499,8 @@ describe("Agent workbench presenter", () => {
 
 describe("Agent editor validation", () => {
   test.each([
-    ["gpt-6.1-sol", "ultra"], ["gpt-6-astra", "ultra"], ["gpt-6-sol", "ultra"],
-    ["gpt-6-luna", "max"], ["gpt-5.6-sol", "ultra"], ["gpt-5.6-terra", "ultra"],
-    ["gpt-5.6-luna", "max"],
+    ["gpt-6.2-sol", "ultra"], ["gpt-6.2-astra", "ultra"], ["gpt-6.1-terra", "ultra"],
+    ["gpt-6.1-sol", "ultra"], ["gpt-6-astra", "ultra"], ["gpt-6-luna", "max"],
   ])("accepts current Codex options for explicit and inherited models: %s %s", (model, effort) => {
     const defaults = { provider: "codex", model };
     const values = { ...editorValuesFor(agent, providers, defaults), model, reasoningEffort: effort };
@@ -518,9 +517,12 @@ describe("Agent editor validation", () => {
     }
   });
 
-  test("retired models remain editable on existing Agents but are absent from new selections", () => {
+  test("legacy and retired models remain editable on existing Agents but are absent from new selections", () => {
     const defaults = { provider: "codex", model: "gpt-6.1-sol" };
-    for (const model of ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"]) {
+    for (const model of [
+      "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+      "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark",
+    ]) {
       const current = { ...agent, model };
       const values = editorValuesFor(current, providers, defaults);
       const context = { providers, models: curatedProviderModels(), defaults };

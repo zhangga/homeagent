@@ -65,7 +65,10 @@ test("missing, malformed and non-file config preserve the CLI default path", () 
 });
 
 test("current model defaults retain newly supported effort and filter unsupported choices", () => {
-  for (const model of ["gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra"]) {
+  for (const model of [
+    "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6.1-sol",
+    "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra",
+  ]) {
     writeFileSync(join(home, "config.toml"), `model = "${model}"\nmodel_reasoning_effort = "ultra"`);
     expect(resolveCodexModelSettings({}, readLocalCodexModelSettings({}, root)))
       .toEqual({ model, reasoningEffort: "ultra" });

@@ -66,7 +66,7 @@ export async function runLiveCodexAcceptance(env: NodeJS.ProcessEnv, args: reado
     // Local scope metadata only: no transport, credentials, scheduler or Feishu server.
     const space = "team/oc_local_live_acceptance" as const;
     await engine.ensureSpace(space);
-    const agent = engine.agents.create({ name: "临时 Codex 真实验收", provider: "codex", model: "gpt-5.6-sol",
+    const agent = engine.agents.create({ name: "临时 Codex 真实验收", provider: "codex", model: "gpt-6.2-sol",
       permission: "write", executionMode: "isolated", visibility: "Team", workdir });
     engine.registry.updateMeta(space, { agentId: agent.id });
     engine.feishuBindings.connect({ spaceId: space, chatId: "oc_local_live_acceptance", boundAppId: "cli_local_fixture",

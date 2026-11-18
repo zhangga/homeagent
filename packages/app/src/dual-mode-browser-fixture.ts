@@ -72,13 +72,12 @@ export async function startDualModeBrowserFixture() {
   try {
     const space = "team/oc_offline_browser" as const;
     await engine.ensureSpace(space);
-    const agentId = engine.agents.create({ name: "离线验收 Agent（非生产）", provider: "codex", model: "gpt-5.6-sol",
+    const agentId = engine.agents.create({ name: "离线验收 Agent（非生产）", provider: "codex", model: "gpt-6.2-sol",
       permission: "read-only", executionMode: "isolated", visibility: "Team", workdir }).id;
     engine.registry.updateMeta(space, { agentId, name: "离线验收群（未连接飞书）" });
     engine.feishuBindings.connect({ spaceId: space, chatId: "oc_offline_browser", boundAppId: "cli_offline_fixture",
       responseMode: "mentions_only", replyInThread: true });
-    const app = createWebApp({ engine, detectProviders: detect, providerModels: async () => ({ codex: ["gpt-5.6-sol"] }),
-      codexSetup: setup, health });
+    const app = createWebApp({ engine, detectProviders: detect, codexSetup: setup, health });
     server = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 120, fetch(request) {
       const url = new URL(request.url);
       if (url.pathname === "/") return Response.redirect(new URL(`/agents/${agentId}`, url).toString());

@@ -1672,7 +1672,10 @@ function codexMcpListArgs(workdir?: string): string[] {
 
 describe("Codex model capabilities", () => {
   test("reasoning effort choices follow the selected model", () => {
-    for (const model of ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra"]) {
+    for (const model of [
+      "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-astra",
+      "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra",
+    ]) {
       expect(codexReasoningEffortsForModel(model)).toEqual([
         "low", "medium", "high", "xhigh", "max", "ultra",
       ]);
@@ -3586,6 +3589,9 @@ describe("provider detection", () => {
       ]);
 
       for (const [model, reasoningEffort] of [
+        ["gpt-6.2-sol", "ultra"],
+        ["gpt-6.2-astra", "ultra"],
+        ["gpt-6.1-terra", "ultra"],
         ["gpt-5.6-sol", "high"],
         ["gpt-6-astra", "ultra"],
         ["gpt-6.1-sol", "ultra"],
@@ -4681,13 +4687,12 @@ describe("provider detection", () => {
     expect(m.gateway).toBeUndefined();
     expect(m["trae-cli"]).toContain("openrouter-3o");
     expect(m.codex).toEqual([
+      "gpt-6.2-sol",
+      "gpt-6.2-astra",
+      "gpt-6.1-terra",
       "gpt-6.1-sol",
       "gpt-6-astra",
-      "gpt-6-sol",
       "gpt-6-luna",
-      "gpt-5.6-sol",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
     ]);
     expect(m.claude?.length).toBeGreaterThan(0);
     // provider lists are not all identical

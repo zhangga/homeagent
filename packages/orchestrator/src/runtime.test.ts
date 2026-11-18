@@ -5426,7 +5426,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(cliConnector.sent[0]!.markdown).toContain("回答超时");
     expect(cliConnector.sent[0]!.markdown).toContain("420 分钟");
     expect(cliConnector.sent[0]!.markdown).not.toContain("120 秒");
-    expect(cliConnector.sent[0]!.markdown).toContain("gpt-5.6-luna");
+    expect(cliConnector.sent[0]!.markdown).toContain("Codex 可选择 gpt-6-luna");
     expect(cliConnector.sent[0]!.markdown).not.toContain("未配置");
     const timedOut = cliEngine.chatRuns.list("personal/ou_me")[0]!;
     expect(cliEngine.runEvents.list(timedOut.id).some((event) => event.kind === "run.timed_out")).toBeTrue();

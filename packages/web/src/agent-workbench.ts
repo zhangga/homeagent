@@ -248,6 +248,7 @@ export interface AgentValidationContext {
   models?: Record<string, string[]>;
   defaults: { provider: string; model: string };
   current?: Agent | null;
+  draft?: AgentRevision;
   catalog?: SkillCatalogSnapshot;
 }
 
@@ -608,8 +609,9 @@ export function validateAgentEditor(
     errors.model = `模型名称不能超过 ${MAX_MODEL_LENGTH} 个字符`;
   } else if (model && context.models) {
     const catalog = context.models[provider] ?? [];
-    const unchangedLegacyModel = context.current?.provider === provider
-      && context.current.model === model;
+    const unchangedLegacyModel = [context.current, context.draft?.snapshot].some(
+      saved => saved?.provider === provider && saved.model === model,
+    );
     if (!catalog.includes(model) && !unchangedLegacyModel) {
       errors.model = `模型 ${model} 不属于所选 Provider；请选择列表模型或使用默认模型`;
     }

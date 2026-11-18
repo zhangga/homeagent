@@ -769,7 +769,7 @@ try {
 
 入口在仓库内创建被 Git 忽略的 `.codex-live-<随机值>/`，内部 `data/` 与 `work/` 互为兄弟；通过既有 helper 仅导入控制台认证缓存，不导入配置、Rules、Plugins、Skills 或旧会话。选择这个位置是因为 [Codex 0.154.0 的辅助程序初始化](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/arg0/src/lib.rs#L319-L329) 拒绝使用系统临时目录作为 Codex Home；不能忽略该警告来伪造准备通过。
 
-入口使用真实 KnowledgeEngine/Provider，无注入假 Provider 或假预检；本地创建一次性 Space/绑定/Agent 和 Task 关闭的持久化本机确认，但不连接飞书。先分别执行无模型准备，再以 `gpt-5.6-sol` 执行两轮最小请求，核对首轮标记、fork child 不同、新 prompt 不重放标记、第二轮模型结果、实际小文件内容和已完成的 command/file-change 工具证据，最后撤销并验证原冻结计划拒绝执行。输出仅保留固定结果、脱敏证据和布尔值，不输出认证、原生会话 ID、回答、命令或 Provider 诊断原文。
+入口使用真实 KnowledgeEngine/Provider，无注入假 Provider 或假预检；本地创建一次性 Space/绑定/Agent 和 Task 关闭的持久化本机确认，但不连接飞书。先分别执行无模型准备，再以 `gpt-6.2-sol` 执行两轮最小请求，核对首轮标记、fork child 不同、新 prompt 不重放标记、第二轮模型结果、实际小文件内容和已完成的 command/file-change 工具证据，最后撤销并验证原冻结计划拒绝执行。输出仅保留固定结果、脱敏证据和布尔值，不输出认证、原生会话 ID、回答、命令或 Provider 诊断原文。
 
 正常完成或失败后关闭 Engine 并清理本次目录；运行中可输入 `stop` 或 Ctrl+C 受控取消。强制结束整个进程/断电不能保证 finally 清理，应在确认测试子进程已退出后按本次精确目录安全清理，不能删除整个仓库或用户 Codex Home。入口不下载 CLI、不运行系统沙箱设置、不改既有服务、不开启 Task，也不验证完整 Skill、真实管理页与 Provider 的联合流程、真实飞书送达/映射持久化或重启。
 

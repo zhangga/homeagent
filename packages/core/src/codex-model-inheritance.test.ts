@@ -87,13 +87,14 @@ test("new Chat snapshots inherit local defaults and preserve them after reopen",
   }));
 });
 
-test("Task retries retain inherited model preferences after local config changes and restart", async () => {
+test("Task retries retain a frozen legacy model after the local default is upgraded and the engine restarts", async () => {
+  saveLocal("gpt-5.6-terra", "xhigh");
   const task = engine.tasks.create({ name: "验证继承", space: SPACE, topic: "检查配置", distillOnRun: false })!;
   failProvider = true;
   const started = engine.startTaskRun(task.id, { distill: false });
-  expect(started.run.executionPlan).toEqual(expect.objectContaining({ model: "gpt-6.1-sol", reasoningEffort: "xhigh" }));
+  expect(started.run.executionPlan).toEqual(expect.objectContaining({ model: "gpt-5.6-terra", reasoningEffort: "xhigh" }));
   expect((await started.completion).ok).toBe(false);
-  saveLocal("gpt-future-model", "ultra");
+  saveLocal("gpt-6.2-sol", "ultra");
   engine.close();
   engine = openEngine();
   failProvider = false;
@@ -101,11 +102,11 @@ test("Task retries retain inherited model preferences after local config changes
   const retry = engine.retryTaskRun(started.run.id);
   expect((await retry.completion).ok).toBe(true);
   expect(calls.length).toBeGreaterThan(0);
-  expect(calls.every(input => input.model === "gpt-6.1-sol" && input.reasoningEffort === "xhigh")).toBe(true);
+  expect(calls.every(input => input.model === "gpt-5.6-terra" && input.reasoningEffort === "xhigh")).toBe(true);
   calls = [];
   expect((await engine.runTask(task.id, { distill: false })).ok).toBe(true);
   expect(calls.length).toBeGreaterThan(0);
-  expect(calls.every(input => input.model === "gpt-future-model" && input.reasoningEffort === "ultra")).toBe(true);
+  expect(calls.every(input => input.model === "gpt-6.2-sol" && input.reasoningEffort === "ultra")).toBe(true);
 });
 
 test("Agent and HomeAgent explicit settings keep priority and other Providers do not inherit Codex", () => {

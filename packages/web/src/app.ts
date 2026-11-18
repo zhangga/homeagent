@@ -2318,6 +2318,7 @@ export function createWebApp(opts: WebOptions): Hono {
       models: await getModels(),
       defaults: { provider: cfg.defaultProvider, model: cfg.defaultModel },
       current,
+      draft: engine.agents.getDraft(id),
       catalog,
     });
     if (!validation.ok) {

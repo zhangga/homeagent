@@ -24,7 +24,7 @@ describe("Agent workbench view", () => {
       const agent = { ...selected, model, reasoningEffort: "" as const };
       const view = buildAgentWorkbench({ agents: mode === "edit" ? [agent] : [], mode,
         selected: mode === "edit" ? agent : null,
-        providers: [{ id: "codex", name: "Codex", bin: "codex", available: true, detail: "0.163.0" }],
+        providers: [{ id: "codex", name: "Codex", bin: "codex", available: true, detail: "0.169.1" }],
         models: curatedProviderModels(), defaults: { provider: "codex", model }, bindings: [], runs: [],
       });
       const body = String(await agentWorkbenchView(view));
@@ -33,11 +33,13 @@ describe("Agent workbench view", () => {
       for (const offered of curatedProviderModels().codex ?? []) {
         expect(models).toContain(`value="${offered}"`);
       }
-      expect(models).not.toMatch(/value="(?:gpt-5\.5|gpt-5\.4|gpt-5\.4-mini|gpt-5\.3-codex-spark)"/u);
+      expect(models).not.toMatch(/value="(?:gpt-6-sol|gpt-5\.6-(?:sol|terra|luna)|gpt-5\.5|gpt-5\.4(?:-mini)?|gpt-5\.3-codex-spark)"/u);
       expect(reasoning).toContain('value="max"');
       expect(reasoning).not.toContain('value="none"');
       expect(reasoning.includes('value="ultra"')).toBe(!model.endsWith("luna"));
-      expect(body).toContain('"gpt-6.1-sol":["low","medium","high","xhigh","max","ultra"]');
+      for (const added of ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra"]) {
+        expect(body).toContain(`"${added}":["low","medium","high","xhigh","max","ultra"]`);
+      }
       expect(body).toContain('"gpt-6-luna":["low","medium","high","xhigh","max"]');
     }
   });

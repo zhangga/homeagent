@@ -35,7 +35,7 @@ export function providerTimeoutNotice(error: unknown): string {
     : "配置的最长回答时间";
   return [
     `⚠️ 回答超时：当前 Agent 已配置，但本机 AI 没有在 ${limit} 内完成这次回答。`,
-    "可以稍后重试、在设置中延长聊天最长回答时间，或改用更快的模型；Codex 推荐 gpt-5.6-luna。",
+    "可以稍后重试、在设置中延长聊天最长回答时间，或改用更快的模型。Codex 可选择 gpt-6-luna。",
   ].join("\n");
 }
 

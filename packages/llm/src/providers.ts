@@ -123,22 +123,34 @@ const LEGACY_CODEX_REASONING_EFFORTS: readonly CodexReasoningEffort[] = [
   "xhigh",
 ];
 
+// Codex CLI 0.169.1, verified 2026-11-18. Legacy entries keep their reasoning
+// levels for saved configurations, frozen runs and archives.
+const CODEX_MODEL_CATALOG: ReadonlyArray<{
+  id: string;
+  efforts: readonly CodexReasoningEffort[];
+  legacy?: boolean;
+}> = [
+  { id: "gpt-6.2-sol", efforts: ULTRA_REASONING_EFFORTS },
+  { id: "gpt-6.2-astra", efforts: ULTRA_REASONING_EFFORTS },
+  { id: "gpt-6.1-terra", efforts: ULTRA_REASONING_EFFORTS },
+  { id: "gpt-6.1-sol", efforts: ULTRA_REASONING_EFFORTS },
+  { id: "gpt-6-astra", efforts: ULTRA_REASONING_EFFORTS },
+  { id: "gpt-6-luna", efforts: LUNA_REASONING_EFFORTS },
+  { id: "gpt-6-sol", efforts: ULTRA_REASONING_EFFORTS, legacy: true },
+  { id: "gpt-5.6-sol", efforts: ULTRA_REASONING_EFFORTS, legacy: true },
+  { id: "gpt-5.6-terra", efforts: ULTRA_REASONING_EFFORTS, legacy: true },
+  { id: "gpt-5.6-luna", efforts: LUNA_REASONING_EFFORTS, legacy: true },
+  { id: "gpt-5.5", efforts: STANDARD_REASONING_EFFORTS, legacy: true },
+  { id: "gpt-5.4", efforts: STANDARD_REASONING_EFFORTS, legacy: true },
+  { id: "gpt-5.4-mini", efforts: STANDARD_REASONING_EFFORTS, legacy: true },
+  { id: "gpt-5.3-codex-spark", efforts: LEGACY_CODEX_REASONING_EFFORTS, legacy: true },
+];
+
 /** Reasoning choices verified for the selected Codex model. */
 export function codexReasoningEffortsForModel(
   model?: string,
 ): readonly CodexReasoningEffort[] {
-  if (model === "gpt-6.1-sol" || model === "gpt-6-astra" || model === "gpt-6-sol"
-    || model === "gpt-5.6-sol" || model === "gpt-5.6-terra") {
-    return ULTRA_REASONING_EFFORTS;
-  }
-  if (model === "gpt-6-luna" || model === "gpt-5.6-luna") {
-    return LUNA_REASONING_EFFORTS;
-  }
-  if (model === "gpt-5.5" || model === "gpt-5.4" || model === "gpt-5.4-mini") {
-    return STANDARD_REASONING_EFFORTS;
-  }
-  if (model === "gpt-5.3-codex-spark") return LEGACY_CODEX_REASONING_EFFORTS;
-  return [];
+  return CODEX_MODEL_CATALOG.find(entry => entry.id === model)?.efforts ?? [];
 }
 
 export function isCodexReasoningEffortSupported(
@@ -1257,17 +1269,7 @@ const KNOWN: CliSpec[] = [
     bin: "codex",
     envBin: "CODEX_BIN",
     versionArgs: ["--version"],
-    // Picker-visible catalog verified with Codex CLI 0.163.0 on 2026-10-23.
-    // Retired model capabilities above remain readable for existing history.
-    models: [
-      "gpt-6.1-sol",
-      "gpt-6-astra",
-      "gpt-6-sol",
-      "gpt-6-luna",
-      "gpt-5.6-sol",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
-    ],
+    models: CODEX_MODEL_CATALOG.filter(model => !model.legacy).map(model => model.id),
     buildRun: ({
       model,
       reasoningEffort,
@@ -2622,9 +2624,7 @@ export function providerSupportsOrdinaryCompletion(id: string): id is "claude" |
 /**
  * Curated model ids per CLI provider id. Drives the provider-dependent Model
  * dropdown (mew shows different models per provider). Free-text is still
- * accepted elsewhere; this is just the menu. CLIs have no list-models command,
- * so these lists are curated. (The network gateway is not a user-selectable
- * provider, so it is not included.)
+ * accepted elsewhere. The picker uses the maintained catalogs offline.
  */
 export async function providerModels(): Promise<Record<string, string[]>> {
   return curatedProviderModels();

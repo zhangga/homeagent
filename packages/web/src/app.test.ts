@@ -82,11 +82,6 @@ beforeEach(async () => {
       { id: "codex", name: "Codex", bin: "codex", available: false, detail: "node not found" },
       { id: "trae-cli", name: "TRAE CLI", bin: "trae-cli", available: true, detail: "0.2" },
     ],
-    providerModels: async () => ({
-      claude: ["sonnet", "opus"],
-      codex: ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"],
-      "trae-cli": ["openrouter-3o"],
-    }),
   });
 });
 
@@ -1112,20 +1107,19 @@ describe("web backend (read-only)", () => {
         available: true,
         detail: "ready",
       }],
-      providerModels: async () => ({ codex: ["gpt-5.4"] }),
     });
 
     const response = await codexSetup.request("/setup/ai", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: "provider=codex&model=gpt-5.4",
+      body: "provider=codex&model=gpt-6.2-sol",
     });
 
     expect(response.status).toBe(302);
     expect(response.headers.get("location")).toBe("/setup");
     expect(readSettings(dir)).toEqual(expect.objectContaining({
       defaultProvider: "codex",
-      defaultModel: "gpt-5.4",
+      defaultModel: "gpt-6.2-sol",
     }));
   });
 
@@ -2702,14 +2696,13 @@ describe("management backend (read-write)", () => {
   });
 
   test.each([
-    ["gpt-5.6-sol", "high"],
+    ["gpt-6.2-sol", "high"],
+    ["gpt-6.2-sol", "ultra"],
+    ["gpt-6.2-astra", "ultra"],
+    ["gpt-6.1-terra", "ultra"],
     ["gpt-6-astra", "ultra"],
     ["gpt-6.1-sol", "ultra"],
-    ["gpt-6-sol", "ultra"],
     ["gpt-6-luna", "max"],
-    ["gpt-5.6-sol", "ultra"],
-    ["gpt-5.6-terra", "ultra"],
-    ["gpt-5.6-luna", "max"],
   ] as const)(
     "creating a Codex agent persists model %s and reasoning %s",
     async (model, reasoningEffort) => {
@@ -2749,7 +2742,7 @@ describe("management backend (read-write)", () => {
       name: created.name,
       instruction: "release two",
       provider: "codex",
-      model: "gpt-5.6-sol",
+      model: "gpt-6.2-astra",
       visibility: "Team",
       permission: "read-only",
       expectedHeadRevisionId: releaseOne,
@@ -2941,10 +2934,10 @@ describe("management backend (read-write)", () => {
 
   test("rejects a reasoning effort unsupported by the selected Codex model", async () => {
     const form = new URLSearchParams({
-      name: "旧模型助手",
+      name: "Luna 助手",
       provider: "codex",
-      model: "gpt-5.5",
-      reasoningEffort: "max",
+      model: "gpt-6-luna",
+      reasoningEffort: "ultra",
     });
     const response = await app.request("/agents", {
       method: "POST",
@@ -2953,10 +2946,10 @@ describe("management backend (read-write)", () => {
     });
 
     expect(response.status).toBe(422);
-    expect(engine.agents.list().find((item) => item.name === "旧模型助手")).toBeUndefined();
+    expect(engine.agents.list().find((item) => item.name === "Luna 助手")).toBeUndefined();
     const body = await response.text();
-    expect(body).toContain("模型 gpt-5.5 不支持该推理强度");
-    expect(body).toContain("旧模型助手");
+    expect(body).toContain("模型 gpt-6-luna 不支持该推理强度");
+    expect(body).toContain("Luna 助手");
   });
 
   test("uses the inherited global Codex model to offer reasoning efforts", async () => {
@@ -3027,6 +3020,29 @@ describe("management backend (read-write)", () => {
     }));
   });
 
+  test("a saved draft can still publish its legacy Codex model after the picker changes", async () => {
+    const agent = engine.agents.create({ name: "旧草稿", provider: "codex", model: "gpt-6-astra" });
+    const model = "gpt-5.6-terra";
+    const draft = engine.saveAgentDraft(agent.id, { model, reasoningEffort: "ultra" }, agent.publishedRevisionId)!;
+    const path = `/agents/${agent.id}`;
+    const view = await (await app.request(path)).text();
+    expect(view).toContain(`value="${model}" selected`);
+    const form = { name: "已发布草稿", provider: "codex", model, reasoningEffort: "ultra" };
+    const post = (url: string, fields: Record<string, string>) => app.request(url, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(fields),
+    });
+    const rejected = await post("/agents", form);
+    expect(rejected.status).toBe(422);
+    expect(await rejected.text()).not.toContain(`value="${model}" selected`);
+    const action = { agentAction: "publish", expectedHeadRevisionId: draft.id };
+    expect((await post(path, { ...form, ...action, model: "gpt-5.6-sol" })).status).toBe(422);
+    const response = await post(path, { ...form, ...action });
+    expect(response.status).toBe(302);
+    expect(engine.agents.get(agent.id)).toMatchObject(form);
+  });
+
   test("new Agent page suggests the next provider-specific name without persisting it", async () => {
     engine.agents.create({ name: "Claude Code Agent", provider: "claude" });
     engine.agents.create({ name: "Claude Code Agent (2)", provider: "claude" });
@@ -3056,7 +3072,7 @@ describe("management backend (read-write)", () => {
     // the client-side catalog carries each provider's models (mew: model list
     // changes with provider)
     expect(body).toContain("openrouter-3o"); // trae-cli
-    expect(body).toContain("gpt-5.5"); // codex
+    expect(body).toContain("gpt-6.2-sol"); // codex
     expect(body).toContain("sonnet"); // claude
     expect(body).toContain("agent-provider"); // the wired <select> ids
     expect(body).toContain("agent-model");
@@ -5215,6 +5231,18 @@ describe("management backend (read-write)", () => {
     expect(view).toContain('value="30"');
     expect(view).toContain('name="chatTimeoutMinutes" value="420"');
     expect(readSettings(dir).chatTimeoutMinutes).toBe(420);
+  });
+
+  test("settings keep a saved legacy Codex default alongside current choices", async () => {
+    saveSettings({ defaultProvider: "codex", defaultModel: "gpt-6-sol" }, dir);
+    const view = await (await app.request("/settings")).text();
+    const picker = view.match(/<select name="defaultModel"[\s\S]*?<\/select>/u)?.[0] ?? "";
+    expect(picker).toContain('value="gpt-6-sol" selected');
+    for (const model of ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra"]) {
+      expect(picker).toContain(`value="${model}"`);
+    }
+    expect(picker).not.toContain("gpt-5.6-");
+    expect(readSettings(dir).defaultModel).toBe("gpt-6-sol");
   });
 
   test("settings schedules a confirmed external data-directory migration", async () => {

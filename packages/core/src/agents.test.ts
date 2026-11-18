@@ -649,9 +649,10 @@ describe("AgentStore", () => {
   });
 
   test.each([
+    ["gpt-6.2-sol", "ultra"], ["gpt-6.2-astra", "ultra"], ["gpt-6.1-terra", "ultra"],
     ["gpt-6.1-sol", "ultra"], ["gpt-6-sol", "ultra"], ["gpt-6-luna", "max"],
     ["gpt-5.6-sol", "ultra"], ["gpt-5.6-terra", "ultra"], ["gpt-5.6-luna", "max"],
-  ] as const)("current Codex selection survives publication and reload: %s %s", (model, reasoningEffort) => {
+  ] as const)("Codex model and reasoning survive publication and reload: %s %s", (model, reasoningEffort) => {
     const store = new AgentStore(dir);
     const agent = store.create({ name: "当前模型", provider: "codex", model, reasoningEffort });
     expect(agent.reasoningEffort).toBe(reasoningEffort);

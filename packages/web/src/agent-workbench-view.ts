@@ -1114,7 +1114,7 @@ export function agentWorkbenchView(
   const modelOptions = selectedProviderModels.map((model) => html`
     <option value="${model}" ${model === values.model ? "selected" : ""}>${model}</option>
   `);
-  if (values.model && !selectedProviderModels.includes(values.model)) {
+  if (isEditing && values.model && !view.errors.model && !selectedProviderModels.includes(values.model)) {
     modelOptions.push(html`<option value="${values.model}" selected>${values.model}（已保存）</option>`);
   }
   const reasoningEfforts = reasoningEffortsForEditor(values, view.defaults);
