@@ -895,81 +895,113 @@ function escapePre(s: string): string {
 
 // ---- runtime health -------------------------------------------------------
 
+const HEALTH_COMPONENT_NAMES: Record<string, string> = {
+  knowledge: "知识存储", providers: "本机 CLI", feishu: "飞书事件监听",
+  dreamCycles: "知识提炼", maintenanceCycles: "知识库维护", tasks: "任务执行", reminders: "提醒", learning: "学习计划",
+  aiQuality: "AI 质量反馈", aiRuntime: "AI 运行指标", dreamScheduler: "知识提炼调度器",
+  maintenanceScheduler: "知识库维护调度器", workContinuationScheduler: "工作续跑调度器",
+  taskScheduler: "任务调度器", reminderScheduler: "提醒调度器", learningScheduler: "学习调度器",
+  service: "后台服务", agentExecution: "Agent 执行配置", healthReporter: "运行状态检查",
+};
+
+function healthTime(value: unknown): string {
+  if (typeof value !== "number") return "未记录";
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "未记录";
+}
+
+function healthComponentRow([key, component]: [string, SystemHealthSnapshot["components"][string]], serviceRestartable: boolean) {
+  const { status, details } = component;
+  const label = Object.hasOwn(HEALTH_COMPONENT_NAMES, key) ? HEALTH_COMPONENT_NAMES[key] : key;
+  const id = `health-component-${encodeURIComponent(key)}`;
+  const heading = html`<span class="health-component-heading"><strong>${label}</strong>
+    <span class="badge ${status}">${{ ok: "正常", degraded: "降级", down: "不可用" }[status]}</span></span>
+    <span class="health-reason">${component.summary}</span>`;
+  if (!details) {
+    return html`<div class="health-component" id="${id}" data-health-component="${key}" data-health-status="${status}">${heading}</div>`;
+  }
+  const service = key === "service";
+  const hasExecution = typeof details.running === "boolean";
+  const previousTime = details.lastStatus === "error" ? details.lastFailureAt : details.lastSuccessAt;
+  const diagnostic = html`<pre aria-label="原始诊断数据">${JSON.stringify(details, null, 2)}</pre>`;
+  return html`<details class="health-component" id="${id}" data-health-component="${key}" data-health-status="${status}">
+    <summary>${heading}<span class="health-detail-label"><span class="health-show">查看详情</span><span class="health-hide">收起详情</span></span></summary>
+    <div class="health-component-body">
+      ${hasExecution ? html`<p>当前：${details.running ? "运行中" : "空闲"}
+        · 上次完成：${details.lastStatus === "error" ? "失败" : details.lastStatus === "ok" ? "成功" : "暂无记录"}
+        ${typeof previousTime === "number" ? healthTime(previousTime) : ""}
+        ${details.running && details.lastStatus === "error" ? "；本轮结果待定，就绪检查将在完成后更新。" : ""}</p>` : ""}
+      ${service ? html`<div class="health-service-controls">
+        <span>PID：${String(details.pid ?? "—")} · 启动时间：${healthTime(details.startedAt)}</span>
+        ${serviceRestartable && details.managed === true ? html`<form method="post" action="/service/restart" class="inline-form"
+          onsubmit="return confirm('安全重启 homeagent 后台服务？')"><button type="submit" class="secondary">安全重启</button></form>` : ""}
+      </div>` : ""}
+      ${hasExecution || service
+        ? html`<details class="health-raw"><summary>原始诊断数据</summary>${diagnostic}</details>`
+        : diagnostic}
+    </div>
+  </details>`;
+}
+
 export function healthView(
   snapshot: SystemHealthSnapshot,
   flashMsg?: string,
   serviceRestartable = false,
   dreamRuns: DreamRunSnapshot[] = [],
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
-  const labels: Record<string, string> = {
-    knowledge: "知识存储",
-    providers: "本机 CLI",
-    feishu: "飞书事件消费者",
-    dreamCycles: "Dream Cycle",
-    maintenanceCycles: "Wiki Maintenance",
-    tasks: "任务执行",
-    reminders: "提醒",
-    learning: "学习计划",
-    aiQuality: "AI 质量反馈",
-    aiRuntime: "AI 运行指标",
-    dreamScheduler: "Dream Cycle 调度器",
-    maintenanceScheduler: "Wiki Maintenance 调度器",
-    workContinuationScheduler: "工作续跑调度器",
-    taskScheduler: "任务调度器",
-    reminderScheduler: "提醒调度器",
-    learningScheduler: "学习调度器",
-    service: "后台服务",
-  };
-  const rows = Object.entries(snapshot.components).map(([key, component]) => {
-    const serviceDetails = key === "service" ? component.details : undefined;
-    const serviceControls = serviceDetails
-      ? html`<div class="row" style="margin-top:12px">
-          <span class="muted">PID：${String(serviceDetails.pid ?? "—")} · 启动时间：${fmtTime(
-            typeof serviceDetails.startedAt === "number" ? serviceDetails.startedAt : undefined,
-          )}</span>
-          ${serviceRestartable && serviceDetails.managed === true
-            ? html`<form method="post" action="/service/restart" class="inline-form"
-                onsubmit="return confirm('安全重启 homeagent 后台服务？')">
-                <button type="submit" class="secondary">安全重启</button>
-              </form>`
-            : ""}
-        </div>`
-      : "";
-    const executionDetails = component.details;
-    const executionStatus = typeof executionDetails?.running === "boolean"
-      ? html`<p class="muted">当前：${executionDetails.running ? "运行中" : "空闲"}
-          · 上次完成：${executionDetails.lastStatus === "error" ? "失败" : executionDetails.lastStatus === "ok" ? "成功" : "暂无记录"}
-          ${typeof (executionDetails.lastStatus === "error" ? executionDetails.lastFailureAt : executionDetails.lastSuccessAt) === "number"
-            ? fmtTime(Number(executionDetails.lastStatus === "error" ? executionDetails.lastFailureAt : executionDetails.lastSuccessAt)) : ""}
-          ${executionDetails.running && executionDetails.lastStatus === "error" ? "；本轮结果待定，就绪检查将在完成后更新。" : ""}</p>`
-      : "";
-    const details = component.details
-      ? html`<details><summary class="muted">查看详情</summary><pre>${raw(
-          escapePre(JSON.stringify(component.details, null, 2)),
-        )}</pre></details>`
-      : "";
-    return html`<div class="card">
-      <div class="row">
-        <strong>${labels[key] ?? key}</strong>
-        <span class="badge ${component.status}">${component.status}</span>
-      </div>
-      <div style="margin-top:8px">${component.summary}</div>
-      ${executionStatus}
-      ${serviceControls}
-      ${details}
-    </div>`;
-  });
-  return html`<h1>运行状态</h1>
-    <p class="subtitle">检查时间：${fmtTime(snapshot.checkedAt)} · Ready：${snapshot.ready ? "是" : "否"}</p>
+  const entries = Object.entries(snapshot.components);
+  const issues = entries.filter(([, c]) => c.status !== "ok")
+    .sort(([, a], [, b]) => Number(b.status === "down") - Number(a.status === "down"));
+  const healthy = entries.filter(([, c]) => c.status === "ok");
+  const overallLabel = { ok: "正常", degraded: "降级", down: "异常" }[snapshot.status];
+  return html`<article class="health-page">
+    <style>
+      .health-page { min-width:0; overflow-wrap:anywhere; }
+      #health-overview { border-left:4px solid var(--ok); }
+      #health-overview[data-ready="false"] { border-left-color:var(--danger); }
+      #health-overview h2 { margin:0 0 6px; font-size:21px; }
+      .health-facts, .health-service-controls { display:flex; align-items:baseline; flex-wrap:wrap; gap:4px 18px; color:var(--muted); font-size:14px; }
+      .health-facts .badge { margin-left:4px; }
+      #health-issues h2 { margin:18px 0 6px; font-size:18px; }
+      .health-component { padding:12px 0; border-bottom:1px solid var(--border); scroll-margin-top:16px; }
+      .health-component-heading { display:flex; align-items:baseline; flex-wrap:wrap; gap:6px 10px; }
+      .health-reason { display:block; margin-top:3px; line-height:1.55; }
+      details.health-component > summary { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:baseline; column-gap:12px; }
+      details.health-component > summary::-webkit-details-marker { display:none; }
+      details.health-component .health-reason { grid-column:1; }
+      .health-page summary { cursor:pointer; }
+      .health-detail-label { grid-column:2; grid-row:1; font-size:13px; color:var(--accent); }
+      .health-detail-label::after { content:" ▾"; }
+      .health-detail-label .health-hide, .health-component[open] > summary .health-show { display:none; }
+      .health-component[open] > summary .health-hide { display:inline; }
+      .health-component[open] .health-detail-label::after { content:" ▴"; }
+      .health-component-body { margin-top:10px; }
+      .health-component-body p { margin:0 0 8px; }
+      .health-component-body pre { padding:12px; margin:6px 0 0; border-radius:6px; background:var(--card);
+        max-width:100%; white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; }
+      .health-raw { margin-top:8px; }
+      .health-raw > summary { width:fit-content; color:var(--muted); font-size:13px; }
+      #health-healthy { margin:14px 0; }
+      #health-healthy > summary { padding:10px 0; font-weight:600; }
+      @media(max-width:640px) { details.health-component .health-reason { grid-column:1 / -1; } }
+    </style>
+    <h1>运行状态</h1>
     ${flash(flashMsg)}
-    <div class="card">
-      <div class="row">
-        <strong>总体状态</strong>
-        <span class="badge ${snapshot.status}">${snapshot.status}</span>
-      </div>
-    </div>
+    <section class="card" id="health-overview" data-ready="${String(snapshot.ready)}" data-status="${snapshot.status}" aria-labelledby="health-readiness">
+      <h2 id="health-readiness">${snapshot.ready ? "服务可用" : "服务未就绪"}</h2>
+      <div class="health-facts"><span>总体健康 <span class="badge ${snapshot.status}">${overallLabel}</span></span>
+        <span>检查时间：${healthTime(snapshot.checkedAt)}</span><a href="/health">刷新状态</a></div>
+    </section>
+    ${issues.length ? html`<section id="health-issues" aria-labelledby="health-issues-title">
+      <h2 id="health-issues-title">异常组件（${issues.length}）</h2>
+      ${issues.map(entry => healthComponentRow(entry, serviceRestartable))}
+    </section>` : !snapshot.ready || snapshot.status !== "ok" || !entries.length
+      ? html`<p class="muted" id="health-issues">${entries.length ? "本次检查未报告具体异常组件。" : "本次检查未返回组件状态。"}</p>` : ""}
+    ${healthy.length ? html`<details id="health-healthy"><summary>正常组件（${healthy.length}）</summary>
+      ${healthy.map(entry => healthComponentRow(entry, serviceRestartable))}
+    </details>` : ""}
     ${dreamRunsPanel(dreamRuns)}
-    ${rows}`;
+  </article>`;
 }
 
 // ---- data governance -----------------------------------------------------

@@ -47,6 +47,16 @@ function requiredProvidersFor(engine: KnowledgeEngine): string[] {
   return [...ids].sort();
 }
 
+const feishuListenerNames = new Map([
+  ["im.message.receive_v1", "飞书消息接收监听"],
+  ["im.chat.member.bot.added_v1", "机器人进群监听"],
+  ["card.action.trigger", "卡片回调监听"],
+]);
+
+const listenerStates = {
+  starting: "正在启动", ready: "已就绪", backoff: "正在等待重试", failed: "失败", stopped: "已停止",
+} satisfies Record<ConnectorHealth["consumers"][number]["state"], string>;
+
 function loopComponent(label: string, health?: RuntimeLoopHealth): ComponentHealth {
   if (!health?.started) {
     return {
@@ -130,9 +140,12 @@ export function createSystemHealthReporter(
         (sum, space) => sum + (typeof space.quarantined === "number" ? space.quarantined : 0),
         0,
       );
+      const failedSpaces = spaces.filter(space => space.ok === false).length;
       components.knowledge = {
         status: core.ok ? quarantined > 0 ? "degraded" : "ok" : "down",
-        summary: `${core.spaces} 个空间，${pending} 条待提炼${heldRaw > 0 ? `，${heldRaw} 条待验收` : ""}${excludedRaw > 0 ? `，${excludedRaw} 条已排除` : ""}${quarantined > 0 ? `，${quarantined} 条提炼失败待恢复` : ""}`,
+        summary: !core.ok
+          ? failedSpaces ? `${failedSpaces} 个空间的存储检查失败` : "知识存储检查未通过"
+          : `${core.spaces} 个空间，${pending} 条待提炼${heldRaw > 0 ? `，${heldRaw} 条待验收` : ""}${excludedRaw > 0 ? `，${excludedRaw} 条已排除` : ""}${quarantined > 0 ? `，${quarantined} 条提炼失败待恢复` : ""}`,
         details: { ...core.details, heldRaw, excludedRaw, quarantined },
       };
     } catch (err) {
@@ -184,13 +197,16 @@ export function createSystemHealthReporter(
         const answerFailureRate = runtime.answers.recent.failureRate;
         const answerErrorRate = runtime.answers.recent.errorRate;
         const answerTimeoutRate = runtime.answers.recent.timeoutRate;
-        const degraded =
-          runtime.queue.pending >= 10
-          || runtime.runs.queued >= 10
-          || (runtime.answers.recent.sampleSize >= 5 && answerFailureRate >= 0.2);
+        const issues: string[] = [];
+        if (runtime.queue.pending >= 10) issues.push(`${runtime.queue.pending} 个消息事件尚未处理完`);
+        if (runtime.runs.queued >= 10) issues.push(`${runtime.runs.queued} 个运行正在排队`);
+        const recent = runtime.answers.recent;
+        if (recent.sampleSize >= 5 && answerFailureRate >= 0.2) {
+          issues.push(`最近 ${recent.sampleSize} 次回答中，${recent.failed} 次失败、${recent.timedOut} 次超时`);
+        }
         components.aiRuntime = {
-          status: degraded ? "degraded" : "ok",
-          summary: `${runtime.answers.succeeded}/${runtime.answers.total} 次回答成功，${runtime.answers.timedOut} 次超时，Run 排队 ${runtime.runs.queued}`,
+          status: issues.length ? "degraded" : "ok",
+          summary: issues.length ? issues.join("，") : `${runtime.answers.succeeded}/${runtime.answers.total} 次回答成功，${runtime.answers.timedOut} 次超时，Run 排队 ${runtime.runs.queued}`,
           details: {
             ...runtime,
             answerFailureRate,
@@ -218,6 +234,9 @@ export function createSystemHealthReporter(
       }
       const failedConsumers = connector.consumers.filter((consumer) => consumer.state === "failed");
       const pendingConsumers = connector.consumers.filter((consumer) => consumer.state !== "ready");
+      const listenerIssues = pendingConsumers.map(({ key, state }) =>
+        (feishuListenerNames.get(key) ?? key) + listenerStates[state]
+      ).join("，");
       components.feishu = {
         status: locallyDisabled
           ? "degraded"
@@ -229,15 +248,15 @@ export function createSystemHealthReporter(
         summary: locallyDisabled
           ? "飞书连接已在 HomeAgent 中停用"
           : connector.ready
-            ? pendingConsumers.length > 0 ? "飞书消息监听已就绪；卡片回调监听未就绪" : "飞书事件消费者已就绪"
-            : `未就绪：${pendingConsumers.map((consumer) => consumer.key).join("、") || "尚未启动"}`,
+            ? listenerIssues ? `飞书消息监听已就绪，${listenerIssues}` : "飞书事件监听已就绪"
+            : listenerIssues || "飞书事件监听尚未就绪",
         details: { ...connector, ...(locallyDisabled ? { locallyDisabled: true } : {}) },
       };
     } catch (err) {
       connector = { name: "feishu", ready: false, consumers: [] };
       components.feishu = {
         status: "down",
-        summary: "飞书事件消费者状态检查失败",
+        summary: "飞书事件监听状态检查失败",
         details: { error: String(err) },
       };
     }
@@ -352,21 +371,15 @@ export function createSystemHealthReporter(
     const truncatedMaintenance = maintenanceCycles.filter(
       (cycle) => cycle.lastTruncated === true,
     );
+    const maintenanceIssues: string[] = [];
+    if (failedMaintenance.length) maintenanceIssues.push(`${failedMaintenance.length} 个空间最近维护检查失败`);
+    if (maintenanceIssueCount > 0) maintenanceIssues.push(`最近发现 ${maintenanceIssueCount} 项问题`);
+    if (truncatedMaintenance.length) maintenanceIssues.push(`${truncatedMaintenance.length} 个空间的维护报告被截断`);
+    const maintenanceSummary = [...maintenanceIssues];
+    if (runningMaintenance.length) maintenanceSummary.push(`${runningMaintenance.length} 个空间正在检查`);
     components.maintenanceCycles = {
-      status: failedMaintenance.length > 0
-        || maintenanceIssueCount > 0
-        || truncatedMaintenance.length > 0
-        ? "degraded"
-        : "ok",
-      summary: runningMaintenance.length > 0
-        ? `${runningMaintenance.length} 个 Wiki Maintenance cycle 运行中`
-        : failedMaintenance.length > 0
-          ? `${failedMaintenance.length} 个空间最近维护检查失败`
-          : maintenanceIssueCount > 0
-            ? `Wiki Maintenance 最近发现 ${maintenanceIssueCount} 项问题`
-            : truncatedMaintenance.length > 0
-              ? `${truncatedMaintenance.length} 个空间的维护报告被截断`
-              : "Wiki Maintenance 无近期问题",
+      status: maintenanceIssues.length ? "degraded" : "ok",
+      summary: maintenanceSummary.join("，") || "Wiki Maintenance 无近期问题",
       details: { runs: maintenanceCycles },
     };
 
@@ -375,10 +388,10 @@ export function createSystemHealthReporter(
     const failedTasks = tasks.filter((task) => task.lastStatus === "error");
     components.tasks = {
       status: failedTasks.length > 0 ? "degraded" : "ok",
-      summary: runningTasks.length > 0
-        ? `${runningTasks.length} 个任务运行中`
-        : failedTasks.length > 0
-          ? `${failedTasks.length} 个任务最近执行失败`
+      summary: failedTasks.length > 0
+        ? `${failedTasks.length} 个任务最近执行失败${runningTasks.length ? `，当前 ${runningTasks.length} 个任务运行中` : ""}`
+        : runningTasks.length > 0
+          ? `${runningTasks.length} 个任务运行中`
           : `${tasks.length} 个任务，无近期失败`,
       details: { tasks },
     };

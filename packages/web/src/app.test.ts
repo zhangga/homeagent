@@ -199,32 +199,53 @@ describe("web backend (read-only)", () => {
     expect(integrations).not.toContain(missingPath);
   });
 
-  test("health endpoints distinguish liveness from readiness", async () => {
-    const snapshot: SystemHealthSnapshot = {
-      status: "degraded",
-      ready: false,
-      checkedAt: 1_783_932_000_000,
-      components: {
-        feishu: {
-          status: "down",
-          summary: "消息消费者未就绪",
-        },
+  test("public health probes and the current management page distinguish readiness from overall status", async () => {
+    const checkedAt = 1_783_932_000_000;
+    const snapshots: SystemHealthSnapshot[] = [
+      {
+        status: "degraded", ready: true, checkedAt,
+        components: { service: { status: "degraded", summary: "当前为终端前台运行（PID 7788）" } },
       },
-    };
+      {
+        status: "down", ready: true, checkedAt: checkedAt + 1,
+        components: { service: { status: "down", summary: "后台服务状态检查失败" } },
+      },
+      {
+        status: "down", ready: false, checkedAt: checkedAt + 2,
+        components: { feishu: { status: "degraded", summary: "未就绪：im.message.receive_v1" } },
+      },
+    ];
+    let current = snapshots[0]!;
+    let checks = 0;
     const healthApp = createWebApp({
       engine,
-      health: async () => snapshot,
+      adminToken: "test-admin",
+      health: async () => { checks += 1; return current; },
     });
 
     const live = await healthApp.request("/healthz");
     expect(live.status).toBe(200);
+    expect(live.headers.get("cache-control")).toBe("no-store");
     expect(await live.json()).toEqual(
       expect.objectContaining({ status: "ok", checkedAt: expect.any(Number) }),
     );
-
-    const ready = await healthApp.request("/readyz");
-    expect(ready.status).toBe(503);
-    expect(await ready.json()).toEqual(snapshot);
+    expect((await healthApp.request("/health")).status).toBe(401);
+    expect(checks).toBe(0);
+    for (const snapshot of snapshots) {
+      current = snapshot;
+      const ready = await healthApp.request("/readyz");
+      expect(ready.status).toBe(snapshot.ready ? 200 : 503);
+      expect(ready.headers.get("cache-control")).toBe("no-store");
+      expect(await ready.json()).toEqual(snapshot);
+      const page = await healthApp.request("/health", { headers: { authorization: "Bearer test-admin" } });
+      expect(page.status).toBe(200);
+      expect(page.headers.get("cache-control")).toBe("no-store");
+      const body = await page.text();
+      expect(body).toContain(`data-ready="${snapshot.ready}"`);
+      expect(body).toContain(`data-status="${snapshot.status}"`);
+      for (const component of Object.values(snapshot.components)) expect(body).toContain(component.summary);
+    }
+    expect(checks).toBe(snapshots.length * 2);
   });
 
   test("fresh installs redirect the dashboard to guided setup", async () => {
@@ -1453,7 +1474,7 @@ describe("web backend (read-only)", () => {
     expect(live.status).toBe(200);
   });
 
-  test("management backend renders component failures and a global readiness alert", async () => {
+  test("management pages link their readiness warning to health without repeating the probe on the health page", async () => {
     const snapshot: SystemHealthSnapshot = {
       status: "down",
       ready: false,
@@ -1473,10 +1494,12 @@ describe("web backend (read-only)", () => {
     const healthBody = await page.text();
     expect(healthBody).toContain("运行状态");
     expect(healthBody).toContain("消息消费者未就绪");
+    expect(healthBody).not.toContain('id="runtime-health-alert"');
+    expect(healthBody).not.toMatch(/fetch\(["']\/readyz["']/);
 
     const homeBody = await (await healthApp.request("/")).text();
-    expect(homeBody).toContain("runtime-health-alert");
-    expect(homeBody).toContain("/readyz");
+    expect(homeBody).toMatch(/id="runtime-health-alert"[^>]*>[\s\S]*?<a\b[^>]*href="\/health"/);
+    expect(homeBody).toMatch(/fetch\(["']\/readyz["']/);
   });
 
   test("health distinguishes a running recovery from the previous completed failure", async () => {
@@ -1507,9 +1530,14 @@ describe("web backend (read-only)", () => {
         },
       },
     };
+    let managed = true;
     const managedApp = createWebApp({
       engine,
-      health: async () => snapshot,
+      health: async () => managed ? snapshot : {
+        ...snapshot,
+        status: "degraded",
+        components: { service: { status: "degraded", summary: "终端前台运行", details: { managed: false, pid: 7788 } } },
+      },
       onServiceRestart: () => { restarts += 1; },
     });
 
@@ -1521,20 +1549,17 @@ describe("web backend (read-only)", () => {
 
     const restart = await managedApp.request("/service/restart", { method: "POST" });
     expect(restart.status).toBe(302);
+    expect(decodeURIComponent(restart.headers.get("location") ?? "")).toBe("/health?ok=已请求后台服务安全重启");
     expect(restarts).toBe(1);
 
-    const manualApp = createWebApp({
-      engine,
-      health: async () => ({
-        ...snapshot,
-        components: {
-          service: { ...snapshot.components.service!, details: { managed: false, pid: 7788 } },
-        },
-      }),
-      onServiceRestart: () => { restarts += 1; },
-    });
-    expect((await manualApp.request("/service/restart", { method: "POST" })).status).toBe(409);
+    managed = false;
+    expect((await managedApp.request("/service/restart", { method: "POST" })).status).toBe(409);
     expect(restarts).toBe(1);
+    expect(await (await managedApp.request("/health")).text()).not.toContain('action="/service/restart"');
+
+    const withoutRestart = createWebApp({ engine, health: async () => snapshot });
+    expect(await (await withoutRestart.request("/health")).text()).not.toContain('action="/service/restart"');
+    expect((await withoutRestart.request("/service/restart", { method: "POST" })).status).toBe(409);
   });
 
   test("home lists spaces", async () => {

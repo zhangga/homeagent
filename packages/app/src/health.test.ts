@@ -119,8 +119,31 @@ describe("system health reporter", () => {
       const snapshot = await report();
       expect(snapshot.ready).toBe(true);
       expect(snapshot.components.feishu).toEqual(expect.objectContaining({ status: "degraded",
-        summary: "飞书消息监听已就绪；卡片回调监听未就绪" }));
+        summary: "飞书消息监听已就绪，卡片回调监听失败" }));
       expect(JSON.stringify(snapshot.components.feishu?.details)).toContain("card.action.trigger");
+    } finally { engine.close(); }
+  });
+
+  test("names unavailable Feishu listeners and keeps event keys and retry details", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-feishu-listeners-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    try {
+      const report = createSystemHealthReporter({ engine,
+        connectorHealth: () => ({ name: "feishu", ready: false, consumers: [
+          { key: "im.message.receive_v1", state: "failed", attempts: 3 },
+          { key: "im.chat.member.bot.added_v1", state: "backoff", attempts: 2 },
+          { key: "future-event", state: "starting", attempts: 1 },
+        ] }),
+        dreamSchedulerHealth: () => loopHealth, taskSchedulerHealth: () => loopHealth,
+        detectProviders: async () => [], requiredProviderIds: () => [],
+      });
+      const snapshot = await report();
+      expect(snapshot.ready).toBe(false);
+      expect(snapshot.components.feishu).toMatchObject({ status: "down",
+        summary: "飞书消息接收监听失败，机器人进群监听正在等待重试，future-event正在启动",
+        details: { consumers: expect.arrayContaining([{ key: "im.message.receive_v1", state: "failed", attempts: 3 }]) },
+      });
     } finally { engine.close(); }
   });
 
@@ -289,6 +312,7 @@ describe("system health reporter", () => {
     expect(backlog.status).toBe("degraded");
     expect(backlog.components.aiRuntime).toEqual(expect.objectContaining({
       status: "degraded",
+      summary: "12 个消息事件尚未处理完",
       details: expect.objectContaining({
         queue: expect.objectContaining({ pending: 12 }),
         answerFailureRate: 0,
@@ -319,6 +343,7 @@ describe("system health reporter", () => {
     expect(failures.status).toBe("degraded");
     expect(failures.components.aiRuntime).toEqual(expect.objectContaining({
       status: "degraded",
+      summary: "最近 10 次回答中，2 次失败、1 次超时",
       details: expect.objectContaining({
         queue: expect.objectContaining({ pending: 0 }),
         answerFailureRate: 0.3,
@@ -512,6 +537,36 @@ describe("system health reporter", () => {
       summary: "2 个空间，0 条待提炼，3 条待验收，5 条已排除",
       details: expect.objectContaining({ heldRaw: 3, excludedRaw: 5 }),
     }));
+  });
+
+  test("issue summaries retain failed checks when a new task or maintenance cycle is running", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hb-health-issue-reasons-"));
+    dirs.push(dir);
+    const engine = new KnowledgeEngine({ dataDir: dir, runProvider: async () => "ok" });
+    try {
+      engine.health = async () => ({ ok: false, spaces: 2, details: {
+        spaces: [{ ok: false, error: "internal probe details" }, { ok: true }],
+        maintenanceCycles: [{ running: true, lastStatus: "error", lastIssueCount: 3, lastTruncated: true }],
+        tasks: [{ running: true, lastStatus: "error" }],
+      } });
+      const report = createSystemHealthReporter({ engine,
+        connectorHealth: () => ({ name: "feishu", ready: true, consumers: [] }),
+        dreamSchedulerHealth: () => loopHealth, taskSchedulerHealth: () => loopHealth,
+        requiredProviderIds: () => ["codex"],
+        detectProviders: async () => [{ id: "codex", name: "Codex", bin: "codex", available: true, detail: "1.0" }],
+      });
+      const snapshot = await report();
+      expect(snapshot.ready).toBe(false);
+      expect(snapshot.components.knowledge?.summary).toBe("1 个空间的存储检查失败");
+      expect(snapshot.components.tasks?.summary).toContain("1 个任务最近执行失败");
+      expect(snapshot.components.tasks?.summary).toContain("1 个任务运行中");
+      const maintenance = snapshot.components.maintenanceCycles?.summary;
+      for (const fact of ["1 个空间最近维护检查失败", "3 项问题", "1 个空间的维护报告被截断", "1 个空间正在检查"]) {
+        expect(maintenance).toContain(fact);
+      }
+    } finally {
+      engine.close();
+    }
   });
 
   test("quarantined distillations degrade knowledge health without blocking readiness", async () => {

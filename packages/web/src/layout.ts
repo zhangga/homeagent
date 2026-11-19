@@ -383,9 +383,18 @@ export function layout(
     <div class="content">
       <main class="${active === "agents" ? "agent-page" : ""}">
         ${crumbs.length > 1 || crumbs[0]?.href ? html`<div class="crumbs">${trail}</div>` : ""}
-        <div id="runtime-health-alert" class="health-alert" hidden>
+        ${active !== "health" ? html`<div id="runtime-health-alert" class="health-alert" hidden>
           运行状态异常，部分能力可能不可用。<a href="/health">查看详情</a>
         </div>
+        <script>
+          fetch("/readyz", { cache: "no-store" })
+            .then(function (response) {
+              if (!response.ok) document.getElementById("runtime-health-alert").hidden = false;
+            })
+            .catch(function () {
+              document.getElementById("runtime-health-alert").hidden = false;
+            });
+        </script>` : ""}
         ${body}
       </main>
     </div>
@@ -438,13 +447,6 @@ export function layout(
         setClosedState(false);
       })();
 
-      fetch("/readyz", { cache: "no-store" })
-        .then(function (response) {
-          if (!response.ok) document.getElementById("runtime-health-alert").hidden = false;
-        })
-        .catch(function () {
-          document.getElementById("runtime-health-alert").hidden = false;
-        });
     </script>
   </body>
 </html>`;

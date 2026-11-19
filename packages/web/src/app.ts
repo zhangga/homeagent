@@ -1028,6 +1028,7 @@ export function createWebApp(opts: WebOptions): Hono {
   });
 
   app.get("/health", async (c) => {
+    c.header("cache-control", "no-store");
     return c.html(
       await layout(
         "运行状态",

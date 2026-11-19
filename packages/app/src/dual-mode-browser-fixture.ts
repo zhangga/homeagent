@@ -7,8 +7,9 @@ import { ProviderPreparationError, type DetectedProvider, type ProviderDetection
 import { resetConfig } from "@homeagent/shared";
 import { createWebApp, type CodexSetupPort } from "@homeagent/web";
 import { createSystemHealthReporter } from "./health.ts";
+import { healthBrowserSamples } from "./health-browser-samples.ts";
 
-export async function startDualModeBrowserFixture() {
+export async function startDualModeBrowserFixture(options: { systemHealth?: boolean } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-dual-browser-")));
   const priorDataDir = process.env.HOMEAGENT_DATA_DIR;
   process.env.HOMEAGENT_DATA_DIR = join(root, "data");
@@ -17,6 +18,7 @@ export async function startDualModeBrowserFixture() {
     detection: 0, isolationDetection: 0, sandboxSetup: 0, sandboxStatus: 0, login: 0, identityReuse: 0 };
   const workdir = join(root, "work");
   mkdirSync(workdir);
+  const healthSamples = options.systemHealth ? healthBrowserSamples() : undefined;
   const engine = new KnowledgeEngine({
     dataDir: join(root, "data"), skillCatalog: new SkillCatalog({ roots: [] }),
     runProvider: async () => { counters.model++; throw new Error("Offline browser fixture forbids model execution"); },
@@ -53,6 +55,7 @@ export async function startDualModeBrowserFixture() {
       { key: "im.chat.member.bot.added_v1", state: "ready", attempts: 0 },
     ] }), dreamSchedulerHealth: loops, maintenanceSchedulerHealth: loops, taskSchedulerHealth: loops,
     workContinuationSchedulerHealth: loops, reminderSchedulerHealth: loops, learningSchedulerHealth: loops,
+    ...healthSamples?.sources,
   });
   let server: ReturnType<typeof Bun.serve> | undefined;
   let closed = false;
@@ -72,19 +75,26 @@ export async function startDualModeBrowserFixture() {
   try {
     const space = "team/oc_offline_browser" as const;
     await engine.ensureSpace(space);
-    const agentId = engine.agents.create({ name: "离线验收 Agent（非生产）", provider: "codex", model: "gpt-6.2-sol",
-      permission: "read-only", executionMode: "isolated", visibility: "Team", workdir }).id;
+    const agentId = engine.agents.create({ name: "离线验收 Agent（非生产）",
+      provider: healthSamples ? "claude" : "codex", model: healthSamples ? undefined : "gpt-6.2-sol",
+      permission: "read-only", executionMode: healthSamples ? undefined : "isolated", visibility: "Team", workdir }).id;
     engine.registry.updateMeta(space, { agentId, name: "离线验收群（未连接飞书）" });
     engine.feishuBindings.connect({ spaceId: space, chatId: "oc_offline_browser", boundAppId: "cli_offline_fixture",
       responseMode: "mentions_only", replyInThread: true });
-    const app = createWebApp({ engine, detectProviders: detect, codexSetup: setup, health });
+    if (healthSamples) await engine.runDreamCycle(space); // Empty Space records a completed run without a model call.
+    const app = createWebApp({ engine, detectProviders: detect, codexSetup: setup, health,
+      onServiceRestart: healthSamples?.onServiceRestart });
     server = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 120, fetch(request) {
       const url = new URL(request.url);
       if (url.pathname === "/") return Response.redirect(new URL(`/agents/${agentId}`, url).toString());
+      if (healthSamples && request.method === "POST" && url.pathname.startsWith("/__fixture/health/")) {
+        return new Response(null, { status: healthSamples.select(url.pathname.slice("/__fixture/health/".length)) ? 204 : 404 });
+      }
       // Test-only external-boundary counters; no credentials, diagnostics, or real records.
       if (url.pathname === "/__fixture" && request.method === "GET") {
         const grants = engine.agents.listLocalExecutionGrants(agentId);
         return Response.json({ offline: true, counters: { ...counters },
+          ...(healthSamples && { healthSample: healthSamples.audit() }),
           mode: engine.agents.get(agentId)?.executionMode, grants: grants.length,
           activeGrants: grants.filter(grant => grant.revokedAt === undefined).length,
           taskEnabled: grants.some(grant => grant.revokedAt === undefined && grant.taskExecutionEnabled),
@@ -97,7 +107,7 @@ export async function startDualModeBrowserFixture() {
 }
 
 if (import.meta.main) {
-  const fixture = await startDualModeBrowserFixture();
+  const fixture = await startDualModeBrowserFixture({ systemHealth: process.argv.includes("--health") });
   console.log(`离线双模式浏览器验收（无真实 Provider/飞书）：${fixture.url}`);
   const stop = () => { void fixture.close().then(() => process.exit(0)); };
   // Windows terminals do not always forward SIGINT to Bun. Explicit stdin stop
