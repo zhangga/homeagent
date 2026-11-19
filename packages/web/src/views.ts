@@ -5,6 +5,8 @@
  * static markup. Mutating pages render POST forms.
  */
 import { html, raw } from "hono/html";
+import { taskRunRefreshScript } from "./task-run-refresh.ts";
+import { belongsToAction, selectWorkAttention, type WorkAttention } from "./work-attention.ts";
 import type { HtmlEscapedString } from "hono/utils/html";
 import type {
   AskResult,
@@ -79,7 +81,7 @@ import {
   type FeishuConnectionProgress,
 } from "./feishu-connection-progress.ts";
 import { feishuProgressBrowserScript } from "./feishu-progress-client.ts";
-import { chatRunLiveScript } from "./chat-run-live.ts";
+import { chatAnswerModelCaption, chatRunLiveScript } from "./chat-run-live.ts";
 import { AGENT_DEFAULT_MODEL_HELP, agentDefaultModelLabel } from "./agent-workbench.ts";
 import type { FeishuExternalSharingStatus } from "./external-sharing.ts";
 import {
@@ -125,7 +127,7 @@ export interface QualityReviewViewItem {
   citations: Array<{ citation: Citation; spaces: SpaceId[] }>;
 }
 
-function fmtTime(ms?: number): string {
+export function fmtTime(ms?: number): string {
   if (!ms) return "—";
   return new Date(ms).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
 }
@@ -149,7 +151,7 @@ function citationEvidenceView(citation: Citation): HtmlEscapedString | Promise<H
     · ${freshness} · ${sourceCount}${evidence.complete ? "" : " · 证据链不完整"}）</span>`;
 }
 
-function flash(msg?: string): HtmlEscapedString | Promise<HtmlEscapedString> | string {
+export function flash(msg?: string): HtmlEscapedString | Promise<HtmlEscapedString> | string {
   return msg ? html`<div class="flash" role="status" aria-live="polite">${msg}</div>` : "";
 }
 
@@ -1297,8 +1299,9 @@ function workAcceptanceView(
   action: WorkAction,
   acceptance: NonNullable<WorkAction["acceptances"]>[number],
   space: SpaceId,
+  taskRunBelongs?: (runId: string, actionId?: string) => boolean,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
-  const headingId = `acceptance-${action.id}-${acceptance.taskRunId}`;
+  const reportId = `acceptance-${action.id}-${acceptance.taskRunId}`;
   const decisionLabel = acceptance.status === "accepted"
     ? "已接受"
     : acceptance.status === "rejected"
@@ -1313,43 +1316,41 @@ function workAcceptanceView(
         : `/spaces/${encodeURIComponent(space)}/pages/${encodeURIComponent(evidence.id)}`;
     return html`<a href="${href}">${evidence.kind} · ${evidence.id}</a>`;
   };
-  return html`<section class="work-acceptance ${acceptance.status}" aria-labelledby="${headingId}">
-    <div class="work-acceptance-head">
-      <div>
-        <p class="work-kicker">Acceptance gate</p>
-        <h3 id="${headingId}">工作动作验收 · ${decisionLabel}</h3>
-      </div>
-      <span class="work-action-state ${acceptance.status === "pending" ? "awaiting_acceptance" : acceptance.status}">
-        ${decisionLabel}
-      </span>
-    </div>
-    <dl class="work-report-meta">
-      <div><dt>权限快照</dt><dd><code>${acceptance.permission}</code></dd></div>
-      <div><dt>Run</dt><dd><a href="/tasks/runs/${encodeURIComponent(acceptance.taskRunId)}">${acceptance.taskRunId}</a></dd></div>
-    </dl>
+  const failedChecks = acceptance.report.checks.filter(check => check.status === "failed").length;
+  const evidence = acceptance.report.evidence.filter(entry =>
+    entry.kind !== "task_run" || taskRunBelongs?.(entry.id, action.id) !== false);
+  return html`<section id="${reportId}" class="work-acceptance ${acceptance.status}" aria-labelledby="${reportId}-heading">
+    <div class="work-acceptance-head"><h3 id="${reportId}-heading">工作动作验收 · ${decisionLabel}</h3></div>
+    <p class="work-next-action">${action.instruction}</p>
     <div class="work-report-result"><strong>结果 · ${acceptance.report.outcome === "completed" ? "已完成" : acceptance.report.outcome === "blocked" ? "受阻" : "待核验"}</strong><p>${acceptance.report.result}</p>
       ${acceptance.report.blockers.length > 0 ? html`<div><strong>阻塞</strong><ul>${acceptance.report.blockers.map((blocker) => html`<li>${blocker}</li>`)}</ul></div>` : ""}
     </div>
+    <details class="work-report-audit"${failedChecks > 0 ? html` open` : ""}>
+    <summary>执行检查 ${acceptance.report.checks.length} 项${failedChecks ? `（${failedChecks} 项未通过）` : ""} · 证据 ${evidence.length} 项</summary>
+    <dl class="work-report-meta">
+      <div><dt>权限快照</dt><dd><code>${acceptance.permission}</code></dd></div>
+      <div><dt>对应运行</dt><dd><a href="/tasks/runs/${encodeURIComponent(acceptance.taskRunId)}">${acceptance.taskRunId}</a></dd></div>
+    </dl>
     <div class="work-report-grid">
       <div><strong>执行检查</strong><ul>${acceptance.report.checks.map((check) =>
         html`<li><span class="work-check ${check.status}">${checkLabel[check.status]}</span>
           ${check.name}${check.detail ? html` · ${check.detail}` : ""}</li>`)}</ul></div>
-      <div><strong>证据</strong><ul>${acceptance.report.evidence.map((evidence) =>
-        html`<li>${evidenceLink(evidence)}${evidence.description ? html` · ${evidence.description}` : ""}</li>`)}</ul></div>
-    </div>
+      <div><strong>证据</strong><ul>${evidence.map((entry) =>
+        html`<li>${evidenceLink(entry)}${entry.description ? html` · ${entry.description}` : ""}</li>`)}</ul></div>
+    </div></details>
     ${acceptance.status === "pending" ? html`
-      <p class="work-acceptance-note">自动续跑已暂停在验收门；接受后才会写入 checkpoint 并开放下一动作。</p>
+      <p class="work-acceptance-note">接受后会保存这一步的成果，事项可以继续。驳回时请写明需要补充的内容。</p>
       <div class="work-acceptance-actions">
         <form method="post" action="/work/actions/${encodeURIComponent(action.id)}/accept">
           <input type="hidden" name="runId" value="${acceptance.taskRunId}" />
-          <button type="submit">接受并写入 checkpoint</button>
+          <button type="submit">接受结果</button>
         </form>
         <form method="post" action="/work/actions/${encodeURIComponent(action.id)}/reject" class="work-reject-form">
           <input type="hidden" name="runId" value="${acceptance.taskRunId}" />
-          <label for="reject-${action.id}">驳回原因 <span class="hint">必填，将作为可重试 blocker</span></label>
-          <textarea id="reject-${action.id}" name="reason" required maxlength="2000"
+          <label for="reject-${action.id}">驳回原因 <span class="hint">必填</span></label>
+          <textarea id="reject-${action.id}" name="reason" rows="2" required maxlength="2000"
             placeholder="说明缺少的结果、检查或证据"></textarea>
-          <button type="submit" class="danger">驳回并保留动作边界</button>
+          <button type="submit" class="danger">驳回结果</button>
         </form>
       </div>` : html`
       <div class="work-decision">
@@ -1369,13 +1370,57 @@ function collectionIndex(
     ${flash(flashMsg)}<ul class="collection-list">${rows}</ul>`;
 }
 
-export function workIndexView(items: WorkItem[], spaces: SpaceMeta[], flashMsg?: string) {
+export function workIndexView(
+  items: WorkItem[], spaces: SpaceMeta[], flashMsg?: string,
+  attentionByItem: ReadonlyMap<string, WorkAttention> = new Map(),
+) {
   const names = new Map(spaces.map((space) => [space.id, spaceLabel(space)]));
-  return collectionIndex("工作事项", "/work?new=1", "新建工作项", flashMsg, items.map((item) => html`
-    <li><div><a href="/work/${encodeURIComponent(item.id)}">${item.title}</a>
-      <span class="collection-meta">${names.get(item.space) ?? item.space} · ${WORK_PHASE_LABELS[item.phase]}</span></div>
-      ${item.nextActions[0] ? html`<span class="collection-next">下一步 · ${item.nextActions[0]}</span>` : ""}
-    </li>`));
+  const groups = [
+    { id: "needs-action", title: "需要处理", rows: [] as ReturnType<typeof html>[] },
+    { id: "in-flight", title: "执行与排队", rows: [] as ReturnType<typeof html>[] },
+    { id: "other", title: "其他事项", rows: [] as ReturnType<typeof html>[] },
+  ] as const;
+  const states = {
+    awaiting_acceptance: { label: "待验收", link: "查看报告", group: groups[0] },
+    awaiting_approval: { label: "待审批", link: "处理审批", group: groups[0] },
+    blocked: { label: "受阻", link: "查看阻塞原因", group: groups[0] },
+    running: { label: "执行中", link: "查看进度", group: groups[1] },
+    queued: { label: "排队中", link: "查看排队进度", group: groups[1] },
+    normal: { label: "", link: "", group: groups[2] },
+    completed: { label: "已完成", link: "", group: groups[2] },
+  } satisfies Record<WorkAttention["kind"], { label: string; link: string; group: typeof groups[number] }>;
+  for (const item of items) {
+    const attention = attentionByItem.get(item.id);
+    const kind = attention?.kind ?? (item.phase === "completed" || item.phase === "blocked" ? item.phase : "normal");
+    const { label, link, group } = states[kind];
+    const phase = WORK_PHASE_LABELS[item.phase];
+    const paused = !item.active && item.phase !== "completed";
+    const next = item.nextActions[0];
+    const note = attention?.description || next;
+    const notePrefix = note && note === next && (kind === "normal" || !attention?.description) ? "下一步 · " : "";
+    const titleId = `work-title-${item.id}`;
+    group.rows.push(html`<li data-work-item="${item.id}" data-work-state="${kind}">
+      <a class="work-list-main" href="/work/${encodeURIComponent(item.id)}" aria-labelledby="${titleId}">
+        <div class="work-list-title">
+          <span class="work-action-state ${kind}">${label || phase}</span>
+          <span class="work-list-name" id="${titleId}">${item.title}</span>
+        </div>
+        <div class="collection-meta">${names.get(item.space) ?? item.space}${label && label !== phase && item.phase !== "active" ? ` · ${phase}` : ""}${paused ? " · 后续执行已暂停" : ""}</div>
+        ${note ? html`<p class="work-list-note">${notePrefix}${note}</p>` : ""}
+      </a>
+      ${attention?.href && link ? html`<a class="work-list-action" href="${attention.href}" aria-describedby="${titleId}">${link}</a>` : ""}
+    </li>`);
+  }
+  return html`<div class="collection-heading work-list-heading"><h1>工作事项</h1>
+    <a class="btn" href="/work?new=1">新建工作项</a></div>${flash(flashMsg)}
+    ${groups.filter(group => group.rows.length).map(group => html`<section class="work-list-section">
+      ${group.id !== "other" || group.rows.length !== items.length
+        ? html`<h2>${group.title} <span>${group.rows.length}</span></h2>` : ""}
+      <ul class="work-list">${group.rows}</ul>
+    </section>`)}
+    <script>window.addEventListener('pageshow', function(event) {
+      if (event.persisted) window.location.reload();
+    });</script>`;
 }
 
 /** Work context page: a compact operational journal with traceable evidence. */
@@ -1386,7 +1431,8 @@ export function workItemsView(
   actions: WorkAction[] = [],
   continuationPolicy?: WorkContinuationPolicy,
   flashMsg?: string,
-  coordination?: { currentIds: string[]; inputs: WorkInput[]; chatRuns: ChatRun[];
+  coordination?: { currentIds: string[]; inputs: WorkInput[]; chatRuns: ChatRun[]; attention?: WorkAttention;
+    taskRunBelongs?: (runId: string, actionId?: string) => boolean; unrelatedChatRunIds?: ReadonlySet<string>;
     plan?: ReturnType<import("@homeagent/core").KnowledgeEngine["getWorkPlanView"]> },
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const listItems = items.map((item) => html`
@@ -1413,25 +1459,26 @@ export function workItemsView(
         <button type="submit" class="secondary">设为当前工作项</button>
       </form>`
     : "";
+  const taskRunIds = selected?.taskRunIds.filter(id => coordination?.taskRunBelongs?.(id) !== false) ?? [];
+  const chatRunIds = selected?.chatRunIds.filter(id => !coordination?.unrelatedChatRunIds?.has(id)) ?? [];
   const refs = selected
-    ? html`<section class="card">
-        <h2 style="margin-top:0">关联证据</h2>
+    ? html`<details class="card work-fold"><summary>关联证据</summary>
         <p class="muted">由输入来源自动串联，不需要手工维护。</p>
         <div class="work-metrics">
           <div class="work-metric"><strong>${selected.rawIds.length}</strong><span>原始输入</span></div>
           <div class="work-metric"><strong>${selected.pageSlugs.length}</strong><span>知识页</span></div>
-          <div class="work-metric"><strong>${selected.chatRunIds.length}</strong><span>Chat Runs</span></div>
-          <div class="work-metric"><strong>${selected.taskRunIds.length}</strong><span>Task Runs</span></div>
+          <div class="work-metric"><strong>${chatRunIds.length}</strong><span>Chat Runs</span></div>
+          <div class="work-metric"><strong>${taskRunIds.length}</strong><span>Task Runs</span></div>
         </div>
         ${selected.rawIds.length > 0 ? html`<div class="work-ref-group"><strong>Raw</strong>${selected.rawIds.map((id) =>
           html`<a href="/spaces/${encodeURIComponent(selected.space)}/raw/${encodeURIComponent(id)}">${id}</a>`)}</div>` : ""}
         ${selected.pageSlugs.length > 0 ? html`<div class="work-ref-group"><strong>Wiki</strong>${selected.pageSlugs.map((slug) =>
           html`<a href="/spaces/${encodeURIComponent(selected.space)}/pages/${encodeURIComponent(slug)}">${slug}</a>`)}</div>` : ""}
-        ${selected.chatRunIds.length > 0 ? html`<div class="work-ref-group"><strong>Chat Runs</strong>${selected.chatRunIds.map((id) =>
+        ${chatRunIds.length > 0 ? html`<div class="work-ref-group"><strong>Chat Runs</strong>${chatRunIds.map((id) =>
           html`<a href="/chats/runs/${encodeURIComponent(id)}">${id}</a>`)}</div>` : ""}
-        ${selected.taskRunIds.length > 0 ? html`<div class="work-ref-group"><strong>Task Runs</strong>${selected.taskRunIds.map((id) =>
+        ${taskRunIds.length > 0 ? html`<div class="work-ref-group"><strong>Task Runs</strong>${taskRunIds.map((id) =>
           html`<a href="/tasks/runs/${encodeURIComponent(id)}">${id}</a>`)}</div>` : ""}
-      </section>`
+      </details>`
     : "";
   const actionStatus: Record<WorkAction["status"], string> = {
     queued: "等待执行",
@@ -1445,11 +1492,14 @@ export function workItemsView(
   const activeAction = actions.find((action) =>
     ["queued", "awaiting_approval", "running", "awaiting_acceptance"].includes(action.status));
   const latestAction = actions[0];
-  const reportAction = activeAction?.status === "awaiting_acceptance"
-    ? activeAction
-    : latestAction;
-  const reportAcceptance = reportAction?.acceptances?.at(-1);
-  const latestRunId = latestAction?.taskRunIds.at(-1);
+  const attention = selected
+    ? coordination?.attention ?? selectWorkAttention(selected, actions, () => undefined, coordination?.chatRuns)
+    : undefined;
+  const closedReport = latestAction?.acceptances?.at(-1);
+  const targetBelongs = (action: WorkAction) => {
+    const id = action.taskRunIds.at(-1);
+    return id === undefined || coordination?.taskRunBelongs?.(id, action.id) !== false;
+  };
   const blockedAction = latestAction?.status === "blocked" ? latestAction : undefined;
   const retryAction = latestAction
     && ["blocked", "cancelled"].includes(latestAction.status)
@@ -1464,56 +1514,39 @@ export function workItemsView(
     && !activeAction
     && coordination?.plan?.dependenciesReady !== false
     && !retryAction;
+  const controlsInPrimary = attention?.kind === "normal" || attention?.kind === "blocked"
+    || Boolean(activeAction && attention?.action?.id === activeAction.id && attention.kind !== "awaiting_acceptance");
   const controls = selected
-    ? html`<section class="card work-continuation">
-        <div class="work-continuation-head">
-          <div>
-            <p class="work-kicker">Continuation control</p>
-            <h2>下一动作</h2>
-            <p class="work-next-action">${activeAction?.instruction ?? retryAction?.instruction
-              ?? blockedAction?.instruction
-              ?? selected.nextActions[0] ?? "等待补充下一步"}</p>
-          </div>
-          ${activeAction
-            ? html`<span class="work-action-state ${activeAction.status}">${actionStatus[activeAction.status]}</span>`
-            : retryAction
-              ? html`<span class="work-action-state ${retryAction.status}">${actionStatus[retryAction.status]}</span>`
-              : blockedAction
-                ? html`<span class="work-action-state blocked">${actionStatus.blocked}</span>`
-              : html`<span class="work-action-state idle">空闲</span>`}
-        </div>
+    ? html`
         <div class="work-control-row">
           ${canContinue ? html`<form method="post" action="/work/${encodeURIComponent(selected.id)}/continue">
               <button type="submit">继续一次</button>
             </form>` : ""}
-          ${activeAction && ["queued", "awaiting_approval", "running"].includes(activeAction.status)
+          ${activeAction && targetBelongs(activeAction) && ["queued", "awaiting_approval", "running"].includes(activeAction.status)
             ? html`<form method="post" action="/work/actions/${encodeURIComponent(activeAction.id)}/cancel">
               <input type="hidden" name="runId" value="${activeAction.taskRunIds.at(-1) ?? ""}" />
               <input type="hidden" name="attempt" value="${activeAction.attempt}" />
               <button type="submit" class="secondary">取消当前动作</button>
             </form>` : ""}
-          ${retryAction ? html`<form method="post" action="/work/actions/${encodeURIComponent(retryAction.id)}/retry">
+          ${retryAction && targetBelongs(retryAction) ? html`<form method="post" action="/work/actions/${encodeURIComponent(retryAction.id)}/retry">
               <input type="hidden" name="runId" value="${retryAction.taskRunIds.at(-1) ?? ""}" />
               <input type="hidden" name="attempt" value="${retryAction.attempt}" />
-              <button type="submit">从动作边界重试</button>
+              <button type="submit">重试此动作</button>
             </form>` : ""}
-          ${blockedAction ? html`
+          ${blockedAction && targetBelongs(blockedAction) ? html`
             <form method="post" action="/work/actions/${encodeURIComponent(blockedAction.id)}/abandon">
               <input type="hidden" name="runId" value="${blockedAction.taskRunIds.at(-1) ?? ""}" />
               <input type="hidden" name="attempt" value="${blockedAction.attempt}" />
               <button type="submit" class="secondary">放弃受阻动作</button>
             </form>` : ""}
-          ${latestRunId ? html`<a class="btn secondary" href="/tasks/runs/${encodeURIComponent(latestRunId)}">查看 Run</a>` : ""}
-          <form method="post" action="/work/${encodeURIComponent(selected.id)}/continuation" class="work-auto-form">
-            <label><input type="checkbox" name="autoContinue" ${continuationPolicy?.autoContinue ? "checked" : ""} />
-              自动续跑 <span class="hint">每轮最多一个动作</span></label>
-            <button type="submit" class="secondary">保存</button>
-          </form>
-        </div>
-        ${reportAction && reportAcceptance
-          ? workAcceptanceView(reportAction, reportAcceptance, selected.space)
-          : ""}
-        ${actions.length > 0 ? html`<div class="work-action-timeline">
+        </div>`
+    : "";
+  const history = selected && actions.length
+    ? html`<details class="card work-fold"><summary>动作历史（${actions.length}）</summary>
+        ${latestAction && closedReport && closedReport.status !== "pending"
+          && coordination?.taskRunBelongs?.(closedReport.taskRunId, latestAction.id) !== false
+          ? workAcceptanceView(latestAction, closedReport, selected.space, coordination?.taskRunBelongs) : ""}
+        <div class="work-action-timeline">
           ${actions.map((action) => html`<article class="work-action-row">
             <span class="work-action-pin ${action.status}" aria-hidden="true"></span>
             <div>
@@ -1526,40 +1559,35 @@ export function workItemsView(
                 ? html`<p>验收：${action.acceptances.at(-1)!.status === "accepted" ? "已接受" : "已驳回"}
                     · ${action.acceptances.at(-1)!.decidedBy}
                     · ${fmtTime(action.acceptances.at(-1)!.decidedAt)}</p>` : ""}
-              <div class="work-run-links">${action.taskRunIds.map((runId) =>
+              <div class="work-run-links">${action.taskRunIds.filter(id => coordination?.taskRunBelongs?.(id, action.id) !== false).map((runId) =>
                 html`<a href="/tasks/runs/${encodeURIComponent(runId)}">${runId}</a>`)}</div>
             </div>
           </article>`)}
-        </div>` : ""}
-      </section>`
+        </div></details>`
     : "";
 
-  return html`<h1>工作事项</h1>
-    <p class="subtitle">多个事项可以同时推进。回复结果或说出事项名称即可补充要求；选择当前事项仅改变默认焦点。</p>
-    <div class="split">
-      <div class="listcol">
-        <a class="item ${newActive}" href="/work?new=1"><div class="name">＋ 新建工作项</div>
-          <div class="sub">开始一条新的工作线</div></a>
-        ${listItems}
-      </div>
-      <div>
-        ${flash(flashMsg)}
-        ${selected ? html`<section class="card">
-          <h2>事项进度</h2>
+  const progress = selected ? html`<details class="card work-fold"><summary>执行设置与最近输入</summary>
           <p>${selected.active ? "允许后续执行" : "后续执行已暂停"} · ${coordination?.currentIds.includes(selected.id) ? "当前默认事项" : "独立事项"}</p>
+          ${!controlsInPrimary && (canContinue || retryAction || blockedAction || (activeAction && activeAction.status !== "awaiting_acceptance"))
+            ? html`<div>事项动作：${activeAction?.instruction ?? retryAction?.instruction ?? blockedAction?.instruction ?? selected.nextActions[0]}${controls}</div>` : ""}
+          <div class="work-control-row">${activation}
           ${selected.phase !== "completed" ? html`<form method="post" action="/work/${encodeURIComponent(selected.id)}/activity">
             <input type="hidden" name="active" value="${selected.active ? "false" : "true"}" />
             <button type="submit" class="secondary">${selected.active ? "暂停后续执行" : "继续后续执行"}</button>
           </form>` : ""}
-          ${(coordination?.chatRuns ?? []).map(run => html`<p><a href="/chats/runs/${encodeURIComponent(run.id)}">${run.input.slice(0, 100)}</a> · ${{ queued: "排队中", running: "执行中", succeeded: "本轮已完成", failed: "执行失败", cancelled: "已取消", timed_out: "执行超时" }[run.status]}</p>`)}
+          <form method="post" action="/work/${encodeURIComponent(selected.id)}/continuation" class="work-auto-form">
+            <label><input type="checkbox" name="autoContinue" ${continuationPolicy?.autoContinue ? "checked" : ""} />
+              自动续跑 <span class="hint">每轮最多一个动作</span></label>
+            <button type="submit" class="secondary">保存</button>
+          </form></div>
+          ${(coordination?.chatRuns ?? []).filter(run => !coordination?.unrelatedChatRunIds?.has(run.id)).map(run => html`<p><a href="/chats/runs/${encodeURIComponent(run.id)}">${run.input.slice(0, 100)}</a> · ${{ queued: "排队中", running: "执行中", succeeded: "本轮已完成", failed: "执行失败", cancelled: "已取消", timed_out: "执行超时" }[run.status]}</p>`)}
           <h3>待处理输入</h3>
           ${(coordination?.inputs ?? []).length ? coordination!.inputs.map(input => html`<p>${input.message.text.slice(0, 300)}<br /><span class="muted">${{
             received: "已接收", preparing: "正在准备", waiting: "等待事项继续", planned: "已有执行计划", dispatched: "已派发",
             settled: "已处理", interrupted: "处理曾中断，请查看运行或重新发送要求", cancelled: "已取消",
           }[input.state]}</span></p>`) : html`<p class="muted">暂无待处理输入。</p>`}
-        </section>` : ""}
-        ${controls}
-        ${coordination?.plan ? html`<section class="card"><h2>计划版本 ${coordination.plan.current.revision}</h2>
+        </details>` : "";
+  const plan = coordination?.plan ? html`<details class="card work-fold"><summary>计划版本 ${coordination.plan.current.revision} · 剩余 ${coordination.plan.remaining.length} 步</summary>
           <p>${coordination.plan.current.reason} · 剩余 ${coordination.plan.remaining.length} 步 · 已验收 ${selected?.completedActionIds?.length ?? 0} 步</p>
           ${coordination.plan.parent ? html`<p>父目标：<a href="/work/${encodeURIComponent(coordination.plan.parent.id)}">${coordination.plan.parent.title}</a></p>` : ""}
           ${coordination.plan.children.length ? html`<h3>独立子事项</h3><ul>${coordination.plan.children.map(child => html`<li>
@@ -1578,15 +1606,8 @@ export function workItemsView(
               return html`<a href="/work/${encodeURIComponent(id)}">${dependency?.title ?? id}（${dependency?.accepted ? "已验收" : "等待验收"}）</a> `;
             })}</p>` : ""}</li>`)}</ol>
           <details><summary>最近的计划修订</summary>${coordination.plan.history.map(plan => html`<p>版本 ${plan.revision} · ${plan.reason} · ${plan.steps.length} 步</p>`)}</details>
-        </section>` : ""}
-        <section class="card work-editor">
-          <p class="work-kicker">Operational context</p>
-          <div class="work-head">
-            <div><h2>${selected ? selected.title : "建立工作项"}</h2>
-              ${selected && coordination?.currentIds.includes(selected.id) ? html`<span class="work-current">● 当前工作项</span>` : ""}
-            </div>
-            ${activation}
-          </div>
+        </details>` : "";
+  const editor = html`<section class="card work-editor">
           <form method="post" action="${formAction}" class="stack">
             ${selected?.planRef ? html`<input type="hidden" name="planRevision" value="${selected.planRef.revision}" /><input type="hidden" name="planProgress" value="${coordination?.plan?.progressToken}" />` : ""}
             <div class="field"><label>标题</label>
@@ -1606,8 +1627,8 @@ export function workItemsView(
               <textarea name="summary" placeholder="现在已经确认了什么">${selected?.summary ?? ""}</textarea>
             </div>
             <div class="grid2">
-              <div class="field"><label>阻塞项 <span class="hint">每行一项</span></label>
-                <textarea name="blockers" placeholder="暂无">${selected?.blockers.join("\n") ?? ""}</textarea>
+              <div class="field"><label for="work-blockers">阻塞项 <span class="hint">每行一项</span></label>
+                <textarea id="work-blockers" name="blockers" placeholder="暂无">${selected?.blockers.join("\n") ?? ""}</textarea>
               </div>
               <div class="field"><label>下一步 <span class="hint">${selected?.planRef ? "每段一步，空行分隔" : "每行一项"}</span></label>
                 <textarea name="nextActions" placeholder="下一件可执行的事">${selected?.nextActions.join(selected.planRef ? "\n\n" : "\n") ?? ""}</textarea>
@@ -1618,10 +1639,73 @@ export function workItemsView(
             </div>
             <div class="actions"><button type="submit">${selected ? "保存上下文" : "创建并设为当前"}</button></div>
           </form>
-        </section>
-        ${refs}
-      </div>
-    </div>`;
+        </section>`;
+  const chooser = html`<div class="listcol">
+    <a class="item ${newActive}" href="/work?new=1"><div class="name">＋ 新建工作项</div>
+      <div class="sub">开始一条新的工作线</div></a>${listItems}
+  </div>`;
+  if (!selected || !attention) return html`<h1>建立工作项</h1>${flash(flashMsg)}
+    <div class="split">${chooser}<div>${editor}</div></div>`;
+
+  const heading = {
+    awaiting_acceptance: "等待验收", awaiting_approval: "执行前需要审批", running: "正在执行",
+    queued: "正在排队", blocked: "受阻原因", completed: "事项已完成",
+    normal: selected.active ? "下一步" : "后续执行已暂停",
+  }[attention.kind];
+  const runLink = attention.runId && (attention.kind === "awaiting_approval" || attention.kind === "queued" || attention.kind === "running")
+    ? attention.href : undefined;
+  const projectedBlocker = attention.action?.error && attention.description === attention.action.error
+    ? selected.actionBlockers?.[attention.action.id] : undefined;
+  const blockers = [...new Set([attention.description, ...selected.blockers.filter(reason => reason !== projectedBlocker)]
+    .filter((value): value is string => Boolean(value)))];
+  const currentReport = attention.kind === "awaiting_acceptance" && attention.action && attention.acceptance
+    ? workAcceptanceView(attention.action, attention.acceptance, selected.space, coordination?.taskRunBelongs) : undefined;
+  const note = attention.description ?? attention.action?.instruction
+    ?? (attention.kind === "completed" ? selected.summary : selected.nextActions[0]) ?? "";
+  return html`<article class="work-detail">
+    <style>
+      .work-detail { overflow-wrap:anywhere; }
+      .work-detail .work-primary { margin-bottom:18px; }
+      .work-detail .work-primary h2 { margin:0 0 10px; font-size:18px; }
+      .work-detail .work-primary p { white-space:pre-wrap; }
+      .work-detail .work-primary > .work-acceptance { margin:0; }
+      .work-detail .work-primary[data-work-attention="blocked"] { border-left:3px solid var(--danger); }
+      .work-detail .work-blockers { margin:8px 0; padding-left:20px; }
+      .work-detail .work-fold > summary { font-weight:650; }
+      .work-detail summary { cursor:pointer; }
+      .work-detail .work-fold[open] > summary { margin-bottom:14px; }
+      .work-detail .work-fold > .work-editor { border:0; padding:0; margin:0; }
+      .work-detail .work-acceptance-actions > form { min-width:0; }
+      .work-detail .work-reject-form textarea { min-height:60px; }
+      .work-detail .work-acceptance, #work-next-action, #work-blockers { scroll-margin-top:72px; }
+      .work-detail .work-report-audit { margin-top:14px; }
+      .work-detail .work-report-result { margin-top:12px; }
+      .work-detail .work-control-row:empty { display:none; }
+    </style>
+    <h1>${selected.title}</h1>
+    <p class="subtitle">${spaces.find(space => space.id === selected.space)?.name ?? selected.space}
+      · ${WORK_PHASE_LABELS[selected.phase]}${coordination?.currentIds.includes(selected.id) ? " · 当前工作项" : ""}</p>
+    ${flash(flashMsg)}
+    <div id="work-next-action" class="work-primary ${currentReport ? "" : "card"}" data-work-attention="${attention.kind}">
+      ${currentReport ?? html`
+        <h2>${heading}</h2>
+        ${attention.kind === "blocked"
+          ? html`${blockers.length ? html`<ul class="work-blockers">${blockers.map(reason => html`<li>${reason}</li>`)}</ul>`
+              : html`<p>当前记录没有给出具体的受阻原因。</p>`}
+            ${!blockedAction && (selected.phase === "blocked" || selected.blockers.length)
+              ? html`<a href="#work-blockers">更新阻塞项</a>` : ""}`
+          : note ? html`<p>${note}</p>` : html`<p class="muted">${attention.kind === "normal" ? "尚未填写下一步。" : "暂无更多进度说明。"}</p>`}
+        ${runLink ? html`<a class="btn" href="${runLink}">${attention.kind === "awaiting_approval" ? "前往审批" : "查看执行进度"}</a>` : ""}
+        ${attention.kind === "queued" && !attention.runId ? html`<p class="muted">正在等待本次运行记录。</p>` : ""}
+        ${controlsInPrimary ? controls : ""}`}
+    </div>
+    ${plan}
+    ${history}
+    ${progress}
+    ${refs}
+    <details class="card work-fold"><summary>编辑事项与计划</summary>${editor}</details>
+    <details class="card work-fold"><summary>切换事项</summary>${chooser}</details>
+  </article>`;
 }
 
 // ---- Tasks (research task execution) ---------------------------------------
@@ -1641,7 +1725,7 @@ const WEEKDAY_LABELS: Record<number, string> = {
   7: "周日",
 };
 
-function taskCadenceLabel(task: Task): string {
+export function taskCadenceLabel(task: Task): string {
   if (task.cadence === "hourly") return CADENCE_LABELS.hourly!;
   if (task.cadence === "weekly") {
     return `每${WEEKDAY_LABELS[task.dayOfWeek] ?? "周一"} ${task.hour}:00`;
@@ -1649,7 +1733,6 @@ function taskCadenceLabel(task: Task): string {
   return `每天 ${task.hour}:00`;
 }
 
-/** Tasks page: list column + right editor. `selected` is the task being edited (or null = new). */
 export function tasksIndexView(
   tasks: Task[], latest: ReadonlyMap<string, Pick<TaskRun, "id" | "status">>,
   spaces: SpaceMeta[], flashMsg?: string,
@@ -1669,20 +1752,14 @@ export function tasksView(
   tasks: Task[],
   selected: Task | null,
   spaces: SpaceMeta[],
-  runs: TaskRun[] = [],
   flashMsg?: string,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
-  const statusBadge = (t: Task) => {
-    if (!t.lastStatus) return html`<span class="muted">未运行</span>`;
-    return t.lastStatus === "ok"
-      ? html`<span class="badge knowledge">成功</span>`
-      : html`<span class="badge general">失败</span>`;
-  };
+  const spaceNames = new Map(spaces.map((space) => [space.id, spaceLabel(space)]));
   const listItems = tasks.map((t) => {
     const active = selected && t.id === selected.id;
     return html`<a class="item ${active ? "active" : ""}" href="/tasks/${encodeURIComponent(t.id)}">
       <div class="name"><span class="dot" style="${t.enabled ? "" : "background:#cbd5e1"}"></span>${t.name}</div>
-      <div class="sub">${taskCadenceLabel(t)} · ${t.space}</div>
+      <div class="sub">${taskCadenceLabel(t)} · ${spaceNames.get(t.space) ?? t.space}</div>
     </a>`;
   });
   const newActive = selected === null ? "active" : "";
@@ -1705,51 +1782,8 @@ export function tasksView(
     ? spaces.map((s) => html`<option value="${s.id}" ${s.id === spaceVal ? "selected" : ""}>${s.name?.trim() || s.id}</option>`)
     : [html`<option value="">还没有知识空间</option>`];
 
-  const deleteControl = editing
-    ? html`<button type="submit" class="danger"
-        formaction="/tasks/${encodeURIComponent(editing.id)}/delete" formmethod="post"
-        onclick="return confirm('删除该任务？')">删除</button>`
-    : "";
-  const activeRun = runs.find((run) =>
-    ["awaiting_approval", "queued", "running"].includes(run.status)
-  );
-  const runControl = editing
-    ? activeRun
-      ? html`<a href="/tasks/runs/${encodeURIComponent(activeRun.id)}">${activeRun.status === "awaiting_approval"
-          ? "查看待审批申请"
-          : activeRun.status === "queued"
-            ? "查看排队任务"
-            : "查看运行中任务"}</a>`
-      : html`<button type="submit" class="secondary"
-          formaction="/tasks/${encodeURIComponent(editing.id)}/run" formmethod="post">立即运行</button>`
-    : "";
-
-  const lastRun = editing?.lastRunAt
-    ? html`<div class="muted" style="margin-top:8px">上次运行：${fmtTime(editing.lastRunAt)} · ${statusBadge(editing)}</div>
-        ${editing.lastStatus === "error" && editing.lastError
-          ? html`<div class="muted">错误：${editing.lastError.slice(0, 200)}</div>`
-          : ""}
-        ${editing.lastSummary ? html`<div class="contentbox" style="margin-top:8px">${editing.lastSummary}</div>` : ""}`
-    : "";
-  const runHistory = editing
-    ? html`<div class="card" style="margin-top:16px">
-        <h2>运行历史</h2>
-        ${runs.length === 0
-          ? html`<div class="empty">还没有运行记录。</div>`
-          : html`<table>
-              <tr><th>状态</th><th>触发方式</th><th>开始时间</th><th>耗时</th></tr>
-              ${runs.map((run) => html`<tr>
-                <td><a href="/tasks/runs/${encodeURIComponent(run.id)}">${taskRunStatus(run.status)}</a></td>
-                <td>${taskRunTrigger(run.trigger)}</td>
-                <td>${fmtTime(run.startedAt)}</td>
-                <td>${taskRunDuration(run)}</td>
-              </tr>`)}
-            </table>`}
-      </div>`
-    : "";
-
-  return html`<h1>研究任务</h1>
-    <p class="subtitle">让空间的 Agent 定期研究一个主题，结果写入该空间知识库（夜间提炼成页）并可推送到飞书。</p>
+  return html`<h1>${editing ? "编辑任务设置" : "新建研究任务"}</h1>
+    ${editing ? html`<p class="subtitle"><a href="${formAction}">返回任务详情</a></p>` : ""}
     <div class="split">
       <div class="listcol">
         <a class="item ${newActive}" href="/tasks?new=1"><div class="name">＋ 新建任务</div>
@@ -1760,12 +1794,12 @@ export function tasksView(
         ${flash(flashMsg)}
         <form method="post" action="${formAction}" class="stack card">
           <div class="field">
-            <label>名称</label>
-            <input type="text" name="name" value="${nameVal}" placeholder="例如：每日 AI 进展" required />
+            <label for="task-name">名称</label>
+            <input type="text" id="task-name" name="name" value="${nameVal}" placeholder="例如：每日 AI 进展" required />
           </div>
           <div class="field">
-            <label>研究主题 <span class="hint">交给空间 Agent 的调研提示</span></label>
-            <textarea name="topic" placeholder="例如：总结大模型 Agent 领域本周的重要进展与观点">${topicVal}</textarea>
+            <label for="task-topic-input">研究主题 <span class="hint">交给空间 Agent 的调研提示</span></label>
+            <textarea id="task-topic-input" name="topic" placeholder="例如：总结大模型 Agent 领域本周的重要进展与观点">${topicVal}</textarea>
           </div>
           <div class="grid2">
             <div class="field">
@@ -1810,19 +1844,19 @@ export function tasksView(
             <div><strong>完成后立即提炼</strong><div class="hint">运行结束就把结果提炼成知识页（关闭则等夜间提炼）</div></div>
             <label class="switch"><input type="checkbox" name="distillOnRun" ${distillOn ? "checked" : ""} /><span class="slider"></span></label>
           </div>
-          ${lastRun}
           <div class="actions">
             <button type="submit">${submitLabel}</button>
-            ${runControl}
-            ${deleteControl}
+            ${editing ? html`<a href="${formAction}">取消编辑</a>` : ""}
           </div>
         </form>
-        ${runHistory}
+        ${editing ? html`<form method="post" action="${formAction}/delete" onsubmit="return confirm('删除该任务？')">
+          <button type="submit" class="danger">删除</button>
+        </form>` : ""}
       </div>
     </div>`;
 }
 
-function taskRunStatus(status: TaskRun["status"]): HtmlEscapedString | Promise<HtmlEscapedString> {
+export function taskRunStatus(status: TaskRun["status"]): HtmlEscapedString | Promise<HtmlEscapedString> {
   if (status === "awaiting_approval") return html`<span class="badge general">待审批</span>`;
   if (status === "queued") return html`<span class="badge general">排队中</span>`;
   if (status === "running") return html`<span class="badge general">运行中</span>`;
@@ -1832,7 +1866,7 @@ function taskRunStatus(status: TaskRun["status"]): HtmlEscapedString | Promise<H
   return html`<span class="badge general">失败</span>`;
 }
 
-function taskRunTrigger(trigger: TaskRun["trigger"]): string {
+export function taskRunTrigger(trigger: TaskRun["trigger"]): string {
   return {
     manual: "后台手动",
     scheduled: "定时调度",
@@ -1841,7 +1875,7 @@ function taskRunTrigger(trigger: TaskRun["trigger"]): string {
   }[trigger];
 }
 
-function taskRunDuration(run: TaskRun): string {
+export function taskRunDuration(run: TaskRun): string {
   if (!run.finishedAt) {
     if (run.status === "awaiting_approval") return "等待审批";
     return run.status === "queued" ? "排队中" : "运行中";
@@ -1855,6 +1889,13 @@ function taskRunTimeout(run: TaskRun): string {
   if (!run.timeoutMs) return "—";
   if (run.timeoutMs < 60_000) return `${run.timeoutMs} ms`;
   return `${run.timeoutMs / 60_000} 分钟`;
+}
+
+function taskRunText(text: string, previewLength: number, fullLabel: string) {
+  const characters = Array.from(text);
+  if (characters.length <= previewLength) return html`<div class="task-run-text">${text}</div>`;
+  return html`<div class="task-run-text">${characters.slice(0, previewLength).join("")}…</div>
+    <details><summary>${fullLabel}</summary><div class="task-run-text">${text}</div></details>`;
 }
 
 export function taskRunView(
@@ -1871,14 +1912,14 @@ export function taskRunView(
   const waitingAutomaticRetry = run.status === "failed" && run.retry?.status === "waiting";
   const retryForm = ["failed", "cancelled", "timed_out"].includes(run.status) && task
     ? html`<form method="post" action="/tasks/runs/${encodeURIComponent(run.id)}/retry" class="inline-form">
-        <button type="submit">重新运行</button>
+        <button type="submit" class="${waitingAutomaticRetry || run.retry?.claimedByRunId ? "secondary" : ""}">重新运行</button>
       </form>`
     : "";
   const cancelForm = waitingAutomaticRetry
     || ["awaiting_approval", "queued", "running"].includes(run.status)
     ? html`<form method="post" action="/tasks/runs/${encodeURIComponent(run.id)}/cancel" class="inline-form"
         onsubmit="return confirm('${waitingAutomaticRetry ? "取消这次自动重试？" : "取消这次运行？"}')">
-        <button type="submit" class="danger">${waitingAutomaticRetry
+        <button type="submit" class="${run.status === "awaiting_approval" ? "secondary" : "danger"}">${waitingAutomaticRetry
           ? "取消自动重试"
           : run.status === "awaiting_approval"
             ? "撤销申请"
@@ -1895,7 +1936,8 @@ export function taskRunView(
         <button type="submit" class="danger">拒绝</button>
       </form>`
     : "";
-  const execution = run.executionPlan?.execution;
+  const plan = run.executionPlan;
+  const execution = plan?.execution;
   const notification = run.notification;
   const notificationLabel = notification?.status === "sent"
     ? "已发送"
@@ -1935,50 +1977,110 @@ export function taskRunView(
             : html`<div>状态：自动重试已结束</div>`}
       </div>`
     : "";
-  return html`<h1>运行详情</h1>
-    <p class="subtitle">
-      ${workContext
-        ? html`<a href="/work/${encodeURIComponent(workContext.item.id)}">${workContext.item.title}</a>`
-        : html`<a href="/tasks/${encodeURIComponent(run.taskId)}">${run.taskName}</a>`}
-      · ${run.id}
-    </p>
+  const actionForApproval = run.status === "awaiting_approval" && workContext && belongsToAction(workContext.item, workContext.action, run)
+    ? workContext.action : undefined;
+  const approvalScope = html`${actionForApproval
+      ? html`<div><strong>本次动作</strong>${taskRunText(actionForApproval.instruction, 180, "查看完整动作指令")}</div>
+        <details><summary>查看完整冻结任务主题</summary><div class="task-run-text">${run.topic}</div></details>`
+      : html`<div><strong>冻结任务主题</strong>${taskRunText(run.topic, 100, "查看完整主题")}</div>`}
+    <div><strong>执行权限：</strong><code>${execution?.permission ?? "未记录"}</code>
+      ${execution?.executionMode === "local-full-access" ? " · 本机完全访问，未隔离" : ""}</div>
+    <div><strong>工作目录：</strong>${taskRunText(execution?.workdir ?? plan?.workdir ?? "未记录", 100, "查看完整工作目录")}</div>
+    ${approval?.expiresAt ? html`<div><strong>审批截止：</strong>${fmtTime(approval.expiresAt)}</div>` : ""}
+    ${localAuthorization ? html`<div><strong>当前本机授权：</strong>${localAuthorization}</div>` : ""}`;
+  const output = html`<div class="task-run-text">${run.output || run.summary || "本次运行没有保存输出正文。"}</div>
+    ${run.outputTruncated ? html`<div class="muted">输出过长，运行记录仅保留前 100,000 个字符。</div>` : ""}`;
+  const rawHref = run.rawId ? `/spaces/${encodeURIComponent(run.space)}/raw/${encodeURIComponent(run.rawId)}` : undefined;
+  const pagesWritten = run.pagesWritten === undefined ? "" : html`<div class="muted">写入知识页：${run.pagesWritten}</div>`;
+  const queuePosition = queue
+    ? html`<div><strong>队列位置：</strong>第 ${queue.position} 位 · 已等待 ${Math.round(queue.waitedMs / 1000)} 秒</div>`
+    : "";
+  const workLink = workContext ? `/work/${encodeURIComponent(workContext.item.id)}` : undefined;
+  const active = ["awaiting_approval", "queued", "running"].includes(run.status);
+  function primaryContent() {
+    switch (run.status) {
+      case "succeeded":
+        return html`<h2>运行输出</h2>${output}
+          ${rawHref ? html`<a href="${rawHref}">查看原始记录</a>` : ""}
+          ${pagesWritten}
+          ${workAcceptance ? html`<a href="#task-run-acceptance">查看工作动作验收</a>` : ""}`;
+      case "awaiting_approval":
+        return html`<h2>高权限执行审批</h2>${approvalScope}
+          <div class="actions task-run-actions">${approvalActions}${cancelForm}</div>`;
+      case "queued":
+        return html`<h2>等待执行</h2>${queuePosition}
+          <div>进入队列：${fmtTime(run.queuedAt)}</div><div class="actions">${cancelForm}</div>`;
+      case "running":
+        return html`<h2>正在执行任务</h2><div>开始时间：${fmtTime(run.runStartedAt)}</div>
+          <div>运行上限：${taskRunTimeout(run)}</div><div class="actions">${cancelForm}</div>`;
+      case "failed":
+      case "cancelled":
+      case "timed_out": {
+        const heading = run.status === "failed" ? "失败原因" : run.status === "timed_out" ? "运行超时"
+          : approval?.status === "expired" ? "审批已过期" : approval?.status === "rejected" ? "审批已拒绝" : "运行已取消";
+        return html`<h2>${heading}</h2>
+          ${taskRunText(run.error || approval?.reason || run.failure?.kind || "运行记录未提供更多原因。", 240, "查看完整原因")}
+          ${automaticRetry}
+          ${workLink ? html`<a href="${workLink}">返回工作事项管理此动作</a>` : ""}
+          ${retryForm ? html`<p class="muted">${!plan || plan.archiveVersion !== undefined
+            ? "这条历史记录没有可执行的冻结计划。要使用当前配置，请从任务页新建一次运行。"
+            : "重新运行会按本次冻结的任务主题和执行配置启动新一轮。"}${execution && execution.permission !== "read-only" ? "可写或完全访问需要为新运行重新审批。" : ""}</p>` : ""}
+          <div class="actions task-run-actions">${cancelForm}${retryForm}</div>`;
+      }
+    }
+  }
+  return html`<article class="task-run-detail">
+    <style>
+      .task-run-detail { min-width:0; overflow-wrap:anywhere; }
+      .task-run-detail .card { display:grid; gap:10px; min-width:0; }
+      .task-run-detail h2 { margin:0; }
+      .task-run-detail .task-run-text { white-space:pre-wrap; line-height:1.7; }
+      .task-run-detail p.muted { margin:0; }
+      .task-run-detail summary { cursor:pointer; }
+      .task-run-detail .task-run-facts { display:grid; gap:10px; margin-top:14px; }
+      .task-run-detail .task-run-actions { flex-wrap:wrap; }
+      .task-run-detail .task-run-result { border-left:3px solid var(--accent); }
+      .task-run-detail [data-task-run-status="succeeded"] { border-left-color:var(--ok); }
+      .task-run-detail [data-task-run-status="failed"], .task-run-detail [data-task-run-status="timed_out"] { border-left-color:var(--danger); }
+      .task-run-detail [data-task-run-status="awaiting_approval"] { border-left-color:var(--warn); }
+    </style>
+    <h1>${run.taskName}</h1>
+    <p class="subtitle">运行详情 · ${taskRunStatus(run.status)} · ${workContext
+      ? html`<a href="${workLink}">${workContext.item.title}</a>`
+      : html`<a href="/tasks/${encodeURIComponent(run.taskId)}">返回研究任务</a>`}</p>
     ${flash(flashMsg)}
+    <section class="card task-run-result" data-task-run-status="${run.status}">${primaryContent()}</section>
     ${workContext && workAcceptance
-      ? workAcceptanceView(workContext.action, workAcceptance, workContext.item.space)
+      ? html`<div id="task-run-acceptance">${workAcceptanceView(workContext.action, workAcceptance, workContext.item.space)}</div>`
       : ""}
-    <div class="card stack">
-      <div><strong>状态：</strong>${taskRunStatus(run.status)}</div>
-      ${localAuthorization ? html`<div class="contentbox"><strong>当前本机授权：</strong>${localAuthorization}</div>` : ""}
-      ${approval
-        ? html`<div class="contentbox">
-            <strong>高权限执行审批</strong>
-            ${approval.status === "expired"
-              ? html`<div><strong>审批已过期</strong></div>`
-              : ""}
-            <div>权限：<code>${execution?.permission ?? "unknown"}</code></div>
-            <div>Workdir：<code>${execution?.workdir ?? "—"}</code></div>
-            <div>Provider / Model：${run.executionPlan?.provider ?? "—"} / ${run.executionPlan?.model ?? "默认"}</div>
-            ${run.executionPlan?.agentRevisionId
-              ? html`<div>Agent 发布版本：<code>${run.executionPlan.agentRevisionId}</code></div>`
-              : ""}
-            <div><strong>冻结任务主题</strong><div class="contentbox">${run.topic}</div></div>
-            <details>
-              <summary>冻结 Agent Instruction</summary>
-              <div class="contentbox">${run.executionPlan?.instruction || "—"}</div>
-            </details>
-            <div>申请时间：${fmtTime(approval.requestedAt)}</div>
-            ${approval.expiresAt ? html`<div>审批截止：${fmtTime(approval.expiresAt)}</div>` : ""}
-            ${approval.decidedAt ? html`<div>决定时间：${fmtTime(approval.decidedAt)}</div>` : ""}
-            ${approval.decidedBy ? html`<div>决定人：${approval.decidedBy}</div>` : ""}
-            ${approval.reason ? html`<div>原因：${approval.reason}</div>` : ""}
-          </div>`
-        : ""}
+    ${notification ? html`<div class="card"><strong>飞书通知</strong>
+      <div>${notificationLabel} · 已尝试 ${notification.attempts} 次</div>
+      ${notification?.nextAttemptAt && notification.status !== "sent" && notification.attempts < MAX_TASK_NOTIFICATION_ATTEMPTS
+        ? html`<div><strong>下次自动重试：</strong>${fmtTime(notification.nextAttemptAt)}</div>` : ""}
+      ${notification?.status === "failed" && notification.attempts >= MAX_TASK_NOTIFICATION_ATTEMPTS
+        ? html`<div class="muted">自动重试已停止，可手动重试通知。</div>` : ""}
+      ${notification?.error ? html`<div><strong>通知错误：</strong>${notification.error}</div>` : ""}
+      ${notificationRetry}
+    </div>` : ""}
+    <details class="card" data-task-run-details><summary>运行记录与冻结配置</summary>
+      <div class="task-run-facts">
+      <div><strong>运行编号：</strong>${run.id}</div>
+      <div><strong>所属空间：</strong>${run.space}</div>
+      ${!notification ? html`<div><strong>飞书通知：</strong>${notificationLabel}</div>` : ""}
+      ${run.status !== "awaiting_approval" ? approvalScope : ""}
+      <div>AI 工具与模型：${plan?.provider ?? run.provider ?? "未记录"} / ${plan?.model || run.model || "默认"}</div>
+      ${plan?.reasoningEffort ? html`<div>推理强度：${plan.reasoningEffort}</div>` : ""}
+      ${plan?.agentRevisionId ? html`<div>助手发布版本：<code>${plan.agentRevisionId}</code></div>` : ""}
+      ${plan ? html`<details><summary>冻结的助手指令</summary><div class="task-run-text">${plan.instruction || "—"}</div></details>` : ""}
+      ${approval ? html`<div><strong>高权限执行审批：</strong>${{pending:"待审批",approved:"已批准",rejected:"已拒绝",expired:"审批已过期",legacy:"历史记录"}[approval.status]}</div>
+        <div>申请时间：${fmtTime(approval.requestedAt)}</div>
+        ${approval.decidedAt ? html`<div>决定时间：${fmtTime(approval.decidedAt)}</div>` : ""}
+        ${approval.decidedBy ? html`<div>决定人：${approval.decidedBy}</div>` : ""}
+        ${approval.reason ? html`<div>原因：${approval.reason}</div>` : ""}` : ""}
       <div><strong>触发方式：</strong>${taskRunTrigger(run.trigger)}</div>
       <div><strong>排队时间：</strong>${fmtTime(run.queuedAt)}</div>
       <div><strong>开始时间：</strong>${fmtTime(run.runStartedAt)}</div>
-      ${queue
-        ? html`<div><strong>队列位置：</strong>第 ${queue.position} 位 · 已等待 ${Math.round(queue.waitedMs / 1000)} 秒</div>`
-        : ""}
+      ${run.status !== "queued" ? queuePosition : ""}
       <div><strong>完成时间：</strong>${fmtTime(run.finishedAt)} · ${taskRunDuration(run)}</div>
       <div><strong>运行上限：</strong>${taskRunTimeout(run)}</div>
       ${run.usage ? runUsageView(run.usage) : ""}
@@ -1986,20 +2088,7 @@ export function taskRunView(
         ? html`<div><strong>失败分类：</strong>${failurePhase ?? run.failure.phase} · ${run.failure.kind}
             · ${run.failure.retryable ? "可自动重试" : "不可自动重试"}</div>`
         : ""}
-      ${automaticRetry}
-      <div><strong>飞书通知：</strong>${notificationLabel}${notification ? ` · 已尝试 ${notification.attempts} 次` : ""}</div>
-      ${notification?.nextAttemptAt
-        && notification.status !== "sent"
-        && notification.attempts < MAX_TASK_NOTIFICATION_ATTEMPTS
-        ? html`<div><strong>下次自动重试：</strong>${fmtTime(notification.nextAttemptAt)}</div>`
-        : ""}
-      ${notification?.status === "failed"
-        && notification.attempts >= MAX_TASK_NOTIFICATION_ATTEMPTS
-        ? html`<div class="muted">自动重试已停止，可手动重试通知。</div>`
-        : ""}
-      ${notification?.error
-        ? html`<div><strong>通知错误：</strong><span class="muted">${notification.error}</span></div>`
-        : ""}
+      ${run.status !== "failed" && run.status !== "cancelled" && run.status !== "timed_out" ? automaticRetry : ""}
       ${run.retryOf
         ? html`<div><strong>重试来源：</strong><a href="/tasks/runs/${encodeURIComponent(run.retryOf)}">${run.retryOf}</a></div>`
         : ""}
@@ -2022,17 +2111,14 @@ export function taskRunView(
               : ""}
           </div>`
         : ""}
-      ${run.rawId
-        ? html`<div><strong>原始记录：</strong><a href="/spaces/${encodeURIComponent(run.space)}/raw/${encodeURIComponent(run.rawId)}">${run.rawId}</a></div>`
-        : ""}
-      ${run.pagesWritten !== undefined ? html`<div><strong>写入知识页：</strong>${run.pagesWritten}</div>` : ""}
-      ${run.output
-        ? html`<div><strong>运行输出</strong><div class="contentbox" style="margin-top:8px">${run.output}</div>
-            ${run.outputTruncated ? html`<div class="muted">输出过长，运行记录仅保留前 100,000 个字符。</div>` : ""}</div>`
-        : ""}
-      ${run.error ? html`<div><strong>错误</strong><div class="contentbox" style="margin-top:8px">${run.error}</div></div>` : ""}
-      <div class="actions">${approvalActions}${cancelForm}${retryForm}${notificationRetry}</div>
-    </div>`;
+      ${rawHref ? html`<div>原始记录编号：<a href="${rawHref}">${run.rawId}</a></div>` : ""}
+      ${run.status !== "succeeded" ? pagesWritten : ""}
+      ${run.status !== "succeeded" && (run.output || run.summary) ? html`<div><strong>运行输出</strong>${output}</div>` : ""}
+      ${run.error && (active || run.status === "succeeded") ? html`<div><strong>错误：</strong>${run.error}</div>` : ""}
+      </div>
+    </details>
+    ${active ? html`<script>${raw(taskRunRefreshScript())}</script>` : ""}
+  </article>`;
 }
 
 const CHAT_RUN_ERROR_LABELS: Record<NonNullable<ChatRun["error"]>["kind"], string> = {
@@ -2048,7 +2134,7 @@ const CHAT_RUN_ERROR_LABELS: Record<NonNullable<ChatRun["error"]>["kind"], strin
 function executionEvidenceView(run: ChatRun): HtmlEscapedString | Promise<HtmlEscapedString> {
   const evidence = run.executionEvidence;
   if (!evidence) return html`<div><strong>执行证据：</strong>未记录执行证据（旧运行或非采集路径），不能据此推断没有调用工具。</div>`;
-  return html`<details><summary>执行证据 · ${evidence.calls.length} 次 Provider 调用记录</summary>
+  return html`<details id="chat-run-evidence"><summary>执行证据 · ${evidence.calls.length} 次 Provider 调用记录</summary>
     ${evidence.preparationFailure ? html`<p><strong>运行准备失败：</strong>
       ${evidence.preparationFailure.stage === "native-session" ? html`${NATIVE_SESSION_ISSUE_LABELS[evidence.preparationFailure.reason]}
         · ${evidence.preparationFailure.reason}${evidence.preparationFailure.exitCode === undefined ? "" : ` · 退出码 ${evidence.preparationFailure.exitCode}`}`
@@ -2075,12 +2161,24 @@ function executionEvidenceView(run: ChatRun): HtmlEscapedString | Promise<HtmlEs
   </details>`;
 }
 
+function chatRunText(text: string, disclosureId: string, fullLabel: string) {
+  if (Array.from(text).length <= 110 && text.split(/\r\n|\r|\n/u, 4).length <= 3) {
+    return html`<div class="chat-run-text">${text}</div>`;
+  }
+  const compact = text.trim().replace(/\s+/gu, " ");
+  const preview = Array.from(compact).slice(0, 90).join("");
+  return html`<details id="${disclosureId}">
+    <summary><span class="chat-run-preview">${preview}${preview.length < compact.length ? "…" : ""} </span><span class="chat-run-full-label">${fullLabel}</span></summary>
+    <div class="chat-run-text">${text}</div></details>`;
+}
+
 export function chatRunView(
   run: ChatRun,
   flashMsg?: string,
   queue?: RunQueueInfo,
   reruns: QualityRerun[] = [],
   localAuthorization?: string,
+  deliveryActive = false,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const retryable =
     ["failed", "cancelled", "timed_out"].includes(run.status)
@@ -2088,79 +2186,109 @@ export function chatRunView(
       run.status === "succeeded"
       && run.delivery.status !== "sent"
       && Boolean(run.output)
+      && !deliveryActive
     );
   const cancellable = run.status === "queued" || run.status === "running";
   const evaluable = run.status === "succeeded"
     && run.traceId !== undefined
     && run.executionPlan !== undefined;
-  const status = run.status === "queued"
-    ? html`<span class="badge">排队中</span>`
-    : run.status === "running"
-    ? html`<span class="badge">运行中</span>`
-    : run.status === "succeeded"
-      ? html`<span class="badge knowledge">成功</span>`
-      : run.status === "timed_out"
-        ? html`<span class="badge general">已超时</span>`
-        : html`<span class="badge general">失败</span>`;
-  const deliveryLabel = run.delivery.status === "sent"
-    ? "已发送"
-    : run.delivery.status === "failed"
-      ? "发送失败"
-      : "待发送";
-  const milliseconds = run.finishedAt
+  const cancelling = cancellable && run.cancelRequestedAt !== undefined;
+  const statusLabel = cancelling ? "正在取消" : {
+    queued: "排队中", running: "运行中", succeeded: "已完成", failed: "执行失败", cancelled: "已取消", timed_out: "已超时",
+  }[run.status];
+  const deliveryLabel = run.delivery.status === "sent" ? "已发送" : deliveryActive ? "发送中"
+    : run.delivery.status === "failed" ? "发送失败" : run.status === "succeeded" && run.delivery.attempts > 0 ? "结果待确认"
+    : cancellable || run.status === "succeeded" ? "待发送" : "未发送";
+  const milliseconds = run.finishedAt !== undefined
     ? Math.max(0, run.finishedAt - (run.runStartedAt ?? run.startedAt))
     : undefined;
   const duration = milliseconds === undefined
-    ? run.status === "queued" ? "排队中" : "运行中"
+    ? cancellable ? statusLabel : "耗时未记录"
     : milliseconds < 1000
       ? `${milliseconds} ms`
       : `${(milliseconds / 1000).toFixed(1)} 秒`;
   const skillEvidence = run.skillEvidence;
   const skillWarnings = skillEvidence ? skillWarningViews({ skipped: skillEvidence.skipped }) : [];
-  return html`<h1>Chat Run 详情</h1>
-    <p class="subtitle">${run.id}</p>
+  const runPath = `/chats/runs/${encodeURIComponent(run.id)}`;
+  const caption = run.output?.match(chatAnswerModelCaption)?.[0] ?? "";
+  const answer = run.output?.slice(caption.length);
+  const emptyAnswer = {
+    queued: "正在等待执行。", running: "正在生成回答。", succeeded: "本次运行没有保存回答正文。",
+    failed: "本次运行未能生成回答。", cancelled: "没有生成回答。", timed_out: "未在时限内生成回答。",
+  }[run.status];
+  return html`<article id="live-run" data-run-id="${run.id}" data-terminal="${cancellable ? "0" : "1"}"
+    data-run-status="${run.status}" data-delivery-status="${run.delivery.status}" data-delivery-attempts="${run.delivery.attempts}"
+    data-cancel-requested="${run.cancelRequestedAt !== undefined ? "1" : "0"}" data-delivery-active="${deliveryActive ? "1" : "0"}">
+    <style>
+      #live-run { min-width:0; overflow-wrap:anywhere; }
+      #live-run h2 { font-size:16px; margin:0 0 6px; }
+      #live-run summary { cursor:pointer; font-weight:600; }
+      #chat-run-overview { display:grid; gap:16px; }
+      .chat-run-states { display:flex; flex-wrap:wrap; align-items:baseline; gap:6px 18px; font-size:14px; }
+      .chat-run-states .badge { margin-left:5px; }
+      .chat-run-text, #live-run-answer { white-space:pre-wrap; line-height:1.7; }
+      .chat-run-response { border-top:1px solid var(--border); padding-top:14px; }
+      #chat-run-overview details > summary { font-weight:400; }
+      #chat-run-overview .chat-run-full-label { color:var(--accent); font-size:13px; }
+      #chat-run-overview details[open] .chat-run-preview { display:none; }
+      #chat-run-overview details[open] .chat-run-text { margin-top:5px; }
+      #chat-run-actions:empty { display:none; }
+      .chat-run-facts { display:grid; gap:10px; margin-top:14px; }
+      #live-run-events { list-style:none; margin:16px 0 0 5px; padding:0 0 0 20px; border-left:2px solid var(--border); }
+      #live-run-events li { position:relative; padding:0 0 16px; overflow-wrap:anywhere; }
+      #live-run-events li::before { content:""; position:absolute; left:-25px; top:7px; width:8px; height:8px; background:var(--border); border-radius:50%; }
+      #live-run-events .run-note { white-space:pre-wrap; line-height:1.75; }
+      #live-run-events .run-note::before { background:var(--accent); }
+      #live-run-events .run-tool, #live-run-events .run-status { color:var(--muted); font-size:13px; }
+      #live-run-events .run-tool-failed { color:var(--danger); }
+    </style>
+    <h1>对话详情</h1>
     ${flash(flashMsg)}
-    <div class="card stack">
-      <div><strong>状态：</strong>${status}</div>
+    <section class="card" id="chat-run-overview" aria-label="对话与飞书投递">
+      <div class="chat-run-states">
+        <span>运行状态 <strong id="chat-run-status">${statusLabel}</strong></span>
+        <span>飞书投递 <strong id="chat-run-delivery" class="badge ${run.delivery.status === "failed" && !deliveryActive ? "down" : run.delivery.status === "sent" ? "ok" : ""}">${deliveryLabel}</strong></span>
+      </div>
+      <section id="chat-run-question"><h2>原问题</h2>
+        ${chatRunText(run.input, "chat-run-full-question", "完整问题")}
+        ${run.inputTruncated ? html`<div class="muted">输入过长，重试只会使用已保留的前 100,000 个字符。</div>` : ""}
+      </section>
+      ${queue ? html`<div>队列位置：第 ${queue.position} 位 · 已等待 ${Math.round(queue.waitedMs / 1000)} 秒</div>` : ""}
+      ${run.error ? html`<div><strong>${CHAT_RUN_ERROR_LABELS[run.error.kind]}</strong>
+        ${chatRunText(run.error.message, "chat-run-full-error", "完整原因")}</div>` : ""}
+      ${run.delivery.error ? html`<div><strong>${deliveryActive ? "上次投递错误" : "投递错误"}</strong>
+        ${chatRunText(run.delivery.error, "chat-run-full-delivery-error", "完整投递错误")}</div>` : ""}
+      <div id="chat-run-actions" class="actions">${cancellable && !cancelling ? html`<form method="post" action="${runPath}/cancel" class="inline-form"
+        onsubmit="return confirm('取消这次对话运行？')"><button type="submit" class="secondary">取消运行</button></form>` : ""}${retryable
+        ? html`<form method="post" action="${runPath}/retry" class="inline-form">
+          <button type="submit">${run.status === "succeeded" ? "重试投递" : "重试文本回答"}</button></form>
+          ${run.status === "succeeded" ? html`<span class="muted">使用已有回答重新发送。</span>` : ""}` : ""}</div>
+      <section class="chat-run-response"><h2>回答</h2>
+        <div id="live-run-answer">${answer || (cancelling ? "正在等待运行停止。" : emptyAnswer)}</div>
+        ${run.outputTruncated ? html`<div class="muted">输出过长，运行记录仅保留前 100,000 个字符。</div>` : ""}
+      </section>
+    </section>
+    <details class="card" id="chat-run-process">
+      <summary>实时执行轨迹 <span id="live-run-summary" class="muted" role="status">正在加载…</span></summary>
+      <ol id="live-run-events"><li class="muted">正在加载事件…</li></ol>
+    </details>
+    <details class="card" id="chat-run-details"><summary>运行记录、模型参数与执行证据</summary>
+      <div class="chat-run-facts">
+      <div><strong>运行编号：</strong>${run.id}</div>
+      <div><strong>空间：</strong>${run.space}</div>
       <div><strong>排队时间：</strong>${fmtTime(run.queuedAt)}</div>
       <div><strong>开始时间：</strong>${fmtTime(run.runStartedAt)}</div>
-      ${queue
-        ? html`<div><strong>队列位置：</strong>第 ${queue.position} 位 · 已等待 ${Math.round(queue.waitedMs / 1000)} 秒</div>`
-        : ""}
       <div><strong>完成时间：</strong>${fmtTime(run.finishedAt)} · ${duration}</div>
       <div><strong>执行快照：</strong>${run.provider ?? "未记录"} / ${run.model || "CLI 默认模型"}
         ${run.reasoningEffort ? ` · reasoning ${run.reasoningEffort}` : ""}</div>
+      ${caption ? html`<div class="chat-run-text">${caption.trimEnd().replace(/^> /gmu, "")}</div>` : ""}
       <div><strong>冻结权限：</strong>${run.executionPlan?.execution?.permission ?? run.execution?.permission ?? "未记录"}</div>
       ${localAuthorization ? html`<div><strong>当前本机授权：</strong>${localAuthorization}</div>` : ""}
       ${executionEvidenceView(run)}
-      <div id="live-run" data-run-id="${run.id}" data-terminal="${["succeeded", "failed", "cancelled", "timed_out"].includes(run.status) ? "1" : "0"}">
-        <style>
-          .run-process { border:1px solid var(--border); border-radius:8px; padding:12px 16px; }
-          .run-process summary { cursor:pointer; font-weight:600; }
-          #live-run-events { list-style:none; margin:16px 0 0 5px; padding:0 0 0 20px; border-left:2px solid var(--border); }
-          #live-run-events li { position:relative; padding:0 0 16px; overflow-wrap:anywhere; }
-          #live-run-events li::before { content:""; position:absolute; left:-25px; top:7px; width:8px; height:8px; background:var(--border); border-radius:50%; }
-          #live-run-events .run-note { white-space:pre-wrap; line-height:1.75; }
-          #live-run-events .run-note::before { background:var(--accent); }
-          #live-run-events .run-tool, #live-run-events .run-status { color:var(--muted); font-size:13px; }
-          #live-run-events .run-tool-failed { color:var(--danger); }
-        </style>
-        <details class="run-process" ${["succeeded", "failed", "cancelled", "timed_out"].includes(run.status) ? "" : "open"}>
-          <summary>实时执行轨迹 <span id="live-run-summary" class="muted" role="status">正在加载…</span></summary>
-          <ol id="live-run-events"><li class="muted">正在加载事件…</li></ol>
-        </details>
-        <div id="live-run-answer" class="contentbox" style="margin-top:10px;display:${run.output ? "block" : "none"}">${run.output ?? ""}</div>
-        ${run.outputTruncated ? html`<div class="muted">输出过长，运行记录仅保留前 100,000 个字符。</div>` : ""}
-      </div>
-      <script>${raw(chatRunLiveScript())}</script>
-      <div><strong>空间：</strong>${run.space}</div>
-      <div><strong>投递：</strong>${deliveryLabel} · 已尝试 ${run.delivery.attempts} 次</div>
+      <div><strong>投递次数：</strong>${run.delivery.attempts}</div>
       ${run.usage ? runUsageView(run.usage) : ""}
       ${run.delivery.lastAttemptAt
         ? html`<div><strong>最近投递：</strong>${fmtTime(run.delivery.lastAttemptAt)}</div>`
-        : ""}
-      ${run.delivery.error
-        ? html`<div><strong>投递错误：</strong><span class="muted">${run.delivery.error}</span></div>`
         : ""}
       ${run.retryOf
         ? html`<div><strong>重试来源：</strong><a href="/chats/runs/${encodeURIComponent(run.retryOf)}">${run.retryOf}</a></div>`
@@ -2186,13 +2314,6 @@ export function chatRunView(
               : ""}
           </div>`
         : ""}
-      <div><strong>输入</strong><div class="contentbox" style="margin-top:8px">${run.input}</div>
-        ${run.inputTruncated ? html`<div class="muted">输入过长，重试只会使用已保留的前 100,000 个字符。</div>` : ""}
-      </div>
-      ${run.error
-        ? html`<div><strong>${CHAT_RUN_ERROR_LABELS[run.error.kind]}</strong>
-            <div class="contentbox" style="margin-top:8px">${run.error.message}</div></div>`
-        : ""}
       ${reruns.length > 0
         ? html`<div><strong>重新评测：</strong><ul>${reruns.map((rerun) => html`<li>
             ${fmtTime(rerun.createdAt)} · ${rerun.status === "completed" ? "已完成" : rerun.status === "failed" ? "失败" : "运行中"}
@@ -2200,73 +2321,118 @@ export function chatRunView(
             ${rerun.error ? ` · ${rerun.error}` : ""}
           </li>`)}</ul></div>`
         : ""}
-      ${cancellable || retryable || evaluable
-        ? html`<div class="actions">
-            ${cancellable
-              ? html`<form method="post" action="/chats/runs/${encodeURIComponent(run.id)}/cancel" class="inline-form"
-                  onsubmit="return confirm('取消这次 Chat Run？')">
-                  <button type="submit" class="danger">取消运行</button>
-                </form>`
-              : ""}
-            ${retryable ? html`
-            <form method="post" action="/chats/runs/${encodeURIComponent(run.id)}/retry" class="inline-form">
-              <button type="submit">${run.status === "succeeded" ? "重试投递" : "重试文本回答"}</button>
-            </form>
-            ` : ""}
-            ${evaluable ? html`
-            <form method="post" action="/chats/runs/${encodeURIComponent(run.id)}/evaluate" class="inline-form">
-              <button type="submit" class="secondary">按冻结快照重新评测</button>
-            </form>
-            ` : ""}
-          </div>`
-        : ""}
-    </div>`;
+      ${evaluable ? html`<form method="post" action="${runPath}/evaluate" class="inline-form">
+        <button type="submit" class="secondary">按冻结快照重新评测</button></form>` : ""}
+      </div>
+    </details>
+    <script>${raw(chatRunLiveScript())}</script>
+  </article>`;
 }
 
 // ---- Reminders ------------------------------------------------------------
 
-const REMINDER_STATUS_LABELS: Record<Reminder["status"], string> = {
-  scheduled: "待提醒",
-  completed: "已完成",
-  cancelled: "已取消",
-};
+function reminderHistoryTime(reminder: Reminder): number | undefined {
+  return reminder.status === "completed" ? reminder.completedAt : reminder.cancelledAt;
+}
+
+function reminderTime(at: number | undefined, kind: "next" | "completed" | "cancelled" | "previous") {
+  const date = new Date(at ?? NaN);
+  const iso = date.toJSON();
+  if (!iso) return html`<span data-reminder-time="${kind}">${at === undefined ? "未记录" : "时间无效"}</span>`;
+  return html`<time data-reminder-time="${kind}" datetime="${iso}">${date.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}</time>`;
+}
+
+function reminderInterval(ms: number): string {
+  if (ms % 86_400_000 === 0) return `${ms / 86_400_000} 天`;
+  if (ms % 3_600_000 === 0) return `${ms / 3_600_000} 小时`;
+  if (ms % 60_000 === 0) return `${ms / 60_000} 分钟`;
+  return `${ms / 1_000} 秒`;
+}
+
+function reminderRow(reminder: Reminder) {
+  const pending = reminder.status === "scheduled";
+  const path = `/reminders/${encodeURIComponent(reminder.id)}`;
+  const historyTime = reminderHistoryTime(reminder);
+  const repeatRule = reminder.untilConfirmed && reminder.repeatEveryMs !== undefined
+    ? `每 ${reminderInterval(reminder.repeatEveryMs)}，直到确认` : undefined;
+  return html`<li data-reminder-id="${reminder.id}" data-reminder-status="${reminder.status}">
+    <div class="reminder-main">
+      <h3 class="reminder-title">${reminder.title}</h3>
+      <div class="reminder-timing">
+        ${reminder.status === "scheduled"
+          ? html`<span>下次提醒 ${reminderTime(reminder.nextTriggerAt, "next")}</span>`
+          : html`<span>${reminder.status === "completed" ? "已完成" : "已取消"} · ${historyTime === undefined ? "处理时间" : ""}${reminderTime(historyTime, reminder.status)}</span>`}
+        ${pending && repeatRule ? html`<span class="muted">${repeatRule}</span>` : ""}
+      </div>
+    </div>
+    ${pending ? html`<div class="actions reminder-actions">
+      <form method="post" action="${path}/complete" class="inline-form">
+        <button type="submit" class="secondary">标记完成</button>
+      </form>
+      <form method="post" action="${path}/cancel" class="inline-form" onsubmit="return confirm('取消该提醒？')">
+        <button type="submit" class="secondary reminder-cancel">取消提醒</button>
+      </form>
+    </div>` : ""}
+    <details class="reminder-meta"><summary>${reminder.title.length > 72 || reminder.title.includes("\n") ? "查看全文与详情" : "提醒详情"}</summary>
+      <dl>
+        <dt>空间</dt><dd>${reminder.space}</dd>
+        <dt>创建者</dt><dd>${reminder.creatorId}</dd>
+        <dt>提醒编号</dt><dd>${reminder.id}</dd>
+        ${pending ? "" : html`<dt>处理前的提醒时间</dt><dd>${reminderTime(reminder.nextTriggerAt, "previous")}</dd>`}
+        ${!pending && repeatRule ? html`<dt>原重复规则</dt><dd>${repeatRule}</dd>` : ""}
+      </dl>
+    </details>
+  </li>`;
+}
 
 export function remindersView(
   reminders: Reminder[],
   flashMsg?: string,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
-  const rows = reminders.map((reminder) => {
-    const controls = reminder.status === "scheduled"
-      ? html`<div class="actions">
-          <form method="post" action="/reminders/${encodeURIComponent(reminder.id)}/complete" class="inline-form">
-            <button type="submit" class="secondary">标记完成</button>
-          </form>
-          <form method="post" action="/reminders/${encodeURIComponent(reminder.id)}/cancel" class="inline-form"
-            onsubmit="return confirm('取消该提醒？')">
-            <button type="submit" class="danger">取消提醒</button>
-          </form>
-        </div>`
-      : "";
-    return html`<tr>
-      <td><strong>${reminder.title}</strong><div class="muted">${reminder.id}</div></td>
-      <td>${fmtTime(reminder.nextTriggerAt)}</td>
-      <td><span class="badge ${reminder.status === "scheduled" ? "knowledge" : "general"}">${REMINDER_STATUS_LABELS[reminder.status]}</span>
-        ${reminder.untilConfirmed && reminder.repeatEveryMs
-          ? html`<div class="muted">每 ${Math.round(reminder.repeatEveryMs / 3600_000)} 小时，直到确认</div>`
-          : ""}</td>
-      <td>${reminder.space}<div class="muted">创建者：${reminder.creatorId}</div></td>
-      <td>${controls}</td>
-    </tr>`;
-  });
-  return html`<h1>提醒</h1>
-    <p class="subtitle">通过飞书对机器人说“明天上午 9 点提醒我……”即可创建。这里显示持久化状态并提供管理员控制。</p>
+  const upcoming = reminders.filter(reminder => reminder.status === "scheduled")
+    .sort((left, right) => left.nextTriggerAt - right.nextTriggerAt || left.createdAt - right.createdAt);
+  const history = reminders.filter(reminder => reminder.status !== "scheduled")
+    .sort((left, right) => (reminderHistoryTime(right) ?? -Infinity) - (reminderHistoryTime(left) ?? -Infinity));
+  return html`<article class="reminders-page">
+    <style>
+      .reminders-page { min-width:0; overflow-wrap:anywhere; }
+      .reminders-heading { display:flex; align-items:baseline; flex-wrap:wrap; justify-content:space-between; gap:0 12px; }
+      .reminders-heading h2 { margin:0 0 8px; }
+      .reminder-list { padding:0; margin:0; list-style:none; border-top:1px solid var(--border); }
+      .reminder-list li { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:4px 18px;
+        align-items:start; padding:14px 0; border-bottom:1px solid var(--border); }
+      .reminder-title { margin:0; white-space:pre-wrap; font-size:16px; line-height:1.5; }
+      .reminder-list li:has(> .reminder-meta:not([open])) .reminder-title {
+        display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
+      .reminder-timing { display:flex; flex-wrap:wrap; align-items:baseline; gap:2px 14px; font-size:14px; margin-top:4px; }
+      .reminder-timing time { font-variant-numeric:tabular-nums; }
+      .reminder-actions { align-self:center; flex-wrap:wrap; }
+      .reminder-actions button { min-height:40px; }
+      .reminder-actions .reminder-cancel { color:var(--muted); background:transparent; border-color:transparent; }
+      .reminder-meta { grid-column:1 / -1; color:var(--muted); font-size:13px; }
+      .reminders-page summary { cursor:pointer; }
+      .reminder-meta summary { width:fit-content; padding:3px 0; }
+      .reminder-meta dl { display:grid; grid-template-columns:auto minmax(0,1fr); gap:4px 16px; margin:6px 0; }
+      .reminder-meta dd { margin:0; color:var(--fg); }
+      #reminders-history { margin-top:24px; }
+      #reminders-history > summary { font-weight:600; padding:8px 0; }
+      @media(max-width:640px) {
+        .reminder-list li { grid-template-columns:minmax(0,1fr); gap:6px; }
+        .reminder-actions button { min-height:44px; }
+      }
+    </style>
+    <h1>提醒</h1>
+    <p class="subtitle">在飞书里对机器人说“明天上午 9 点提醒我开会”即可创建提醒。</p>
     ${flash(flashMsg)}
-    ${rows.length > 0
-      ? html`<table>
-          <tr><th>内容</th><th>下次提醒</th><th>状态</th><th>空间</th><th>操作</th></tr>
-          ${rows}
-        </table>`
-      : html`<div class="empty">还没有提醒。</div>`}`;
+    <section id="reminders-upcoming" aria-labelledby="reminders-upcoming-title">
+      <div class="reminders-heading"><h2 id="reminders-upcoming-title">待提醒（${upcoming.length}）</h2><span class="muted">北京时间</span></div>
+      ${upcoming.length ? html`<ul class="reminder-list">${upcoming.map(reminderRow)}</ul>`
+        : html`<p class="card muted">${history.length ? "当前没有待提醒。" : "还没有提醒。"}</p>`}
+    </section>
+    ${history.length ? html`<details id="reminders-history"><summary>处理历史（${history.length}）</summary>
+      <ul class="reminder-list">${history.map(reminderRow)}</ul>
+    </details>` : ""}
+  </article>`;
 }
 
 // ---- Guided learning ------------------------------------------------------

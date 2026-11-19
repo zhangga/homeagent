@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -143,7 +143,95 @@ describe("web backend (read-only)", () => {
     expect(body).not.toContain("id: 1");
 
     const detail = await app.request(`/chats/runs/${encodeURIComponent(run.id)}`);
+    expect(detail.headers.get("cache-control")).toBe("no-store");
     expect(await detail.text()).toContain("实时执行轨迹");
+  });
+
+  test("Chat status exposes cancellation and delivery changes without including answer or diagnostics", async () => {
+    const run = engine.chatRuns.start({ space: SPACE, input: "仅详情可见的问题", trigger: "message" });
+    const path = `/chats/runs/${run.id}/status`;
+    const status = await app.request(path);
+    expect(status.headers.get("cache-control")).toBe("no-store");
+    expect(await status.json()).toEqual({
+      status: "queued", delivery: { status: "pending", attempts: 0 }, cancelRequested: false, deliveryActive: false,
+    });
+    engine.chatRuns.begin(run.id);
+    engine.chatRuns.requestCancel(run.id);
+    expect(await (await app.request(path)).json()).toEqual({
+      status: "running", delivery: { status: "pending", attempts: 0 }, cancelRequested: true, deliveryActive: false,
+    });
+    expect((await app.request("/chats/runs/missing/status")).status).toBe(404);
+    expect((await createWebApp({ engine, adminToken: "private-admin" }).request(path)).status).toBe(401);
+  });
+
+  test("a stale retry during the first Chat delivery does not dispatch again", async () => {
+    const run = engine.chatRuns.start({ space: SPACE, input: "查看进度", trigger: "message" });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const delivered = engine.runScheduler.schedule({ id: run.id, priority: "interactive", layers: [{ key: "chat-delivery", limit: 1 }],
+      execute: async () => {
+        engine.chatRuns.begin(run.id);
+        engine.chatRuns.succeed(run.id, { output: "已保存的回答", finishedAt: Date.now() });
+        engine.chatRuns.startDeliveryAttempt(run.id, Date.now());
+        entered.resolve();
+        await release.promise;
+        engine.chatRuns.deliverySent(run.id, Date.now());
+      },
+    });
+    const retryApp = createWebApp({ engine, onChatRunRetry: async () => { throw new Error("unexpected second delivery"); } });
+    const path = `/chats/runs/${run.id}`;
+    try {
+      await entered.promise;
+      expect(await (await retryApp.request(`${path}/status`)).json()).toEqual({
+        status: "succeeded", delivery: { status: "pending", attempts: 1 }, cancelRequested: false, deliveryActive: true,
+      });
+      const early = await retryApp.request(`${path}/retry`, { method: "POST" });
+      expect(decodeURIComponent(early.headers.get("location") ?? "")).toContain("正在投递");
+    } finally {
+      release.resolve();
+      await delivered;
+    }
+    const stale = await retryApp.request(`${path}/retry`, { method: "POST" });
+    expect(decodeURIComponent(stale.headers.get("location") ?? "")).toContain("已经发送");
+    expect(await (await retryApp.request(`${path}/status`)).json()).toEqual({
+      status: "succeeded", delivery: { status: "sent", attempts: 1 }, cancelRequested: false, deliveryActive: false,
+    });
+  });
+
+  test.each(["pending", "failed"] as const)("duplicate Chat delivery requests share a single attempt on a saved %s result", async (previous) => {
+    const run = engine.chatRuns.start({ space: SPACE, input: "不重新计算", trigger: "message" });
+    engine.chatRuns.begin(run.id);
+    engine.chatRuns.succeed(run.id, { output: "已保存的原回答", finishedAt: Date.now() });
+    engine.chatRuns.startDeliveryAttempt(run.id, Date.now());
+    if (previous === "failed") engine.chatRuns.deliveryFailed(run.id, "发送失败");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const deliveries: string[] = [];
+    const retryApp = createWebApp({ engine, onChatRunRetry: async id => {
+      deliveries.push(engine.chatRuns.get(id)!.output!);
+      engine.chatRuns.startDeliveryAttempt(id, Date.now());
+      entered.resolve();
+      await release.promise;
+      return engine.chatRuns.deliverySent(id, Date.now())!;
+    } });
+    const path = `/chats/runs/${run.id}`;
+    const retry = () => retryApp.request(`${path}/retry`, { method: "POST" });
+    const first = retry();
+    await entered.promise;
+    const second = retry();
+    try {
+      expect(await (await retryApp.request(`${path}/status`)).json()).toEqual({
+        status: "succeeded", delivery: { status: "pending", attempts: 2 }, cancelRequested: false, deliveryActive: true,
+      });
+    } finally {
+      release.resolve();
+    }
+    for (const response of await Promise.all([first, second])) {
+      expect(decodeURIComponent(response.headers.get("location") ?? "")).toContain("已经发送");
+    }
+    expect(deliveries).toEqual(["已保存的原回答"]);
+    expect(engine.chatRuns.list(SPACE)).toHaveLength(1);
+    expect(engine.chatRuns.get(run.id)?.delivery.attempts).toBe(2);
   });
 
   test("serves only the injected HomeAgent Feishu avatar with manual-upload guidance", async () => {
@@ -559,17 +647,18 @@ describe("web backend (read-only)", () => {
       },
     });
 
-    const page = await recovering.request(`/agents/${encodeURIComponent(selected.id)}`);
+    const page = await recovering.request(`/agents/${encodeURIComponent(selected.id)}?edit=1`);
     expect(await page.text()).toContain(
-      `action="/agents/${encodeURIComponent(selected.id)}/provider/windows-sandbox"`,
+      `action="/agents/${encodeURIComponent(selected.id)}/provider/windows-sandbox?edit=1"`,
     );
 
     const start = await recovering.request(
-      `/agents/${encodeURIComponent(selected.id)}/provider/windows-sandbox`,
+      `/agents/${encodeURIComponent(selected.id)}/provider/windows-sandbox?edit=1`,
       { method: "POST" },
     );
     expect([302, 303]).toContain(start.status);
     expect(starts).toBe(1);
+    expect(start.headers.get("location")).toStartWith(`/agents/${selected.id}?edit=1&ok=`);
     expect(decodeURIComponent(start.headers.get("location") ?? "")).toContain(
       "请在 Windows 系统窗口中批准管理员授权",
     );
@@ -2711,7 +2800,7 @@ describe("management backend (read-write)", () => {
     expect(body).not.toContain("PRIVATE_SKILL_BODY");
   });
 
-  test("creating an agent via POST persists and redirects to its editor", async () => {
+  test("creating an agent via POST persists and opens its published overview", async () => {
     const form = new URLSearchParams({ name: "知识助手", instruction: "简洁作答", model: "", provider: "claude", visibility: "Team" });
     const res = await app.request("/agents", {
       method: "POST",
@@ -2722,9 +2811,10 @@ describe("management backend (read-write)", () => {
     const agents = engine.agents.list();
     expect(agents.length).toBe(1);
     expect(agents[0]!.name).toBe("知识助手");
-    // the agent editor renders the saved instruction
-    const view = await (await app.request(`/agents/${encodeURIComponent(agents[0]!.id)}`)).text();
+    expect(res.headers.get("location")).toStartWith(`/agents/${agents[0]!.id}?ok=`);
+    const view = await (await app.request(res.headers.get("location")!)).text();
     expect(view).toContain("简洁作答");
+    expect(view).toContain(`href="/agents/${agents[0]!.id}?edit=1"`);
   });
 
   test.each([
@@ -2755,7 +2845,7 @@ describe("management backend (read-write)", () => {
       expect(agent?.model).toBe(model);
       expect(agent?.reasoningEffort).toBe(reasoningEffort);
 
-      const view = await (await app.request(`/agents/${encodeURIComponent(agent!.id)}`)).text();
+      const view = await (await app.request(`/agents/${encodeURIComponent(agent!.id)}?edit=1`)).text();
       expect(view).toContain('name="reasoningEffort"');
       expect(view).toContain(`value="${model}" selected`);
       expect(view).toContain(`value="${reasoningEffort}" selected`);
@@ -2797,7 +2887,12 @@ describe("management backend (read-write)", () => {
       provider: "codex",
     }));
 
-    const draftPage = await (await app.request(`/agents/${encodeURIComponent(created.id)}`)).text();
+    expect(savedDraft.headers.get("location")).toStartWith(`/agents/${created.id}?edit=1&ok=`);
+    const overview = await (await app.request(`/agents/${created.id}`)).text();
+    expect(overview).toContain("release one");
+    expect(overview).not.toContain("release two");
+    expect(overview).not.toContain('<form id="agent-editor-form"');
+    const draftPage = await (await app.request(savedDraft.headers.get("location")!)).text();
     expect(draftPage).toContain("release two");
     expect(draftPage).toContain("有未发布草稿");
     expect(draftPage).toContain('name="agentAction" value="draft"');
@@ -2814,6 +2909,7 @@ describe("management backend (read-write)", () => {
       body: editorBody.toString(),
     });
     expect([302, 303]).toContain(published.status);
+    expect(published.headers.get("location")).toStartWith(`/agents/${created.id}?ok=`);
     expect(engine.agents.get(created.id)).toEqual(expect.objectContaining({
       instruction: "release two",
       provider: "codex",
@@ -2821,7 +2917,7 @@ describe("management backend (read-write)", () => {
 
     const publishedHead = engine.agents.listRevisions(created.id)[0]!.id;
     const publishedPage = await (
-      await app.request(`/agents/${encodeURIComponent(created.id)}`)
+      await app.request(`/agents/${encodeURIComponent(created.id)}?edit=1`)
     ).text();
     for (const historicalDraft of engine.agents.listRevisions(created.id)
       .filter((revision) => revision.source === "draft")) {
@@ -3001,7 +3097,7 @@ describe("management backend (read-write)", () => {
     expect([302, 303]).toContain(response.status);
     const agent = engine.agents.list().find((item) => item.name === "继承 Sol");
     expect(agent?.reasoningEffort).toBe("max");
-    const view = await (await app.request(`/agents/${encodeURIComponent(agent!.id)}`)).text();
+    const view = await (await app.request(`/agents/${encodeURIComponent(agent!.id)}?edit=1`)).text();
     expect(view).toContain('value="max" selected');
   });
 
@@ -3057,7 +3153,7 @@ describe("management backend (read-write)", () => {
     const model = "gpt-5.6-terra";
     const draft = engine.saveAgentDraft(agent.id, { model, reasoningEffort: "ultra" }, agent.publishedRevisionId)!;
     const path = `/agents/${agent.id}`;
-    const view = await (await app.request(path)).text();
+    const view = await (await app.request(`${path}?edit=1`)).text();
     expect(view).toContain(`value="${model}" selected`);
     const form = { name: "已发布草稿", provider: "codex", model, reasoningEffort: "ultra" };
     const post = (url: string, fields: Record<string, string>) => app.request(url, {
@@ -3153,7 +3249,51 @@ describe("management backend (read-write)", () => {
     expect(body).not.toContain("Repositories");
   });
 
-  test("agents index selects the first Agent and the editor shows its bindings", async () => {
+  test("the published overview defers editor catalogs while retaining provider status", async () => {
+    const agent = engine.agents.create({ name: "已发布助手", provider: "claude" });
+    let detections = 0;
+    let modelCatalogs = 0;
+    let skillCatalogs = 0;
+    const currentSkills = engine.skillCatalog.currentAsync.bind(engine.skillCatalog);
+    engine.skillCatalog.currentAsync = async (...args) => {
+      skillCatalogs++;
+      return currentSkills(...args);
+    };
+    const overviewApp = createWebApp({
+      engine,
+      detectProviders: async () => {
+        detections++;
+        return [{ id: "claude", name: "Claude Code", bin: "claude", available: true, detail: "2.x" }];
+      },
+      providerModels: async () => { modelCatalogs++; return { claude: ["sonnet"] }; },
+    });
+    const home = await overviewApp.request(`/agents/${agent.id}`);
+    expect(home.status).toBe(200);
+    expect(await home.text()).toContain("Claude Code");
+    expect([detections, modelCatalogs, skillCatalogs]).toEqual([1, 0, 0]);
+    const editor = await overviewApp.request(`/agents/${agent.id}?edit=1`);
+    expect(editor.status).toBe(200);
+    expect(await editor.text()).toContain('id="agent-provider"');
+    expect([detections, modelCatalogs, skillCatalogs]).toEqual([1, 1, 1]);
+  });
+
+  test("overview and editor retain the published version number beyond the visible history of drafts", async () => {
+    const agent = engine.agents.create({ name: "版本助手", instruction: "当前线上职责", provider: "claude" });
+    for (let i = 1; i <= 21; i++) {
+      engine.saveAgentDraft(agent.id, { instruction: `草稿职责 ${i}` });
+    }
+    expect(engine.agents.listRevisions(agent.id).slice(0, 20).every((revision) => revision.source === "draft")).toBe(true);
+    const path = `/agents/${agent.id}`;
+    const overview = await (await app.request(path)).text();
+    expect(overview).toContain("已发布 · v1");
+    expect(overview).toContain("当前线上职责");
+    expect(overview).not.toContain("草稿职责 21");
+    const editor = await (await app.request(`${path}?edit=1`)).text();
+    expect(editor).toContain("线上 v1");
+    expect(editor).toContain("草稿职责 21");
+  });
+
+  test("agents index selects a published overview before opening the editor or returning to the list", async () => {
     const first = engine.agents.create({ name: "首选助手", provider: "claude" });
     engine.updateSpaceMeta(SPACE, { agentId: first.id, name: "产品讨论群" });
 
@@ -3161,7 +3301,11 @@ describe("management backend (read-write)", () => {
     expect([302, 303]).toContain(index.status);
     expect(index.headers.get("location")).toBe(`/agents/${encodeURIComponent(first.id)}`);
 
-    const body = await (await app.request(index.headers.get("location")!)).text();
+    const overview = await (await app.request(index.headers.get("location")!)).text();
+    expect(overview).toContain("产品讨论群");
+    expect(overview).toContain(`href="/agents/${first.id}?edit=1"`);
+    expect(overview).not.toContain('id="agent-provider"');
+    const body = await (await app.request(`/agents/${first.id}?edit=1`)).text();
     expect(body).toContain('data-pane="agent-list"');
     expect(body).toContain('data-pane="agent-editor"');
     expect(body).toContain('data-pane="agent-inspector"');
@@ -3172,7 +3316,7 @@ describe("management backend (read-write)", () => {
       body.indexOf('data-pane="agent-inspector"'),
     );
     const inspectorBody = body.slice(body.indexOf('data-pane="agent-inspector"'));
-    expect(editorBody).toContain("Recent runs");
+    expect(editorBody).toContain("最近运行");
     expect(inspectorBody).toContain(">Agent 设置<");
     expect(inspectorBody).toContain('id="agent-provider"');
     expect(inspectorBody).toContain('form="agent-editor-form"');
@@ -3250,6 +3394,18 @@ describe("management backend (read-write)", () => {
     expect(fake.calls.length).toBe(calls);
   });
 
+  test("refreshing recent Agent runs retains the current overview or editor pagination link", async () => {
+    const agent = engine.agents.create({ name: "分页助手", provider: "claude" });
+    for (let i = 0; i < 21; i++) {
+      engine.chatRuns.start({ space: SPACE, trigger: "message", input: `对话 ${i}`, agentId: agent.id });
+    }
+    const url = `/agents/activity?agent=${agent.id}&runs=20`;
+    const overview = await (await app.request(url)).json();
+    expect(overview).toHaveProperty("recentHtml", expect.stringContaining(`href="/agents/${agent.id}?runs=40"`));
+    const editor = await (await app.request(`${url}&edit=1`)).json();
+    expect(editor).toHaveProperty("recentHtml", expect.stringContaining(`href="/agents/${agent.id}?edit=1&amp;runs=40"`));
+  });
+
   test("Agent activity uses management authorization and works without configured Agents", async () => {
     const run = engine.chatRuns.start({ space: SPACE, input: "默认任务", trigger: "message" });
     const secured = createWebApp({ engine, adminToken: "activity-admin", agentReadToken: "activity-reader",
@@ -3286,15 +3442,10 @@ describe("management backend (read-write)", () => {
     const body = await (
       await app.request(`/agents/${encodeURIComponent(selected.id)}`)
     ).text();
-    const editorBody = body.slice(
-      body.indexOf('data-pane="agent-editor"'),
-      body.indexOf('data-pane="agent-inspector"'),
-    );
-
-    expect(editorBody).toContain("Recent runs");
-    expect(editorBody).toContain("Chat");
-    expect(editorBody).toContain("summarize the release status");
-    expect(editorBody).toContain(
+    expect(body).toContain("最近运行");
+    expect(body).toContain("Chat");
+    expect(body).toContain("summarize the release status");
+    expect(body).toContain(
       `/spaces/${encodeURIComponent(SPACE)}/raw/${encodeURIComponent(rawId)}`,
     );
   });
@@ -3332,7 +3483,7 @@ describe("management backend (read-write)", () => {
     const detail = await retryApp.request(`/chats/runs/${encodeURIComponent(run.id)}`);
     const body = await detail.text();
     expect(detail.status).toBe(200);
-    expect(body).toContain("Chat Run 详情");
+    expect(body).toContain("<h1>对话详情</h1>");
     expect(body).toContain("鉴权失败");
     expect(body).toContain("Provider authentication expired");
     expect(body).toContain(`/chats/runs/${encodeURIComponent(run.id)}/retry`);
@@ -5405,18 +5556,115 @@ describe("management backend (read-write)", () => {
     expect(html).toContain("人工修订");
   });
 
+  test("work attention links to owned live runs and retains chat history without a reverse link", async () => {
+    const item = engine.workItems.create({ space: SPACE, title: "核对对话回复" });
+    const other = "team/oc_elsewhere";
+    engine.ensureSpace(other);
+    const foreignTask = engine.tasks.create({ space: other, name: "其他空间的任务", topic: "其他空间" })!;
+    const foreignRun = engine.taskRuns.start({ task: foreignTask, trigger: "manual", distill: false });
+    engine.workItems.attachTaskRun(item.id, foreignRun.id);
+    const sibling = engine.workItems.create({ space: SPACE, title: "同一空间的另一事项", nextActions: ["另一事项的步骤"] });
+    const siblingAction = engine.workContinuations.claimNext(sibling);
+    const conflictingRun = engine.taskRuns.start({ task: { ...foreignTask, space: SPACE, id: siblingAction.id },
+      workItemId: item.id, workActionId: siblingAction.id, trigger: "manual", distill: false });
+    engine.workItems.attachTaskRun(item.id, conflictingRun.id);
+    const foreignChat = engine.chatRuns.start({ space: other, workItemId: item.id, input: "其他空间私有正文", trigger: "message" });
+    engine.workItems.attachChatRun(item.id, foreignChat.id);
+    const chat = engine.chatRuns.start({ space: SPACE, workItemId: item.id, input: "本事项的进度", trigger: "message" });
+    const view = async (path: string) => {
+      const response = await app.request(path);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      return response.text();
+    };
+    let index = await view("/work");
+    expect(index).toContain(`data-work-item="${item.id}" data-work-state="queued"`);
+    expect(index).toContain(`href="/chats/runs/${chat.id}"`);
+    engine.chatRuns.begin(chat.id);
+    const detail = await view(`/work/${item.id}`);
+    expect(detail).toContain('data-work-attention="running"');
+    expect(detail).toContain("本事项的进度");
+    expect(detail).toContain(`href="/chats/runs/${chat.id}"`);
+    expect(detail).not.toContain(foreignRun.id);
+    expect(detail).not.toContain(conflictingRun.id);
+    expect(detail).not.toContain(foreignChat.id);
+    expect(detail).not.toContain("其他空间私有正文");
+    index = await view("/work");
+    expect(index).toContain(`data-work-item="${item.id}" data-work-state="running"`);
+    expect(index).not.toContain(foreignRun.id);
+    expect(index).not.toContain(conflictingRun.id);
+    expect(index).not.toContain(foreignChat.id);
+  });
+
   test("work plan shows professional workers, child goals and pending dependencies", async () => {
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, skillCatalog: new SkillCatalog({ roots: [] }), runProvider: async () =>
+      JSON.stringify({ version: 1, outcome: "completed", result: "已整理调研来源", blockers: [], checks: [{ name: "来源核对", status: "passed" }] }) });
+    app = createWebApp({ engine });
     const worker = engine.agents.create({ name: "研究专员", visibility: "Team", provider: "codex" });
     const parent = engine.workItems.create({ space: SPACE, title: "独立研究后汇总" });
     engine.commitWorkPlanRevision(engine.prepareWorkPlanRevision(parent.id, { kind: "manual", id: "m3-view" }), [
       { instruction: "汇总", doneWhen: "引用子事项成果", dependsOn: ["a"] },
-    ], { children: [{ key: "a", title: "研究A", goal: "完成调研", steps: [{ instruction: "调研A", doneWhen: "注明来源", agentId: worker.id }] }] });
+      { instruction: "复查", doneWhen: "补齐独立复核", dependsOn: ["b"] },
+    ], { children: [
+      { key: "a", title: "研究A", goal: "完成调研", steps: [{ instruction: "调研A", doneWhen: "注明来源", agentId: worker.id }] },
+      { key: "b", title: "研究B", goal: "独立复核", steps: [{ instruction: "调研B", doneWhen: "注明来源" }] },
+    ] });
     const child = engine.getWorkPlanView(parent.id)!.children[0]!;
+    const planWait = "下一步等待依赖事项「研究A」完成验收。";
+    const editorPlan = spyOn(engine, "getWorkPlanView");
+    const index = await (await app.request("/work")).text();
+    expect(editorPlan).not.toHaveBeenCalled();
+    editorPlan.mockRestore();
+    expect(index).toContain(`data-work-item="${parent.id}" data-work-state="blocked"`);
+    expect(index).toContain(planWait);
+    expect(index).not.toContain("下一步等待依赖事项「研究B」");
     const parentHtml = await (await app.request(`/work/${parent.id}`)).text();
+    expect(parentHtml).toContain('data-work-attention="blocked"');
+    expect(parentHtml).toContain(planWait);
     expect(parentHtml).toContain("独立子事项"); expect(parentHtml).toContain("等待验收"); expect(parentHtml).toContain(`/work/${child.workItemId}`);
     expect(parentHtml).not.toContain(`action="/work/${parent.id}/continue"`);
     const childHtml = await (await app.request(`/work/${child.workItemId}`)).text();
     expect(childHtml).toContain("父目标"); expect(childHtml).toContain("研究专员"); expect(childHtml).toContain("执行 Agent");
+
+    engine.workItems.update(parent.id, { active: false });
+    const paused = "父目标「独立研究后汇总」已暂停";
+    const childPage = `/work/${child.workItemId}`;
+    expect(await (await app.request("/work")).text()).toContain(paused);
+    expect(await (await app.request(childPage)).text()).toContain(paused);
+    engine.workItems.update(parent.id, { active: true });
+    expect(await (await app.request(childPage)).text()).toContain(`action="${childPage}/continue"`);
+    const finished = await (await engine.startWorkContinuationAsync(child.workItemId)).completion;
+    expect(finished.ok).toBe(true);
+    const released = await (await app.request("/work")).text();
+    expect(released).toContain(`data-work-item="${child.workItemId}" data-work-state="completed"`);
+    expect(released).toContain(`data-work-item="${parent.id}" data-work-state="normal"`);
+    expect(released).not.toContain(planWait);
+    const ready = await (await app.request(`/work/${parent.id}`)).text();
+    expect(ready).toContain('data-work-attention="normal"');
+    expect(ready).toContain(`action="/work/${parent.id}/continue"`);
+  });
+
+  test("an active research Task remains visible on its own Work item when the reverse reference is missing", async () => {
+    const item = engine.workItems.create({ space: SPACE, title: "周报里的研究任务" });
+    const sibling = engine.workItems.create({ space: SPACE, title: "独立事项" });
+    const research = engine.tasks.create({ space: SPACE, name: "核对周报材料", topic: "周报调研" })!;
+    const run = engine.taskRuns.start({ task: research, workItemId: item.id, trigger: "manual", distill: false });
+    engine.taskRuns.begin(run.id);
+    const other = engine.workItems.create({ space: SPACE, title: "另一个动作", nextActions: ["生成摘要"] });
+    const action = engine.workContinuations.claimNext(other);
+    const conflicting = engine.taskRuns.start({ task: { ...research, id: action.id }, workItemId: sibling.id, trigger: "manual", distill: false });
+    expect(engine.workItems.get(item.id)?.taskRunIds).toEqual([]);
+    const index = await (await app.request("/work")).text();
+    expect(index).toContain(`data-work-item="${item.id}" data-work-state="running"`);
+    expect(index).toContain(`data-work-item="${sibling.id}" data-work-state="normal"`);
+    expect(index).toContain(`href="/tasks/runs/${run.id}"`);
+    expect(index).not.toContain(conflicting.id);
+    const detail = await (await app.request(`/work/${item.id}`)).text();
+    expect(detail).toContain('data-work-attention="running"');
+    expect(detail).toContain(`href="/tasks/runs/${run.id}"`);
+    const siblingDetail = await (await app.request(`/work/${sibling.id}`)).text();
+    expect(siblingDetail).not.toContain(run.id);
+    expect(siblingDetail).not.toContain(conflicting.id);
   });
 
   test("work context: focus selection does not pause another item and pending inputs remain visible", async () => {
@@ -5465,6 +5713,9 @@ describe("management backend (read-write)", () => {
     });
     expect([302, 303]).toContain(continueResponse.status);
     const action = engine.workContinuations.list(item.id)[0]!;
+    const approvalIndex = await (await app.request("/work")).text();
+    expect(approvalIndex).toContain(`data-work-item="${item.id}" data-work-state="awaiting_approval"`);
+    expect(approvalIndex).toContain(`href="/tasks/runs/${action.taskRunIds.at(-1)}"`);
     let view = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
     expect(view).toContain("更新灰度环境配置");
     expect(view).toContain("等待审批");
@@ -5484,6 +5735,7 @@ describe("management backend (read-write)", () => {
     expect([302, 303]).toContain(cancelResponse.status);
     view = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
     expect(view).toContain("已取消");
+    expect(await (await app.request("/work")).text()).not.toContain(`href="/tasks/runs/${action.taskRunIds.at(-1)}"`);
     expect(view).toContain(`/work/actions/${encodeURIComponent(action.id)}/retry`);
     expect(view).toContain(`name="runId" value="${action.taskRunIds.at(-1)}"`);
     expect(view).toContain(`name="attempt" value="${action.attempt}"`);
@@ -5587,6 +5839,9 @@ describe("management backend (read-write)", () => {
     const report = await engine.approveTaskRun(pending.run.id, "operator").completion;
     const actionId = pending.run.workActionId!;
 
+    const index = await (await app.request("/work")).text();
+    expect(index).toContain(`data-work-item="${item.id}" data-work-state="awaiting_acceptance"`);
+    expect(index).toContain(`href="/work/${item.id}#acceptance-${actionId}-${pending.run.id}"`);
     const workView = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
     expect(workView).toContain("工作动作验收 · 待验收");
     expect(workView).toContain("配置已更新，并完成核对");
@@ -5594,7 +5849,7 @@ describe("management backend (read-write)", () => {
     expect(workView).toContain(`/work/actions/${encodeURIComponent(actionId)}/accept`);
     expect(workView).toContain(`/work/actions/${encodeURIComponent(actionId)}/reject`);
     expect(workView).toContain(`name="runId" value="${pending.run.id}"`);
-    expect(workView).toContain("自动续跑已暂停在验收门");
+    expect(workView).toContain("接受后会保存这一步的成果");
 
     const runView = await (await app.request(`/tasks/runs/${encodeURIComponent(pending.run.id)}`)).text();
     expect(runView).toContain("工作动作验收 · 待验收");
@@ -5623,6 +5878,33 @@ describe("management backend (read-write)", () => {
     const acceptedView = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
     expect(acceptedView).toContain("工作动作验收 · 已接受");
     expect(acceptedView).toContain("local-admin");
+    const done = await (await app.request("/work")).text();
+    expect(done).toContain(`data-work-item="${item.id}" data-work-state="normal"`);
+    expect(done).not.toContain(`#acceptance-${actionId}-${pending.run.id}`);
+  });
+
+  test("a historical WorkAction Run without the reverse item link retains its report and return route", async () => {
+    const item = engine.workItems.create({ space: SPACE, title: "历史工作事项", nextActions: ["历史步骤"] });
+    const action = engine.workContinuations.claimNext(item);
+    const baseTask = engine.tasks.create({ name: "历史任务", topic: "历史步骤", space: SPACE })!;
+    const run = engine.taskRuns.start({ task: { ...baseTask, id: action.id }, trigger: "manual", workActionId: action.id,
+      workItemId: item.id, distill: false });
+    engine.workContinuations.attachRun(action.id, run.id, "queued");
+    engine.taskRuns.begin(run.id);
+    const finishedAt = Date.now();
+    engine.taskRuns.succeed(run.id, { finishedAt, output: "历史验收的结果", summary: "历史验收的结果" });
+    engine.workContinuations.submitForAcceptance(action.id, {
+      runId: run.id, permission: "unknown", finishedAt, summary: "历史验收的结果",
+    });
+    engine.workContinuations.accept(action.id, { runId: run.id, mode: "human", decidedAt: finishedAt, decidedBy: "operator" });
+    const history = await (await app.request(`/tasks/runs/${run.id}`)).text();
+    expect(history).toContain(`href="/work/${item.id}"`);
+    expect(history).toContain("工作动作验收 · 已接受");
+    expect(history).not.toContain(`href="/tasks/${action.id}"`);
+    const detail = await (await app.request(`/work/${item.id}`)).text();
+    expect(detail).toContain("历史验收的结果");
+    expect(detail).toContain(`href="/tasks/runs/${run.id}"`);
+    expect(await (await app.request("/work")).text()).not.toContain(`#acceptance-${action.id}-${run.id}`);
   });
 
   test("work action rejection requires a reason and exposes the retry boundary", async () => {
@@ -5667,6 +5949,9 @@ describe("management backend (read-write)", () => {
     const view = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
     expect(view).toContain("工作动作验收 · 已驳回");
     expect(view).toContain("缺少变更后的环境截图");
+    const blocked = await (await app.request("/work")).text();
+    expect(blocked).toContain(`data-work-item="${item.id}" data-work-state="blocked"`);
+    expect(blocked).toContain("缺少变更后的环境截图");
     expect(view).toContain(`/work/actions/${encodeURIComponent(actionId)}/retry`);
     expect(engine.workItems.get(item.id)?.nextActions).toEqual(["更新灰度环境配置"]);
   });
@@ -5796,6 +6081,17 @@ describe("management backend (read-write)", () => {
       attempt: Number(staleToken.attempt),
     });
 
+    const index = await (await app.request("/work")).text();
+    expect(index).toContain(`data-work-item="${item.id}" data-work-state="awaiting_approval"`);
+    expect(index).toContain(`href="/tasks/runs/${retried.run.id}"`);
+    expect(index).not.toContain(first.run.id);
+    const detail = await (await app.request(`/work/${item.id}`)).text();
+    expect(detail).toContain('data-work-attention="awaiting_approval"');
+    expect(detail).toContain(`href="/tasks/runs/${retried.run.id}"`);
+    const previous = await (await app.request(`/tasks/runs/${first.run.id}`)).text();
+    expect(previous).toContain("工作动作验收 · 已驳回");
+    expect(previous).not.toContain(`action="/tasks/runs/${retried.run.id}/approve"`);
+
     const staleAbandon = await app.request(`/work/actions/${encodeURIComponent(actionId)}/abandon`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -5849,10 +6145,16 @@ describe("management backend (read-write)", () => {
     expect(index).not.toContain('name="topic"');
     expect(await (await app.request("/tasks?new=1")).text()).toContain('name="topic"');
 
-    // editor renders the task + the distill toggle
-    const editor = await (await app.request(`/tasks/${encodeURIComponent(created!.id)}`)).text();
+    const path = `/tasks/${encodeURIComponent(created!.id)}`;
+    expect(res.headers.get("location")).toStartWith(`${path}?ok=`);
+    const overview = await (await app.request(res.headers.get("location")!)).text();
+    expect(overview).toContain("大模型进展");
+    expect(overview).toContain('name="expectedTaskPreview"');
+    expect(overview).toContain(`href="${path}?edit=1"`);
+    expect(overview).not.toContain('name="topic"');
+    const editor = await (await app.request(`${path}?edit=1`)).text();
     expect(editor).toContain("大模型进展");
-    expect(editor).toContain("立即运行");
+    expect(editor).not.toContain(`formaction="${path}/run"`);
     expect(editor).toContain("完成后立即提炼");
     expect(editor).toContain('name="timeoutMinutes"');
     expect(editor).toContain('value="420"');
@@ -5883,8 +6185,10 @@ describe("management backend (read-write)", () => {
       hour: 17,
     }));
 
-    const editor = await (await app.request(`/tasks/${encodeURIComponent(created!.id)}`)).text();
-    expect(editor).toContain("每周五 17:00");
+    const path = `/tasks/${encodeURIComponent(created!.id)}`;
+    const overview = await (await app.request(path)).text();
+    expect(overview).toContain("每周五 17:00");
+    const editor = await (await app.request(`${path}?edit=1`)).text();
     expect(editor).toContain('<option value="5" selected>周五</option>');
   });
 
@@ -5947,7 +6251,9 @@ describe("management backend (read-write)", () => {
       onTaskRun: (id) => { ranId = id; },
     });
     const task = engine.tasks.create({ name: "run-me", space: SPACE, topic: "x" })!;
-    const res = await app2.request(`/tasks/${encodeURIComponent(task.id)}/run`, { method: "POST" });
+    const res = await app2.request(`/tasks/${encodeURIComponent(task.id)}/run`, {
+      method: "POST", body: new URLSearchParams({ topic: "未保存的研究主题" }),
+    });
     expect([302, 303]).toContain(res.status);
     const location = res.headers.get("location")!;
     expect(location).toMatch(/^\/tasks\/runs\/run_/);
@@ -5955,6 +6261,8 @@ describe("management backend (read-write)", () => {
     expect(engine.tasks.get(task.id)?.lastStatus).toBe("ok");
     expect(ranId).toBe(task.id);
     const run = engine.listTaskRuns(task.id)[0]!;
+    expect(run.topic).toBe("x");
+    expect(engine.tasks.get(task.id)?.topic).toBe("x");
     expect(location).toContain(run.id);
     const detail = await (await app2.request(location)).text();
     expect(detail).toContain("运行详情");
@@ -5964,6 +6272,66 @@ describe("management backend (read-write)", () => {
     expect(detail).toContain("shared-agents:review");
     // captured into the space as a task raw entry
     expect(engine.registry.store(SPACE).index().listRaw({}).some((r) => r.source === "task")).toBe(true);
+  });
+
+  test("a second tab saving a new topic invalidates the first tab's preview and allows a fresh run", async () => {
+    const task = engine.tasks.create({ name: "汇总进展", space: SPACE, topic: "主题 X", distillOnRun: false })!;
+    const path = `/tasks/${task.id}`;
+    const first = await (await app.request(path)).text();
+    const preview = first.match(/name="expectedTaskPreview" value="([a-f0-9]{64})"/u)?.[1];
+    expect(preview).toBeDefined();
+    const saved = await app.request(path, {
+      method: "POST", body: new URLSearchParams({ name: task.name, space: SPACE, topic: "主题 Y", notify: "on" }),
+    });
+    expect(saved.headers.get("location")).toStartWith(`${path}?ok=`);
+    const calls = fake.calls.length;
+    const stale = await app.request(`${path}/run`, {
+      method: "POST", body: new URLSearchParams({ expectedTaskPreview: preview! }),
+    });
+    const staleLocation = stale.headers.get("location")!;
+    expect(staleLocation).toStartWith(`${path}?ok=`);
+    const refreshed = await (await app.request(staleLocation)).text();
+    expect(refreshed).toContain("任务主题或空间已变化，请核对后再运行");
+    expect(refreshed).toContain("主题 Y");
+    expect(engine.listTaskRuns(task.id)).toHaveLength(0);
+    expect(fake.calls).toHaveLength(calls);
+    const currentPreview = refreshed.match(/name="expectedTaskPreview" value="([a-f0-9]{64})"/u)?.[1];
+    expect(currentPreview).toBeDefined();
+    const completed = Promise.withResolvers<void>();
+    const runner = createWebApp({ engine, onTaskRun: () => completed.resolve() });
+    fake.onText(() => "新主题的研究结果");
+    const started = await runner.request(`${path}/run`, {
+      method: "POST", body: new URLSearchParams({ expectedTaskPreview: currentPreview!, topic: "伪造主题" }),
+    });
+    expect(started.headers.get("location")).toStartWith("/tasks/runs/");
+    await completed.promise;
+    expect(engine.listTaskRuns(task.id)[0]?.topic).toBe("主题 Y");
+  });
+
+  test.each([false, true])("a changed destination during Skill preparation creates no Run (preparation failure %s)", async (failPreparation) => {
+    const task = engine.tasks.create({ name: "准备中变更", topic: "已显示的主题", space: SPACE })!;
+    const other = "team/oc_preparation_changed";
+    engine.ensureSpace(other);
+    const path = `/tasks/${task.id}`;
+    const html = await (await app.request(path)).text();
+    const preview = html.match(/name="expectedTaskPreview" value="([a-f0-9]{64})"/u)?.[1];
+    expect(preview).toBeDefined();
+    const prepare = engine.skillCatalog.withResolution.bind(engine.skillCatalog);
+    engine.skillCatalog.withResolution = async (request, run) => {
+      await Promise.resolve();
+      engine.updateTask(task.id, { space: other });
+      if (failPreparation) throw new Error("injected preparation failure");
+      return prepare(request, run);
+    };
+    const calls = fake.calls.length;
+    const response = await app.request(`${path}/run`, {
+      method: "POST", body: new URLSearchParams({ expectedTaskPreview: preview! }),
+    });
+    expect(decodeURIComponent(response.headers.get("location") ?? "")).toBe(
+      `${path}?ok=任务主题或空间已变化，请核对后再运行`,
+    );
+    expect(engine.listTaskRuns(task.id)).toHaveLength(0);
+    expect(fake.calls).toHaveLength(calls);
   });
 
   test("tasks: write execution shows its frozen approval request and runs once after approval", async () => {
@@ -6002,6 +6370,10 @@ describe("management backend (read-write)", () => {
     );
     const run = isolatedEngine.listTaskRuns(task.id)[0]!;
     expect(run.status).toBe("awaiting_approval");
+    const statusUrl = `/tasks/runs/${encodeURIComponent(run.id)}/status`;
+    const pendingStatus = await isolatedApp.request(statusUrl);
+    expect(pendingStatus.headers.get("cache-control")).toBe("no-store");
+    expect(await pendingStatus.json()).toEqual({ status: "awaiting_approval" });
     expect(providerCalls).toBe(0);
     const index = await (await isolatedApp.request("/tasks")).text();
     expect(index).toContain(`href="/tasks/runs/${run.id}"`);
@@ -6026,6 +6398,7 @@ describe("management backend (read-write)", () => {
       },
     );
     expect([302, 303]).toContain(moveResponse.status);
+    expect(moveResponse.headers.get("location")).toStartWith(`/tasks/${task.id}?edit=1&ok=`);
     expect(decodeURIComponent(moveResponse.headers.get("location") ?? ""))
       .toContain("已有运行历史");
     expect(isolatedEngine.tasks.get(task.id)?.space).toBe(SPACE);
@@ -6055,6 +6428,7 @@ describe("management backend (read-write)", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     expect(providerCalls).toBe(1);
+    expect(await (await isolatedApp.request(statusUrl)).json()).toEqual({ status: "succeeded" });
     expect(isolatedEngine.getTaskRun(run.id)).toEqual(expect.objectContaining({
       status: "succeeded",
       approval: expect.objectContaining({
@@ -6536,5 +6910,72 @@ describe("management backend (read-write)", () => {
     });
     expect([302, 303]).toContain(response.status);
     expect(engine.reminders.get(reminder.id)?.status).toBe("completed");
+    const staleCancel = await app.request(`/reminders/${reminder.id}/cancel`, { method: "POST" });
+    expect(decodeURIComponent(staleCancel.headers.get("location")!)).toContain("这条提醒已经完成");
+    expect(engine.reminders.get(reminder.id)?.cancelledAt).toBeUndefined();
+    expect((await app.request("/reminders/unknown/complete", { method: "POST" })).status).toBe(404);
+  });
+
+  test("reminders: both administrative actions report a failed save and allow a fresh attempt", async () => {
+    const reminder = engine.reminders.create({ title: "跟进排期", space: SPACE, chatId: "oc_web", creatorId: "ou_me", triggerAt: Date.now() })!;
+    // Fail the store's persistence step after it builds the detached candidate.
+    Object.defineProperty(engine.reminders, "persist", { configurable: true, value: () => { throw new Error("private disk path"); } });
+    try {
+      for (const action of ["complete", "cancel"]) {
+        const result = await app.request(`/reminders/${reminder.id}/${action}`, { method: "POST" });
+        const location = result.headers.get("location")!;
+        expect(location).toBe("/reminders?error=save");
+        const page = await (await app.request(location)).text();
+        expect(page).toContain('role="alert">提醒保存失败');
+        expect(page).not.toContain("private disk path");
+        expect(page).toContain(`action="/reminders/${reminder.id}/${action}"`);
+        expect(engine.reminders.get(reminder.id)?.status).toBe("scheduled");
+      }
+    } finally {
+      Reflect.deleteProperty(engine.reminders, "persist");
+    }
+    const cancelled = await app.request(`/reminders/${reminder.id}/cancel`, { method: "POST" });
+    expect(decodeURIComponent(cancelled.headers.get("location")!)).toContain("已取消");
+    const staleComplete = await app.request(`/reminders/${reminder.id}/complete`, { method: "POST" });
+    expect(decodeURIComponent(staleComplete.headers.get("location")!)).toContain("这条提醒已经取消");
+    expect(engine.reminders.get(reminder.id)?.completedAt).toBeUndefined();
+  });
+
+  test("reminders: repeated notifications stay upcoming until confirmation and history survives a restart", async () => {
+    const time = Date.UTC(2025, 10, 10, 2);
+    const hour = 3_600_000;
+    const scope = { space: SPACE, chatId: "oc_web", creatorId: "ou_me" };
+    const repeat = engine.reminders.create({ ...scope, title: "重复确认一次", triggerAt: time, repeatEveryMs: 2 * hour, untilConfirmed: true }, time)!;
+    const next = engine.reminders.create({ ...scope, title: "另一条待办", triggerAt: time + hour }, time)!;
+    const once = engine.reminders.create({ ...scope, title: "已送达的一次性提醒", triggerAt: time - 2 * hour }, time)!;
+    await expect(engine.deliverReminder(repeat.id, time, () => { throw new Error("simulated send failure"); })).rejects.toThrow();
+    expect(engine.reminders.get(repeat.id)?.nextTriggerAt).toBe(time);
+    await engine.deliverReminder(repeat.id, time, () => {});
+    await engine.deliverReminder(once.id, time - hour, () => {});
+    engine.reminders.restore([{ ...once, id: "legacy_missing_time", title: "旧版已取消提醒", status: "cancelled" }]);
+    const row = (page: string, id: string) => {
+      const start = page.indexOf(`data-reminder-id="${id}"`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      return page.slice(page.lastIndexOf("<li", start), page.indexOf("</li>", start));
+    };
+    const before = await app.request("/reminders");
+    expect(before.headers.get("cache-control")).toBe("no-store");
+    const pending = await before.text();
+    expect(pending.indexOf(next.title)).toBeLessThan(pending.indexOf(repeat.title));
+    expect(row(pending, repeat.id)).toContain(`datetime="${new Date(time + 2 * hour).toISOString()}"`);
+    expect(row(pending, repeat.id)).toContain(`action="/reminders/${repeat.id}/complete"`);
+    const confirmed = await app.request(`/reminders/${repeat.id}/complete`, { method: "POST" });
+    const completedAt = engine.reminders.get(repeat.id)!.completedAt!;
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
+    app = createWebApp({ engine });
+    const refreshed = await (await app.request(confirmed.headers.get("location")!)).text();
+    const historyStart = refreshed.indexOf('id="reminders-history"');
+    expect(refreshed.indexOf(next.title)).toBeLessThan(historyStart);
+    expect(refreshed.indexOf(repeat.title)).toBeGreaterThan(historyStart);
+    expect(row(refreshed, repeat.id)).toContain(`datetime="${new Date(completedAt).toISOString()}"`);
+    expect(row(refreshed, repeat.id)).not.toContain("<form");
+    expect(row(refreshed, once.id)).toContain(`datetime="${new Date(time - hour).toISOString()}"`);
+    expect(row(refreshed, "legacy_missing_time")).toContain('data-reminder-time="cancelled">未记录');
   });
 });

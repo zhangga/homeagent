@@ -12,7 +12,16 @@ async page => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(base);
   const agentUrl = page.url();
-  await page.getByRole('button', { name: '详情', exact: true }).click();
+  assert(await page.locator('#agent-model').count() === 0, 'Opening an Agent on a phone must start in overview');
+  const edit = page.getByRole('link', { name: '编辑配置', exact: true });
+  assert(await edit.isVisible(), 'The overview must offer an edit action');
+  for (const control of [edit, page.locator('.overview-actions button'), page.locator('.overview-back')]) {
+    const box = await control.boundingBox();
+    assert(box && box.height >= 44, 'Overview actions must be at least 44px tall on a phone');
+  }
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'The Agent overview must fit the phone');
+  await edit.click();
+  await page.getByRole('button', { name: '模型与执行参数', exact: true }).click();
   assert(await page.locator('#agent-execution-mode').isVisible(), 'Agent settings must open on a phone');
   await page.keyboard.press('Escape');
   assert(await page.locator('#agent-inspector').isHidden(), 'Closed settings must leave the focus order');
@@ -21,6 +30,8 @@ async page => {
     const box = await action.boundingBox();
     assert(box && box.x >= 0 && box.x + box.width <= 390, 'Each Agent action must fit the phone');
   }
+  await page.getByRole('link', { name: '返回概览', exact: true }).click();
+  assert(page.url() === agentUrl && await edit.isVisible(), 'Leaving the editor must restore the selected Agent overview');
   await openNav();
   const taskLink = nav.locator('a[href="/tasks"]');
   assert(await taskLink.evaluate(el => parseFloat(getComputedStyle(el).fontSize) > 0), 'Drawer link names must be visible');
@@ -39,4 +50,5 @@ async page => {
   const list = await page.locator('.listcol').boundingBox();
   const field = await taskName.boundingBox();
   assert(list && field && list.x + list.width < field.x, 'Desktop must retain its two-column task editor');
+  return { mobileOverviewAndEdit: true, mobileWorkAndTask: true, desktopTaskLayout: true };
 }

@@ -158,6 +158,23 @@ const STYLE = `
   .collection-list li > div a { font-weight:600; }
   .collection-meta, .collection-next { display:block; color:var(--muted); font-size:13px; }
   .collection-next { max-width:min(100%,36ch); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .work-list-heading .btn, .work-list-action { display:inline-flex; align-items:center; min-height:44px; }
+  .work-list-section { margin:24px 0; }
+  .work-list-section h2 { display:flex; align-items:baseline; gap:8px; margin:0 0 6px; }
+  .work-list-section h2 span { color:var(--muted); font-size:13px; font-weight:400; }
+  .work-list { list-style:none; padding:0; margin:0; border-top:1px solid var(--border); }
+  .work-list li { display:grid; grid-template-columns:minmax(0, 1fr) auto; align-items:center; gap:6px 20px;
+    padding:12px 0; border-bottom:1px solid var(--border); overflow-wrap:anywhere; }
+  .work-list-main { display:block; min-width:0; min-height:44px; color:var(--fg); }
+  .work-list-main:hover { text-decoration:none; }
+  .work-list-main:hover .work-list-name { text-decoration:underline; }
+  .work-list-title { display:flex; align-items:baseline; gap:8px; }
+  .work-list-name { font-size:16px; font-weight:650; }
+  .work-list .work-action-state { margin:0; padding:2px 8px; }
+  .work-list .collection-meta { margin-top:4px; }
+  .work-list-note { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden;
+    margin:4px 0 0; line-height:1.5; font-size:14px; }
+  .work-list-action { justify-self:end; font-size:14px; white-space:nowrap; }
 
   /* work context: an operations field journal, not another dashboard */
   .work-editor { position:relative; overflow:hidden; border-left:4px solid var(--accent); }
@@ -281,6 +298,8 @@ const STYLE = `
     .listcol .item { flex:0 0 auto; max-width:80%; margin:0; overflow-wrap:anywhere; }
     .actions, .row { flex-wrap:wrap; }
     .actions > *, .row > * { min-width:0; max-width:100%; }
+    .work-list li { column-gap:10px; }
+    .work-list-title { align-items:baseline; flex-wrap:wrap; gap:4px 7px; }
     input[type=text], input[type=password], input[type=number], select, textarea, button, .btn { min-height:44px; }
     .settings-section { padding:16px; }
     .settings-actions { display:grid; grid-template-columns:1fr 1fr; }

@@ -4,7 +4,7 @@ import { isResolvedExecutionPlan, type KnowledgeEngine, type StoredExecutionPlan
 import type { SpaceId } from "@homeagent/shared";
 import type { DetectedProvider } from "@homeagent/llm";
 import { layout } from "./layout.ts";
-import type { AgentLocalExecutionView } from "./agent-workbench.ts";
+import { agentDetailUrl, type AgentLocalExecutionView } from "./agent-workbench.ts";
 
 export const localExecutionConfirmationUrl = (agentId: string, revisionId: string) =>
   `/agents/${encodeURIComponent(agentId)}/revisions/${encodeURIComponent(revisionId)}/local-execution`;
@@ -111,7 +111,7 @@ export function registerAgentLocalExecutionRoutes(app: Hono, options: {
     try {
       const status = await engine.agentReadiness.check(id);
       if (status?.reason === "busy") return c.text("已有两个 Agent 正在检测，请稍后重试。", 503);
-      return c.redirect(`/agents/${encodeURIComponent(id)}`);
+      return c.redirect(agentDetailUrl(id, { edit: c.req.query("edit") === "1" }));
     } catch { return c.text("当前配置检测未完成，请重试。", 503); }
   });
 
@@ -134,7 +134,7 @@ export function registerAgentLocalExecutionRoutes(app: Hono, options: {
       const preview = engine.localExecution.preview(id, revisionId);
       const activeOldRuns = [...engine.chatRuns.list(), ...engine.taskRuns.list()].filter(run => run.agentId === id
         && ["queued", "running", "awaiting_approval"].includes(run.status)).length;
-      return c.html(await layout("确认本机完全访问", [{ label: "Agents", href: "/agents" }, { label: agent.name, href: `/agents/${encodeURIComponent(id)}` }, { label: "确认发布" }], html`
+      return c.html(await layout("确认本机完全访问", [{ label: "Agent 助手", href: "/agents" }, { label: agent.name, href: `/agents/${encodeURIComponent(id)}` }, { label: "确认发布" }], html`
         <section class="agent-consent" style="max-width:760px;margin:24px auto;line-height:1.65">
           <p class="muted">CODEX · 本机执行授权</p>
           <h1>确认本机完全访问（无沙箱）</h1>
@@ -161,7 +161,7 @@ export function registerAgentLocalExecutionRoutes(app: Hono, options: {
             <input type="hidden" name="termsVersion" value="1" />
             <p><label><input type="checkbox" name="taskExecutionEnabled" value="1" /> 同时允许显式 Task 使用本机完全访问（每个 Task 仍须单独人工审批）</label></p>
             <p><label><input type="checkbox" name="confirmFullAccess" value="1" required /> 我已了解无沙箱风险，允许上述范围以 HomeAgent 运行账户权限执行。</label></p>
-            <button type="submit">确认并发布新版本</button> <a href="/agents/${encodeURIComponent(id)}">返回工作台，不发布</a>
+            <button type="submit">确认并发布新版本</button> <a href="${agentDetailUrl(id, { edit: true })}">返回配置，不发布</a>
           </form>
           <p class="muted">发布不代表模型、网络或飞书权限已经验证；隔离失败不会自动降级为完全访问。默认不启用此模式。</p>
         </section>`, "agents"));
@@ -208,7 +208,10 @@ export function registerAgentLocalExecutionRoutes(app: Hono, options: {
     if (!engine.agents.has(id)) return c.notFound();
     try {
       engine.agents.revokeLocalExecutionGrants(id, body.get("expectedHeadRevisionId") ?? "");
-      return c.redirect(`/agents/${encodeURIComponent(id)}?ok=${encodeURIComponent("完全访问确认已撤销；相关在途调用已请求取消，已发生的外部效果不能回滚")}`);
+      return c.redirect(agentDetailUrl(id, {
+        edit: c.req.query("edit") === "1",
+        ok: "完全访问确认已撤销；相关在途调用已请求取消，已发生的外部效果不能回滚",
+      }));
     } catch (error) { return c.text(publicError(error), 409); }
   });
 }

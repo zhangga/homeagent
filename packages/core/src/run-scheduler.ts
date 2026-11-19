@@ -100,7 +100,7 @@ export class RunScheduler {
     }
     if (
       this.queue.some((run) => run.id === input.id)
-      || this.usage.has(`run:${input.id}`)
+      || this.isRunning(input.id)
     ) {
       throw new Error(`run is already scheduled: ${input.id}`);
     }
@@ -146,6 +146,10 @@ export class RunScheduler {
       averageWaitMs: this.started === 0 ? 0 : Math.round(this.totalWaitMs / this.started),
       maxWaitMs: this.maxWaitMs,
     };
+  }
+
+  isRunning(id: string): boolean {
+    return this.usage.has(`run:${id}`);
   }
 
   queueInfo(id: string): RunQueueInfo | undefined {

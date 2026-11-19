@@ -4,7 +4,12 @@ import { chatRunLiveScript } from "./chat-run-live.ts";
 class Node {
   children: Node[] = [];
   className = "";
-  dataset = { runId: "test-run" };
+  dataset: Record<string, string> = {};
+  id = "";
+  open = false;
+  replaceWith?: (fresh: Node) => void;
+  querySelectorAll = (): Node[] => [];
+  contains = () => false;
   style = { display: "none" };
   parent?: Node;
   private text = "";
@@ -23,6 +28,30 @@ function harness(snapshot: unknown, finalSnapshot = snapshot) {
   const answer = new Node();
   const summary = new Node();
   const nodes = new Map([["live-run", root], ["live-run-events", list], ["live-run-answer", answer], ["live-run-summary", summary]]);
+  const initialState = { status: "running", delivery: { status: "pending", attempts: 0 }, cancelRequested: false, deliveryActive: false };
+  let state = initialState;
+  function dataset() {
+    return { runId: "test-run", runStatus: state.status, deliveryStatus: state.delivery.status,
+      deliveryAttempts: String(state.delivery.attempts), cancelRequested: state.cancelRequested ? "1" : "0",
+      deliveryActive: state.deliveryActive ? "1" : "0", terminal: ["queued", "running"].includes(state.status) ? "0" : "1" };
+  }
+  root.dataset = dataset();
+  const sections = ["chat-run-overview", "chat-run-details"];
+  function section(id: string) {
+    const node = new Node();
+    node.id = id;
+    node.replaceWith = fresh => { nodes.set(id, fresh); };
+    return node;
+  }
+  for (const id of sections) nodes.set(id, section(id));
+  root.querySelectorAll = () => [...nodes.values()].filter(node => node.open);
+  class Parser {
+    parseFromString() {
+      const next = new Node();
+      next.dataset = dataset();
+      return { getElementById: (id: string) => id === "live-run" ? next : section(id) };
+    }
+  }
   const streams: Stream[] = [];
   class Stream {
     onmessage?: (message: { data: string }) => void;
@@ -30,12 +59,33 @@ function harness(snapshot: unknown, finalSnapshot = snapshot) {
     constructor(readonly url: string) { streams.push(this); }
     close(): void { this.closed = true; }
   }
-  let requests = 0;
-  new Function("document", "fetch", "EventSource", chatRunLiveScript())({
+  let reads = 0;
+  const urls: string[] = [];
+  const events = new Map<string, () => void>();
+  const timers = new Map<number, () => Promise<void>>();
+  let timerId = 0;
+  const listen = (name: string, fn: () => void) => events.set(name, fn);
+  const document = {
     getElementById: (id: string) => nodes.get(id),
     createElement: () => new Node(),
-  }, async () => ({ ok: true, json: async () => requests++ === 0 ? snapshot : finalSnapshot }), Stream);
-  return { list, answer, summary, streams };
+    hidden: false, activeElement: null, addEventListener: listen,
+  };
+  new Function("document", "window", "fetch", "EventSource", "DOMParser", "setTimeout", "clearTimeout", chatRunLiveScript())(
+    document, { addEventListener: listen }, async (url: string) => {
+      urls.push(url);
+      return { ok: true, text: async () => "", json: async () => url.endsWith("/status") ? state : reads++ === 0 ? snapshot : finalSnapshot };
+    }, Stream, Parser,
+    (fn: () => Promise<void>) => { timers.set(++timerId, fn); return timerId; },
+    (id: number) => timers.delete(id),
+  );
+  return { list, answer, summary, streams, root, document, nodes, urls, timers,
+    setState: (next: typeof state) => { state = next; },
+    visibility: () => events.get("visibilitychange")?.(),
+    tick: async () => {
+      const [id, fn] = [...timers][0]!;
+      timers.delete(id);
+      await fn();
+    } };
 }
 
 async function flush(): Promise<void> { for (let index = 0; index < 10; index++) await Promise.resolve(); }
@@ -102,14 +152,54 @@ test("retains a Provider reasoning summary even when its text is also the final 
 });
 
 test("a model caption does not leave the final assistant text duplicated in the process", async () => {
-  const output = "> 本次模型：Codex · `gpt-5.6-sol`（本次运行配置）\n\n完成更新。";
+  const output = "> 本次模型：Codex · `gpt-5.6-sol`（本次运行配置）\n> 推理等级：高\n\n完成更新。";
   const view = harness({ run: { status: "succeeded", output }, events: [
     note(1, "先核对构建。"), tool(2), tool(3, "tool.completed", "completed"), note(4, "完成更新。"),
     { seq: 5, kind: "phase.started", title: "会话模型已确认" },
     { seq: 6, kind: "run.succeeded", title: "执行完成", delta: output },
   ] });
   await flush();
-  expect(view.answer.textContent).toBe(output);
+  expect(view.answer.textContent).toBe("完成更新。");
   expect(view.list.children.map(node => node.textContent)).not.toContain("完成更新。");
   expect(view.list.children[0]?.textContent).toBe("先核对构建。");
+});
+
+test("an open Run follows completion and delayed delivery while preserving expanded details", async () => {
+  const view = harness({ run: { status: "running" }, events: [] }, { run: { status: "succeeded", output: "完整回答" }, events: [] });
+  await flush();
+  view.nodes.get("chat-run-details")!.open = true;
+  const timeline = view.nodes.get("live-run-events");
+  const change = async (status: string, delivery: string, attempts: number, cancelRequested = false, deliveryActive = false) => {
+    view.setState({ status, delivery: { status: delivery, attempts }, cancelRequested, deliveryActive });
+    await view.tick();
+    expect(view.root.dataset).toMatchObject({ runStatus: status, deliveryStatus: delivery, deliveryAttempts: String(attempts),
+      cancelRequested: cancelRequested ? "1" : "0", deliveryActive: deliveryActive ? "1" : "0" });
+    expect(view.nodes.get("chat-run-details")!.open).toBe(true);
+    expect(view.nodes.get("live-run-events")).toBe(timeline);
+  };
+  await change("succeeded", "pending", 1, false, true);
+  await change("succeeded", "failed", 1);
+  view.document.hidden = true;
+  view.visibility();
+  expect(view.timers.size).toBe(0);
+  view.document.hidden = false;
+  view.visibility();
+  await change("succeeded", "pending", 2, false, true);
+  await change("succeeded", "sent", 2);
+  expect(view.timers.size).toBe(0);
+  expect(view.answer.textContent).toBe("完整回答");
+  expect(view.urls.filter(url => url === "/chats/runs/test-run")).toHaveLength(4);
+});
+
+test("a missed terminal event still retires the cancellation controls using the saved Run", async () => {
+  const view = harness({ run: { status: "running" }, events: [] }, { run: { status: "cancelled" }, events: [] });
+  await flush();
+  view.setState({ status: "running", delivery: { status: "pending", attempts: 0 }, cancelRequested: true, deliveryActive: false });
+  await view.tick();
+  expect(view.root.dataset.cancelRequested).toBe("1");
+  view.setState({ status: "cancelled", delivery: { status: "pending", attempts: 0 }, cancelRequested: true, deliveryActive: false });
+  await view.tick();
+  expect(view.root.dataset).toMatchObject({ runStatus: "cancelled", terminal: "1" });
+  expect(view.streams[0]!.closed).toBe(true);
+  expect(view.summary.textContent).toBe("已取消");
 });

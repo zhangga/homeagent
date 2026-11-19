@@ -273,6 +273,11 @@ export class NoProviderError extends Error {
   }
 }
 
+export interface WorkPlanWait {
+  kind: "dependency" | "parent_paused" | "parent_completed" | "parent_pending";
+  title?: string;
+}
+
 export class TaskAlreadyRunningError extends Error {
   constructor(
     readonly taskId: string,
@@ -280,6 +285,13 @@ export class TaskAlreadyRunningError extends Error {
   ) {
     super(`task already running: ${taskId} (${runId})`);
     this.name = "TaskAlreadyRunningError";
+  }
+}
+
+export class TaskPreviewChangedError extends Error {
+  constructor() {
+    super("任务主题或空间已变化，请核对后再运行");
+    this.name = "TaskPreviewChangedError";
   }
 }
 
@@ -319,6 +331,8 @@ export interface TaskReport {
 
 /** Options for a task run. */
 export interface RunTaskOptions {
+  /** Topic and destination shown to the operator before a manual run. */
+  expectedTask?: Pick<Task, "space" | "topic">;
   /** Identifies where the run was requested for history and diagnostics. */
   trigger?: TaskRunTrigger;
   /**
@@ -5596,9 +5610,17 @@ export class KnowledgeEngine implements Knowledge {
     return updated;
   }
 
-  startTaskRun(taskId: string, opts: RunTaskOptions = {}): StartedTaskRun {
+  private taskForStart(taskId: string, expected?: RunTaskOptions["expectedTask"]): Task {
     const task = this.tasks.get(taskId);
     if (!task) throw new Error(`unknown task: ${taskId}`);
+    if (expected && (task.space !== expected.space || task.topic !== expected.topic)) {
+      throw new TaskPreviewChangedError();
+    }
+    return task;
+  }
+
+  startTaskRun(taskId: string, opts: RunTaskOptions = {}): StartedTaskRun {
+    const task = this.taskForStart(taskId, opts.expectedTask);
     const configuredTimeoutMs = task.timeoutMinutes * 60_000;
     return this.launchTaskRun(
       task,
@@ -5610,8 +5632,7 @@ export class KnowledgeEngine implements Knowledge {
   }
 
   async startTaskRunAsync(taskId: string, opts: RunTaskOptions = {}): Promise<StartedTaskRun> {
-    const task = this.tasks.get(taskId);
-    if (!task) throw new Error(`unknown task: ${taskId}`);
+    const task = this.taskForStart(taskId, opts.expectedTask);
     let admitted = false;
     try {
       return await this.withAgentSkillResolution(task.space, true, () => {
@@ -5620,6 +5641,7 @@ export class KnowledgeEngine implements Knowledge {
       });
     } catch (error) {
       if (admitted) throw error;
+      if (opts.expectedTask) this.taskForStart(taskId, opts.expectedTask);
       return this.launchTaskRun(task, opts.trigger ?? "manual", opts.distill ?? task.distillOnRun,
         undefined, normalizeTaskRunTimeoutMs(opts.timeoutMs, task.timeoutMinutes * 60_000), undefined, error);
     }
@@ -5804,8 +5826,9 @@ export class KnowledgeEngine implements Knowledge {
       actionStatus: this.workContinuations.activeForWorkItem(child.workItemId)?.status, accepted: this.workDependencyAccepted(child.workItemId, item.space) }));
     const dependencies = [...new Set(remaining.flatMap(step => step.dependsOn ?? []))].map(id => ({ id,
       title: this.workItems.get(id)?.title ?? id, accepted: this.workDependencyAccepted(id, item.space) }));
+    const wait = this.workPlanWait(item, remaining[0]);
     return { current, remaining, actions: this.workContinuations.list(item.id), history, progressToken, parent, children, dependencies,
-      dependenciesReady: this.workDependenciesReady(item) && this.workParentAllows(item),
+      wait, dependenciesReady: wait === undefined,
       recovery: recovery && this.workRecoveryCurrent(recovery) ? { status: recovery.status, decision: recovery.decision } : undefined, notices };
   }
 
@@ -6063,19 +6086,47 @@ export class KnowledgeEngine implements Knowledge {
     return !plan || (plan.children ?? []).every(child => this.workDependencyAccepted(child.workItemId, item.space));
   }
 
-  private workDependenciesReady(item: WorkItem): boolean {
+  private nextWorkPlanStep(item: WorkItem): WorkPlanStep | undefined {
     const plan = item.planRef && this.workItems.plans.get(item.id, item.planRef);
-    const step = plan && plan.steps.find(step => step.id === item.nextStepIds?.[0]);
-    return !step || (step.dependsOn ?? []).every(id => this.workDependencyAccepted(id, item.space));
+    return plan?.steps.find(step => step.id === item.nextStepIds?.[0]);
+  }
+
+  private firstUnacceptedDependency(item: WorkItem, step: WorkPlanStep | undefined): string | undefined {
+    return step?.dependsOn?.find(id => !this.workDependencyAccepted(id, item.space));
+  }
+
+  private workDependenciesReady(item: WorkItem): boolean {
+    return !this.firstUnacceptedDependency(item, this.nextWorkPlanStep(item));
   }
 
   private workParentAllows(item: WorkItem, automatic = false): boolean {
-    if (!item.parentWorkItemId) return true;
+    return this.workParentWait(item, automatic) === undefined;
+  }
+
+  private workParentWait(item: WorkItem, automatic = false): WorkPlanWait | undefined {
+    if (!item.parentWorkItemId) return;
     const parent = this.workItems.get(item.parentWorkItemId);
-    return !!parent && parent.space === item.space && parent.active && parent.phase !== "completed"
-      && parent.planDelivery?.status !== "pending" && this.workRecoveryDelivered(parent.id) && !this.hasPendingWorkInputs(parent.id)
-      && parent.childCancellation?.status !== "pending"
-      && (!automatic || this.workContinuations.policyFor(parent.id, parent.space).autoContinue) && this.workParentAllows(parent, automatic);
+    if (!parent || parent.space !== item.space) return { kind: "parent_pending" };
+    if (parent.phase === "completed") return { kind: "parent_completed", title: parent.title };
+    if (!parent.active) return { kind: "parent_paused", title: parent.title };
+    if (parent.planDelivery?.status === "pending" || !this.workRecoveryDelivered(parent.id) || this.hasPendingWorkInputs(parent.id)
+      || parent.childCancellation?.status === "pending" || (automatic && !this.workContinuations.policyFor(parent.id, parent.space).autoContinue)) {
+      return { kind: "parent_pending", title: parent.title };
+    }
+    return this.workParentWait(parent, automatic);
+  }
+
+  private workPlanWait(item: WorkItem, nextStep: WorkPlanStep | undefined): WorkPlanWait | undefined {
+    const id = this.firstUnacceptedDependency(item, nextStep);
+    if (!id) return this.workParentWait(item);
+    const dependency = this.workItems.get(id);
+    return { kind: "dependency", title: dependency?.space === item.space ? dependency.title : undefined };
+  }
+
+  /** Manual continuation state for an index row; reads only the selected plan revision. */
+  getWorkPlanWait(workItemId: string): WorkPlanWait | undefined {
+    const item = this.workItems.get(workItemId);
+    return item && this.workPlanWait(item, this.nextWorkPlanStep(item));
   }
 
   cancelWorkChildren(workItemId: string): void {

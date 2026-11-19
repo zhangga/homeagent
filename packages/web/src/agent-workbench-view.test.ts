@@ -19,6 +19,69 @@ const selected: Agent = {
 };
 
 describe("Agent workbench view", () => {
+  test("the overview shows published duties and bound spaces and opens the draft only in the editor", async () => {
+    const agent = { ...selected, publishedRevisionId: "rev_published" };
+    const draft = {
+      id: "rev_draft", agentId: agent.id, number: 2, source: "draft" as const, createdAt: 200,
+      snapshot: { ...selected, name: "尚未发布的名称", instruction: "这段职责还在草稿中。" },
+    };
+    const input = {
+      agents: [agent], selected: agent, draft, revisions: [draft],
+      providers: [{ id: "codex" as const, name: "Codex", bin: "codex", available: true, detail: "CLI 就绪" }],
+      models: { codex: ["gpt-6.2-sol"] }, defaults: { provider: "codex", model: "gpt-6.2-sol" },
+      bindings: [{ id: "team/oc_ops" as const, name: "运营群", agentId: agent.id, createdAt: 1 }], runs: [],
+    };
+    const overview = String(await agentWorkbenchView(buildAgentWorkbench({ ...input, mode: "overview" })));
+    expect(overview).toContain(selected.name);
+    expect(overview).toContain(selected.instruction);
+    expect(overview).toContain("草稿");
+    expect(overview).not.toContain(draft.snapshot.instruction);
+    expect(overview).toContain('href="/spaces/team%2Foc_ops"');
+    expect(overview).toContain("运营群");
+    expect(overview).toContain('href="/agents/agent_ops?edit=1"');
+    expect(overview).not.toContain('id="agent-editor-form"');
+    expect(overview).not.toContain('id="agent-model"');
+    const editor = String(await agentWorkbenchView(buildAgentWorkbench({ ...input, mode: "edit" })));
+    expect(editor).toContain(draft.snapshot.instruction);
+    expect(editor).toContain('id="agent-model"');
+    expect(editor).toContain("保存草稿");
+  });
+
+  test.each([
+    ["unknown", "配置待检测"], ["checking", "正在检测"],
+    ["ready", "准备检查通过"], ["unavailable", "准备检查未通过"],
+  ] as const)("overview reports published configuration readiness when it is %s", async (state, label) => {
+    const view = buildAgentWorkbench({
+      mode: "overview", selected, agents: [selected], models: {}, bindings: [], runs: [],
+      defaults: { provider: "codex", model: "" },
+      providers: [{ id: "codex", name: "Codex", bin: "codex", available: true, detail: "CLI 就绪" }],
+      readiness: { csrfToken: "fixture", snapshot: {
+        state, mode: "isolated", sandboxCheck: "not-checked", modelCall: "not-verified",
+      } },
+    });
+    const body = String(await agentWorkbenchView(view));
+    expect(body).toContain(`data-agent-readiness="${state}"`);
+    expect(body).toContain(label);
+    expect(body).toContain("实际模型调用未验证");
+  });
+
+  test("the overview retains every binding and the full responsibility behind native disclosures", async () => {
+    const agent = { ...selected, instruction: "需要逐项检查资料来源。".repeat(20) + "最终复核。" };
+    const bindings = Array.from({ length: 5 }, (_, index) => ({
+      id: `team/oc_${index}` as const, name: `运营群 ${index + 1}`, agentId: agent.id, createdAt: index,
+    }));
+    const view = buildAgentWorkbench({
+      mode: "overview", agents: [agent], selected: agent, bindings, runs: [],
+      providers: [], models: {}, defaults: { provider: "", model: "" },
+    });
+    const body = String(await agentWorkbenchView(view));
+    expect(body).toMatch(/<details>\s*<summary>完整职责<\/summary>/u);
+    expect(body).toContain(agent.instruction);
+    expect(body).toMatch(/<details>\s*<summary>其余 2 个空间<\/summary>/u);
+    for (const binding of bindings) {
+      expect(body).toContain(`href="/spaces/${encodeURIComponent(binding.id)}"`);
+    }
+  });
   test.each(["create", "edit"] as const)("%s shows current Codex model and reasoning choices", async (mode) => {
     for (const model of curatedProviderModels().codex ?? []) {
       const agent = { ...selected, model, reasoningEffort: "" as const };
@@ -115,7 +178,7 @@ describe("Agent workbench view", () => {
     expect(body).toContain("Codex · 需要连接");
     expect(body).toContain("恢复 Codex 连接");
     expect(body).toContain(
-      `action="/agents/${encodeURIComponent(selected.id)}/provider/recover"`,
+      `action="/agents/${encodeURIComponent(selected.id)}/provider/recover?edit=1"`,
     );
     expect(body).toContain(">恢复 Codex<");
     expect(body).toContain('href="/settings"');
@@ -177,7 +240,7 @@ describe("Agent workbench view", () => {
     const body = String(await agentWorkbenchView(view));
     expect(body).toContain('data-provider-recovery="codex-windows-sandbox"');
     expect(body).toContain(
-      `action="/agents/${encodeURIComponent(selected.id)}/provider/windows-sandbox"`,
+      `action="/agents/${encodeURIComponent(selected.id)}/provider/windows-sandbox?edit=1"`,
     );
     expect(body).toContain("等待系统授权…");
     expect(body).toContain(
@@ -186,7 +249,7 @@ describe("Agent workbench view", () => {
     expect(body).toContain("window.setTimeout(pollWindowsSandbox, 1000)");
   });
 
-  test("renders Chat delivery failure and its Chat retry endpoint", async () => {
+  test.each(["overview", "edit"] as const)("%s renders Chat delivery failure and its Chat retry endpoint", async (mode) => {
     const activityRuns: AgentActivityRun[] = [{
       kind: "chat",
       legacy: false,
@@ -216,15 +279,9 @@ describe("Agent workbench view", () => {
       },
     }];
     const view = buildAgentWorkbench({
-      agents: [selected],
-      mode: "edit",
-      selected,
-      providers: [],
-      models: {},
+      agents: [selected], mode, selected, providers: [], models: {},
       defaults: { provider: "codex", model: "gpt-5.6-sol" },
-      bindings: [],
-      runs: [],
-      activityRuns,
+      bindings: [], runs: [], activityRuns,
     });
 
     const body = String(await agentWorkbenchView(view));
@@ -332,7 +389,7 @@ describe("Agent workbench view", () => {
     expect(body).not.toContain("Environment");
   });
 
-  test("renders the approved three-pane workbench without Mew device fields", async () => {
+  test("explicit editing retains all three panes and configuration controls", async () => {
     const view = buildAgentWorkbench({
       agents: [selected],
       mode: "edit",
@@ -385,7 +442,7 @@ describe("Agent workbench view", () => {
       body.indexOf('data-pane="agent-editor"'),
       body.indexOf('data-pane="agent-inspector"'),
     );
-    expect(editorBody).toContain("Recent runs");
+    expect(editorBody).toContain("最近运行");
     expect(editorBody).toContain("Provider process exited before producing a result");
     expect(body).toContain("运营研究员");
     expect(body).toContain("CLI 就绪");

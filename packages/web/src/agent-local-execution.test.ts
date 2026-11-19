@@ -86,19 +86,20 @@ test("the workbench exposes mode intent and revocation stops the published grant
   const fields = hidden(await (await app.request(url)).text());
   expect((await app.request(url, form({ ...fields, confirmFullAccess: "1" }))).status).toBe(302);
   const published = engine.agents.get(agentId)!;
-  const page = await (await app.request(`/agents/${agentId}`)).text();
+  const page = await (await app.request(`/agents/${agentId}?edit=1`)).text();
   expect(page).toContain('name="executionMode"');
   expect(page).toContain("本机完全访问（无沙箱）");
   expect(page).toContain("撤销完全访问");
   expect(page).not.toContain("启用 Windows 安全沙箱</button>");
   const tokens = hidden(page);
-  const revoked = await app.request(`/agents/${agentId}/local-execution/revoke`, form({
+  const revoked = await app.request(`/agents/${agentId}/local-execution/revoke?edit=1`, form({
     csrfToken: tokens.csrfToken!, expectedHeadRevisionId: published.publishedRevisionId!,
   }));
   expect(revoked.status).toBe(302);
+  expect(revoked.headers.get("location")).toStartWith(`/agents/${agentId}?edit=1&ok=`);
   expect(engine.agents.get(agentId)).toEqual(published);
   expect(engine.agents.listLocalExecutionGrants(agentId).every(grant => grant.revokedAt !== undefined)).toBe(true);
-  const after = await (await app.request(`/agents/${agentId}`)).text();
+  const after = await (await app.request(revoked.headers.get("location")!)).text();
   expect(after).toContain("等待本机确认");
 });
 
@@ -264,10 +265,14 @@ test("the current published Agent has a protected readiness action; GET never pr
   expect(await cached.json()).toMatchObject({ state: "unknown" });
   const fields = hidden(page);
   const request = form({ csrfToken: fields.csrfToken!, expectedPublishedRevisionId: fields.expectedPublishedRevisionId! });
-  expect((await app.request(`/agents/${agentId}/readiness`, request)).status).toBe(302);
+  const checked = await app.request(`/agents/${agentId}/readiness`, request);
+  expect(checked.status).toBe(302);
+  expect(checked.headers.get("location")).toBe(`/agents/${agentId}`);
+  const editCheck = await app.request(`/agents/${agentId}/readiness?edit=1`, request);
+  expect(editCheck.headers.get("location")).toBe(`/agents/${agentId}?edit=1`);
   expect(engine.agentReadiness.status(agentId)?.state).toBe("ready");
   const readyPage = await (await app.request(`/agents/${agentId}`)).text();
-  expect(readyPage).toContain("当前配置准备通过");
+  expect(readyPage).toContain('data-agent-readiness="ready"');
   expect(readyPage).toContain("实际模型调用未验证");
   const draft = engine.saveAgentDraft(agentId, { instruction: "replacement" })!;
   engine.releaseAgent(agentId, draft.id, draft.id);
@@ -281,7 +286,7 @@ test("revision history shows mode intent and Run authorization uses the frozen r
   await app.request(url, form(fields));
   const plan = engine.agentRunExecutionSnapshot(space).executionPlan;
   expect(localExecutionRunStatus(engine, space, agentId, plan, "chat")).toContain("本机确认当前有效");
-  const page = await (await app.request(`/agents/${agentId}`)).text();
+  const page = await (await app.request(`/agents/${agentId}?edit=1`)).text();
   expect(page).toContain("版本模式：本机完全访问（未隔离）");
   engine.agents.revokeLocalExecutionGrants(agentId, engine.agents.get(agentId)!.publishedRevisionId!);
   expect(localExecutionRunStatus(engine, space, agentId, plan, "chat")).toContain("已撤销、失效或未授权");

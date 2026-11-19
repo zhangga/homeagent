@@ -75,7 +75,7 @@ HomeAgent 的 Codex setup、能力探测和实际运行共同使用 `<dataDir>/p
 
 Windows 控制台里的 Codex 能正常执行普通任务，不等于 HomeAgent 隔离模式飞书话题所需的 exact filesystem profile 已可用：
 Codex 的 `unelevated` fallback 无法满足 restricted read-only root-deny 时，HomeAgent 会继续允许普通调用，但把原生会话标成
-“安全沙箱待设置”。此时在 Agent 详情右侧点击“启用 Windows 安全沙箱”；HomeAgent 通过 Codex App Server 发起官方
+“安全沙箱待设置”。此时从助手概览打开「查看恢复选项」，点击“启用 Windows 安全沙箱”；HomeAgent 通过 Codex App Server 发起官方
 `elevated` 设置，请在弹出的 UAC/管理员窗口中批准。页面会等待完成并自动重新执行同一无模型隔离探测，只有探测通过才显示
 “机器隔离探测已通过”；实际 Agent 的 Workdir、Skill 和模型调用仍单独核验。拒绝 UAC、企业策略禁止本地用户/组、防火墙或登录权限变更时，设置会固定失败并允许重试；不要伪造隔离通过或把用户的完整 `~/.codex` 配置复制进 HomeAgent。
 默认启动和页面检测只检查 CLI、身份与原生命令支持；隔离模式需显式点击“检测隔离能力”才执行机器探针，未检测不算通过。完全访问的连接检测和旧沙箱轮询不会再触发隔离探针或设置。
@@ -112,7 +112,7 @@ Task 默认不启用，勾选后仍须逐次人工审批。新增绑定/修改�
 运行详情的“不适用（未启用沙箱）”不代表隔离通过；“进程已启动”也不代表模型调用已验证。
 这些状态来自 HomeAgent 选定参数、子进程状态及结构化结果，不从回答文字猜测；旧记录不补造新结论。
 
-排查“只看得到几个群”时，从 Agent 的 Recent runs 打开本轮 Chat Run，先看冻结的 Skill 目录和权限，
+排查“只看得到几个群”时，从助手概览的「最近运行」打开本轮 Chat Run，先看冻结的 Skill 目录和权限，
 再看执行证据中的飞书操作、显式身份和 CLI 报告身份。普通 Chat 默认冻结全部兼容 Skill；这不会自动
 授予飞书用户身份或跨 Space 读取权限。没有执行证据的旧回答不能当作权限检查结果。
 旧或未确认 `full` 的群话题会明确报配置/授权问题，不会自动降级；修改为 `read-only` 或 `write` 后须发布

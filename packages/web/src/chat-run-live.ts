@@ -1,12 +1,14 @@
-/** Static browser bootstrap: public progress stays in order, answers have one slot. */
+export const chatAnswerModelCaption = /^> 本次模型：[^\r\n]+(?:\r?\n> 推理等级：[^\r\n]+)?\r?\n\r?\n/u;
+
+/** The event journal owns the timeline. Durable Run state owns the answer, delivery and available actions. */
 export function chatRunLiveScript(): string {
   return String.raw`(() => {
     const root = document.getElementById("live-run");
     const list = document.getElementById("live-run-events");
-    const answer = document.getElementById("live-run-answer");
     const summary = document.getElementById("live-run-summary");
-    if (!root || !list || !answer || !summary) return;
+    if (!root || !list || !summary) return;
     const runId = root.dataset.runId;
+    const pagePath = "/chats/runs/" + encodeURIComponent(runId);
     let lastSeq = 0;
     let lastMessage;
     let deltaMessage;
@@ -18,13 +20,15 @@ export function chatRunLiveScript(): string {
     const labels = { command: "命令执行", "file-read": "读取文件", "file-change": "修改文件", mcp: "外部工具", "web-search": "网络查询", other: "工具调用" };
     const statuses = { running: "执行中", completed: "已完成", failed: "失败", unknown: "已结束" };
     const endpoint = "/api/chats/runs/" + encodeURIComponent(runId) + "/snapshot";
-    const readSnapshot = () => fetch(endpoint, { credentials: "same-origin", cache: "no-store" })
+    const readSnapshot = () => fetch(endpoint, { credentials: "same-origin", cache: "no-store", signal: AbortSignal.timeout(10000) })
       .then(response => response.ok ? response.json() : Promise.reject(new Error("snapshot failed")));
     const setAnswer = text => {
       if (!text) return;
-      answer.textContent = text;
+      const answer = document.getElementById("live-run-answer");
+      const content = text.replace(${chatAnswerModelCaption}, "");
+      answer.textContent = content;
       answer.style.display = "block";
-      const body = text.replace(/^> 本次模型：[^\n]{1,300}\n\n/u, "").trim();
+      const body = content.trim();
       const message = lastMessage?.textContent.trim();
       const hasLaterTool = lastMessage && Array.from(list.children).slice(Array.from(list.children).indexOf(lastMessage) + 1)
         .some(node => node.className.split(" ").includes("run-tool"));
@@ -71,29 +75,124 @@ export function chatRunLiveScript(): string {
       list.appendChild(item);
       if (terminal.has(event.kind)) {
         stateLabel = { "run.succeeded": "已完成", "run.failed": "执行失败", "run.cancelled": "已取消", "run.timed_out": "已超时" }[event.kind];
-        source?.close();
         if (event.kind === "run.succeeded") setAnswer(event.delta);
-        // The journal bounds deltas; the durable Run owns the complete answer.
-        if (source) readSnapshot().then(snapshot => setAnswer(snapshot.run?.output)).catch(() => {});
       }
       summary.textContent = stateLabel + " · 已调用 " + toolCount + " 次工具";
     };
-    readSnapshot().then(snapshot => {
-      for (const event of snapshot.events || []) render(event);
-      if (!(snapshot.events || []).length) {
-        const empty = document.createElement("li");
-        empty.className = "muted";
-        empty.textContent = "这次运行尚无公开过程记录。";
-        list.textContent = "";
-        list.appendChild(empty);
-        summary.textContent = { queued: "排队中", running: "执行中", succeeded: "已完成", failed: "执行失败", cancelled: "已取消", timed_out: "已超时" }[snapshot.run?.status] || "等待进度";
+    const runLabels = { queued: "排队中", running: "执行中", succeeded: "已完成", failed: "执行失败", cancelled: "已取消", timed_out: "已超时" };
+    let stopped = false, reading = false, checking = false, progressUnavailable = false, timer;
+    async function readProgress() {
+      if (reading || stopped) return;
+      reading = true;
+      try {
+        const snapshot = await readSnapshot();
+        if (stopped) return;
+        stateLabel = runLabels[snapshot.run?.status] || "等待进度";
+        for (const event of snapshot.events || []) render(event);
+        if (!lastSeq) {
+          const empty = document.createElement("li");
+          empty.className = "muted";
+          empty.textContent = "这次运行尚无公开过程记录。";
+          list.textContent = "";
+          list.appendChild(empty);
+        }
+        summary.textContent = stateLabel + (lastSeq ? " · 已调用 " + toolCount + " 次工具" : "");
+        setAnswer(snapshot.run?.output);
+        if (!["queued", "running"].includes(snapshot.run?.status)) {
+          source?.close();
+          source = undefined;
+        } else if (!source) {
+          source = new EventSource("/api/chats/runs/" + encodeURIComponent(runId) + "/events?after=" + lastSeq);
+          source.onmessage = message => {
+            let event;
+            try { event = JSON.parse(message.data); } catch { return; }
+            render(event);
+            if (terminal.has(event.kind)) {
+              source?.close();
+              source = undefined;
+              // Terminal deltas are bounded. Read the complete saved answer.
+              void readProgress();
+            }
+            if (terminal.has(event.kind) || event.kind === "run.started" || event.kind.startsWith("delivery.")) schedule(0);
+          };
+        }
+        progressUnavailable = false;
+      } catch {
+        progressUnavailable = true;
+        summary.textContent = "暂时无法读取执行轨迹，正在重连。";
+        schedule(8000);
+      } finally {
+        reading = false;
       }
-      setAnswer(snapshot.run?.output);
-      if (["succeeded", "failed", "cancelled", "timed_out"].includes(snapshot.run?.status)) return;
-      source = new EventSource("/api/chats/runs/" + encodeURIComponent(runId) + "/events?after=" + lastSeq);
-      source.onmessage = message => { try { render(JSON.parse(message.data)); } catch {} };
-    }).catch(() => {
-      summary.textContent = "实时连接不可用，可刷新页面查看持久化状态。";
+    }
+
+    function schedule(delay) {
+      clearTimeout(timer);
+      if (!stopped && !document.hidden) timer = setTimeout(check, delay);
+    }
+    function stateChanged(state) {
+      return root.dataset.runStatus !== state.status || root.dataset.deliveryStatus !== state.delivery.status
+        || root.dataset.deliveryAttempts !== String(state.delivery.attempts)
+        || root.dataset.cancelRequested !== (state.cancelRequested ? "1" : "0")
+        || root.dataset.deliveryActive !== (state.deliveryActive ? "1" : "0");
+    }
+    async function refreshSections() {
+      const response = await fetch(pagePath, { cache: "no-store", signal: AbortSignal.timeout(10000) });
+      if (!response.ok || response.redirected) throw new Error();
+      const page = new DOMParser().parseFromString(await response.text(), "text/html");
+      const next = page.getElementById("live-run");
+      if (next?.dataset.runId !== runId) throw new Error();
+      const ids = ["chat-run-overview", "chat-run-details"];
+      const replacements = ids.map(id => [document.getElementById(id), page.getElementById(id)]);
+      if (replacements.some(([old, fresh]) => !old || !fresh)) throw new Error();
+      if (stopped || document.hidden) return;
+      const opened = [...root.querySelectorAll("details[open][id]")].map(el => el.id);
+      const focus = document.activeElement;
+      const focusedId = root.contains(focus) && focus.id;
+      for (const [old, fresh] of replacements) old.replaceWith(fresh);
+      for (const id of opened) {
+        const details = document.getElementById(id);
+        if (details) details.open = true;
+      }
+      if (focusedId && !focus.isConnected) document.getElementById(focusedId)?.focus({ preventScroll: true });
+      Object.assign(root.dataset, next.dataset);
+    }
+    async function check() {
+      if (checking || stopped || document.hidden) return;
+      checking = true;
+      let delay;
+      try {
+        const response = await fetch(pagePath + "/status", { cache: "no-store", signal: AbortSignal.timeout(10000) });
+        if (!response.ok || response.redirected) throw new Error();
+        const state = await response.json();
+        if (stopped || document.hidden) return;
+        const changed = stateChanged(state);
+        if (changed) await refreshSections();
+        if (changed || progressUnavailable || (!source && root.dataset.terminal === "0")) await readProgress();
+        if (root.dataset.terminal === "0" || root.dataset.deliveryStatus === "pending" || root.dataset.deliveryActive === "1") delay = 3000;
+        else if (progressUnavailable || (root.dataset.runStatus === "succeeded" && root.dataset.deliveryStatus === "failed")) delay = 8000;
+      } catch {
+        delay = 8000;
+      } finally {
+        checking = false;
+        if (delay !== undefined) schedule(delay);
+      }
+    }
+    document.addEventListener("visibilitychange", () => schedule(0));
+    window.addEventListener("pagehide", () => {
+      stopped = true;
+      clearTimeout(timer);
+      source?.close();
+      source = undefined;
     });
+    window.addEventListener("pageshow", event => {
+      if (event.persisted) {
+        stopped = false;
+        void readProgress();
+        schedule(0);
+      }
+    });
+    void readProgress();
+    schedule(0);
   })();`;
 }

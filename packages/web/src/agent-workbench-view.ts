@@ -3,11 +3,13 @@ import type { HtmlEscapedString } from "hono/utils/html";
 import { codexReasoningEffortsForModel, EXECUTION_POLICY_ISSUE_LABELS, NATIVE_SESSION_ISSUE_LABELS } from "@homeagent/llm";
 import {
   AGENT_DEFAULT_MODEL_HELP,
+  agentDetailUrl,
   agentDefaultModelLabel,
   reasoningEffortsForEditor,
   type AgentFieldErrors,
   type AgentWorkbenchView,
 } from "./agent-workbench.ts";
+import { agentOverviewView } from "./agent-overview-view.ts";
 import { agentActivityPanel } from "./agent-activity-view.ts";
 
 const STATUS_LABELS = {
@@ -81,6 +83,48 @@ const AGENT_STYLE = `
   }
   .agent-workbench.is-create {
     grid-template-columns:var(--agent-list-width) minmax(520px, 1fr);
+  }
+  .agent-workbench.is-overview { grid-template-columns:var(--agent-list-width) minmax(0,1fr); }
+  .overview-inner { max-width:960px; margin:auto; padding:32px clamp(22px, 4vw, 64px) 64px; overflow-wrap:anywhere; }
+  .overview-header { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  .overview-header h1 { color:var(--fg); font-size:clamp(22px, 2.1vw, 32px); line-height:1.25; margin:0; }
+  .overview-version, .overview-muted { color:var(--muted); font-size:14px; }
+  .overview-version { margin:5px 0 0; }
+  .overview-header .overview-edit { display:inline-flex; align-items:center; justify-content:center; flex:none;
+    min-height:44px; padding:7px 16px; font-size:14px; white-space:nowrap; }
+  .overview-back { display:none; }
+  .agent-overview h2 { margin:0 0 8px; font-size:16px; }
+  .overview-responsibility { padding:24px 0; }
+  .overview-responsibility p, .overview-facts p { margin:0 0 6px; }
+  .overview-instruction { white-space:pre-wrap; line-height:1.65; }
+  .overview-responsibility:has(details[open]) .overview-preview { display:none; }
+  .agent-overview summary, .overview-activity > summary { cursor:pointer; padding:6px 0; }
+  .overview-facts { display:grid; grid-template-columns:1fr 1fr; gap:24px; padding:20px 0;
+    border-top:1px solid var(--border); }
+  .overview-facts > section { min-width:0; }
+  .overview-facts .agent-count { margin-left:4px; }
+  .overview-space-list { list-style:none; margin:0; padding:0; }
+  .overview-space-list li { display:flex; flex-wrap:wrap; align-items:baseline; gap:2px 8px; margin:5px 0; }
+  .overview-space-list span { color:var(--muted); font-size:12px; }
+  .overview-state { display:flex; align-items:baseline; gap:7px; }
+  .overview-state::before { content:""; flex:0 0 8px; height:8px; border-radius:50%; background:#727976; }
+  .overview-state.ready::before { background:#21845e; }
+  .overview-state.issue::before { background:#b4442a; }
+  .overview-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px 16px; font-size:14px; }
+  .overview-actions:not(:empty) { margin-top:10px; }
+  .overview-actions form { margin:0; }
+  .overview-inner .agent-runs-heading h2 { font-size:16px; }
+  .overview-activity { margin-top:20px; border-top:1px solid var(--border); padding-top:8px; }
+  .overview-activity > summary { font-size:14px; }
+  .overview-inner #agent-activity { margin:8px 0; }
+  @media (max-width:759px) {
+    .overview-inner { padding:14px 16px 40px; }
+    .overview-back { display:inline-flex; align-items:center; min-height:44px; font-size:14px; margin-bottom:4px; }
+    .overview-actions button { min-height:44px; }
+    .overview-header { align-items:flex-start; }
+    .overview-responsibility { padding:16px 0; }
+    .overview-facts { grid-template-columns:minmax(0,1fr); gap:16px; padding:16px 0; }
+    .overview-space-list a { padding:3px 0; }
   }
   .agent-visually-hidden {
     position:absolute;
@@ -203,6 +247,9 @@ const AGENT_STYLE = `
   .agent-resizer-inspector { left:0; }
 
   .agent-editor-header { padding:0 26px; }
+  .agent-edit-bar { flex-wrap:wrap; gap:8px 14px; padding-block:10px; }
+  .agent-edit-bar .agent-editor-heading, .agent-edit-bar .agent-editor-actions { flex-wrap:wrap; }
+  .agent-edit-bar .agent-editor-actions { margin-left:auto; }
   .agent-editor-heading { display:flex; min-width:0; align-items:center; gap:10px; }
   .agent-mobile-back { display:none; color:#4e4e49; font-size:13px; }
   .agent-title-text {
@@ -271,6 +318,8 @@ const AGENT_STYLE = `
     margin-bottom:8px;
   }
   .agent-context-label { color:#353530; font-size:12px; font-weight:700; }
+  .agent-context-form .agent-edit-name-wrap { display:grid; gap:6px; width:100%; margin-bottom:20px; }
+  .agent-context-form .agent-edit-name { border:1px solid #d5d5cf; background:#fff; }
   .agent-context-heading .agent-field-hint { margin:0; }
   .agent-context-section .agent-field-control textarea { min-height:150px; }
   .is-create .agent-editor-scroll { max-width:1080px; padding-top:28px; }
@@ -439,6 +488,7 @@ const AGENT_STYLE = `
   .agent-inspector-content { padding:6px 18px 34px; }
   .agent-inspector-section { padding:19px 0; border-bottom:1px solid #e2e2dd; }
   .agent-inspector-section:last-child { border-bottom:0; }
+  #agent-provider-status { scroll-margin-block-start:66px; }
   .agent-inspector-label {
     display:flex;
     align-items:center;
@@ -983,13 +1033,13 @@ export function agentRecentRunsView(view: AgentWorkbenchView) {
   return html`<section class="agent-recent-runs" aria-labelledby="agent-recent-runs-heading">
         <div class="agent-runs-heading">
           <h2 id="agent-recent-runs-heading">
-            Recent runs
+            最近运行
             <span class="agent-count">${view.inspector!.runTotal}</span>
           </h2>
         </div>
         ${view.inspector!.runs.length > 0
           ? html`
-            <div class="agent-run-list" aria-label="Recent runs">
+            <div class="agent-run-list" aria-label="最近运行">
               ${view.inspector!.runs.map((run) => html`
                 <div class="agent-run-item ${run.status}">
                   <a
@@ -1062,11 +1112,67 @@ export function agentRecentRunsView(view: AgentWorkbenchView) {
         ${view.inspector!.hasMoreRuns ? html`
           <a
             class="agent-load-more"
-            href="/agents/${encodeURIComponent(view.selected!.id)}?runs=${Math.min(100, view.inspector!.runLimit + 20)}"
+            href="${agentDetailUrl(view.selected!.id, { edit: view.mode === "edit", runs: Math.min(100, view.inspector!.runLimit + 20) })}"
           >加载更多（${view.inspector!.runs.length} / ${view.inspector!.runTotal}）</a>
         ` : ""}
       </section>`;
 }
+
+const paneSizing = raw(`<script>(function () {
+  var root = document.querySelector('.agent-workbench');
+  if (!root) return;
+  function setupResize(handle, variable, storageKey, startValue, min, max, invert) {
+    if (!handle) return;
+    function setWidth(value) {
+      var next = Math.min(max, Math.max(min, value));
+      root.style.setProperty(variable, next + 'px');
+      handle.setAttribute('aria-valuenow', String(Math.round(next)));
+      return next;
+    }
+    handle.addEventListener('keydown', function (event) {
+      if (window.innerWidth < 1180 || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) return;
+      event.preventDefault();
+      var current = parseFloat(getComputedStyle(root).getPropertyValue(variable)) || startValue;
+      var direction = event.key === 'ArrowRight' ? 1 : -1;
+      var next = setWidth(current + direction * (invert ? -10 : 10));
+      try { localStorage.setItem(storageKey, next + 'px'); } catch (_) {}
+    });
+    handle.addEventListener('pointerdown', function (event) {
+      if (window.innerWidth < 1180) return;
+      event.preventDefault();
+      handle.setPointerCapture(event.pointerId);
+      handle.classList.add('dragging');
+      var startX = event.clientX;
+      var style = getComputedStyle(root);
+      var current = parseFloat(style.getPropertyValue(variable)) || startValue;
+      function move(moveEvent) {
+        var delta = (moveEvent.clientX - startX) * (invert ? -1 : 1);
+        setWidth(current + delta);
+      }
+      function done() {
+        handle.classList.remove('dragging');
+        handle.removeEventListener('pointermove', move);
+        handle.removeEventListener('pointerup', done);
+        try {
+          localStorage.setItem(storageKey, root.style.getPropertyValue(variable));
+        } catch (_) {}
+      }
+      handle.addEventListener('pointermove', move);
+      handle.addEventListener('pointerup', done);
+    });
+  }
+  var LIST_WIDTH_KEY = 'homeagent.agents.workbench.v1.list-width';
+  var INSPECTOR_WIDTH_KEY = 'homeagent.agents.workbench.v1.inspector-width';
+  try {
+    var listWidth = localStorage.getItem(LIST_WIDTH_KEY);
+    var inspectorWidth = localStorage.getItem(INSPECTOR_WIDTH_KEY);
+    if (listWidth) root.style.setProperty('--agent-list-width', listWidth);
+    if (inspectorWidth) root.style.setProperty('--agent-inspector-width', inspectorWidth);
+  } catch (_) {}
+  setupResize(document.querySelector('[data-resize="list"]'), '--agent-list-width', LIST_WIDTH_KEY, 244, 200, 360, false);
+  setupResize(document.querySelector('[data-resize="inspector"]'), '--agent-inspector-width', INSPECTOR_WIDTH_KEY, 324, 260, 420, true);
+
+})();</script>`);
 
 export function agentWorkbenchView(
   view: AgentWorkbenchView,
@@ -1097,11 +1203,55 @@ export function agentWorkbenchView(
       </div>
       <div class="agent-list-meta">
         <span data-agent-status>${agent.running ? "任务运行中" : agent.queued ? "任务排队中" : agent.readinessLabel}</span>
-        <span>${agent.providerName}</span>
-        <span>${agent.modelLabel}</span>
+        ${isEditing ? html`<span>${agent.providerName}</span><span>${agent.modelLabel}</span>` : ""}
       </div>
     </a>
   `);
+
+  const listPane = html`<aside class="agent-pane agent-list-pane" data-pane="agent-list" aria-label="Agent 列表">
+        <div class="agent-pane-header">
+          <div>
+            ${view.mode === "empty" ? html`<h1 class="agent-pane-title">Agent 助手</h1>` : html`<div class="agent-pane-title">Agent 助手</div>`}
+            <span class="agent-count">${view.list.length} 个</span>
+          </div>
+          <a class="agent-icon-button" href="/agents/new" aria-label="新建 Agent">+</a>
+        </div>
+        <nav class="agent-list" aria-label="选择 Agent">
+          ${listItems.length > 0
+            ? listItems
+            : html`<div class="agent-empty-list">还没有 Agent</div>`}
+        </nav>
+        <div
+          class="agent-resizer agent-resizer-list"
+          data-resize="list"
+          role="separator"
+          tabindex="0"
+          aria-label="调整 Agent 列表宽度"
+          aria-orientation="vertical"
+          aria-valuemin="200"
+          aria-valuemax="360"
+          aria-valuenow="244"
+        ></div>
+      </aside>`;
+  const activityQuery = new URLSearchParams();
+  if (view.selected) {
+    activityQuery.set("agent", view.selected.id);
+    activityQuery.set("runs", String(view.inspector?.runLimit ?? 20));
+    if (isEditing) activityQuery.set("edit", "1");
+  }
+  const activity = view.activity ? agentActivityPanel(view.activity,
+    view.selected ? `/agents/activity?${activityQuery}` : "/agents/activity") : "";
+  if (view.mode === "overview") {
+    return html`<style>${raw(AGENT_STYLE)}</style>
+      <div class="agent-workbench has-editor is-overview">
+        ${listPane}
+        <article class="agent-pane agent-overview-pane"><div class="overview-inner">
+          ${agentOverviewView(view)}
+          <div id="agent-recent-runs">${agentRecentRunsView(view)}</div>
+          ${activity ? html`<details class="overview-activity"><summary>所有助手的运行动态</summary>${activity}</details>` : ""}
+        </div></article>
+      </div>${paneSizing}`;
+  }
 
   const providerOptions = [...view.providers];
   if (values.provider && !providerOptions.some((provider) => provider.id === values.provider)) {
@@ -1495,38 +1645,18 @@ export function agentWorkbenchView(
   `;
 
   const editOrEmptyEditor = hasEditor ? html`
-    <div class="agent-pane-header agent-editor-header">
+    <div class="agent-pane-header agent-editor-header agent-edit-bar">
       <div class="agent-editor-heading">
-        <a class="agent-mobile-back" href="/agents?view=list" aria-label="返回 Agent 列表">返回</a>
-        <div class="agent-edit-name-wrap">
-          <label class="agent-visually-hidden" for="agent-name">Agent 名称</label>
-          <input
-            class="agent-edit-name"
-            id="agent-name"
-            name="name"
-            type="text"
-            form="agent-editor-form"
-            value="${values.name}"
-            placeholder="例如：研究助手"
-            maxlength="100"
-            required
-            aria-invalid="${nameAttrs.invalid}"
-            aria-describedby="${nameAttrs.describedBy}"
-            autocomplete="off"
-          />
-          ${errorFor(view.errors, "name")}
-        </div>
+        <h2 class="agent-pane-title">编辑助手</h2>
         <span class="agent-save-state" id="agent-save-state">未保存</span>
         ${isEditing && view.revision
-          ? html`<span class="agent-count">线上 v${view.revision.history.find((item) => item.published)?.number ?? "—"}</span>
+          ? html`<span class="agent-count">线上 v${view.revision.publishedRevisionNumber ?? "—"}</span>
               ${view.revision.draftRevisionId ? html`<span class="badge general">有未发布草稿</span>` : ""}`
           : ""}
       </div>
       <div class="agent-editor-actions">
-        <button type="button" class="agent-secondary agent-inspector-toggle" data-inspector-toggle>
-          详情
-        </button>
-        <a class="agent-secondary" href="${cancelHref}">取消</a>
+        <a class="agent-secondary" href="${cancelHref}">返回概览</a>
+        <button type="button" class="agent-secondary agent-inspector-toggle" data-inspector-toggle aria-controls="agent-inspector">模型与执行参数</button>
         ${isEditing ? html`
           <button class="agent-secondary" type="submit" form="agent-editor-form" name="agentAction" value="draft">保存草稿</button>
           <button
@@ -1546,9 +1676,16 @@ export function agentWorkbenchView(
         ${isEditing && view.revision?.headRevisionId
           ? html`<input type="hidden" name="expectedHeadRevisionId" value="${view.revision.headRevisionId}" />`
           : ""}
+        <div class="agent-edit-name-wrap">
+          <label class="agent-context-label" for="agent-name">助手名称</label>
+          <input class="agent-edit-name" id="agent-name" type="text" name="name"
+            value="${values.name}" placeholder="例如：研究助手" maxlength="100" required
+            aria-invalid="${nameAttrs.invalid}" aria-describedby="${nameAttrs.describedBy}" autocomplete="off" />
+          ${errorFor(view.errors, "name")}
+        </div>
         <section class="agent-context-section" aria-labelledby="agent-instruction-label">
           <div class="agent-context-heading">
-            <label class="agent-context-label" id="agent-instruction-label" for="agent-instruction">Instruction</label>
+            <label class="agent-context-label" id="agent-instruction-label" for="agent-instruction">职责与工作指令</label>
             <span class="agent-field-hint"><span id="agent-instruction-count">${values.instruction.length}</span> / 20,000</span>
           </div>
           <div class="agent-field-control">
@@ -1586,13 +1723,13 @@ export function agentWorkbenchView(
   const inspector = view.inspector ? html`
     <div class="agent-pane-header">
       <h2 class="agent-pane-title">Agent 设置</h2>
-      <button type="button" class="agent-icon-button agent-inspector-toggle" data-inspector-toggle aria-label="关闭详情">×</button>
+      <button type="button" class="agent-icon-button agent-inspector-toggle" data-inspector-toggle aria-controls="agent-inspector" aria-label="关闭参数">×</button>
     </div>
     <div class="agent-inspector-content">
       <section class="agent-inspector-section agent-properties-section">
-        <h3 class="agent-inspector-label">Execution</h3>
+        <h3 class="agent-inspector-label">模型与执行参数</h3>
         <div class="agent-property-field">
-          <label class="agent-property-label" for="agent-provider">Provider</label>
+          <label class="agent-property-label" for="agent-provider">本机 AI 工具</label>
           <div class="agent-property-control">
             <select
               id="agent-provider"
@@ -1615,7 +1752,7 @@ export function agentWorkbenchView(
           </div>
         </div>
         <div class="agent-property-field">
-          <label class="agent-property-label" for="agent-model">Model</label>
+          <label class="agent-property-label" for="agent-model">模型</label>
           <div class="agent-property-control">
             <select
               id="agent-model"
@@ -1653,7 +1790,7 @@ export function agentWorkbenchView(
         </div>
         ${executionModeField}
         <div class="agent-property-field">
-          <label class="agent-property-label" for="agent-permission">Permission</label>
+          <label class="agent-property-label" for="agent-permission">执行权限</label>
           <div class="agent-property-control">
             <select
               id="agent-permission"
@@ -1673,9 +1810,9 @@ export function agentWorkbenchView(
         </div>
       </section>
       <section class="agent-inspector-section agent-properties-section">
-        <h3 class="agent-inspector-label">Scope & tools</h3>
+        <h3 class="agent-inspector-label">空间与工作目录</h3>
         <div class="agent-property-field">
-          <label class="agent-property-label" for="agent-visibility">Visibility</label>
+          <label class="agent-property-label" for="agent-visibility">适用空间</label>
           <div class="agent-property-control">
             <select
               id="agent-visibility"
@@ -1684,14 +1821,14 @@ export function agentWorkbenchView(
               aria-invalid="${visibilityAttrs.invalid}"
               aria-describedby="${visibilityAttrs.describedBy}"
             >
-              <option value="Team" ${values.visibility === "Team" ? "selected" : ""}>Team</option>
-              <option value="Personal" ${values.visibility === "Personal" ? "selected" : ""}>Personal</option>
+              <option value="Team" ${values.visibility === "Team" ? "selected" : ""}>团队空间</option>
+              <option value="Personal" ${values.visibility === "Personal" ? "selected" : ""}>个人空间</option>
             </select>
             ${errorFor(view.errors, "visibility")}
           </div>
         </div>
         <div class="agent-property-field">
-          <label class="agent-property-label" for="agent-workdir">Workdir</label>
+          <label class="agent-property-label" for="agent-workdir">工作目录</label>
           <div class="agent-property-control">
             <input
               id="agent-workdir"
@@ -1715,7 +1852,7 @@ export function agentWorkbenchView(
           <p class="agent-field-hint">${view.localExecution.confirmed ? `已确认 ${view.localExecution.confirmedScopes} 个 Chat 范围` : "当前发布版本等待本机确认"}；${view.localExecution.pendingScopes} 个范围待确认。</p>
           <p class="agent-field-hint">Task ${view.localExecution.taskExecutionEnabled ? "已允许，仍须逐次审批" : "未启用"}。CLI 已连接不代表实际模型调用或飞书权限已经验证；此处只显示已发布版本。</p>
           ${view.localExecution.confirmationUrl ? html`<p><a href="${view.localExecution.confirmationUrl}">查看完整范围并确认发布</a></p>` : ""}
-          ${view.localExecution.activeGrants > 0 ? html`<form method="post" action="/agents/${encodeURIComponent(view.selected!.id)}/local-execution/revoke"
+          ${view.localExecution.activeGrants > 0 ? html`<form method="post" action="/agents/${encodeURIComponent(view.selected!.id)}/local-execution/revoke?edit=1"
             onsubmit="return confirm('撤销此 Agent 全部版本的完全访问确认并请求取消相关调用？已发生的外部效果不能回滚。')">
             <input type="hidden" name="csrfToken" value="${view.localExecution.csrfToken}" />
             <input type="hidden" name="expectedHeadRevisionId" value="${view.revision!.headRevisionId}" />
@@ -1723,8 +1860,8 @@ export function agentWorkbenchView(
           </form>` : ""}
         </section>
       ` : ""}
-      <section class="agent-inspector-section">
-        <h3 class="agent-inspector-label">Provider status</h3>
+      <section class="agent-inspector-section" id="agent-provider-status" aria-labelledby="agent-provider-status-title" tabindex="-1">
+        <h3 class="agent-inspector-label" id="agent-provider-status-title">连接检测与恢复</h3>
         ${view.readiness ? html`
           <div class="agent-provider-recovery" data-agent-readiness="${view.readiness.snapshot.state}" aria-live="polite">
             <div class="agent-provider-recovery-title">${{
@@ -1736,7 +1873,7 @@ export function agentWorkbenchView(
               : view.readiness.snapshot.failure.stage === "native-session" ? NATIVE_SESSION_ISSUE_LABELS[view.readiness.snapshot.failure.reason] : "冻结 Skill 副本容量超限"}</p>` : ""}
             <p class="agent-field-hint">${view.readiness.snapshot.reason === "configuration-changed" ? "配置、身份或目录已变化，请重新检测。" : view.readiness.snapshot.reason === "expired" ? "上次结果已过期，请重新检测。" : view.readiness.snapshot.reason === "check-failed" && !view.readiness.snapshot.failure ? "准备检查失败，请恢复 CLI 连接或检查执行配置后重试。" : "仅核验当前发布配置，不调用模型，不修改授权，也不设置 Windows 沙箱。"}</p>
             ${view.readiness.snapshot.checkedAt ? html`<p class="agent-field-hint">检查时间 ${formatTime(view.readiness.snapshot.checkedAt)} · 结果最多保留 60 秒，执行前仍重新核验。</p>` : ""}
-            <form method="post" action="/agents/${encodeURIComponent(view.selected!.id)}/readiness">
+            <form method="post" action="/agents/${encodeURIComponent(view.selected!.id)}/readiness?edit=1">
               <input type="hidden" name="csrfToken" value="${view.readiness.csrfToken}" />
               <input type="hidden" name="expectedPublishedRevisionId" value="${view.selected!.publishedRevisionId}" />
               <button type="submit" class="agent-secondary" ${view.readiness.snapshot.state === "checking" ? "disabled" : ""}>检测当前发布配置</button>
@@ -1751,7 +1888,7 @@ export function agentWorkbenchView(
             <div class="agent-provider-detail">${view.inspector.provider.detail}</div>
           </div>
         </div>
-        ${view.selected?.provider === "codex" && !view.inspector.provider.recovery ? html`<form method="post" action="/agents/${encodeURIComponent(view.selected.id)}/provider/recover">
+        ${view.selected?.provider === "codex" && !view.inspector.provider.recovery ? html`<form method="post" action="/agents/${encodeURIComponent(view.selected.id)}/provider/recover?edit=1">
           <button type="submit" class="agent-secondary">${view.selected.executionMode === "local-full-access" ? "重新检测 CLI 连接" : "检测隔离能力"}</button>
         </form>` : ""}
         ${view.inspector.provider.recovery ? html`
@@ -1775,7 +1912,7 @@ export function agentWorkbenchView(
                 view.inspector.provider.recovery.kind === "codex-windows-sandbox"
                   ? "windows-sandbox"
                   : "recover"
-              }">
+              }?edit=1">
                 ${view.inspector.provider.recovery.pending
                   ? html`<button type="submit" class="agent-primary" disabled>${view.inspector.provider.recovery.actionLabel}</button>`
                   : html`<button type="submit" class="agent-primary">${view.inspector.provider.recovery.actionLabel}</button>`}
@@ -1789,7 +1926,7 @@ export function agentWorkbenchView(
       </section>
       <section class="agent-inspector-section">
         <h3 class="agent-inspector-label">
-          Bindings
+          已绑定空间
           <span>${view.inspector.bindings.length}</span>
         </h3>
         ${view.inspector.bindings.length > 0
@@ -1832,7 +1969,7 @@ export function agentWorkbenchView(
       ` : ""}
       ${isEditing ? html`
         <section class="agent-inspector-section">
-          <h3 class="agent-inspector-label">Danger zone</h3>
+          <h3 class="agent-inspector-label">删除助手</h3>
           <p class="agent-delete-note">删除前会解除 ${view.inspector.bindings.length} 个空间绑定，绑定将回退到默认 AI。</p>
           <form
             id="agent-delete-form"
@@ -1939,6 +2076,7 @@ export function agentWorkbenchView(
     }).then(function (session) {
       if (session.state === 'ready' || session.state === 'failed') {
         var next = new URL(window.location.href);
+        next.searchParams.set('edit', '1');
         next.searchParams.set('ok', String(session.message || 'Codex 状态已更新'));
         window.location.replace(next.toString());
         return;
@@ -2163,13 +2301,28 @@ export function agentWorkbenchView(
       setInspectorOpen(open, button);
     });
   });
-  var firstInvalid = document.querySelector('[aria-invalid="true"]');
-  if (firstInvalid && typeof firstInvalid.focus === 'function') {
-    if (inspector && inspector.contains(firstInvalid) && window.innerWidth < 1180) {
+  function revealParameter(target) {
+    if (inspector && inspector.contains(target) && window.innerWidth < 1180 && !inspector.classList.contains('open')) {
       setInspectorOpen(true, document.querySelector('[data-inspector-toggle]'));
     }
-    firstInvalid.focus();
   }
+  var firstInvalid = document.querySelector('[aria-invalid="true"]');
+  if (firstInvalid && typeof firstInvalid.focus === 'function') {
+    revealParameter(firstInvalid);
+    firstInvalid.focus();
+  } else if (window.location.hash === '#agent-provider-status') {
+    var recoverySection = document.getElementById('agent-provider-status');
+    if (recoverySection) {
+      revealParameter(recoverySection);
+      recoverySection.focus({ preventScroll:true });
+      recoverySection.scrollIntoView({ block:'start' });
+    }
+  }
+  document.addEventListener('invalid', function (event) {
+    if (!form || event.target.form !== form || !inspector || !inspector.contains(event.target)) return;
+    var first = Array.from(form.elements).find(function (control) { return control.willValidate && !control.validity.valid; });
+    if (event.target === first) revealParameter(first);
+  }, true);
   if (overlay) overlay.addEventListener('click', function () { setInspectorOpen(false); });
   document.addEventListener('keydown', function (event) {
     if (!inspector || !inspector.classList.contains('open') || window.innerWidth >= 1180) return;
@@ -2194,57 +2347,6 @@ export function agentWorkbenchView(
     }
   });
 
-  function setupResize(handle, variable, storageKey, startValue, min, max, invert) {
-    if (!handle) return;
-    function setWidth(value) {
-      var next = Math.min(max, Math.max(min, value));
-      root.style.setProperty(variable, next + 'px');
-      handle.setAttribute('aria-valuenow', String(Math.round(next)));
-      return next;
-    }
-    handle.addEventListener('keydown', function (event) {
-      if (window.innerWidth < 1180 || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) return;
-      event.preventDefault();
-      var current = parseFloat(getComputedStyle(root).getPropertyValue(variable)) || startValue;
-      var direction = event.key === 'ArrowRight' ? 1 : -1;
-      var next = setWidth(current + direction * (invert ? -10 : 10));
-      try { localStorage.setItem(storageKey, next + 'px'); } catch (_) {}
-    });
-    handle.addEventListener('pointerdown', function (event) {
-      if (window.innerWidth < 1180) return;
-      event.preventDefault();
-      handle.setPointerCapture(event.pointerId);
-      handle.classList.add('dragging');
-      var startX = event.clientX;
-      var style = getComputedStyle(root);
-      var current = parseFloat(style.getPropertyValue(variable)) || startValue;
-      function move(moveEvent) {
-        var delta = (moveEvent.clientX - startX) * (invert ? -1 : 1);
-        setWidth(current + delta);
-      }
-      function done() {
-        handle.classList.remove('dragging');
-        handle.removeEventListener('pointermove', move);
-        handle.removeEventListener('pointerup', done);
-        try {
-          localStorage.setItem(storageKey, root.style.getPropertyValue(variable));
-        } catch (_) {}
-      }
-      handle.addEventListener('pointermove', move);
-      handle.addEventListener('pointerup', done);
-    });
-  }
-  var LIST_WIDTH_KEY = 'homeagent.agents.workbench.v1.list-width';
-  var INSPECTOR_WIDTH_KEY = 'homeagent.agents.workbench.v1.inspector-width';
-  try {
-    var listWidth = localStorage.getItem(LIST_WIDTH_KEY);
-    var inspectorWidth = localStorage.getItem(INSPECTOR_WIDTH_KEY);
-    if (listWidth) root.style.setProperty('--agent-list-width', listWidth);
-    if (inspectorWidth) root.style.setProperty('--agent-inspector-width', inspectorWidth);
-  } catch (_) {}
-  setupResize(document.querySelector('[data-resize="list"]'), '--agent-list-width', LIST_WIDTH_KEY, 244, 200, 360, false);
-  setupResize(document.querySelector('[data-resize="inspector"]'), '--agent-inspector-width', INSPECTOR_WIDTH_KEY, 324, 260, 420, true);
-
   var deleteForm = document.getElementById('agent-delete-form');
   if (deleteForm) {
     deleteForm.addEventListener('submit', function (event) {
@@ -2263,37 +2365,12 @@ export function agentWorkbenchView(
   return html`
     <style>${raw(AGENT_STYLE)}</style>
     <form id="agent-skill-refresh-form" method="post" action="/agent-skills/refresh" hidden>
-      <input type="hidden" name="returnTo" value="${cancelHref}" />
+      <input type="hidden" name="returnTo" value="${isEditing ? `${cancelHref}?edit=1` : cancelHref}" />
     </form>
     <div class="${workbenchClasses}">
-      <aside class="agent-pane agent-list-pane" data-pane="agent-list" aria-label="Agent 列表">
-        <div class="agent-pane-header">
-          <div>
-            <h1 class="agent-pane-title">Agents</h1>
-            <span class="agent-count">${view.list.length} 个</span>
-          </div>
-          <a class="agent-icon-button" href="/agents/new" aria-label="新建 Agent">+</a>
-        </div>
-        <nav class="agent-list" aria-label="选择 Agent">
-          ${listItems.length > 0
-            ? listItems
-            : html`<div class="agent-empty-list">还没有 Agent</div>`}
-        </nav>
-        <div
-          class="agent-resizer agent-resizer-list"
-          data-resize="list"
-          role="separator"
-          tabindex="0"
-          aria-label="调整 Agent 列表宽度"
-          aria-orientation="vertical"
-          aria-valuemin="200"
-          aria-valuemax="360"
-          aria-valuenow="244"
-        ></div>
-      </aside>
+      ${listPane}
       <section class="agent-pane agent-editor-pane" data-pane="agent-editor">
-        ${view.activity ? agentActivityPanel(view.activity, `/agents/activity${view.selected
-          ? `?agent=${encodeURIComponent(view.selected.id)}&runs=${view.inspector?.runLimit ?? 20}` : ""}`) : ""}
+        ${activity}
         ${editor}
       </section>
       ${view.mode === "create" ? "" : html`
@@ -2303,6 +2380,7 @@ export function agentWorkbenchView(
         <button class="agent-inspector-overlay" type="button" aria-label="关闭详情"></button>
       `}
     </div>
+    ${paneSizing}
     ${script}
   `;
 }

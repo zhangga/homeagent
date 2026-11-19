@@ -29,7 +29,18 @@ import {
 } from "@homeagent/llm";
 import type { AgentActivity } from "./agent-activity.ts";
 
-export type AgentWorkbenchMode = "empty" | "create" | "edit";
+export type AgentWorkbenchMode = "empty" | "create" | "overview" | "edit";
+
+export function agentDetailUrl(
+  id: string,
+  options: { edit?: boolean; runs?: number; ok?: string } = {},
+): string {
+  const query: string[] = [];
+  if (options.edit) query.push("edit=1");
+  if (options.runs !== undefined) query.push(`runs=${options.runs}`);
+  if (options.ok) query.push(`ok=${encodeURIComponent(options.ok)}`);
+  return `/agents/${encodeURIComponent(id)}${query.length ? `?${query.join("&")}` : ""}`;
+}
 
 export interface AgentEditorValues {
   name: string;
@@ -156,6 +167,7 @@ export interface AgentWorkbenchView {
   revision: {
     headRevisionId?: string;
     publishedRevisionId?: string;
+    publishedRevisionNumber?: number;
     draftRevisionId?: string;
     history: AgentRevisionView[];
   } | null;
@@ -766,7 +778,7 @@ export function agentInputForEditor(
 export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkbenchView {
   const generatedNames = generatedAgentNames(input.agents);
   const automaticName = input.mode === "create" && input.values === undefined;
-  const editorAgent = input.selected && input.draft
+  const editorAgent = input.mode === "edit" && input.selected && input.draft
     ? {
         ...input.selected,
         ...input.draft.snapshot,
@@ -971,6 +983,7 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
             ?? input.revisions?.[0]?.id
             ?? input.selected.publishedRevisionId,
           publishedRevisionId: input.selected.publishedRevisionId,
+          publishedRevisionNumber: input.revisions?.find((revision) => revision.id === input.selected?.publishedRevisionId)?.number,
           draftRevisionId: input.draft?.id,
           history: (input.revisions ?? []).slice(0, 20).map((revision) => ({
             id: revision.id,
