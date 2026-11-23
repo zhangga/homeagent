@@ -29,8 +29,8 @@ afterEach(() => {
   resetConfig();
 });
 
-function seed(content: string): string {
-  return store.index().insertRaw({ space: SPACE, source: "message", content });
+function seed(content: string, createdAt?: number): string {
+  return store.index().insertRaw({ space: SPACE, source: "message", content, createdAt });
 }
 
 function operation(name: string, rawIds: string[]) {
@@ -237,8 +237,8 @@ test("cancelling shared extraction leaves Raw pending and writes no partial page
 });
 
 test("groups short sources only when every target has the same provenance", async () => {
-  const common = [seed("COMMON_FIRST"), seed("COMMON_SECOND")];
-  const exclusive = seed("A_PRIVATE");
+  const common = [seed("COMMON_FIRST", 1000), seed("COMMON_SECOND", 2000)];
+  const exclusive = seed("A_PRIVATE", 3000);
   const fake = new FakeLlm().onJSON(opts => {
     const prompt = opts.prompt ?? "";
     if (prompt.includes("## 待提炼的原始条目")) return {

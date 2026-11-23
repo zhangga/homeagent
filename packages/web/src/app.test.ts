@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1726,6 +1727,51 @@ describe("web backend (read-only)", () => {
     expect(await res.text()).toContain("一条原始消息");
   });
 
+  test("raw history links reach entries beyond 300 and keep the cursor when new records arrive", async () => {
+    engine.registry.updateMeta(SPACE, { name: "交付团队" });
+    const index = engine.registry.store(SPACE).index();
+    for (let i = 1; i <= 301; i++) {
+      const id = "raw-" + String(i).padStart(3, "0");
+      index.restoreRaw({ space: SPACE, source: "message", id, createdAt: 1000, content: id, ingested: false, admission: "ready" });
+    }
+    const other = "team/oc_other_history";
+    await engine.remember({ space: other, source: "manual", content: "另一空间的记录" });
+    const path = `/spaces/${encodeURIComponent(SPACE)}/raw`;
+    const link = (body: string, rel: "prev" | "next") =>
+      body.match(new RegExp(`rel="${rel}" href="([^"]+)"`, "u"))?.[1]?.replaceAll("&amp;", "&");
+    const entries = (body: string) => [...body.matchAll(/class="raw-title" href="[^"]+\/raw\/([^"]+)"/gu)].map(match => match[1]!);
+    let body = await (await app.request(path)).text();
+    expect(body).toContain("原始条目 · 交付团队");
+    expect(body).not.toContain("另一空间的记录");
+    const first = entries(body);
+    expect(first).toHaveLength(50);
+    expect(first[1]).toBe("raw-301");
+    expect(link(body, "prev")).toBeUndefined();
+    const added = await engine.remember({ space: SPACE, source: "manual", content: "翻页时新增", createdAt: 2000 });
+    const seen = [...first];
+    while (link(body, "next")) {
+      body = await (await app.request(link(body, "next")!)).text();
+      const page = entries(body);
+      expect(page.length).toBeGreaterThan(0);
+      expect(page.some(id => seen.includes(id))).toBe(false);
+      if (seen.length === 50) {
+        const previous = await (await app.request(link(body, "prev")!)).text();
+        expect(entries(previous).slice(1)).toEqual(first.slice(1));
+        expect(entries(previous)[0]).toBe(added);
+      }
+      seen.push(...page);
+    }
+    expect(seen).toHaveLength(302);
+    expect(seen.at(-1)).toBe("raw-001");
+    expect(entries(await (await app.request(path)).text())).toContain(added);
+    for (const query of ["before=NaN&id=x", "after=1000", "before=5&after=10&id=x", "id=x"]) {
+      expect((await app.request(`${path}?${query}`)).status).toBe(400);
+    }
+    const pastEnd = await (await app.request(`${path}?before=0&id=x`)).text();
+    expect(pastEnd).toContain("这个位置没有更多原始条目。");
+    expect(pastEnd).toContain(`href="${path}">返回最新`);
+  }, 30_000);
+
   test("ask box renders a knowledge answer", async () => {
     // script routing + synthesis
     fake.onJSON((call) => {
@@ -1745,6 +1791,80 @@ describe("web backend (read-only)", () => {
     expect(body).toContain('value="helpful"');
     expect(body).toContain('value="unhelpful"');
     expect(body).toContain('value="citation_error"');
+  });
+
+  test("space question submissions redirect to a saved answer; only an explicit new submission asks again", async () => {
+    const path = `/spaces/${encodeURIComponent(SPACE)}/ask`;
+    const question = "谁负责后端？";
+    fake.onJSON(call => "relevant" in (call.schema as { properties: object }).properties
+      ? { relevant: true, slugs: ["entities/alice"] }
+      : { answer: "后端由 Alice 负责。", grounded: true, usedSlugs: ["entities/alice"], gaps: [] });
+    const post = () => app.request(path, { method: "POST", body: new URLSearchParams({ q: question }) });
+    const response = await post();
+    expect(response.status).toBe(303);
+    const location = response.headers.get("location")!;
+    expect(location).toStartWith(`${path}?traceId=answer_`);
+    const calls = fake.calls.length;
+    expect(calls).toBeGreaterThan(0);
+    for (let i = 0; i < 2; i++) {
+      const reopened = await app.request(location);
+      const body = await reopened.text();
+      expect(body).toContain("后端由 Alice 负责。");
+      expect(body).toContain("证据链不完整");
+      expect(body).toContain("entities%2Falice");
+      expect(body).toContain(`<form method="post" action="${path}"`);
+      expect(body).toContain("重新提问");
+    }
+    const other = "team/oc_other";
+    engine.ensureSpace(other);
+    expect((await app.request(location.replace(encodeURIComponent(SPACE), encodeURIComponent(other)))).status).toBe(404);
+    expect((await app.request(`${path}?traceId=unknown&q=question`)).status).toBe(404);
+    expect(fake.calls.length).toBe(calls);
+    expect((await post()).headers.get("location")).not.toBe(location);
+    expect(fake.calls.length).toBeGreaterThan(calls);
+  });
+
+  test("space questions show the entire first answer and disclose a saved excerpt on reopening", async () => {
+    const path = `/spaces/${encodeURIComponent(SPACE)}/ask`;
+    const q = "谁负责后端？" + "问题".repeat(2100) + "问题尾标";
+    const answer = "后端由 Alice 负责。".repeat(1500) + "回答尾标";
+    fake.onJSON(call => "relevant" in (call.schema as { properties: object }).properties
+      ? { relevant: true, slugs: ["entities/alice"] }
+      : { answer, grounded: true, usedSlugs: ["entities/alice"], gaps: [] });
+    const original = await app.request(path, { method: "POST", body: new URLSearchParams({ q }) });
+    const originalBody = await original.text();
+    expect(originalBody).toContain("问题尾标");
+    expect(originalBody).toContain("回答尾标");
+    expect(originalBody).toContain("已显示本次完整回答");
+    const location = original.headers.get("content-location")!;
+    expect(originalBody).toContain(`data-result-url="${location}"`);
+    const calls = fake.calls.length;
+    const reopened = await app.request(location);
+    const body = await reopened.text();
+    expect(body).toContain("本机保存的节选");
+    expect(body).not.toContain("回答尾标");
+    expect(body).not.toContain("问题尾标");
+    expect(body).toContain("entities%2Falice");
+    expect(fake.calls.length).toBe(calls);
+  });
+
+  test("a trace write failure keeps the answer visible and its reopen address never calls the provider", async () => {
+    const path = `/spaces/${encodeURIComponent(SPACE)}/ask`;
+    const spy = spyOn(engine.quality, "recordTrace").mockImplementation(() => { throw new Error("unavailable"); });
+    try {
+      fake.onJSON(call => "relevant" in (call.schema as { properties: object }).properties
+        ? { relevant: true, slugs: ["entities/alice"] }
+        : { answer: "这次回答仍然完整。", grounded: true, usedSlugs: ["entities/alice"], gaps: [] });
+      const response = await app.request(path, { method: "POST", body: new URLSearchParams({ q: "谁负责后端？" }) });
+      const body = await response.text();
+      expect(body).toContain("这次回答仍然完整。");
+      expect(body).toContain("本次回答未保存");
+      expect(body).not.toContain('name="traceId"');
+      const calls = fake.calls.length;
+      const reopened = await app.request(response.headers.get("content-location")!);
+      expect(await reopened.text()).toContain("没有可重开的回答记录");
+      expect(fake.calls.length).toBe(calls);
+    } finally { spy.mockRestore(); }
   });
 
   test("all ask feedback kinds are recorded and return to the rated answer", async () => {
@@ -2539,6 +2659,65 @@ describe("management backend (read-write)", () => {
     expect(rawList).toContain("beta.txt");
   });
 
+  test("local material receipts retry only a partially written ZIP after a projection failure and restart", async () => {
+    const path = `/spaces/${encodeURIComponent(SPACE)}/materials`;
+    const pageHtml = await (await app.request(`/spaces/${encodeURIComponent(SPACE)}`)).text();
+    const batch = pageHtml.match(/name="materialBatch" value="([^"]+)"/u)![1]!;
+    const originalWork = engine.workItems.create({ space: SPACE, title: "第一次上传时的事项" });
+    const archive = new File([zipFixture([{ name: "long.txt", content: "a".repeat(200_000) + "END" }])], "research.zip");
+    const form = new FormData();
+    form.set("materialBatch", batch);
+    form.append("material", new File(["before"], "memo.txt"));
+    form.append("material", archive);
+    form.append("material", new File(["after"], "memo.txt"));
+    const request = (body: FormData) => app.request(path, { method: "POST", body });
+    const db = new Database(join(engine.registry.store(SPACE).root, ".index.db"));
+    let receipt: string;
+    try {
+      db.exec("CREATE TRIGGER fail_zip_tail BEFORE INSERT ON raw WHEN NEW.content LIKE '%正文分段：2/2%' BEGIN SELECT RAISE(FAIL, 'private fixture details'); END");
+      const response = await request(form);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("location")).toBeNull();
+      receipt = await response.text();
+      expect(receipt).toContain("已导入 2 份资料");
+      expect(receipt.match(/data-complete="true"/gu)).toHaveLength(2);
+      expect(receipt.match(/data-complete="false"/gu)).toHaveLength(1);
+      expect(receipt).toContain("已确认 2/3 条原始记录");
+      expect(receipt).not.toContain("private fixture details");
+      expect(receipt.match(/<form data-material-retry/gu)).toHaveLength(1);
+      expect(receipt).toContain('name="materialSlot" value="1"');
+      db.exec("DROP TRIGGER fail_zip_tail");
+    } finally { db.close(); }
+    const retryForm = (file: File) => {
+      const body = new FormData();
+      for (const [, key, value] of receipt.matchAll(/name="(materialBatch|materialSlot|materialIdentity|materialBudget)" value="([^"]+)"/gu)) body.set(key!, value!);
+      body.set("material", file);
+      return body;
+    };
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
+    app = createWebApp({ engine });
+    const newWork = engine.workItems.create({ space: SPACE, title: "重试前切换的事项" });
+    expect((await request(retryForm(new File(["changed"], "research.zip")))).status).toBe(400);
+    const completed = await request(retryForm(archive));
+    expect(await completed.text()).toContain("research.zip</strong> · 已导入");
+    const repeated = await request(retryForm(archive));
+    expect(await repeated.text()).not.toContain("重试此文件");
+    const records = () => engine.registry.store(SPACE).index().listRaw({}).filter(raw => raw.source === "manual");
+    expect(records()).toHaveLength(5);
+    expect(engine.workItems.get(originalWork.id)?.rawIds.toSorted()).toEqual(records().map(raw => raw.id).toSorted());
+    expect(engine.workItems.get(newWork.id)?.rawIds).toEqual([]);
+    expect(records().filter(raw => raw.attachments?.[0]?.name === "memo.txt")).toHaveLength(2);
+    const tail = records().find(raw => raw.content.includes("正文分段：2/2"))!;
+    expect(await (await app.request(`/spaces/${encodeURIComponent(SPACE)}/raw/${tail.id}/attachments/0`)).text()).toBe("a".repeat(200_000) + "END");
+    const fresh = new FormData();
+    fresh.set("materialBatch", crypto.randomUUID());
+    fresh.set("material", archive);
+    expect((await request(fresh)).status).toBe(302);
+    expect(records()).toHaveLength(8);
+    expect(engine.workItems.get(newWork.id)?.rawIds).toHaveLength(3);
+  });
+
   test("preserves an empty local material as an original file", async () => {
     const form = new FormData();
     form.set("material", new File([], "empty.md", { type: "text/markdown" }));
@@ -2758,6 +2937,7 @@ describe("management backend (read-write)", () => {
       "/health", "/quality", "/governance", "/logs", "/settings",
     ]);
     expect(nav).toMatch(/<a href="\/"[^>]*aria-current="true"/u);
+    expect(nav.match(/<svg class="ico" aria-hidden="true" focusable="false"/gu)).toHaveLength(13);
     expect(nav).toContain("Agent 助手");
     expect(nav).toContain("技能目录");
   });
@@ -5496,6 +5676,7 @@ describe("management backend (read-write)", () => {
       space: SPACE,
       brief: "把验收证据集中到一个工作上下文。",
       runbook: "1. 跑回归\n2. 检查归档",
+      summary: "已准备初稿", blockers: "等待访谈\n等待样本", nextActions: "整理方案\n评审",
     });
     const createdResponse = await app.request("/work", {
       method: "POST",
@@ -5506,6 +5687,7 @@ describe("management backend (read-write)", () => {
     expect([302, 303]).toContain(createdResponse.status);
     const item = engine.workItems.list(SPACE)[0]!;
     expect(item.active).toBe(true);
+    expect(item).toMatchObject({ summary: "已准备初稿", blockers: ["等待访谈", "等待样本"], nextActions: ["整理方案", "评审"] });
     const index = await (await app.request("/work")).text();
     expect(index).toContain(`href="/work/${item.id}"`);
     expect(index).toContain('href="/work?new=1"');
@@ -5554,6 +5736,64 @@ describe("management backend (read-write)", () => {
     const html = await (await app.request(`/work/${item.id}`)).text();
     expect(html).toContain("计划版本 2");
     expect(html).toContain("人工修订");
+  });
+
+  test("work editor retains the draft and checks the reviewed version on every conflict retry", async () => {
+    const item = engine.workItems.create({ space: SPACE, title: "协调计划" });
+    const savePlan = (source: string, instruction: string) =>
+      engine.commitWorkPlanRevision(engine.prepareWorkPlanRevision(item.id, { kind: "manual", id: source }), [{ instruction, doneWhen: "可供核对" }]);
+    savePlan("first", "起始步骤");
+    const first = engine.getWorkPlanView(item.id)!;
+    const form = new URLSearchParams({ title: "保留的标题", brief: "目标", phase: "active", summary: "草稿当前进展", blockers: "",
+      nextActions: "先审稿\n完成标准：可分享", runbook: "草稿执行手册", planRevision: "1", planProgress: first.progressToken });
+    const submit = () => app.request(`/work/${item.id}`, { method: "POST", body: form });
+    savePlan("second", "另一标签页已写入的步骤");
+    const conflict = await submit();
+    expect(conflict.status).toBe(409);
+    const draft = await conflict.text();
+    expect(draft).toContain("另一标签页已写入的步骤");
+    expect(draft).toContain("先审稿\n完成标准：可分享");
+    expect(draft).toContain("草稿当前进展");
+    expect(draft).toContain('name="planRevision" value="1"');
+    expect(draft).toContain('name="reviewedPlanRevision" value="2"');
+    expect((await submit()).status).toBe(409);
+    const reviewed = engine.getWorkPlanView(item.id)!;
+    expect(draft).toContain(`name="reviewedPlanProgress" value="${reviewed.progressToken}"`);
+    form.set("reviewedPlanRevision", "2");
+    form.set("reviewedPlanProgress", reviewed.progressToken);
+    savePlan("third", "最新步骤");
+    expect((await submit()).status).toBe(409);
+    expect(engine.workItems.get(item.id)?.summary).toBe("");
+    const latest = engine.getWorkPlanView(item.id)!;
+    form.set("reviewedPlanRevision", String(latest.current.revision));
+    form.set("reviewedPlanProgress", "outdated-progress");
+    expect((await submit()).status).toBe(409);
+    form.set("reviewedPlanProgress", latest.progressToken);
+    form.set("nextActions", "最新步骤\n\n先审稿\n完成标准：可分享");
+    expect((await submit()).status).toBe(302);
+    expect(engine.workItems.get(item.id)).toMatchObject({ title: "保留的标题", summary: "草稿当前进展", runbook: "草稿执行手册" });
+  });
+
+  test("a work form keeps unsaved text and identifies the invalid field for create and edit", async () => {
+    const form = new URLSearchParams({ title: "起始草稿", space: "team/oc_missing", phase: "active", brief: "<资料>",
+      summary: "当前进度", blockers: "等待反馈", nextActions: "第一步\n第二步", runbook: "操作草稿" });
+    const invalid = await app.request("/work", { method: "POST", body: form });
+    expect(invalid.status).toBe(422);
+    const page = await invalid.text();
+    expect(page).toContain('id="work-space" name="space" required aria-invalid="true"');
+    expect(page).toContain("第一步\n第二步");
+    expect(page).toContain("&lt;资料&gt;");
+    form.set("space", SPACE);
+    expect((await app.request("/work", { method: "POST", body: form })).status).toBe(302);
+    const item = engine.workItems.list(SPACE)[0]!;
+    form.set("title", " ");
+    form.set("runbook", "编辑后的草稿");
+    const edit = await app.request(`/work/${item.id}`, { method: "POST", body: form });
+    expect(edit.status).toBe(422);
+    const editPage = await edit.text();
+    expect(editPage).toContain("请输入事项标题");
+    expect(editPage).toContain("编辑后的草稿");
+    expect(engine.workItems.get(item.id)?.runbook).toBe("操作草稿");
   });
 
   test("work attention links to owned live runs and retains chat history without a reverse link", async () => {
@@ -5694,11 +5934,12 @@ describe("management backend (read-write)", () => {
       workdir: dir,
     });
     engine.registry.updateMeta(SPACE, { agentId: agent.id });
-    const item = engine.workItems.create({
-      space: SPACE,
-      title: "推进灰度发布",
-      nextActions: ["更新灰度环境配置"],
-    });
+    const created = await app.request("/work", { method: "POST", body: new URLSearchParams({
+      space: SPACE, title: "推进灰度发布", nextActions: "更新灰度环境配置",
+    }) });
+    const item = engine.workItems.list(SPACE)[0]!;
+    expect(created.headers.get("location")).toStartWith(`/work/${item.id}?ok=`);
+    expect(await (await app.request(`/work/${item.id}`)).text()).toContain(`action="/work/${item.id}/continue"`);
 
     const policyResponse = await app.request(`/work/${encodeURIComponent(item.id)}/continuation`, {
       method: "POST",
@@ -5836,9 +6077,15 @@ describe("management backend (read-write)", () => {
     });
     app = createWebApp({ engine });
     const pending = engine.startWorkContinuation(item.id);
+    const homeBeforeApproval = await (await app.request("/")).text();
+    expect(homeBeforeApproval.split(`href="/tasks/runs/${pending.run.id}"`)).toHaveLength(2);
     const report = await engine.approveTaskRun(pending.run.id, "operator").completion;
     const actionId = pending.run.workActionId!;
 
+    const home = await (await app.request("/")).text();
+    const acceptanceLink = `href="/work/${item.id}#acceptance-${actionId}-${pending.run.id}"`;
+    expect(home).toContain(acceptanceLink);
+    expect(home).toContain("查看报告");
     const index = await (await app.request("/work")).text();
     expect(index).toContain(`data-work-item="${item.id}" data-work-state="awaiting_acceptance"`);
     expect(index).toContain(`href="/work/${item.id}#acceptance-${actionId}-${pending.run.id}"`);
@@ -5875,6 +6122,7 @@ describe("management backend (read-write)", () => {
       checkpoint: expect.objectContaining({ rawId: report.rawId, taskRunId: pending.run.id }),
     }));
     expect(engine.workItems.get(item.id)?.nextActions).toEqual([]);
+    expect(await (await app.request("/")).text()).not.toContain(acceptanceLink);
     const acceptedView = await (await app.request(`/work/${encodeURIComponent(item.id)}`)).text();
     expect(acceptedView).toContain("工作动作验收 · 已接受");
     expect(acceptedView).toContain("local-admin");
@@ -6192,15 +6440,28 @@ describe("management backend (read-write)", () => {
     expect(editor).toContain('<option value="5" selected>周五</option>');
   });
 
-  test("tasks: create with invalid space is rejected with a flash", async () => {
-    const form = new URLSearchParams({ name: "bad", space: "not-a-space", topic: "x" });
+  test("tasks: invalid space keeps the draft, field error, and submitted checkbox states", async () => {
+    const form = new URLSearchParams({ name: "草稿名称", space: "not-a-space", topic: "第一行\n<保留原文>", cadence: "weekly",
+      dayOfWeek: "5", hour: "17", timeoutMinutes: "420", notify: "on" });
     const res = await app.request("/tasks", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: form.toString(),
     });
-    expect([302, 303]).toContain(res.status);
-    expect(res.headers.get("location")).toContain("ok=");
+    expect(res.status).toBe(422);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const html = await res.text();
+    expect(html).toContain('role="alert"');
+    expect(html).toContain('id="task-space" name="space" aria-invalid="true"');
+    expect(html).toContain('name="name" value="草稿名称"');
+    expect(html).toContain("第一行\n&lt;保留原文&gt;");
+    expect(html).toContain('<option value="5" selected>');
+    for (const key of ["enabled", "notify", "distillOnRun"]) {
+      expect(html).toContain(`class="toggle-row task-switch-row" for="task-${key}"`);
+      const toggle = html.match(new RegExp(`<input id="task-${key}"[^>]+>`, "u"))?.[0];
+      expect(toggle).toContain(`aria-labelledby="task-${key}-label"`);
+      expect(toggle?.includes("checked")).toBe(key === "notify");
+    }
     expect(engine.tasks.list().length).toBe(0);
   });
 
@@ -6215,11 +6476,35 @@ describe("management backend (read-write)", () => {
       }).toString(),
     });
 
-    expect([302, 303]).toContain(response.status);
-    expect(decodeURIComponent(response.headers.get("location") ?? ""))
-      .toContain("创建失败：请选择有效空间");
+    expect(response.status).toBe(422);
+    expect(await response.text()).toContain("请选择有效空间");
     const tasksPage = await (await app.request("/tasks")).text();
     expect(tasksPage).not.toContain("orphan-space-task");
+  });
+
+  test("tasks: a rejected space change keeps the edited topic until the original space is selected", async () => {
+    const other = "team/oc_another_editor";
+    engine.ensureSpace(other);
+    const task = engine.tasks.create({ space: SPACE, name: "版本回顾", topic: "原研究主题" })!;
+    const run = engine.taskRuns.start({ task, trigger: "manual", distill: false });
+    engine.taskRuns.begin(run.id);
+    engine.taskRuns.succeed(run.id, { finishedAt: Date.now(), output: "已完成" });
+    const topic = "核对本周验收情况\n" + "保留完整研究步骤。".repeat(120);
+    const form = new URLSearchParams({ space: other, name: task.name, topic, enabled: "on" });
+    const save = () => app.request(`/tasks/${task.id}`, { method: "POST", body: form });
+
+    const refused = await save();
+    expect(refused.status).toBe(409);
+    const page = await refused.text();
+    expect(page).toContain("已有运行历史的任务不能更换空间");
+    expect(page).toContain('id="task-space" name="space" aria-invalid="true"');
+    expect(page).toContain(`value="${other}" selected`);
+    expect(page).toContain(topic);
+    expect(engine.tasks.get(task.id)).toMatchObject({ space: SPACE, topic: task.topic });
+
+    form.set("space", SPACE);
+    expect((await save()).status).toBe(302);
+    expect(engine.tasks.get(task.id)).toMatchObject({ space: SPACE, topic });
   });
 
   test("tasks: manual run redirects to a durable run detail and fires onTaskRun", async () => {
@@ -6343,7 +6628,7 @@ describe("management backend (read-write)", () => {
       runProvider: async (_provider, input) => {
         providerCalls += 1;
         expect(input.prompt).toContain("dangerous original topic");
-        expect(input.prompt).not.toContain("harmless current topic");
+        expect(input.prompt).not.toContain("保留 <研究问题>");
         return "approved web output";
       },
     });
@@ -6390,19 +6675,26 @@ describe("management backend (read-write)", () => {
         body: new URLSearchParams({
           name: task.name,
           space: otherSpace,
-          topic: task.topic,
+          topic: "保留 <研究问题>\n以及待核实的长段落",
           cadence: task.cadence,
           hour: String(task.hour),
           timeoutMinutes: String(task.timeoutMinutes),
         }).toString(),
       },
     );
-    expect([302, 303]).toContain(moveResponse.status);
-    expect(moveResponse.headers.get("location")).toStartWith(`/tasks/${task.id}?edit=1&ok=`);
-    expect(decodeURIComponent(moveResponse.headers.get("location") ?? ""))
-      .toContain("已有运行历史");
+    expect(moveResponse.status).toBe(409);
+    const draft = await moveResponse.text();
+    expect(draft).toContain("已有运行历史");
+    expect(draft).toContain("保留 &lt;研究问题&gt;\n以及待核实的长段落");
+    expect(draft).toContain(`<option value="${otherSpace}" selected>`);
+    expect(draft).toContain('id="task-space" name="space" aria-invalid="true"');
     expect(isolatedEngine.tasks.get(task.id)?.space).toBe(SPACE);
-    isolatedEngine.tasks.update(task.id, { topic: "harmless current topic" });
+    expect(isolatedEngine.tasks.get(task.id)?.topic).toBe("dangerous original topic");
+    const corrected = await isolatedApp.request(`/tasks/${task.id}`, { method: "POST", body: new URLSearchParams({
+      space: SPACE, name: task.name, topic: "保留 <研究问题>\n以及待核实的长段落", notify: "on",
+    }) });
+    expect(corrected.status).toBe(302);
+    expect(isolatedEngine.tasks.get(task.id)?.topic).toBe("保留 <研究问题>\n以及待核实的长段落");
 
     const detail = await (
       await isolatedApp.request(`/tasks/runs/${encodeURIComponent(run.id)}`)
@@ -6428,7 +6720,9 @@ describe("management backend (read-write)", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     expect(providerCalls).toBe(1);
-    expect(await (await isolatedApp.request(statusUrl)).json()).toEqual({ status: "succeeded" });
+    expect(await (await isolatedApp.request(statusUrl)).json()).toEqual({
+      status: "succeeded", notification: { status: "pending", attempts: 0 },
+    });
     expect(isolatedEngine.getTaskRun(run.id)).toEqual(expect.objectContaining({
       status: "succeeded",
       approval: expect.objectContaining({
@@ -6656,11 +6950,15 @@ describe("management backend (read-write)", () => {
       attempts: 1,
       error: "Error: Feishu delivery failed",
     }));
-    const failedPage = await (
-      await failingApp.request(`/tasks/runs/${encodeURIComponent(run.id)}`)
-    ).text();
+    const runPath = `/tasks/runs/${encodeURIComponent(run.id)}`;
+    const failedDetail = await failingApp.request(runPath);
+    expect(failedDetail.headers.get("cache-control")).toBe("no-store");
+    const failedPage = await failedDetail.text();
     expect(failedPage).toContain("通知失败");
     expect(failedPage).toContain("重试通知");
+    expect(await (await failingApp.request(runPath + "/status")).json()).toMatchObject({
+      status: "succeeded", notification: { status: "failed", attempts: 1 },
+    });
 
     const retryApp = createWebApp({
       engine,
@@ -6679,6 +6977,9 @@ describe("management backend (read-write)", () => {
       status: "sent",
       attempts: 2,
     }));
+    expect(await (await retryApp.request(runPath + "/status")).json()).toMatchObject({
+      status: "succeeded", notification: { status: "sent", attempts: 2 },
+    });
   });
 
   test("tasks: delete removes it", async () => {
@@ -6768,10 +7069,33 @@ describe("management backend (read-write)", () => {
     expect(malformed.headers.get("location")).toContain("%E4%BF%9D%E5%AD%98%E5%A4%B1%E8%B4%A5");
     expect(engine.learning.get(plan.id)?.hour).toBe(10);
 
-    await app.request(`/learning/${encodeURIComponent(plan.id)}/pause`, { method: "POST" });
+    const path = `/learning/${encodeURIComponent(plan.id)}`;
+    const post = (action: string) => app.request(`${path}/${action}`, { method: "POST" });
+    const formFields: string[] = [];
+    await new HTMLRewriter()
+      .on(`form[action="${path}"] input[required]`, {
+        element: el => { formFields.push(el.getAttribute("name")!); },
+      })
+      .on(`form[action="${path}/pause"] button`, { element: () => { formFields.push("pause"); } })
+      .transform(new Response(detail)).text();
+    expect(formFields).toEqual(["hour", "dailyCharacters", "pause"]);
+    const paused = await post("pause");
+    expect(decodeURIComponent(paused.headers.get("location")!)).toBe(`${path}?ok=已暂停`);
     expect(engine.learning.get(plan.id)?.status).toBe("paused");
-    await app.request(`/learning/${encodeURIComponent(plan.id)}/resume`, { method: "POST" });
+    const resumed = await post("resume");
+    expect(decodeURIComponent(resumed.headers.get("location")!)).toBe(`${path}?ok=已恢复`);
     expect(engine.learning.get(plan.id)?.status).toBe("active");
+    // The last lesson finishes after the browser rendered its pause control.
+    engine.learning.skipCurrent(plan.id, plan.creatorId);
+    expect(engine.learning.get(plan.id)?.status).toBe("completed");
+    for (const action of ["pause", "resume"]) {
+      const stale = await post(action);
+      expect(stale.status).toBe(302);
+      const current = await (await app.request(stale.headers.get("location")!)).text();
+      expect(current).toContain("计划当前状态为「已完成」");
+      expect(current).not.toMatch(/>(已暂停|已恢复)<\/div>/u);
+      expect(engine.learning.get(plan.id)?.status).toBe("completed");
+    }
     const removed = await app.request(`/learning/${encodeURIComponent(plan.id)}/delete`, {
       method: "POST",
     });

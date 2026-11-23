@@ -63,6 +63,107 @@ test("a title card, an inaccessible reply, and unrelated recent context cannot p
   expect((await ask([store], named, {}, { client: selector })).answer).toContain("未找到能核验");
 });
 
+test("a linked report card identifies the imported document by source URL and quotes only its body", async () => {
+  const { store, root } = fixture();
+  const url = "https://example.test/reports/weekly";
+  const cardTitle = "星桥验收周报";
+  const title = "星桥本周验收总结";
+  const body = "周五完成客户端与服务端的联调验收。";
+  const question = "这份周报已收录了吗？";
+  const target = { space: store.space, chatId: "oc_request", messageId: "om_report_card",
+    text: `[${cardTitle}](${url}#summary)`, fullText: true };
+  const add = (owner: SpaceStore, digit: string, link: string, label: string, text: string, messageId: string) => {
+    const id = "doc-import-" + digit.repeat(64);
+    const metadata = { format: "homeagent.document-source", version: 1, capture: "agent-submitted", title: label,
+      complete: true, part: 1, parts: 1 };
+    owner.index().captureImportedRaw(id, { space: owner.space, source: "doc", chatId: target.chatId, messageId,
+      attachments: [{ kind: "file", name: "article.md", ref: "article.md" }],
+      content: `# 来源资料：${link}\n\n<!-- ${JSON.stringify(metadata)} -->\n\n${text}` });
+    return id;
+  };
+  store.index().insertRaw({ space: store.space, source: "message", chatId: target.chatId, messageId: target.messageId, content: target.text });
+  add(store, "a", url + "-previous", cardTitle, "另一份同名周报。", target.messageId);
+  add(store, "b", url, cardTitle, "# " + cardTitle, "om_only_heading");
+  const other = new SpaceStore("team/oc_other", root); other.ensure(); stores.push(other);
+  const imported = add(other, "c", url, title, body, "om_import");
+  const fake = new FakeLlm().onJSON(call => {
+    const candidates = JSON.parse(call.prompt!.split("已入库 Raw 候选（JSON 数据）：\n")[1]!);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({ rawId: imported, documentTitle: title, documentUrl: url, content: body });
+    return { matches: [{ key: candidates[0].key, quote: body }] };
+  });
+  const missing = await ask([store], question, { rawReplyTarget: target }, { client: fake });
+  expect(missing.answer).toContain("未找到能核验");
+  expect(fake.calls).toHaveLength(0);
+  // The body was separately imported in another readable Space. Its title has changed
+  // since the card was posted. A title-only reply can also use that stored title.
+  for (const text of [target.text, url, title]) {
+    const result = await ask([store, other], question, { rawReplyTarget: { ...target, text, messageId: "om_reply" } }, { client: fake });
+    expect(result.answer).toContain(imported);
+    expect(result.answer).toContain(body);
+    expect(result.answer).toContain("尚未核实全文");
+  }
+  other.index().recordMessageRetraction({ chatId: target.chatId, messageId: "om_import", originalAuthor: "ou_me", retractedBy: "ou_me" });
+  expect((await ask([store, other], question, { rawReplyTarget: target }, { client: fake })).answer).toContain("未找到能核验");
+});
+
+test("historic Feishu post labels cannot stand in for the document linked by a structured card", async () => {
+  const { store } = fixture();
+  const title = "本周交付周报";
+  const url = "https://example.feishu.cn/docx/week";
+  const text = title + "\n查看全文";
+  const target = { space: store.space, chatId: "oc_request", messageId: "om_legacy_card", text, fullText: true,
+    sourceCard: { title, url: url + "#details" } };
+  for (const content of [text, "查看全文"]) {
+    store.index().insertRaw({ space: store.space, chatId: target.chatId, messageId: target.messageId, source: "message", content });
+  }
+  store.index().insertRaw({ space: store.space, source: "manual", content: text });
+  const snapshot = parseChatRawImport(JSON.stringify({ version: 1, chatId: target.chatId, mainComplete: true, threadsComplete: true,
+    olderThreadsScanned: true, startAt: 0, endAt: 200, failedMessageIds: [], messages: [{ messageId: "om_history", createdAt: 150, text }] }),
+    store.space, target.chatId);
+  store.index().captureImportedRaw(chatRawImportId(store.space, target.chatId, "om_history"), snapshot.entries[0]!);
+  const llm = new FakeLlm();
+  const check = () => ask([store], "这份周报已收录了吗？", { rawReplyTarget: target }, { client: llm });
+  expect((await check()).answer).toContain("未找到能核验");
+  expect(llm.calls).toHaveLength(0);
+
+  const passage = "全部交付项已通过本周验收。";
+  const id = store.index().insertRaw({ space: store.space, source: "doc", content: `# 来源资料：${url}\n\n${passage}` });
+  llm.onJSON(call => {
+    const rows = JSON.parse(call.prompt!.split("已入库 Raw 候选（JSON 数据）：\n")[1]!);
+    expect(rows.map((row: { rawId: string }) => row.rawId)).toEqual([id]);
+    return { matches: [{ key: rows[0].key, quote: passage }] };
+  });
+  const found = await check();
+  expect(found.answer).toContain(id);
+  expect(found.answer).toContain("尚未核实全文");
+});
+
+test("a separately synchronized Feishu document uses its source URL and original body heading", async () => {
+  const { store } = fixture();
+  const url = "https://example.feishu.cn/docx/weekly";
+  const title = "迭代验收周报";
+  const body = `# ${title}\n\n本周已完成移动端验收。`;
+  const id = store.index().insertRaw({ space: store.space, source: "doc", chatId: "oc_request", messageId: "om_sync",
+    content: `# 来源资料：${url}\n\n${body}` });
+  for (const text of [`# ${title}\n[查看全文](${url})`, title]) {
+    const fake = new FakeLlm().onJSON(call => {
+      const rows = JSON.parse(call.prompt!.split("已入库 Raw 候选（JSON 数据）：\n")[1]!);
+      expect(rows[0]).toMatchObject({ rawId: id, documentUrl: url, content: body });
+      return { matches: [{ key: rows[0].key, quote: "本周已完成移动端验收。" }] };
+    });
+    const result = await ask([store], "这份周报已收录了吗？", { rawReplyTarget: {
+      space: store.space, chatId: "oc_request", messageId: "om_card", text, fullText: true } }, { client: fake });
+    expect(result.answer).toContain(id);
+    expect(result.answer).toContain("尚未核实全文");
+  }
+  const header = "# 来源资料：" + url;
+  const result = await ask([store], "查询已入库 Raw 的「来源资料」原文", {}, {
+    client: new FakeLlm().queueJSON({ matches: [{ key: "raw-1", quote: header }] }),
+  });
+  expect(result.answer).toContain(header);
+});
+
 test("a verified reply status keeps a routed native topic turn on its provider session", async () => {
   const { store } = fixture();
   const text = "工作周报\n本周已完成联调。";
@@ -79,6 +180,28 @@ test("a verified reply status keeps a routed native topic turn on its provider s
   expect(result.nativeSessionId).toBe("child");
   expect(result.answeredLocally).toBeUndefined();
   expect(fake.calls.map(call => call.opts.nativeSession)).toEqual([{ mode: "fork", id: "parent" }]);
+});
+
+test("an empty title lookup answers locally while a routed native topic still returns its child", async () => {
+  const { store } = fixture();
+  const question = "《未入库周报》是否已收录？";
+  const fake = new FakeLlm();
+  const local = await ask([store], question, {}, { client: fake });
+  expect(local.answer).toContain("未找到能核验");
+  expect(local.answeredLocally).toBe(true);
+  expect(fake.calls).toHaveLength(0);
+  fake.queueJSON({ matches: [] });
+  const nativeSession = { mode: "fork" as const, id: "parent" };
+  const native = await ask([store], question, { nativeSession }, {
+    client: { complete: opts => fake.complete(opts), completeJSON: async opts => {
+      const completed = await fake.completeJSON(opts);
+      return { ...completed, result: { ...completed.result, nativeSessionId: "child" } };
+    } },
+  });
+  expect(native.answer).toBe(local.answer);
+  expect(native.nativeSessionId).toBe("child");
+  expect(native.answeredLocally).toBeUndefined();
+  expect(fake.calls.map(call => call.opts.nativeSession)).toEqual([nativeSession]);
 });
 
 test("Raw query works before any knowledge page exists and returns verified source metadata", async () => {
@@ -222,4 +345,37 @@ test("a quoted status question cannot turn a request to explain the quote into a
     { retrievalQuestion: user }, { client: llm });
   expect(result.answer).toContain("这是一条核对周报收录状态的提问");
   expect(llm.calls.map(call => call.kind)).toEqual(["complete"]);
+});
+
+test("title and reply status checks fill their ranked candidates after skipping older questions and empty title cards", async () => {
+  const { store } = fixture();
+  const title = "项目周报";
+  const question = `《${title}》是否已收录？`;
+  const passage = "交付已完成，验收通过。";
+  const content = `${title}\n查看全文\n${passage.repeat(20)}`;
+  const index = store.index();
+  const saved: string[] = [];
+  for (let i = 0; i < 24; i++) {
+    saved.unshift(index.insertRaw({ space: store.space, source: "manual", content, createdAt: i + 1 }));
+  }
+  const noise = [question, title, title + "\n查看全文"];
+  for (let i = 0; i < 28; i++) {
+    index.insertRaw({ space: store.space, source: "message", content: noise[i % noise.length]!, createdAt: 100 + i });
+  }
+  const firstPage = index.searchRaw(title, 20);
+  expect(firstPage).toHaveLength(20);
+  expect(firstPage.every(raw => raw.source === "message")).toBe(true);
+
+  const client = new FakeLlm().onJSON(call => {
+    const candidates: { key: string; rawId: string }[] = JSON.parse(call.prompt!.split("已入库 Raw 候选（JSON 数据）：\n")[1]!);
+    expect(candidates.map(raw => raw.rawId)).toEqual(saved.slice(0, 20));
+    return { matches: [{ key: candidates[0]!.key, quote: passage }] };
+  });
+  const byTitle = await ask([store], question, {}, { client });
+  const byReply = await ask([store], "这个报告记录下来了吗", {
+    rawReplyTarget: { space: store.space, chatId: "oc_request", messageId: "om_card", text: title, fullText: false },
+  }, { client });
+  expect(byTitle.answer).toContain(saved[0]!);
+  expect(byReply.answer).toContain(saved[0]!);
+  expect(client.calls).toHaveLength(2);
 });

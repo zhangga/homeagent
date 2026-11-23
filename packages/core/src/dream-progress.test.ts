@@ -117,20 +117,25 @@ test("failed analysis, cancellation and quarantine retry leave accurate terminal
   createEngine(fake);
   const rawId = await engine.remember({ space: SPACE, source: "message", content: "故障复盘" });
   await engine.runDreamCycle(SPACE);
-  expect(engine.listDreamRuns()[0]).toMatchObject({ status: "failed", errorCount: 1, stage: "analyzing" });
+  const failed = engine.listDreamRuns()[0]!;
+  expect(failed).toMatchObject({ status: "failed", errorCount: 1, stage: "analyzing" });
   expect(JSON.stringify(engine.listDreamRuns())).not.toContain("FakeLlm");
   const cancelled = new AbortController();
   cancelled.abort(new Error("PRIVATE_DIAGNOSTIC"));
   await expect(engine.runDreamCycle(SPACE, { signal: cancelled.signal })).rejects.toThrow();
-  expect(engine.listDreamRuns()[0]?.status).toBe("cancelled");
-  expect(JSON.stringify(engine.listDreamRuns())).not.toContain("PRIVATE_DIAGNOSTIC");
+  const afterCancellation = engine.listDreamRuns();
+  expect(afterCancellation).toHaveLength(2);
+  expect(afterCancellation.find(run => run.id !== failed.id)?.status).toBe("cancelled");
+  expect(JSON.stringify(afterCancellation)).not.toContain("PRIVATE_DIAGNOSTIC");
   fake.queueJSON({ operations: [{ type: "concept", name: "retry", title: "重试页面", rawIds: [rawId] }], skippedRawIds: [] });
   fake.queueJSON({ title: "重试页面", content: "" });
   await engine.runDreamCycle(SPACE);
   const quarantine = (await engine.listQuarantines(SPACE))[0]!;
   fake.queueJSON({ title: "重试页面", summary: "恢复", content: "已恢复" });
   await engine.retryQuarantine(SPACE, quarantine.id);
-  expect(engine.listDreamRuns()[0]).toMatchObject({ trigger: "retry", status: "completed", pagesWritten: 1, pagesTotal: 1 });
+  expect(engine.listDreamRuns().find(run => run.trigger === "retry")).toMatchObject({
+    status: "completed", pagesWritten: 1, pagesTotal: 1,
+  });
 });
 
 test("tracker keeps active runs plus 50 terminal runs and measures progress without fake heartbeats", () => {

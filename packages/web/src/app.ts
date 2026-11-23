@@ -11,7 +11,7 @@
  * through hono/html (auto-escaped); redirects use the PRG pattern with a ?ok=
  * flash so a refresh doesn't re-POST.
  */
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { html } from "hono/html";
 import { streamSSE } from "hono/streaming";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
@@ -38,6 +38,7 @@ import {
   type LarkProvisioningSession,
   type LarkSetupStatus,
   type SpaceId,
+  type AskResult,
   type PersistedSettings,
   type SystemHealthSnapshot,
 } from "@homeagent/shared";
@@ -94,10 +95,12 @@ import {
   buildSetupSnapshot,
   type SetupDataDirectoryStatus,
 } from "./setup.ts";
-import { localMaterialRawContent, prepareLocalMaterials } from "./local-materials.ts";
+import { localMaterialRawContent, prepareLocalMaterialGroups, type PreparedLocalMaterial } from "./local-materials.ts";
+import { materialReceiptView, type MaterialReceipt } from "./material-import-view.ts";
 import { dreamRunsFragment } from "./dream-progress-view.ts";
 import { taskOverviewView, taskPreviewKey } from "./task-overview-view.ts";
-import { workAttentionDetail, workAttentionIndex } from "./work-attention.ts";
+import { taskRunRefreshState } from "./task-run-refresh.ts";
+import { homeDecisions, workAttentionDetail, workAttentionIndex } from "./work-attention.ts";
 import { restartingView, setupLayout, setupView } from "./setup-view.ts";
 import {
   resolveExternalSharingState,
@@ -108,6 +111,7 @@ import {
   agentKnowledgeFeedbackView,
   integrationsView,
   learningView,
+  LEARNING_STATUS_LABELS,
   healthView,
   feishuGroupConnectView,
   governanceView,
@@ -129,6 +133,7 @@ import {
   tasksView,
   tasksIndexView,
   workItemsView,
+  type EditorSubmission,
   workIndexView,
 } from "./views.ts";
 
@@ -1481,6 +1486,7 @@ export function createWebApp(opts: WebOptions): Hono {
   // ---- spaces / knowledge --------------------------------------------------
 
   app.get("/", async (c) => {
+    c.header("Cache-Control", "no-store");
     const cfg = config();
     const metas = engine.registry.list();
     if (!cfg.onboardingCompletedAt) {
@@ -1503,13 +1509,11 @@ export function createWebApp(opts: WebOptions): Hono {
           binding.state === "pending_confirmation" && binding.boundAppId === cfg.feishuAppId
         ).length
       : 0;
-    const activity = buildAgentActivity(
-      engine.agents.list(),
-      engine.taskRuns.list(undefined, ["awaiting_approval", "queued", "running"]),
-      engine.chatRuns.list(undefined, ["queued", "running"]),
-    );
+    const liveTasks = engine.taskRuns.list(undefined, ["awaiting_approval", "queued", "running"]);
+    const liveChats = engine.chatRuns.list(undefined, ["queued", "running"]);
+    const activity = buildAgentActivity(engine.agents.list(), liveTasks, liveChats);
     return c.html(await layout("首页", [{ label: "首页" }], await spaceListView(
-      spaces, activity.activeRuns, cfg.feishuBotName || "HomeAgent", pendingGroups,
+      spaces, homeDecisions(engine, liveTasks, liveChats), activity.activeRuns, cfg.feishuBotName || "HomeAgent", pendingGroups,
     ), "spaces"));
   });
 
@@ -1557,40 +1561,63 @@ export function createWebApp(opts: WebOptions): Hono {
     const space = parseSpace(c.req.param("space"));
     if (!space || !engine.registry.has(space)) return c.notFound();
     const body = await c.req.parseBody({ all: true });
-    let materials;
+    const spaceUrl = `/spaces/${encodeURIComponent(space)}`;
+    const batch = body.materialBatch ?? randomUUID();
+    const retry = body.materialSlot !== undefined;
+    const slot = Number(body.materialSlot);
+    const budget = Number(body.materialBudget);
+    if (typeof batch !== "string" || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/iu.test(batch)
+      || (retry && (!Number.isInteger(slot) || slot < 0 || slot >= 20 || !Number.isSafeInteger(budget) || budget < 0
+        || typeof body.materialIdentity !== "string" || !/^[a-f0-9]{64}$/u.test(body.materialIdentity) || Array.isArray(body.material)))) {
+      return c.text("导入回执无效", 400);
+    }
+    let groups;
     try {
-      materials = await prepareLocalMaterials(body.material, opts.materialTextExtractor);
+      groups = await prepareLocalMaterialGroups(body.material, opts.materialTextExtractor, retry ? [budget] : []);
     } catch (error) {
-      const reason = error instanceof Error ? error.message : "无法读取资料文件";
+      const reason = error instanceof Error && ["请选择资料文件", "单个文件不能超过 20 MiB", "一次最多选择 20 份资料"].includes(error.message)
+        ? error.message : "无法读取资料文件";
       return c.redirect(
         `/spaces/${encodeURIComponent(space)}?ok=${encodeURIComponent(`导入失败：${reason}`)}`,
       );
     }
     const rawIds: string[] = [];
-    for (const material of materials) {
-      rawIds.push(await engine.rememberFile(
-        {
-          space,
-          source: "manual",
-          author: LOCAL_GOVERNANCE_ACTOR,
-          content: localMaterialRawContent(material),
-        },
-        {
-          attachment: {
-            kind: "file",
-            ref: `sha256:${material.digest}`,
-            name: material.name,
-          },
-          bytes: material.bytes,
-        },
-      ));
+    const materials: PreparedLocalMaterial[] = [];
+    const rows: MaterialReceipt[] = [];
+    for (const [index, group] of groups.entries()) {
+      const original = group.materials[0]!;
+      const identity = createHash("sha256").update(JSON.stringify([original.name, original.digest])).digest("hex");
+      const row: MaterialReceipt = { name: original.name, slot: retry ? slot : index, identity, expansionBudget: group.expansionBudget, confirmed: 0, total: group.materials.length };
+      if (retry && identity !== body.materialIdentity) return c.text("请选择回执中对应的原文件", 400);
+      rows.push(row);
+      const fileIds: string[] = [];
+      let workItemId: string | undefined;
+      try {
+        for (const [part, material] of group.materials.entries()) {
+          const key = createHash("sha256").update(JSON.stringify([space, batch, row.slot, identity, part])).digest("hex");
+          const id = await engine.rememberFile(
+            { space, source: "manual", author: LOCAL_GOVERNANCE_ACTOR, workItemId, content: localMaterialRawContent(material) },
+            { attachment: { kind: "file", ref: `sha256:${material.digest}`, name: material.name }, bytes: material.bytes },
+            { localImportId: `local-import-${key}`, useCurrentWorkItem: part === 0 },
+          );
+          fileIds.push(id);
+          row.firstId ??= id;
+          row.confirmed++;
+          if (part === 0 && group.materials.length > 1) workItemId = engine.registry.store(space).index().getRaw(id)?.workItemId;
+        }
+        for (const id of fileIds) rawIds.push(id);
+        for (const material of group.materials) materials.push(material);
+      } catch {
+        // A failed projection can follow a committed journal write. A retry
+        // with the same file identity repairs it without creating another Raw.
+      }
     }
-    const uploadCount = materials.filter((material) => !material.archive && (!material.textPart || material.textPart.index === 1)).length;
+    const uploadCount = rows.filter(row => row.confirmed === row.total).length;
     const label = uploadCount === 1 ? "资料" : `${uploadCount} 份资料`;
-    let message = uploadCount === 1
-      ? "资料已导入，等待提炼"
-      : `已导入 ${uploadCount} 份资料，等待提炼`;
-    if (checkbox(body, "distillNow")) {
+    let detail = "等待提炼";
+    let completedDream = false;
+    const distillNow = checkbox(body, "distillNow");
+    if (distillNow && rawIds.length) {
       try {
         const model = engine.agentForSpace(space)?.model || undefined;
         let pagesWritten = 0;
@@ -1605,25 +1632,30 @@ export function createWebApp(opts: WebOptions): Hono {
           errors.push(...report.errors);
           if (errors.length > 0) break;
         }
-        message = errors.length === 0
-          ? `${label}已导入并完成提炼：写入 ${pagesWritten} 个知识页`
-          : `${label}已导入，但立即提炼未完成：${errors.join("; ")}`;
-      } catch (error) {
-        const reason = (error instanceof Error ? error.message : String(error)).slice(0, 500);
-        message = `${label}已导入，但立即提炼失败：${reason}`;
+        completedDream = errors.length === 0;
+        detail = completedDream ? `完成提炼：写入 ${pagesWritten} 个知识页` : "立即提炼未完成，请查看提炼任务";
+      } catch {
+        detail = "立即提炼失败，请查看提炼任务";
       }
     }
     const archiveMessages = materials
       .filter((material) => !material.archive && material.name.toLowerCase().endsWith(".zip"))
       .map((material) => material.content?.split("\n")[0]);
-    if (archiveMessages.length > 0) message += `；${archiveMessages.join("；")}`;
+    if (archiveMessages.length > 0) detail += `；${archiveMessages.join("；")}`;
     const textParts = materials.filter(material => !material.archive && material.textPart).length;
-    if (textParts > 0) message += `；长资料已完整分为 ${textParts} 段正文`;
+    if (textParts > 0) detail += `；长资料已完整分为 ${textParts} 段正文`;
     const unreadable = materials.filter(material => !material.archive && material.content === null).length;
-    if (unreadable > 0) message += `；${unreadable} 份资料未提取到正文，原文件已完整保存`;
+    if (unreadable > 0) detail += `；${unreadable} 份资料未提取到正文，原文件已完整保存`;
+    if (uploadCount < rows.length || (body.materialBatch && (rows.length > 1 || retry))) {
+      const receipt = materialReceiptView(spaceUrl, batch, rows, uploadCount ? detail : "", distillNow);
+      return c.html(c.req.header("X-Material-Receipt") === "fragment" ? await receipt :
+        await layout("资料导入回执", [{ label: "空间", href: spaceUrl }, { label: "资料导入回执" }], receipt, "spaces"));
+    }
     const destination = rawIds.length === 1
       ? `/spaces/${encodeURIComponent(space)}/raw/${encodeURIComponent(rawIds[0]!)}`
       : `/spaces/${encodeURIComponent(space)}`;
+    const message = distillNow ? `${label}已导入${completedDream ? "并" : "，但"}${detail}`
+      : `${uploadCount === 1 ? "资料已导入" : `已导入 ${label}`}，${detail}`;
     return c.redirect(
       `${destination}?ok=${encodeURIComponent(message)}`,
     );
@@ -1789,12 +1821,21 @@ export function createWebApp(opts: WebOptions): Hono {
   app.get("/spaces/:space/raw", async (c) => {
     const space = parseSpace(c.req.param("space"));
     if (!space || !engine.registry.has(space)) return c.notFound();
-    const raws = engine.registry.store(space).index().listRaw({ limit: 300 });
+    const { before, after, id } = c.req.query();
+    const direction = before !== undefined ? "before" : "after";
+    const time = before ?? after;
+    const cursor = time !== undefined && time.trim() && Number.isFinite(Number(time)) && id
+      ? { direction, createdAt: Number(time), id } as const : undefined;
+    if ((before !== undefined && after !== undefined) || ((time !== undefined || id !== undefined) && !cursor)) {
+      return c.text("分页位置无效。", 400);
+    }
+    const page = engine.registry.store(space).index().listRawHistory(50, cursor);
+    const name = engine.registry.get(space)?.name?.trim() || space;
     return c.html(
       await layout(
-        `原始条目 · ${space}`,
-        [{ label: "首页", href: "/" }, { label: space, href: `/spaces/${encodeURIComponent(space)}` }, { label: "原始条目" }],
-        await rawListView(space, raws.reverse()),
+        `原始条目 · ${name}`,
+        [{ label: "首页", href: "/" }, { label: name, href: `/spaces/${encodeURIComponent(space)}` }, { label: "原始条目" }],
+        await rawListView(space, name, page, !!cursor),
         "spaces",
       ),
     );
@@ -1916,18 +1957,18 @@ export function createWebApp(opts: WebOptions): Hono {
     return c.redirect(`/spaces/${encodeURIComponent(space)}/quarantine?ok=${encodeURIComponent(message)}`);
   });
 
-  app.get("/spaces/:space/ask", async (c) => {
+  app.on(["GET", "POST"], "/spaces/:space/ask", async (c) => {
     const space = parseSpace(c.req.param("space"));
     if (!space || !engine.registry.has(space)) return c.notFound();
     const spaceName = engine.registry.get(space)?.name?.trim() || space;
-    let q = c.req.query("q") ?? null;
+    const askPath = `/spaces/${encodeURIComponent(space)}/ask`;
     const traceId = c.req.query("traceId");
-    // The engine routes to the space's agent CLI (or the default). We pass
-    // model/instruction so the test box reflects what the group would get.
-    const agent = engine.agentForSpace(space);
-    let result = null;
+    let q: string | null = null;
+    let result: AskResult | null = null;
     let feedbackRecorded = false;
-    if (traceId) {
+    let note: string | undefined;
+    let historyUrl: string | undefined;
+    if (traceId !== undefined) {
       const trace = engine.answerTrace(traceId);
       if (
         !trace
@@ -1943,21 +1984,44 @@ export function createWebApp(opts: WebOptions): Hono {
         citations: trace.citations,
         traceId: trace.id,
       };
+      if (trace.questionTruncated || trace.answerTruncated) {
+        note = "本页显示本机保存的节选。如需重新提问，请先核对或补全问题。";
+      }
       feedbackRecorded = engine.quality.feedbackFor(trace.id) !== undefined;
-    } else if (q && q.trim()) {
-      try {
-        result = await engine.ask([space], q, {
-          model: agent?.model || undefined,
-          instruction: agent?.instruction || undefined,
-        });
-      } catch {
-        result = {
-          answer: "⚠️ 无法作答：本空间没有可用的回答 Agent。请在 Integrations 指定 Agent 或在设置里配置默认 CLI。",
-          source: "general" as const,
-          citations: [],
-        };
+    } else if (c.req.query("unsaved") === "1") {
+      note = "上次提问没有可重开的回答记录。可在此重新提问。";
+    } else {
+      const posted = c.req.method === "POST";
+      q = posted ? str(await c.req.parseBody(), "q") : c.req.query("q") ?? null;
+      if (q?.trim()) {
+        const agent = engine.agentForSpace(space);
+        try {
+          result = await engine.ask([space], q, {
+            model: agent?.model || undefined,
+            instruction: agent?.instruction || undefined,
+          });
+          const trace = result.traceId ? engine.answerTrace(result.traceId) : undefined;
+          if (trace && trace.spaces.includes(space) && trace.outcome === "succeeded" && trace.answer !== undefined) {
+            historyUrl = `${askPath}?traceId=${encodeURIComponent(trace.id)}`;
+            if (posted && !trace.questionTruncated && !trace.answerTruncated) return c.redirect(historyUrl, 303);
+            if (trace.questionTruncated || trace.answerTruncated) {
+              note = "此处已显示本次完整回答。重新打开时只能查看本机保存的节选。";
+            }
+          } else {
+            historyUrl = `${askPath}?unsaved=1`;
+            note = "本次回答未保存，重新打开后无法找回。请在离开前复制需要的内容。";
+          }
+        } catch {
+          historyUrl = `${askPath}?unsaved=1`;
+          result = {
+            answer: "⚠️ 无法作答：本空间没有可用的回答 Agent。请在 Integrations 指定 Agent 或在设置里配置默认 CLI。",
+            source: "general" as const,
+            citations: [],
+          };
+        }
       }
     }
+    if (historyUrl) c.header("Content-Location", historyUrl);
     return c.html(
       await layout(
         `向空间提问 · ${spaceName}`,
@@ -1968,6 +2032,7 @@ export function createWebApp(opts: WebOptions): Hono {
           result,
           c.req.query("ok") ?? undefined,
           feedbackRecorded,
+          { note, historyUrl },
         ),
         "spaces",
       ),
@@ -2699,50 +2764,50 @@ export function createWebApp(opts: WebOptions): Hono {
     ));
   });
 
-  app.post("/work", async (c) => {
+  async function saveWorkItem(c: Context, id?: string) {
+    const item = id ? engine.workItems.get(id) : undefined;
+    if (id && !item) return c.notFound();
     const body = await c.req.parseBody();
-    const space = str(body, "space").trim();
-    if (!isSpaceId(space) || !engine.registry.has(space)) {
-      return c.redirect(`/work?new=1&ok=${encodeURIComponent("创建失败：请选择有效空间")}`);
-    }
+    const reviewed = body.reviewedPlanRevision !== undefined;
+    const planRevision = str(body, reviewed ? "reviewedPlanRevision" : "planRevision");
+    const planProgress = str(body, reviewed ? "reviewedPlanProgress" : "planProgress");
+    const space = item?.space ?? str(body, "space").trim();
     try {
-      const item = engine.workItems.create({
-        title: str(body, "title"),
-        space,
-        brief: str(body, "brief"),
-        runbook: str(body, "runbook"),
-        phase: (str(body, "phase") || "active") as WorkItemPhase,
-      });
-      return c.redirect(`/work/${encodeURIComponent(item.id)}?ok=${encodeURIComponent("已创建并设为当前工作项")}`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "创建失败";
-      return c.redirect(`/work?new=1&ok=${encodeURIComponent(`创建失败：${message}`)}`);
-    }
-  });
-
-  app.post("/work/:id", async (c) => {
-    const id = decodeURIComponent(c.req.param("id"));
-    const item = engine.workItems.get(id);
-    if (!item) return c.notFound();
-    const body = await c.req.parseBody();
-    try {
-      engine.updateWorkItem(id, {
-        title: str(body, "title"),
-        brief: str(body, "brief"),
-        runbook: str(body, "runbook"),
-        phase: str(body, "phase") as WorkItemPhase,
-        summary: str(body, "summary"),
+      if (!item && (!isSpaceId(space) || !engine.registry.has(space))) throw new Error("invalid work item space");
+      const input = {
+        space, title: str(body, "title"), brief: str(body, "brief"), runbook: str(body, "runbook"),
+        phase: (str(body, "phase") || (item ? "" : "active")) as WorkItemPhase, summary: str(body, "summary"),
         blockers: workList(str(body, "blockers")),
-        nextActions: item.planRef ? str(body, "nextActions").split(/\r?\n\s*\r?\n/u).map(value => value.trim()).filter(Boolean)
+        nextActions: item?.planRef ? str(body, "nextActions").split(/\r?\n\s*\r?\n/u).map(value => value.trim()).filter(Boolean)
           : workList(str(body, "nextActions")),
-      }, item.planRef ? Number(str(body, "planRevision")) : undefined,
-      item.planRef ? str(body, "planProgress") : undefined);
-      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent("工作上下文已保存")}`);
+      };
+      const saved = item
+        ? engine.updateWorkItem(item.id, input, item.planRef ? Number(planRevision) : undefined, item.planRef ? planProgress : undefined)
+        : engine.workItems.create(input);
+      return c.redirect(`/work/${encodeURIComponent(saved.id)}?ok=${encodeURIComponent(item ? "工作上下文已保存" : "已创建并设为当前工作项")}`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "保存失败";
-      return c.redirect(`/work/${encodeURIComponent(id)}?ok=${encodeURIComponent(`保存失败：${message}`)}`);
+      const reason = error instanceof Error ? error.message : "";
+      const errors: Record<string, { field?: string; message: string; planConflict?: boolean }> = {
+        "invalid work item space": { field: "space", message: "请选择有效空间。" },
+        "work item title is required": { field: "title", message: "请输入事项标题。" },
+        "invalid work item phase": { field: "phase", message: "请选择有效阶段。" },
+        "当前步骤正在执行或等待验收，可以修改后续步骤": { field: "nextActions", message: "当前步骤正在执行或等待验收，可以修改后续步骤。" },
+      };
+      const conflict = reason === "计划已更新，请刷新后保存" || reason === "事项进展已更新，请刷新后保存" || reason === "Work plan boundary changed";
+      const draft: EditorSubmission = { values: { ...body, planRevision, planProgress },
+        ...(conflict ? { planConflict: true, message: "计划或执行进展已更新。请核对下方当前内容，合并你的草稿后保存。" }
+          : errors[reason] ?? { message: "工作事项保存失败，请重试。" }) };
+      const current = item && engine.workItems.get(item.id);
+      const plan = current?.planRef ? engine.getWorkPlanView(current.id) : undefined;
+      const view = await workItemsView(engine.workItems.list(), current ?? null, engine.registry.list(), [], undefined, undefined,
+        plan ? { currentIds: [], inputs: [], chatRuns: [], plan } : undefined, draft);
+      c.header("Cache-Control", "no-store");
+      return c.html(await layout("工作事项", [{ label: "工作事项", href: "/work" }, { label: current?.title ?? "新建" }], view, "work"),
+        conflict ? 409 : draft.field ? 422 : 500);
     }
-  });
+  }
+  app.post("/work", c => saveWorkItem(c));
+  app.post("/work/:id", c => saveWorkItem(c, decodeURIComponent(c.req.param("id"))));
 
   app.post("/work/:id/activate", async (c) => {
     const id = decodeURIComponent(c.req.param("id"));
@@ -2938,10 +3003,11 @@ export function createWebApp(opts: WebOptions): Hono {
   app.get("/tasks/runs/:runId/status", (c) => {
     c.header("Cache-Control", "no-store");
     const run = engine.getTaskRun(c.req.param("runId"));
-    return run ? c.json({ status: run.status }) : c.notFound();
+    return run ? c.json(taskRunRefreshState(run)) : c.notFound();
   });
 
   app.get("/tasks/runs/:runId", async (c) => {
+    c.header("Cache-Control", "no-store");
     const runId = decodeURIComponent(c.req.param("runId"));
     const run = engine.getTaskRun(runId);
     if (!run) return c.notFound();
@@ -3004,38 +3070,18 @@ export function createWebApp(opts: WebOptions): Hono {
     );
   });
 
-  app.post("/tasks", async (c) => {
-    const body = await c.req.parseBody();
-    const space = str(body, "space").trim();
-    if (!isSpaceId(space) || !engine.registry.has(space)) {
-      return c.redirect(`/tasks?new=1&ok=${encodeURIComponent("创建失败：请选择有效空间")}`);
-    }
-    const timeoutMinutes = str(body, "timeoutMinutes");
-    const task = engine.tasks.create({
-      name: str(body, "name"),
-      space,
-      topic: str(body, "topic"),
-      cadence: str(body, "cadence"),
-      hour: Number(str(body, "hour")),
-      dayOfWeek: Number(str(body, "dayOfWeek")),
-      enabled: checkbox(body, "enabled"),
-      notify: checkbox(body, "notify"),
-      distillOnRun: checkbox(body, "distillOnRun"),
-      timeoutMinutes: timeoutMinutes ? Number(timeoutMinutes) : undefined,
-    });
-    if (!task) return c.redirect(`/tasks?new=1&ok=${encodeURIComponent("创建失败：请选择有效空间")}`);
-    return c.redirect(`/tasks/${encodeURIComponent(task.id)}?ok=${encodeURIComponent("已创建")}`);
-  });
-
-  app.post("/tasks/:id", async (c) => {
-    const id = decodeURIComponent(c.req.param("id"));
-    if (!engine.tasks.has(id)) return c.notFound();
+  async function saveResearchTask(c: Context, id?: string) {
+    const task = id ? engine.tasks.get(id) : undefined;
+    if (id && !task) return c.notFound();
     const body = await c.req.parseBody();
     const timeoutMinutes = str(body, "timeoutMinutes");
+    const space = body.space === undefined && task ? task.space : str(body, "space").trim();
+    const invalidSpace = !isSpaceId(space) || (space !== task?.space && !engine.registry.has(space));
     try {
-      engine.updateTask(id, {
+      if (invalidSpace) throw new Error("invalid task space");
+      const input = {
         name: str(body, "name"),
-        space: str(body, "space"),
+        space,
         topic: str(body, "topic"),
         cadence: str(body, "cadence"),
         hour: Number(str(body, "hour")),
@@ -3044,15 +3090,25 @@ export function createWebApp(opts: WebOptions): Hono {
         notify: checkbox(body, "notify"),
         distillOnRun: checkbox(body, "distillOnRun"),
         timeoutMinutes: timeoutMinutes ? Number(timeoutMinutes) : undefined,
-      });
+      };
+      const saved = task ? engine.updateTask(task.id, input) : engine.tasks.create(input);
+      if (!saved) throw new Error("invalid task space");
+      return c.redirect(`/tasks/${encodeURIComponent(saved.id)}?ok=${encodeURIComponent(task ? "已保存" : "已创建")}`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "保存失败";
-      return c.redirect(
-        `/tasks/${encodeURIComponent(id)}?edit=1&ok=${encodeURIComponent(`保存失败：${message}`)}`,
-      );
+      const lockedSpace = error instanceof Error && error.message === "已有运行历史的任务不能更换空间；请在目标空间新建任务";
+      const draft: EditorSubmission = { values: body,
+        field: invalidSpace || lockedSpace ? "space" : undefined,
+        message: invalidSpace ? "请选择有效空间。" : lockedSpace
+          ? `已有运行历史的任务不能更换空间。请选择原空间「${engine.registry.get(task!.space)?.name || task!.space}」继续保存，或在目标空间新建任务。`
+          : "研究任务保存失败，请重试。" };
+      const view = await tasksView(engine.tasks.list(), task ?? null, engine.registry.list(), undefined, draft);
+      c.header("Cache-Control", "no-store");
+      return c.html(await layout("研究任务", [{ label: "研究任务", href: "/tasks" }, { label: task?.name ?? "新建" }], view, "tasks"),
+        lockedSpace ? 409 : invalidSpace ? 422 : 500);
     }
-    return c.redirect(`/tasks/${encodeURIComponent(id)}?ok=${encodeURIComponent("已保存")}`);
-  });
+  }
+  app.post("/tasks", c => saveResearchTask(c));
+  app.post("/tasks/:id", c => saveResearchTask(c, decodeURIComponent(c.req.param("id"))));
 
   app.post("/tasks/:id/delete", async (c) => {
     const id = decodeURIComponent(c.req.param("id"));
@@ -3212,7 +3268,10 @@ export function createWebApp(opts: WebOptions): Hono {
     const id = decodeURIComponent(c.req.param("id"));
     const plan = engine.learning.get(id);
     if (!plan) return c.notFound();
-    const ok = c.req.query("ok") ?? undefined;
+    c.header("cache-control", "no-store");
+    const notice = c.req.query("notice") === "status"
+      ? `计划当前状态为「${LEARNING_STATUS_LABELS[plan.status]}」`
+      : c.req.query("ok");
     const plans = engine.learning.list();
     const sources = Object.fromEntries(
       plans.flatMap((candidate) => {
@@ -3229,7 +3288,7 @@ export function createWebApp(opts: WebOptions): Hono {
           plan,
           sources,
           engine.learning.sessionsForPlan(id),
-          ok,
+          notice,
         ),
         "learning",
       ),
@@ -3262,19 +3321,15 @@ export function createWebApp(opts: WebOptions): Hono {
     return c.redirect(`/learning/${encodeURIComponent(id)}?ok=${encodeURIComponent("已保存")}`);
   });
 
-  app.post("/learning/:id/pause", async (c) => {
-    const id = decodeURIComponent(c.req.param("id"));
-    if (!engine.learning.has(id)) return c.notFound();
-    engine.learning.pause(id);
-    return c.redirect(`/learning/${encodeURIComponent(id)}?ok=${encodeURIComponent("已暂停")}`);
-  });
-
-  app.post("/learning/:id/resume", async (c) => {
-    const id = decodeURIComponent(c.req.param("id"));
-    if (!engine.learning.has(id)) return c.notFound();
-    engine.learning.resume(id);
-    return c.redirect(`/learning/${encodeURIComponent(id)}?ok=${encodeURIComponent("已恢复")}`);
-  });
+  for (const action of ["pause", "resume"] as const) {
+    app.post(`/learning/:id/${action}`, (c) => {
+      const id = decodeURIComponent(c.req.param("id"));
+      if (!engine.learning.has(id)) return c.notFound();
+      const updated = engine.learning[action](id);
+      const notice = updated ? `ok=${encodeURIComponent(action === "pause" ? "已暂停" : "已恢复")}` : "notice=status";
+      return c.redirect(`/learning/${encodeURIComponent(id)}?${notice}`);
+    });
+  }
 
   app.post("/learning/:id/delete", async (c) => {
     const id = decodeURIComponent(c.req.param("id"));

@@ -1079,6 +1079,30 @@ describe("FeishuConnector outbound", () => {
     expect((await connector.resolveReplyTarget("om_reply"))?.text).toBe(`10 月 26 日—11 月 1 日工作周报\n${body}`);
   });
 
+  test("keeps a standalone post link as source identity and preserves historical rich-text rendering", async () => {
+    const url = "https://example.test/reports/current";
+    const link = { tag: "a", text: "查看全文", href: url };
+    let title = "工作周报";
+    let content: Record<string, string>[][] = [[link]];
+    connector = new FeishuConnector({ spawner: new FakeSpawner(), runCommand: async cmd => JSON.stringify({ data: {
+      items: [cmd.some(part => part.endsWith("/om_reply")) ? { parent_id: "om_post" }
+        : { msg_type: "post", body: { content: JSON.stringify({ zh_cn: { title, content } }) } }],
+    } }) });
+    const read = () => connector.resolveReplyTarget("om_reply", { fullText: true });
+    expect(await read()).toMatchObject({ text: "工作周报\n查看全文", sourceCard: { title: "工作周报", url } });
+    title = "";
+    expect(await read()).toMatchObject({ text: "查看全文", sourceCard: { title: "查看全文", url } });
+    title = "工作周报";
+    content = [[{ tag: "text", text: "验收已通过。" }], [link]];
+    const report = await read();
+    expect(report?.text).toBe("工作周报\n验收已通过。\n查看全文");
+    expect(report?.sourceCard).toBeUndefined();
+    content = [[link], [{ ...link, href: "https://example.test/previous" }]];
+    expect((await read())?.sourceCard).toBeUndefined();
+    content = [[link], [{ tag: "media", file_key: "video_clip" }]];
+    expect((await read())?.sourceCard).toBeUndefined();
+  });
+
   test("explicit preservation reads past the reply preview limit and retains the source timestamp", async () => {
     const body = "周报正文".repeat(6_000) + "\n末尾待验收事项";
     const source = { message_id: "om_report", msg_type: "text", create_time: "1793577600000",

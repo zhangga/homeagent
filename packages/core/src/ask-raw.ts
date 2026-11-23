@@ -2,6 +2,7 @@ import { AI_GENERATION_MAX_TOKENS, MAX_MATERIAL_BYTES, messageRawParts, type Ask
 import type { SpaceStore } from "./space.ts";
 import type { AskOptions } from "./types.ts";
 import type { LlmClient } from "./llm.ts";
+import { documentRawSource, documentSourceUrl } from "./chat-document-import.ts";
 import { chatRawEntryUpdatedAt, chatRawSourceName, isChatSourceSnapshot } from "./chat-raw-import.ts";
 import { isReplyRawStatusTopic, planRawQuery, storedRawStatusTopic } from "./raw-query.ts";
 import { rawExcerpt } from "./raw-excerpts.ts";
@@ -9,10 +10,12 @@ import { rawExcerpt } from "./raw-excerpts.ts";
 const MAX_RAW_CANDIDATES = 20;
 const MAX_RAW_CONTEXT = 120_000;
 const MAX_RAW_EXCERPT = 12_000;
-interface RawCandidate { key: string; raw: RawRecord; content: string; fragments: string[]; truncated: boolean; chatName?: string }
+interface RawSourceText { content: string; chatName?: string; documentTitle?: string; documentUrl?: string }
+interface RawCandidate extends RawSourceText { key: string; raw: RawRecord; fragments: string[]; truncated: boolean }
 interface RawMatch { key: string; quote: string }
 
-function sourceText(raw: RawRecord): { content: string; chatName?: string } {
+export function sourceText(raw: RawRecord, documentBodyOnly = true): RawSourceText {
+  if (raw.source === "doc" && documentBodyOnly) return documentRawSource(raw) ?? { content: raw.content };
   if (!isChatSourceSnapshot(raw)) return { content: raw.content };
   try {
     return { content: raw.content.slice(raw.content.indexOf("\n\n") + 2), chatName: chatRawSourceName(raw) };
@@ -29,20 +32,39 @@ function titleKey(text: string): string {
   return text.normalize("NFKC").toLowerCase().replace(/^[《「“]|[》」”]$/gu, "").replace(/[—–]/gu, "-").replace(/\s/gu, "");
 }
 
+/** A standalone link, optionally preceded by a title, identifies a document rather than its text. */
+interface DocumentCard { url: string; title: string }
+function documentCard(text: string, structured?: DocumentCard): DocumentCard | undefined {
+  if (structured) {
+    try { return { ...structured, url: documentSourceUrl(structured.url) }; }
+    catch { /* Fall back to a link present in the rendered text. */ }
+  }
+  if (!text.includes("://")) return undefined;
+  const content = text.replace(/^>\s*(?:本次模型|推理等级)[：:][^\n]*\n?/gmu, "").trim();
+  const last = content.lastIndexOf("\n");
+  const label = content.slice(0, last < 0 ? 0 : last).trim();
+  if (label.includes("\n")) return undefined;
+  const link = heading(content.slice(last + 1)).match(/^(?:\[([^\]]*)\]\((https?:\/\/\S+)\)|(https?:\/\/\S+))$/iu);
+  if (!link) return undefined;
+  try { return { url: documentSourceUrl(link[2] ?? link[3]), title: heading(label) || link[1] || "" }; }
+  catch { return undefined; }
+}
+
 function isStatusEvidence(raw: RawRecord): boolean {
   return (raw.source !== "message" && !isChatSourceSnapshot(raw)) || !storedRawStatusTopic(sourceText(raw).content);
 }
 
 function hasBodyBeyondTitle(text: string, title: string): boolean {
   const content = text.replace(/^>\s*(?:本次模型|推理等级)[：:][^\n]*\n?/gmu, "").trim();
-  if (!content || /^【(?:文件|图片|音频|视频)(?:[：:].*)?】$/u.test(content)) return false;
+  if (!content || documentCard(content) || /^#{1,6}\s+[^\n]+$/u.test(content)
+    || /^【(?:文件|图片|音频|视频)(?:[：:].*)?】$/u.test(content)) return false;
   if (!title || titleKey(heading(content)) !== title) return true;
   const newline = content.indexOf("\n");
   if (newline < 0) return content.length > 4000 || /[。！!？?]$/u.test(content);
   // A title card can also contain a link to the full report or an image placeholder.
   for (const [line] of content.slice(newline + 1).matchAll(/[^\r\n]+/gu)) {
     const part = line.trim();
-    if (part && !/^(?:https?:\/\/\S+|\[[^\]]*\]\(https?:\/\/[^)]*\)|【[^】]*】)$/u.test(part)) return true;
+    if (part && !/^(?:查看全文|https?:\/\/\S+|\[[^\]]*\]\(https?:\/\/[^)]*\)|【[^】]*】)$/u.test(part)) return true;
   }
   return false;
 }
@@ -63,12 +85,28 @@ function lookupReply(stores: SpaceStore[], target: AskOptions["rawReplyTarget"],
   const direct = index.findRawsByMessageId(target.messageId, target.chatId)
     .filter(raw => raw.admission === "ready" && isStatusEvidence(raw));
   const original = target.text ?? "";
-  const title = heading(original || (direct[0] ? sourceText(direct[0]).content : ""));
+  const targetText = original || (direct[0] ? sourceText(direct[0]).content : "");
+  const card = documentCard(targetText, target.sourceCard);
+  const isCard = !!(card || target.sourceCard);
+  const title = card ? card.title || card.url : heading(targetText);
   const key = titleKey(title);
   const document = /报告|周报|日报|文档|文章|文件|附件|资料|全文|正文/u.test(topic + title);
-  const hasBody = (text: string) => hasBodyBeyondTitle(text, document ? key : "");
-  const records = direct.filter(raw => hasBody(sourceText(raw).content));
-  const canCompare = target.fullText && original.length <= MAX_MATERIAL_BYTES && hasBody(original);
+  const expectedTitle = document ? key : "";
+  // Old Feishu post renderers stored hyperlink labels as ordinary text, sometimes
+  // with the post title on a separate line. Neither form contains document prose.
+  const display = isCard ? original.replace(/\[([^\]\n]*)\]\(https?:\/\/[^\n]+\)/giu, "$1").trim() : "";
+  const cardLabels = display ? new Set([display, ...display.split(/\r?\n/u)].map(text => text.trim())) : undefined;
+  const matchesSource = (raw: RawRecord, sameMessage: boolean): boolean => {
+    const source = sourceText(raw);
+    if (cardLabels?.has(source.content.trim())) return false;
+    if (!hasBodyBeyondTitle(source.content, source.documentTitle ? titleKey(source.documentTitle) : expectedTitle)) return false;
+    // The explicit link distinguishes same-titled reports at different URLs.
+    if (card && source.documentUrl) return card.url === source.documentUrl;
+    return sameMessage || (source.documentTitle !== undefined && titleKey(source.documentTitle) === key)
+      || titleKey(heading(source.content)) === key || !!raw.attachments?.some(file => titleKey(file.name ?? "") === key);
+  };
+  const records = direct.filter(raw => matchesSource(raw, true));
+  const canCompare = !isCard && target.fullText && original.length <= MAX_MATERIAL_BYTES && hasBodyBeyondTitle(original, expectedTitle);
   if (canCompare) {
     const byContent = new Map(records.map(raw => [sourceText(raw).content, raw]));
     const whole = byContent.get(original);
@@ -78,11 +116,11 @@ function lookupReply(stores: SpaceStore[], target: AskOptions["rawReplyTarget"],
     if (first && parts.every(part => byContent.has(part))) return { records, title, complete: { first, count: parts.length } };
   }
   if (!key) return { records, title, missing: "按被回复消息的 ID 未查到可核验的正文，本次也未取得标题，无法按标题检索。" };
-  // A separately imported copy can have a different message ID. Bind it to the quoted heading
-  // (or attachment name) so FTS token overlap cannot turn an adjacent week's report into this one.
-  const copies = stores.flatMap(store => store.index().searchRaw(title, MAX_RAW_CANDIDATES))
-    .filter(raw => isStatusEvidence(raw) && hasBody(sourceText(raw).content) && (titleKey(heading(sourceText(raw).content)) === key
-      || raw.attachments?.some(file => titleKey(file.name ?? "") === key)));
+  // FTS proposes candidates. Verify their document URL, stored title, heading or
+  // attachment name before they count towards the candidate limit.
+  const lookup = card ? `${card.url} ${card.title}` : title;
+  const copies = stores.flatMap(store => store.index().searchRaw(lookup, MAX_RAW_CANDIDATES, {},
+    raw => isStatusEvidence(raw) && matchesSource(raw, false)));
   const copy = canCompare ? copies.find(raw => sourceText(raw).content === original) : undefined;
   const seen = new Set(records.map(raw => raw.id));
   return { records: [...records, ...copies.filter(raw => !seen.has(raw.id))], title, complete: copy ? { first: copy, count: 1 } : undefined };
@@ -113,25 +151,28 @@ export async function askStoredRaw(stores: SpaceStore[], question: string, clien
     : opts.retrievalQuestion !== undefined && (!plan.query || /^(?:这条|那条|这份|那份|刚才|它)$/u.test(plan.query))
     ? planRawQuery(question, now) : plan;
   const queues = reply ? [reply.records] : stores.map(store => {
-    const raws = store.index().searchRaw(terms.query, MAX_RAW_CANDIDATES, plan.filters);
-    if (!checkingStatus) return raws;
-    // Older installations and imported chat histories can include previous status checks.
+    if (!checkingStatus) return store.index().searchRaw(terms.query, MAX_RAW_CANDIDATES, plan.filters);
     const title = titleKey(terms.query);
-    return raws.filter(raw => isStatusEvidence(raw) && hasBodyBeyondTitle(sourceText(raw).content, title));
+    return store.index().searchRaw(terms.query, MAX_RAW_CANDIDATES, plan.filters,
+      raw => isStatusEvidence(raw) && hasBodyBeyondTitle(sourceText(raw).content, title));
   });
   const selected: RawRecord[] = [];
   for (let index = 0; index < MAX_RAW_CANDIDATES; index++) for (const queue of queues) {
     const raw = queue[index];
     if (raw && selected.length < MAX_RAW_CANDIDATES) selected.push(raw);
   }
+  const conditions = plan.conditions.length > 0 ? `检索条件：${plan.conditions.join("；")}\n\n` : "";
+  if (checkingStatus && !selected.length && !opts.nativeSession) {
+    return { answer: conditions + statusMiss, source: "general", citations: [], answeredLocally: true };
+  }
   const candidates: RawCandidate[] = [];
   let remaining = MAX_RAW_CONTEXT;
   for (const [index, raw] of selected.entries()) {
-    const source = sourceText(raw);
+    const source = sourceText(raw, checkingStatus);
     const excerpt = rawExcerpt(source.content, terms.query, terms.phrases,
       Math.min(MAX_RAW_EXCERPT, Math.floor(remaining / (selected.length - index))));
     remaining -= excerpt.content.length;
-    candidates.push({ key: `raw-${candidates.length + 1}`, raw, chatName: source.chatName, ...excerpt });
+    candidates.push({ key: `raw-${candidates.length + 1}`, raw, ...source, ...excerpt });
   }
   const { value, result } = await client.completeJSON<{ matches: RawMatch[] }>({
     system: [opts.instruction, "你是 HomeAgent 原文核验助手。后台已直接查询授权 Space 的 Raw 全文索引，下面就是已入库的原文证据，不需要另找 Raw 查询接口。",
@@ -163,7 +204,6 @@ export async function askStoredRaw(stores: SpaceStore[], question: string, clien
       `消息时间：${new Date(raw.createdAt).toISOString()}（UTC）`, ...(updatedAt === undefined ? [] : [`编辑时间：${new Date(updatedAt).toISOString()}（UTC）`]), `发送者：${raw.author ?? "未记录"}`,
       `消息 ID：${raw.messageId ?? "未记录"}`, `所属 Space：${raw.space}`, "", ...match.quote.split("\n").map(line => `> ${line}`)].join("\n");
   });
-  const conditions = plan.conditions.length > 0 ? `检索条件：${plan.conditions.join("；")}\n\n` : "";
   const found = reply ? "查到已收录的正文摘录，尚未核实全文是否完整。" : checkingStatus ? "查到已收录的原文记录。" : "查到以下已入库 Raw：";
   const missing = checkingStatus ? statusMiss
     : "已查询当前可读 Space 的 Raw 全文索引，未找到能核验所问内容的原文摘录。";

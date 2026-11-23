@@ -61,9 +61,11 @@ export interface AnswerTrace {
   id: string;
   spaces: SpaceId[];
   question: string;
+  questionTruncated?: true;
   outcome: AnswerOutcome;
   source?: "knowledge" | "general";
   answer?: string;
+  answerTruncated?: true;
   citations: Citation[];
   execution?: AnswerTraceExecution;
   retrievalPages?: AnswerTraceRetrievalPage[];
@@ -235,6 +237,13 @@ function validCitation(value: unknown): value is Citation {
   const citation = value as Partial<Citation>;
   return typeof citation.slug === "string" && citation.slug.length > 0
     && typeof citation.title === "string" && citation.title.length > 0
+    && (citation.evidence === undefined || (
+      citation.evidence !== null && typeof citation.evidence === "object"
+      && Number.isSafeInteger(citation.evidence.sourceCount) && citation.evidence.sourceCount >= 0
+      && (citation.evidence.latestSourceAt === undefined || finiteNonNegative(citation.evidence.latestSourceAt))
+      && ["recent", "aging", "stale", "unknown"].includes(citation.evidence.freshness)
+      && typeof citation.evidence.complete === "boolean"
+    ))
     && (citation.space === undefined || (
       typeof citation.space === "string" && isSpaceId(citation.space)
     ));
@@ -294,6 +303,8 @@ function validTrace(value: unknown): value is AnswerTrace {
     && trace.spaces.length > 0
     && trace.spaces.every((space) => typeof space === "string" && isSpaceId(space))
     && typeof trace.question === "string"
+    && (trace.questionTruncated === undefined || trace.questionTruncated === true)
+    && (trace.answerTruncated === undefined || trace.answerTruncated === true)
     && ["succeeded", "failed", "timed_out"].includes(trace.outcome ?? "")
     && (trace.source === undefined || trace.source === "knowledge" || trace.source === "general")
     && (trace.answer === undefined || typeof trace.answer === "string")
@@ -455,7 +466,7 @@ function cloneTrace(trace: AnswerTrace): AnswerTrace {
   return {
     ...trace,
     spaces: [...trace.spaces],
-    citations: trace.citations.map((citation) => ({ ...citation })),
+    citations: structuredClone(trace.citations),
     execution: trace.execution
       ? {
           ...trace.execution,
@@ -471,7 +482,7 @@ function cloneEvaluationCase(item: QualityEvaluationCase): QualityEvaluationCase
   return {
     ...item,
     spaces: [...item.spaces],
-    observedCitations: item.observedCitations.map((citation) => ({ ...citation })),
+    observedCitations: structuredClone(item.observedCitations),
   };
 }
 
@@ -643,10 +654,12 @@ export class QualityStore {
       id: `answer_${randomUUID()}`,
       spaces: [...new Set(input.spaces.filter(isSpaceId))],
       question: input.question.slice(0, MAX_QUESTION_LENGTH),
+      ...(input.question.length > MAX_QUESTION_LENGTH ? { questionTruncated: true } : {}),
       outcome: input.outcome,
       source: input.source,
       answer: bounded(input.answer, MAX_ANSWER_LENGTH),
-      citations: input.citations.map((citation) => ({ ...citation })),
+      ...((input.answer?.trim().length ?? 0) > MAX_ANSWER_LENGTH ? { answerTruncated: true } : {}),
+      citations: structuredClone(input.citations),
       execution,
       retrievalPages,
       usage,
@@ -853,7 +866,7 @@ export class QualityStore {
       question: trace.question,
       observedAnswer: trace.answer,
       observedSource: trace.source,
-      observedCitations: trace.citations.map((citation) => ({ ...citation })),
+      observedCitations: structuredClone(trace.citations),
       feedbackKind: feedback.kind,
       feedbackNote: feedback.note,
       curatorNote: normalizedNote,

@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { KnowledgeEngine } from "./engine.ts";
+import { ask } from "./ask.ts";
+import { FakeLlm } from "./testing.ts";
 import { SkillCatalog } from "./skill-catalog.ts";
 import { RawJournal } from "./raw-journal.ts";
 import { parseSpaceArchive } from "./governance.ts";
@@ -91,6 +93,30 @@ test("rejects an invalid later artifact before writing any Raw or source file", 
   expect(f.engine.registry.store(space).index().listRaw({})).toHaveLength(0);
   const sources = join(f.engine.registry.store(space).root, "raw", "sources");
   expect(!existsSync(sources) || readdirSync(sources).length === 0).toBe(true);
+});
+
+test("a reply to a document link finds the previously imported body after reopening the Space", async () => {
+  const f = fixture();
+  const passage = "本周完成了专用服务器的构建和测试。";
+  f.manifest(passage);
+  expect(await f.capture.finish()).toContain("文档原文入库：新增 1 条");
+  const [saved] = f.engine.registry.store(space).index().listRaw({});
+  expect(saved?.source).toBe("doc");
+  f.engine.close();
+
+  const reopened = new KnowledgeEngine({ dataDir: f.dataDir, skillCatalog: new SkillCatalog({ roots: [] }) });
+  engines.push(reopened);
+  const client = new FakeLlm().queueJSON({ matches: [{ key: "raw-1", quote: passage }] });
+  const result = await ask([reopened.registry.store(space)], "这个报告记录下来了吗", {
+    rawReplyTarget: {
+      space, chatId: "oc_documents", messageId: "om_shared_card",
+      text: `[UE5 / Graviton](${url})`, fullText: true,
+    },
+  }, { client });
+
+  expect(result.answer).toContain(saved!.id);
+  expect(result.answer).toContain(passage);
+  expect(result.answer).toContain("尚未核实全文");
 });
 
 test("partial journal failure reports confirmed progress and retry does not duplicate committed parts", async () => {

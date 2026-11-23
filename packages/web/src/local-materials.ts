@@ -4,6 +4,7 @@ import { extractMaterialText, isExtractableMaterial, readZipDirectory, splitMate
 const MAX_BYTES = 20 * 1024 * 1024;
 const MAX_CHARACTERS = 200_000;
 const MAX_FILES = 20;
+const MAX_EXPANDED_BYTES = MAX_BYTES * MAX_FILES;
 
 interface LocalMaterialUpload {
   name?: string;
@@ -21,8 +22,8 @@ export interface PreparedLocalMaterial {
   archive?: { name: string; path: string; part: number; parts: number };
 }
 
-/** Validate every upload before returning any material, preventing partial input batches. */
-export async function prepareLocalMaterials(input: unknown, extractText: MaterialTextExtractor = extractMaterialText): Promise<PreparedLocalMaterial[]> {
+/** Keep each upload's original and parts together, including same-name uploads. */
+export async function prepareLocalMaterialGroups(input: unknown, extractText: MaterialTextExtractor = extractMaterialText, retryBudgets: number[] = []) {
   const candidates = Array.isArray(input) ? input : [input];
   if (
     candidates.length === 0
@@ -33,19 +34,21 @@ export async function prepareLocalMaterials(input: unknown, extractText: Materia
   const uploads = candidates as LocalMaterialUpload[];
   if (uploads.length > MAX_FILES) throw new Error("一次最多选择 20 份资料");
 
-  const materials: PreparedLocalMaterial[] = [];
+  const groups: { materials: PreparedLocalMaterial[]; expansionBudget: number }[] = [];
   // Reuse the existing per-request upload budget for expanded ZIP members.
-  let remainingExpandedBytes = MAX_BYTES * MAX_FILES;
-  for (const upload of uploads) {
+  let remainingExpandedBytes = MAX_EXPANDED_BYTES;
+  for (const [index, upload] of uploads.entries()) {
     const name = safeUploadName(upload.name);
     const extension = extname(name).toLowerCase();
     if (upload.size > MAX_BYTES) throw new Error("单个文件不能超过 20 MiB");
 
     const bytes = new Uint8Array(await upload.arrayBuffer());
     if (bytes.byteLength > MAX_BYTES) throw new Error("单个文件不能超过 20 MiB");
-    const prepared = await prepareMaterial(name, bytes, extractText);
-    const material = prepared[0]!;
-    materials.push(...prepared);
+    const materials = await prepareMaterial(name, bytes, extractText);
+    const material = materials[0]!;
+    const expansionBudget = Math.min(remainingExpandedBytes, retryBudgets[index] ?? MAX_EXPANDED_BYTES);
+    let fileBudget = expansionBudget;
+    groups.push({ materials, expansionBudget });
     if (extension !== ".zip") continue;
 
     const notes: string[] = [];
@@ -68,11 +71,12 @@ export async function prepareLocalMaterials(input: unknown, extractText: Materia
           continue;
         }
         try {
-          if (entry.size > remainingExpandedBytes) {
+          if (entry.size > fileBudget) {
             throw new Error("本次解压已达到导入总字节预算 400 MiB，原内容保留在 ZIP 中");
           }
           const expanded = entry.read();
           remainingExpandedBytes -= expanded.length;
+          fileBudget -= expanded.length;
           const member = await prepareMaterial(safeUploadName(entry.path), expanded, extractText);
           if (!member[0]?.content) {
             skippedFiles += 1;
@@ -93,15 +97,19 @@ export async function prepareLocalMaterials(input: unknown, extractText: Materia
         }
       }
       material.content = [
-        `ZIP 已展开：${extractedFiles} 个文本文件，登记为 ${rawParts} 段 Raw 正文；${skippedFiles} 个文件未提取正文。`,
-        "内部正文分别登记在本 Space 的原始条目中，保留压缩包名称和内部路径。原 ZIP 已完整保存。",
+        `ZIP 已展开：${extractedFiles} 个文本文件，共提取 ${rawParts} 段正文；${skippedFiles} 个文件未提取正文。`,
+        "内部正文按压缩包名称和内部路径分段保存。原 ZIP 已完整保存。",
         ...notes,
       ].join("\n");
     } catch {
       material.content = "ZIP 目录损坏或格式不受支持，未提取内部正文；原 ZIP 已完整保存，可下载检查。";
     }
   }
-  return materials;
+  return groups;
+}
+
+export async function prepareLocalMaterials(input: unknown, extractText?: MaterialTextExtractor): Promise<PreparedLocalMaterial[]> {
+  return (await prepareLocalMaterialGroups(input, extractText)).flatMap(group => group.materials);
 }
 
 export function localMaterialRawContent(material: PreparedLocalMaterial): string {

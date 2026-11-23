@@ -136,6 +136,8 @@ export interface ReplyTarget {
   senderId?: string;
   /** Human-readable source content when the connector can retrieve it. */
   text?: string;
+  /** Single source link on a card, separate from its human-readable text. */
+  sourceCard?: { title: string; url: string };
   /** A bounded preview must never be acknowledged as a complete saved body. */
   textTruncated?: true;
   createdAt?: number;

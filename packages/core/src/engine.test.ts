@@ -1955,12 +1955,14 @@ describe("Knowledge seam contract", () => {
 
   test("startup excludes a legacy captured Raw whose interrupted Run never persisted rawId", async () => {
     engine.ensureSpace(SPACE);
+    const startedAt = Date.UTC(2026, 0, 10);
+    const restartedAt = startedAt + 3;
     const item = engine.workItems.create({
       space: SPACE,
       title: "恢复旧版捕获崩溃窗口",
       nextActions: ["执行旧版只读检查"],
-    });
-    const action = engine.workContinuations.claimNext(item);
+    }, startedAt);
+    const action = engine.workContinuations.claimNext(item, startedAt);
     const task = {
       id: action.id,
       name: `继续：${item.title}`,
@@ -1979,6 +1981,7 @@ describe("Knowledge seam contract", () => {
     const snapshot = engine.agentRunExecutionSnapshot(SPACE, true);
     const run = engine.taskRuns.start({
       task,
+      startedAt,
       trigger: "manual",
       workItemId: item.id,
       workActionId: action.id,
@@ -1988,7 +1991,7 @@ describe("Knowledge seam contract", () => {
       skillEvidence: snapshot.skillEvidence,
       distill: false,
     });
-    engine.workItems.attachTaskRun(item.id, run.id);
+    engine.workItems.attachTaskRun(item.id, run.id, run.startedAt);
     engine.workContinuations.attachRun(action.id, run.id, "queued", run.startedAt);
     engine.taskRuns.begin(run.id, run.startedAt + 1);
     engine.workContinuations.markRunning(action.id, run.id, run.startedAt + 1);
@@ -2004,13 +2007,18 @@ describe("Knowledge seam contract", () => {
     expect(engine.registry.store(SPACE).index().getRaw(rawId)?.workActionId).toBeUndefined();
 
     engine.close();
-    engine = new KnowledgeEngine({
-      skillCatalog: new SkillCatalog({ roots: [] }),
-      dataDir: dir,
-      recoverInterruptedTaskRuns: true,
-    });
+    const clock = spyOn(Date, "now").mockReturnValue(restartedAt);
+    try {
+      engine = new KnowledgeEngine({
+        skillCatalog: new SkillCatalog({ roots: [] }),
+        dataDir: dir,
+        recoverInterruptedTaskRuns: true,
+      });
+    } finally {
+      clock.mockRestore();
+    }
 
-    expect(engine.getTaskRun(run.id)).toEqual(expect.objectContaining({ status: "failed" }));
+    expect(engine.getTaskRun(run.id)).toEqual(expect.objectContaining({ status: "failed", finishedAt: restartedAt }));
     expect(engine.workContinuations.get(action.id))
       .toEqual(expect.objectContaining({ status: "blocked" }));
     expect(engine.registry.store(SPACE).index().getRaw(rawId)).toEqual(expect.objectContaining({

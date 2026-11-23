@@ -91,7 +91,7 @@ test("returning admins can open an approval or active Chat and continue to their
   const ended = engine.chatRuns.start({ space, input: "终态对话", trigger: "message" });
   engine.chatRuns.begin(ended.id);
   engine.chatRuns.succeed(ended.id, { output: "完成", finishedAt: Date.now() });
-  for (const input of ["分析采购报价", "整理讨论纪要"]) {
+  for (const input of ["分析采购报价", "整理讨论纪要", "整理上周反馈"]) {
     engine.chatRuns.start({ space, input, trigger: "message" });
   }
 
@@ -100,6 +100,9 @@ test("returning admins can open an approval or active Chat and continue to their
   const body = await (await app.request("/", { headers })).text();
   expect(body).toContain(`href="/tasks/runs/${approval!.id}"`);
   expect(body).toContain("待审批");
+  expect(body).toContain("处理审批");
+  expect(body.indexOf('id="home-decisions"')).toBeLessThan(body.indexOf('id="home-runs"'));
+  expect(body.split(`href="/tasks/runs/${approval!.id}"`)).toHaveLength(2);
   expect(body).toContain(`href="/chats/runs/${chat.id}"`);
   expect(body.indexOf(approval!.id)).toBeLessThan(body.indexOf(chat.id));
   expect(body).toContain("核对 &lt;资料&gt;");
@@ -107,4 +110,20 @@ test("returning admins can open an approval or active Chat and continue to their
   expect(body).not.toContain(ended.id);
   expect(body).toContain('href="/spaces/team%2Foc_homepage" aria-label="产品小组"');
   expect(body).toContain("待提炼");
+});
+
+test("home links to the current work decision and drops resolved blockers", async () => {
+  const space = "team/oc_decisions";
+  engine.ensureSpace(space);
+  const item = engine.workItems.create({ space, title: "准备交接", blockers: ["缺少交接人"] });
+  const app = createWebApp({ engine });
+  const home = async () => (await app.request("/")).text();
+  const href = `href="/work/${item.id}#work-next-action"`;
+  const blocked = await home();
+  expect(blocked).toContain(href);
+  expect(blocked).toContain("查看阻塞原因");
+  engine.workItems.update(item.id, { blockers: [] });
+  const resolved = await home();
+  expect(resolved).not.toContain(href);
+  expect(resolved).not.toContain('id="home-decisions"');
 });

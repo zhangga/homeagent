@@ -15,8 +15,8 @@ import { brandMark } from "./brand-mark.ts";
 const STYLE = `
   :root {
     --fg:#1a1a1a; --muted:#6b7280; --bg:#fafafa; --card:#fff; --border:#e5e7eb;
-    --accent:#2563eb; --accent-soft:#eef2ff; --nav-bg:#111317; --nav-fg:#c7cbd1;
-    --nav-fg-active:#fff; --nav-active:#1f232b; --ok:#16a34a; --ok-soft:#dcfce7;
+    --accent:#205bc4; --accent-soft:#edf3ff; --nav-bg:#142237; --nav-fg:#c6d1df;
+    --nav-fg-active:#fff; --nav-active:#243951; --ok:#16a34a; --ok-soft:#dcfce7;
     --warn:#92400e; --warn-soft:#fef3c7; --danger:#dc2626;
   }
   * { box-sizing: border-box; }
@@ -25,6 +25,7 @@ const STYLE = `
          margin:0; color:var(--fg); background:var(--bg); line-height:1.5; display:flex; }
   a { color:var(--accent); text-decoration:none; }
   a:hover { text-decoration:underline; }
+  :where(a, button, summary):focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
 
   /* left nav rail */
   nav.rail { width:220px; min-width:220px; background:var(--nav-bg); color:var(--nav-fg);
@@ -34,12 +35,14 @@ const STYLE = `
   nav.rail a { display:flex; align-items:center; gap:10px; color:var(--nav-fg);
                padding:8px 12px; border-radius:8px; font-size:14px; margin-bottom:2px; }
   nav.rail a:hover { background:var(--nav-active); text-decoration:none; }
-  nav.rail a.active { background:var(--nav-active); color:var(--nav-fg-active); font-weight:600; }
-  nav.rail .ico { width:18px; text-align:center; opacity:.9; }
+  nav.rail a.active { background:var(--nav-active); color:var(--nav-fg-active); font-weight:600;
+    box-shadow:inset 3px 0 #8eb9fc; }
+  nav.rail a:focus-visible, .mobile-bar button:focus-visible, .nav-close:focus-visible { outline-color:#a9caff; }
+  nav.rail .ico { width:18px; height:18px; flex:none; }
   nav.rail .spacer { flex:1; }
-  nav.rail .foot { font-size:12px; color:#6b7280; padding:8px 12px; }
-  .nav-group + .nav-group { margin-top:10px; border-top:1px solid #30343b; }
-  .nav-group-label { margin:10px 12px 4px; color:#a0a7b1; font-size:12px; font-weight:500; }
+  nav.rail .foot { font-size:12px; color:#a5b3c6; padding:8px 12px; }
+  .nav-group + .nav-group { margin-top:10px; border-top:1px solid #304158; }
+  .nav-group-label { margin:10px 12px 4px; color:#a5b3c6; font-size:12px; font-weight:500; }
   @media (min-width:901px) and (max-width:1179px) {
     body:has(main.agent-page) .nav-group-label { display:none; }
   }
@@ -271,6 +274,10 @@ const STYLE = `
   .switch input:checked + .slider { background:var(--accent); }
   .switch input:checked + .slider:before { transform:translateX(18px); }
   .toggle-row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 0; }
+  .task-switch-row { min-height:44px; cursor:pointer; }
+  .task-switch-row .hint { display:block; }
+  .task-switch-row .switch { flex-shrink:0; }
+  .task-switch-row input:focus-visible + .slider { outline:3px solid var(--accent); outline-offset:3px; }
   @media (max-width:900px) {
     body { display:block; overflow-x:hidden; }
     nav.rail { width:100%; min-width:0; min-height:auto; }
@@ -329,23 +336,23 @@ export interface Crumb {
 
 const NAV = [
   { label: "日常工作", links: [
-    { key: "spaces", label: "首页与空间", href: "/", ico: "🗂" },
-    { key: "tasks", label: "研究任务", href: "/tasks", ico: "⏰" },
-    { key: "work", label: "工作事项", href: "/work", ico: "🧭" },
-    { key: "learning", label: "学习", href: "/learning", ico: "📖" },
-    { key: "reminders", label: "提醒", href: "/reminders", ico: "🔔" },
+    { key: "spaces", label: "首页与空间", href: "/", icon: "M3 10l9-7 9 7M5 9v12h5v-7h4v7h5V9" },
+    { key: "tasks", label: "研究任务", href: "/tasks", icon: "M8 4H5v17h14V4h-3M9 3h6v4H9zM8 12h8M8 16h5" },
+    { key: "work", label: "工作事项", href: "/work", icon: "M3 7h18v13H3zM8 7V4h8v3M3 12q9 5 18 0M10 13h4v3h-4z" },
+    { key: "learning", label: "学习", href: "/learning", icon: "M12 6Q7 3 2 5v14q5-2 10 1 5-3 10-1V5q-5-2-10 1zm0 0v14" },
+    { key: "reminders", label: "提醒", href: "/reminders", icon: "M5 17h14l-2-3V9a5 5 0 0 0-10 0v5zM10 20q2 3 4 0M12 2v2" },
   ] },
   { label: "助手与连接", links: [
-    { key: "agents", label: "Agent 助手", href: "/agents", ico: "🤖" },
-    { key: "skills", label: "技能目录", href: "/skills", ico: "🧩" },
-    { key: "integrations", label: "飞书连接", href: "/integrations", ico: "🔌" },
+    { key: "agents", label: "Agent 助手", href: "/agents", icon: "M12 3v4M5 7h14v13H5zM2 12v4m20-4v4M9 12v1m6-1v1M9 16h6" },
+    { key: "skills", label: "技能目录", href: "/skills", icon: "M3 4h7v7H3zM14 4h7v7h-7zM3 15h7v6H3zM14 15h7v6h-7z" },
+    { key: "integrations", label: "飞书连接", href: "/integrations", icon: "m10 14 4-4M8 12l-3 3a3.5 3.5 0 0 0 5 5l4-4m2-4 3-3a3.5 3.5 0 0 0-5-5l-4 4" },
   ] },
   { label: "系统管理", links: [
-    { key: "health", label: "运行状态", href: "/health", ico: "🩺" },
-    { key: "quality", label: "AI 质量", href: "/quality", ico: "🎯" },
-    { key: "governance", label: "数据治理", href: "/governance", ico: "🛡" },
-    { key: "logs", label: "调用日志", href: "/logs", ico: "📋" },
-    { key: "settings", label: "设置", href: "/settings", ico: "⚙️" },
+    { key: "health", label: "运行状态", href: "/health", icon: "M2 12h5l3-8 4 16 3-8h5" },
+    { key: "quality", label: "AI 质量", href: "/quality", icon: "M3 3v17h18M6 15l5-6 4 3 6-7" },
+    { key: "governance", label: "数据治理", href: "/governance", icon: "M12 3 4 6v6c0 5 4 8 8 10 4-2 8-5 8-10V6zM8 12l3 3 5-6" },
+    { key: "logs", label: "调用日志", href: "/logs", icon: "M5 3h10l4 4v14H5zM14 3v5h5M8 12h8M8 16h6" },
+    { key: "settings", label: "设置", href: "/settings", icon: "M3 6h4m5 0h9M3 12h11m5 0h2M3 18h2m5 0h11M8 4h3v4H8zM15 10h3v4h-3zM6 16h3v4H6z" },
   ] },
 ];
 
@@ -366,7 +373,8 @@ export function layout(
     <div class="nav-group-label" aria-hidden="true">${group.label}</div>
     ${group.links.map((link) => html`<a href="${link.href}" title="${link.label}"
       class="${link.key === active ? "active" : ""}"${link.key === active ? html` aria-current="true"` : ""}
-      ><span class="ico" aria-hidden="true">${link.ico}</span>${link.label}</a>`)}
+      ><svg class="ico" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none"
+        stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="${link.icon}"/></svg>${link.label}</a>`)}
   </div>`);
   return html`<!doctype html>
 <html lang="zh-CN">

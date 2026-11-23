@@ -3846,7 +3846,7 @@ export class KnowledgeEngine implements Knowledge {
     }).client;
   }
 
-  private rememberSerialized(entry: RawEntry, deduplicateMessage = false, useCurrentWorkItem = true): string {
+  private rememberSerialized(entry: RawEntry, deduplicateMessage = false, useCurrentWorkItem = true, localImportId?: string): string {
     const requestedWorkItem = entry.workItemId
       ? this.workItems.get(entry.workItemId)
       : useCurrentWorkItem ? this.workItems.currentForSpace(entry.space) : undefined;
@@ -3870,8 +3870,12 @@ export class KnowledgeEngine implements Knowledge {
     const normalizedEntry: RawEntry = requestedWorkItem
       ? { ...entry, workItemId: requestedWorkItem.id }
       : entry;
+    let ownerId = requestedWorkItem?.id;
     let id: string;
-    if (deduplicateMessage) {
+    if (localImportId !== undefined) {
+      id = localImportId;
+      if (!index.captureImportedRaw(id, normalizedEntry)) ownerId = index.getRaw(id)?.workItemId;
+    } else if (deduplicateMessage) {
       id = `message-import-${createHash("sha256").update(JSON.stringify([
         entry.space, entry.chatId, entry.messageId, entry.content,
       ])).digest("hex")}`;
@@ -3879,7 +3883,7 @@ export class KnowledgeEngine implements Knowledge {
     } else {
       id = index.insertRaw(normalizedEntry);
     }
-    if (requestedWorkItem) this.workItems.attachRaw(requestedWorkItem.id, id);
+    if (ownerId) this.workItems.attachRaw(ownerId, id);
     log.debug("remembered raw entry", { space: entry.space, source: entry.source, id });
     return id;
   }
@@ -3902,13 +3906,16 @@ export class KnowledgeEngine implements Knowledge {
   async rememberFile(
     entry: RawEntry,
     file: RawSourceCapture,
-    options?: { useCurrentWorkItem?: boolean },
+    options?: { useCurrentWorkItem?: boolean; localImportId?: string },
   ): Promise<string> {
     return this.rememberFiles(entry, [file], options);
   }
 
   /** Commit one Raw with all of its originals, after validating the whole batch. */
-  async rememberFiles(entry: RawEntry, files: readonly RawSourceCapture[], options?: { useCurrentWorkItem?: boolean }): Promise<string> {
+  async rememberFiles(entry: RawEntry, files: readonly RawSourceCapture[], options?: { useCurrentWorkItem?: boolean; localImportId?: string }): Promise<string> {
+    if (options?.localImportId !== undefined && (entry.source !== "manual" || !/^local-import-[a-f0-9]{64}$/u.test(options.localImportId))) {
+      throw new Error("Invalid local import identity");
+    }
     if (files.length + (entry.attachments?.length ?? 0) > MAX_MATERIAL_FILES) throw new Error("too many raw source files");
     let inputBytes = 0;
     for (const file of files) if ("bytes" in file) {
@@ -3958,7 +3965,7 @@ export class KnowledgeEngine implements Knowledge {
             ...(entry.attachments ?? []).map((attachment) => ({ ...attachment })),
             ...attachments,
           ],
-        }, false, options?.useCurrentWorkItem !== false);
+        }, false, options?.useCurrentWorkItem !== false, options?.localImportId);
       } catch (error) {
         this.removeUnreferencedRawSources(entry.space, written);
         throw error;
@@ -7837,11 +7844,7 @@ export class KnowledgeEngine implements Knowledge {
           outcome: "succeeded",
           source: result.source,
           answer: result.answer,
-          citations: result.citations.map(({ slug, title, space }) => ({
-            slug,
-            title,
-            ...(space ? { space } : {}),
-          })),
+          citations: result.citations,
           execution: traceExecution,
           retrievalPages,
           usage: usage.snapshot(),

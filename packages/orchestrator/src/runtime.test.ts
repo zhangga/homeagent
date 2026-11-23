@@ -238,6 +238,39 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(engine.workDispatch.summaries(space).every(input => input.operation === "chat")).toBe(true);
   });
 
+  test("a Feishu post link checks the linked document even when the original message only saved its label", async () => {
+    const title = "验收周报";
+    const url = "https://example.test/docs/acceptance";
+    const messageId = "om_acceptance_card";
+    const space = "personal/ou_me";
+    const feishu = new FeishuConnector({ runCommand: async cmd => JSON.stringify({ data: { items: [
+      cmd.some(part => part.endsWith("/" + messageId))
+        ? { msg_type: "post", body: { content: JSON.stringify({ zh_cn: { title, content: [[{ tag: "a", href: url, text: "查看全文" }]] } }) } }
+        : { parent_id: messageId },
+    ] } }) });
+    (connector as Connector).resolveReplyTarget = (id, options) => feishu.resolveReplyTarget(id, options);
+    const shell = await engine.remember({ space, source: "message", chatId: "oc_dm", messageId, content: `${title}\n查看全文` });
+    const check = (id: string) => connector.inject({
+      kind: "message", eventId: id, chatType: "p2p", chatId: "oc_dm", senderId: "ou_me",
+      messageId: id, parentMessageId: messageId, messageType: "text", text: "这个报告记录下来了吗", mentionsBot: false, createdAt: Date.now(),
+    });
+    await orch.start();
+    await check("om_before_document");
+    expect(connector.sent.at(-1)?.markdown).toContain("未找到能核验");
+    const passage = "本周完成验收，剩余问题由产品跟进。";
+    const document = await engine.remember({ space, source: "doc", content: `# 来源资料：${url}\n\n${passage}` });
+    fake.onJSON(call => {
+      const candidates: { rawId: string; key: string }[] = JSON.parse(call.prompt!.split("已入库 Raw 候选（JSON 数据）：\n")[1]!);
+      expect(candidates.map(raw => raw.rawId)).toEqual([document]);
+      return { matches: [{ key: candidates[0]!.key, quote: passage }] };
+    });
+    await check("om_after_document");
+    const reply = connector.sent.at(-1)?.markdown;
+    expect(reply).toContain(document);
+    expect(reply).toContain(passage);
+    expect(reply).not.toContain(shell);
+  });
+
   test("checks a weekly report by title without counting status questions as stored reports", async () => {
     const space = "team/oc_team";
     const title = "工作周报｜11 月 16—22 日";
@@ -258,7 +291,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
 
     const id = await engine.remember({ space, source: "message", chatId: "oc_team", messageId: "om_weekly_report", content: body });
     await connector.sendGroup(`@HomeAgent 帮我核对一下《${title}》是否已经保存到 HomeAgent。`, true);
-    expect(seen).toEqual([[], [id]]);
+    expect(seen).toEqual([[id]]);
     expect(engine.workDispatch.summaries(space).map(input => input.operation)).toEqual(["chat", "chat"]);
     const reply = connector.sent.at(-1)?.markdown;
     expect(reply).toContain(id);
@@ -2305,6 +2338,37 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     },
   );
 
+  test.each(["success", "transient-error", "empty-first-target"] as const)(
+    "saving a quoted text reuses a retrieved body and retries an unavailable target: %s", async scenario => {
+      const body = "项目交付单已回收。";
+      const command = "om_save";
+      const source = "om_source";
+      const reads: string[] = [];
+      const feishu = new FeishuConnector({ runCommand: async args => {
+        const id = args[3]!.split("/").at(-1)!;
+        reads.push(id);
+        if (scenario === "success" && reads.length > 2) throw new Error("unexpected repeated lookup");
+        if (scenario === "transient-error" && reads.length === 1) throw new Error("transient lookup failure");
+        const items = scenario === "empty-first-target" && reads.length === 2 ? [] : [id === command
+          ? { parent_id: source }
+          : { msg_type: "text", body: { content: JSON.stringify({ text: body }) } }];
+        return JSON.stringify({ data: { items } });
+      } });
+      (connector as Connector).resolveReplyTarget = (id, options) => feishu.resolveReplyTarget(id, options);
+      orch = new Orchestrator({ engine, connector, llm: fake, attachmentDownloader: async () => [] });
+      await orch.start();
+      await connector.inject({ kind: "message", eventId: "quote-save", chatType: "p2p", chatId: "oc_dm",
+        senderId: "ou_me", text: "记下这条消息", messageId: command, parentMessageId: source,
+        messageType: "text", mentionsBot: false, createdAt: Date.now() });
+      expect(connector.sent.at(-1)?.markdown).toContain("已记下被回复消息的正文");
+      expect(engine.registry.store("personal/ou_me").index().findRawsByMessageId(source, "oc_dm"))
+        .toEqual([expect.objectContaining({ content: body })]);
+      const expectedReads = scenario === "success" ? [command, source] : scenario === "transient-error"
+        ? [command, command, source] : [command, source, command, source];
+      expect(reads).toEqual(expectedReads);
+    },
+  );
+
   test.each(["group", "p2p"] as const)("quoted long reports retain their complete body, ownership and timestamp across retries/reopen: %s", async chatType => {
     const space = chatType === "group" ? "team/oc_team" : "personal/ou_me";
     const body = "本周工作进展。".repeat(30_000) + "\n末尾：验收尚未完成，不能当作线上交付。";
@@ -2315,7 +2379,12 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
             body: { content: JSON.stringify({ zh_cn: { title: "工作周报", content: [[{ tag: "md", text: body }]] } }) } }
         : { parent_id: "om_long_report" },
     ] } }) });
-    (connector as CliConnector & Connector).resolveReplyTarget = (id, options) => fetcher.resolveReplyTarget(id, options);
+    const lookups: Array<{ fullText?: boolean } | undefined> = [];
+    (connector as Connector).resolveReplyTarget = (id, options) => {
+      lookups.push(options);
+      return fetcher.resolveReplyTarget(id, options);
+    };
+    orch = new Orchestrator({ engine, connector, llm: fake, attachmentDownloader: async () => [] });
     engine.askWithExecutionPlan = async () => { throw new Error("recording quoted text must not invoke a Provider"); };
     await orch.start();
     for (let i = 0; i < 2; i++) {
@@ -2323,6 +2392,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
         senderId: "ou_me", text: "@HomeAgent 上周的工作周报也记录下", messageId: `om_record_long_${i}`,
         parentMessageId: "om_long_report", mentionsBot: true, createdAt: Date.now() });
       expect(connector.sent.at(-1)?.markdown).toContain("已记下被回复消息的正文");
+      expect(lookups).toEqual(Array(i + 1).fill({ fullText: true }));
     }
     const records = engine.registry.store(space).index().findRawsByMessageId("om_long_report", chatType === "group" ? "oc_team" : "oc_dm");
     expect(records).toHaveLength(2);
@@ -5114,7 +5184,12 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
       space, source: "message", chatId: "oc_dm", messageId: target.messageId, author: target.senderId,
       createdAt: target.createdAt, content: `@HomeAgent ${target.text.replaceAll("【图片】", "![Image](img_fixture)")}`,
     });
-    (connector as CliConnector & Connector).resolveReplyTarget = async () => target;
+    const lookedUp: string[] = [];
+    (connector as Connector).resolveReplyTarget = async (id, options) => {
+      expect(options?.fullText).toBe(true);
+      lookedUp.push(id);
+      return target;
+    };
     let downloadAttempts = 0;
     orch = new Orchestrator({
       engine, connector, llm: fake,
@@ -5136,6 +5211,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
         mentionsBot: true, createdAt: Date.now(), messageType: "text", text: "记录这张图",
       });
       expect(connector.sent.at(-1)?.markdown).toContain(`已收录 ${index} 张图片的原件和识别文字`);
+      expect(lookedUp).toHaveLength(index);
     }
     const raws = engine.registry.store(space).index().findRawsByMessageId(target.messageId, "oc_dm")
       .filter(raw => raw.attachments?.length);
@@ -5308,9 +5384,12 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     writeFileSync(localPath, "report fixture");
     await engine.remember({ space, source: "message", chatId: "oc_dm", messageId,
       content: "【文件：验收报告.pdf】", attachments: [attachment] });
-    (connector as Connector).resolveReplyTarget = async () => ({
-      messageId, messageType: "file", text: "【文件：验收报告.pdf】",
-    });
+    const lookedUp: string[] = [];
+    (connector as Connector).resolveReplyTarget = async (id, options) => {
+      expect(options?.fullText).toBe(true);
+      lookedUp.push(id);
+      return lookedUp.length === 1 ? undefined : { messageId, messageType: "file", text: "【文件：验收报告.pdf】" };
+    };
     let attempts = 0;
     orch = new Orchestrator({
       engine, connector, llm: fake,
@@ -5336,6 +5415,7 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(connector.sent.at(-1)?.markdown).toContain("已收录 1 个附件的原件和正文");
     await save("om_repeat");
     expect(attempts).toBe(2);
+    expect(lookedUp).toEqual(["om_missing", "om_missing", "om_retry", "om_repeat"]);
     expect(saved()).toHaveLength(1);
     expect(connector.sent.at(-1)?.markdown).toContain("已收录 1 个附件的原件和正文");
   });

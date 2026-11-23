@@ -158,6 +158,34 @@ describe("SpaceIndex raw capture", () => {
     expect(idx.listRawByIds(ids, { limit: 0 })).toEqual([]);
   });
 
+  test("raw history seeks both ways across timestamp ties and new arrivals", () => {
+    expect(idx.listRawHistory(2)).toEqual({ records: [], hasNewer: false, hasOlder: false });
+    const add = (id: string, createdAt: number) => idx.restoreRaw({
+      ...raw(id), id, createdAt, ingested: false, admission: "ready",
+    });
+    add("oldest", 10);
+    for (const id of ["b", "d", "a", "c"]) add(id, 20);
+    add("newest", 30);
+    const contents = (page: ReturnType<SpaceIndex["listRawHistory"]>) =>
+      [page.records.map(record => record.id), page.hasNewer, page.hasOlder];
+    const first = idx.listRawHistory(2);
+    expect(contents(first)).toEqual([["newest", "d"], false, true]);
+    add("fresh", 40);
+    add("e", 20);
+    const second = idx.listRawHistory(2, { direction: "before", ...first.records[1]! });
+    expect(contents(second)).toEqual([["c", "b"], true, true]);
+    const last = idx.listRawHistory(2, { direction: "before", ...second.records[1]! });
+    expect(contents(last)).toEqual([["a", "oldest"], true, false]);
+    expect(contents(idx.listRawHistory(2, { direction: "after", ...last.records[0]! })))
+      .toEqual([["c", "b"], true, true]);
+    expect(contents(idx.listRawHistory(2, { direction: "after", ...second.records[0]! })))
+      .toEqual([["e", "d"], true, true]);
+    expect(contents(idx.listRawHistory(2, { direction: "after", createdAt: 20, id: "e" })))
+      .toEqual([["fresh", "newest"], false, true]);
+    expect(contents(idx.listRawHistory(2, { direction: "before", ...last.records[1]! })))
+      .toEqual([[], false, false]);
+  });
+
   test("held WorkAction raw remains auditable but is not pending for distillation", () => {
     const id = idx.insertRaw({
       ...raw("candidate result"),

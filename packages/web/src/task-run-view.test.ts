@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import type { Task, TaskRun } from "@homeagent/core";
+import { MAX_TASK_NOTIFICATION_ATTEMPTS, type Task, type TaskRun } from "@homeagent/core";
+import { taskRunRefreshState } from "./task-run-refresh.ts";
 import { taskRunView } from "./views.ts";
 
 const task: Task = {
@@ -43,7 +44,7 @@ describe("Task Run status detail", () => {
     expect(body).not.toContain('action="/tasks/runs/run_original/retry"');
     expect(details).toContain("冻结的指令");
     expect(details).toContain("Skill 解析");
-    expect(body).not.toContain("<script>");
+    expect(body).toContain("<script>");
   });
 
   test("the approval surface shows the frozen scope and all three decisions", async () => {
@@ -108,4 +109,76 @@ describe("Task Run status detail", () => {
       expect(body).toContain("<script>");
     }
   });
+});
+
+/** Run the script delivered with this page against a controllable status endpoint and clock. */
+async function openRunPage(initial: TaskRun) {
+  const body = String(await taskRunView(initial, task));
+  const script = body.match(/<script>([\s\S]*?)<\/script>/u)?.[1];
+  const renderedState = JSON.stringify(taskRunRefreshState(initial));
+  expect(body).toContain(`data-task-run-snapshot="${Bun.escapeHTML(renderedState)}"`);
+  const path = `/tasks/runs/${initial.id}`;
+  let latest = initial, reload = false, timer: (() => Promise<void>) | undefined;
+  const document = Object.assign(new EventTarget(), {
+    hidden: false,
+    querySelector: (selector: string) => selector === "[data-task-run-snapshot]"
+      ? { dataset: { taskRunSnapshot: renderedState } } : null,
+  });
+  if (script) {
+    new Function("document", "window", "location", "fetch", "setTimeout", "clearTimeout", script)(
+      document, new EventTarget(), { pathname: path, replace: (url: string) => { expect(url).toBe(path); reload = true; } },
+      async (url: string) => {
+        expect(url).toBe(path + "/status");
+        return Response.json(taskRunRefreshState(latest));
+      },
+      (callback: () => Promise<void>) => { timer = callback; }, () => { timer = undefined; },
+    );
+  }
+  return {
+    body, get polling() { return timer !== undefined; },
+    async poll(next: TaskRun) {
+      latest = next;
+      const callback = timer;
+      if (!callback) throw new Error("No status poll scheduled");
+      timer = undefined;
+      await callback();
+      return reload;
+    },
+  };
+}
+
+test("an open failed Run follows its automatic retry to the child and retires cancellation", async () => {
+  const waiting: TaskRun = { ...snapshot, status: "failed",
+    retry: { attempt: 1, maxAttempts: 2, status: "waiting", nextAttemptAt: 1000 } };
+  const claimed: TaskRun = { ...waiting,
+    retry: { attempt: 1, maxAttempts: 2, status: "claimed", claimedByRunId: "run_child" } };
+  const page = await openRunPage(waiting);
+  expect(page.body).toContain("取消自动重试");
+  // The child may already exist before the first request from this page.
+  expect(await page.poll(claimed)).toBe(true);
+  const updated = await openRunPage(claimed);
+  expect(updated.body).toContain('href="/tasks/runs/run_child"');
+  expect(updated.body).not.toContain("取消自动重试");
+  expect(updated.polling).toBe(false);
+});
+
+test("an open succeeded Run follows notification attempts and stops when delivery settles", async () => {
+  const pending: TaskRun = { ...snapshot, status: "succeeded", notification: { status: "pending", attempts: 0 } };
+  const failed: TaskRun = { ...pending, notification: { status: "failed", attempts: 1, nextAttemptAt: 2000, error: "暂时无法投递" } };
+  const finalAttempt: TaskRun = { ...failed, notification: { status: "pending", attempts: MAX_TASK_NOTIFICATION_ATTEMPTS } };
+  const sent: TaskRun = { ...pending, notification: { status: "sent", attempts: MAX_TASK_NOTIFICATION_ATTEMPTS, sentAt: 3000 } };
+  const page = await openRunPage(pending);
+  expect(await page.poll(pending)).toBe(false);
+  expect(await page.poll(failed)).toBe(true);
+  const retryPage = await openRunPage(failed);
+  expect(retryPage.body).toContain("重试通知");
+  expect(await retryPage.poll(finalAttempt)).toBe(true);
+  expect(await (await openRunPage(finalAttempt)).poll(sent)).toBe(true);
+  const delivered = await openRunPage(sent);
+  expect(delivered.body).toContain("已发送");
+  expect(delivered.body).not.toContain("重试通知");
+  expect(delivered.polling).toBe(false);
+  const exhausted = await openRunPage({ ...failed, notification: { ...failed.notification!, attempts: MAX_TASK_NOTIFICATION_ATTEMPTS } });
+  expect(exhausted.body).toContain("可手动重试通知");
+  expect(exhausted.polling).toBe(false);
 });

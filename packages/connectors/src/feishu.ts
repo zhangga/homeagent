@@ -192,37 +192,45 @@ interface FetchedMessage {
   body?: { content?: string };
 }
 
-function renderFetchedMessage(message: FetchedMessage | undefined, maxChars = MAX_REPLY_CONTEXT_CHARS): string | undefined {
-  if (!message) return undefined;
+type RichTextPart = { kind: "text" | "title"; text: string } | { kind: "link"; text: string; href: string };
+interface RichTextScan { truncated: boolean; unsupportedTag: boolean }
+
+function renderFetchedMessage(message: FetchedMessage | undefined, maxChars: number): Pick<ReplyTarget, "text" | "sourceCard"> {
+  if (!message) return {};
   const type = message.msg_type;
   const content = message.body?.content;
-  if (type === "image") return "【图片】";
-  if (type === "audio") return "【音频：当前只获取到音频引用】";
-  if (type === "media") return "【视频：当前只获取到视频引用】";
-  if (!content) return type === "file" ? "【文件：当前只获取到文件引用】" : undefined;
+  if (type === "image") return { text: "【图片】" };
+  if (type === "audio") return { text: "【音频：当前只获取到音频引用】" };
+  if (type === "media") return { text: "【视频：当前只获取到视频引用】" };
+  if (!content) return type === "file" ? { text: "【文件：当前只获取到文件引用】" } : {};
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
   } catch {
-    return boundReplyContext(content, maxChars);
+    return { text: boundReplyContext(content, maxChars) };
   }
-  if (typeof parsed !== "object" || parsed === null) return boundReplyContext(content, maxChars);
+  if (typeof parsed !== "object" || parsed === null) return { text: boundReplyContext(content, maxChars) };
 
   const value = parsed as Record<string, unknown>;
-  if (typeof value.text === "string" && value.text.trim()) return boundReplyContext(value.text, maxChars);
+  if (typeof value.text === "string" && value.text.trim()) return { text: boundReplyContext(value.text, maxChars) };
   if (type === "file") {
     const name = typeof value.file_name === "string" ? value.file_name.trim() : "";
-    return name ? `【文件：${name}】` : "【文件】";
+    return { text: name ? `【文件：${name}】` : "【文件】" };
   }
 
-  const parts: string[] = [];
-  const scan = { truncated: false };
+  const parts: RichTextPart[] = [];
+  const scan: RichTextScan = { truncated: false, unsupportedTag: false };
   collectRichText(parsed, parts, 0, scan);
-  const rendered = parts.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const rendered = parts.map(part => part.text).join("\n").replace(/\n{3,}/g, "\n\n").trim();
   const text = boundReplyContext(rendered || content, maxChars);
-  return scan.truncated && text && !text.endsWith("\n【上下文已截断】")
-    ? `${text}\n【上下文已截断】` : text;
+  if (scan.truncated && text && !text.endsWith("\n【上下文已截断】")) return { text: `${text}\n【上下文已截断】` };
+  const link = parts.at(-1);
+  if (type === "post" && !scan.truncated && !scan.unsupportedTag && text === rendered && link?.kind === "link" && /^https?:\/\//iu.test(link.href)
+    && (parts.length === 1 || (parts.length === 2 && parts[0]?.kind === "title"))) {
+    return { text, sourceCard: { title: parts[0]!.text, url: link.href } };
+  }
+  return { text };
 }
 
 function boundReplyContext(text: string, maxChars = MAX_REPLY_CONTEXT_CHARS): string | undefined {
@@ -232,7 +240,7 @@ function boundReplyContext(text: string, maxChars = MAX_REPLY_CONTEXT_CHARS): st
   return `${normalized.slice(0, maxChars)}\n【上下文已截断】`;
 }
 
-function collectRichText(value: unknown, parts: string[], depth: number, scan: { truncated: boolean }): void {
+function collectRichText(value: unknown, parts: RichTextPart[], depth: number, scan: RichTextScan): void {
   if (depth > 20 || parts.length > 1_000) {
     scan.truncated = true;
     return;
@@ -246,26 +254,27 @@ function collectRichText(value: unknown, parts: string[], depth: number, scan: {
   const node = value as Record<string, unknown>;
   const tag = typeof node.tag === "string" ? node.tag : undefined;
   if ((tag === "text" || tag === "md") && typeof node.text === "string" && node.text.trim()) {
-    parts.push(node.text.trim());
+    parts.push({ kind: "text", text: node.text.trim() });
     return;
   }
   if (tag === "a") {
     const label = typeof node.text === "string" ? node.text.trim() : "";
     const href = typeof node.href === "string" ? node.href.trim() : "";
-    if (label || href) parts.push(label || href);
+    if (label || href) parts.push({ kind: "link", text: label || href, href });
     return;
   }
   if (tag === "at") {
     const name = typeof node.user_name === "string" ? node.user_name.trim() : "";
-    if (name) parts.push(`@${name}`);
+    if (name) parts.push({ kind: "text", text: `@${name}` });
     return;
   }
   if (tag === "img") {
-    parts.push("【图片】");
+    parts.push({ kind: "text", text: "【图片】" });
     return;
   }
 
-  if (typeof node.title === "string" && node.title.trim()) parts.push(node.title.trim());
+  if (tag && tag !== "text" && tag !== "md") scan.unsupportedTag = true;
+  if (typeof node.title === "string" && node.title.trim()) parts.push({ kind: "title", text: node.title.trim() });
   if ("content" in node) collectRichText(node.content, parts, depth + 1, scan);
   for (const [key, child] of Object.entries(node)) {
     if (key === "title" || key === "content" || key === "tag") continue;
@@ -741,9 +750,10 @@ export class FeishuConnector implements Connector {
         messageId: targetId,
         senderId: target?.sender?.id,
       };
-      const text = renderFetchedMessage(target, options?.fullText ? MAX_MATERIAL_BYTES : MAX_REPLY_CONTEXT_CHARS);
-      if (text) resolved.text = text;
-      if (text?.endsWith("\n【上下文已截断】")) resolved.textTruncated = true;
+      const rendered = renderFetchedMessage(target, options?.fullText ? MAX_MATERIAL_BYTES : MAX_REPLY_CONTEXT_CHARS);
+      if (rendered.text) resolved.text = rendered.text;
+      if (rendered.sourceCard) resolved.sourceCard = rendered.sourceCard;
+      if (rendered.text?.endsWith("\n【上下文已截断】")) resolved.textTruncated = true;
       const createdAt = Number(target?.create_time);
       if (target?.create_time && Number.isSafeInteger(createdAt) && createdAt >= 0) resolved.createdAt = createdAt;
       if (target?.msg_type) resolved.messageType = target.msg_type;

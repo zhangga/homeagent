@@ -5,8 +5,10 @@
  * static markup. Mutating pages render POST forms.
  */
 import { html, raw } from "hono/html";
-import { taskRunRefreshScript } from "./task-run-refresh.ts";
-import { belongsToAction, selectWorkAttention, type WorkAttention } from "./work-attention.ts";
+import { randomUUID } from "node:crypto";
+import { materialUploadScript } from "./material-import-view.ts";
+import { taskRunRefreshScript, taskRunRefreshState } from "./task-run-refresh.ts";
+import { belongsToAction, selectWorkAttention, workDecisionLabels, type HomeDecision, type WorkAttention } from "./work-attention.ts";
 import type { HtmlEscapedString } from "hono/utils/html";
 import type {
   AskResult,
@@ -37,6 +39,7 @@ import type {
   KnowledgeGovernanceSnapshot,
   KnowledgePageTrace,
   RawGovernanceDetail,
+  RawHistoryPage,
   QuarantineRecord,
   AnswerFeedbackReview,
   QualitySnapshot,
@@ -57,6 +60,7 @@ import {
   MAX_TASK_TIMEOUT_MINUTES,
   MIN_TASK_TIMEOUT_MINUTES,
   isKnowledgeContentRef,
+  rawSourceText,
   resolveGroupParticipationLevel,
   MAX_TASK_NOTIFICATION_ATTEMPTS,
   TASK_CADENCES,
@@ -189,6 +193,7 @@ function spaceLabel(meta: SpaceMeta): string {
 
 export function spaceListView(
   spaces: { meta: SpaceMeta; pages: number; pending: number }[],
+  decisions: HomeDecision[],
   activeRuns: AgentActivityEntry[],
   botName: string,
   pendingGroups: number,
@@ -198,15 +203,31 @@ export function spaceListView(
   </p>` : "";
   const groupInstruction = html`请群主或管理员在群内发送 <strong>@${botName} 启用群聊</strong>。`;
   const names = new Map<string, string>(spaces.map(({ meta }) => [meta.id, spaceLabel(meta)]));
-  const runRows = [...activeRuns].sort((left, right) =>
-    Number(right.status === "awaiting_approval") - Number(left.status === "awaiting_approval")
-  ).map((run) => html`<li><a class="home-item" href="${run.href}">
+  const decisionRows = decisions.map(item => html`<li><a class="home-decision" href="${item.href}">
+    <span class="work-action-state ${item.kind}">${workDecisionLabels[item.kind].label}</span>
+    <span class="home-subject"><strong>${item.title}</strong><small>${names.get(item.space) ?? item.space}</small></span>
+    <span class="home-action">${workDecisionLabels[item.kind].link}</span>
+  </a></li>`);
+  const runRows = activeRuns.filter(run => run.status !== "awaiting_approval").map((run) => html`<li><a class="home-item" href="${run.href}">
     <strong>${run.title || (run.kind === "chat" ? "飞书对话" : "研究任务")}</strong>
-    <span>${run.status === "awaiting_approval" ? html`<span class="badge general">待审批</span>` : run.status === "running" ? "运行中" : "排队中"}
+    <span>${run.status === "running" ? "运行中" : "排队中"}
       · ${names.get(run.space) ?? run.space}</span></a>
   </li>`);
+  const compactList = (rows: ReturnType<typeof html>[]) => html`<ul class="home-list">${rows.slice(0, 3)}</ul>
+    ${rows.length > 3 ? html`<details class="home-more"><summary>查看其余 ${rows.length - 3} 项</summary>
+      <ul class="home-list">${rows.slice(3)}</ul></details>` : ""}`;
   return html`<style>
     .home-list { list-style:none; margin:0; padding:0; }
+    .home-decisions { margin-top:20px; }
+    .home-decisions h2 { margin:0 0 6px; }
+    .home-decision { display:grid; grid-template-columns:4em minmax(0,1fr) auto; align-items:center; gap:10px;
+      padding:12px 0; border-bottom:1px solid var(--border); color:var(--fg); overflow-wrap:anywhere; }
+    .home-decision:hover { text-decoration:none; }
+    .home-decision:hover .home-action { text-decoration:underline; }
+    .home-decision .work-action-state { justify-self:start; margin:0; font:inherit; font-size:12px; }
+    .home-subject strong,.home-subject small { display:block; }
+    .home-subject small { margin-top:2px; color:var(--muted); font-size:13px; }
+    .home-action { color:var(--accent); font-size:14px; }
     .home-item { padding:12px 0; display:flex; align-items:baseline; flex-wrap:wrap; gap:4px 16px;
       justify-content:space-between; border-bottom:1px solid var(--border); overflow-wrap:anywhere; }
     .home-item:hover { text-decoration:none; }
@@ -219,10 +240,10 @@ export function spaceListView(
     @media(max-width:720px) { .home-item { align-items:flex-start; flex-direction:column; } }
   </style>
   <h1>首页</h1>
+  ${decisionRows.length ? html`<section class="home-decisions" aria-labelledby="home-decisions">
+    <h2 id="home-decisions">待我处理</h2>${compactList(decisionRows)}</section>` : ""}
   ${runRows.length ? html`<section aria-labelledby="home-runs"><h2 id="home-runs">运行动态</h2>
-    <ul class="home-list">${runRows.slice(0, 3)}</ul>
-    ${runRows.length > 3 ? html`<details class="home-more"><summary>查看其余 ${runRows.length - 3} 项</summary>
-      <ul class="home-list">${runRows.slice(3)}</ul></details>` : ""}
+    ${compactList(runRows)}
   </section>` : ""}
   ${spaces.length ? html`<section aria-labelledby="home-spaces"><h2 id="home-spaces">知识空间</h2>
     <ul class="home-list">${spaces.map(({ meta, pages, pending: pendingRaw }) => html`<li>
@@ -313,6 +334,7 @@ export function spaceDetailView(
       <details>
         <summary class="btn secondary">导入本地资料</summary>
         <form method="post" action="/spaces/${enc}/materials" enctype="multipart/form-data" class="card space-upload">
+          <input type="hidden" name="materialBatch" value="${randomUUID()}" />
           <div class="field">
             <label for="local-material-${enc}">资料文件</label>
             <input class="material-file-input" id="local-material-${enc}" name="material" type="file"
@@ -332,7 +354,11 @@ export function spaceDetailView(
             <a href="/health#dream-runs">查看提炼任务</a>
           </div>
         </form>
+        <p role="status" data-material-status></p>
+        <div data-material-results></div>
+        ${materialUploadScript}
       </details>
+      <a class="btn secondary" href="/spaces/${enc}/raw">原始条目（${counts.raw}）</a>
     </div>
     ${maps.length > 0
       ? html`<h2>知识地图（${maps.length}）</h2>
@@ -348,7 +374,6 @@ export function spaceDetailView(
       <summary>空间设置与维护</summary>
       <p class="muted">空间标识：${space}${meta?.chatId ? ` · 绑定群：${meta.chatId}` : ""}</p>
       <div class="space-related">
-        <a href="/spaces/${enc}/raw">原始条目（${counts.raw}）</a>
         <a href="/spaces/${enc}/governance">空间规则与治理记录</a>
         ${isTeam ? html`<a href="/integrations">群设置</a>` : ""}
       </div>
@@ -556,23 +581,95 @@ function rawStatusLabel(raw: RawRecord): string {
   return raw.ingested ? "已提炼" : "待提炼";
 }
 
-export function rawListView(space: SpaceId, raws: RawRecord[]): HtmlEscapedString | Promise<HtmlEscapedString> {
-  const enc = encodeURIComponent(space);
-  const rows = raws.length
-    ? raws.map(
-        (r) => html`<tr>
-          <td class="muted">${fmtTime(r.createdAt)}</td>
-          <td><span class="tag">${r.source}</span></td>
-          <td>${rawStatusLabel(r)}</td>
-          <td><a href="/spaces/${enc}/raw/${encodeURIComponent(r.id)}">${r.content.slice(0, 160)}</a></td>
-        </tr>`,
-      )
-    : [html`<tr><td colspan="4" class="empty">暂无原始条目。</td></tr>`];
-  return html`<h1>原始条目 · ${space}</h1>
-    <table>
-      <tr><th>时间</th><th>来源</th><th>状态</th><th>内容</th></tr>
-      ${rows}
-    </table>`;
+const rawSourceLabels: Record<RawRecord["source"], string> = {
+  message: "消息", doc: "文档", manual: "手动录入", task: "任务", learning: "学习",
+};
+
+function rawListPreview(record: RawRecord) {
+  const source = rawSourceText(record);
+  const isChatSnapshot = record.source === "manual" && source.content !== record.content;
+  const label = isChatSnapshot ? "群消息快照" : rawSourceLabels[record.source];
+  let content = source.content;
+  let title = source.documentTitle;
+  if (record.source === "task" && record.workActionId && content.startsWith("# 任务研究：继续：")) {
+    const action = /\n## 本次动作\n([^\n]+)/u.exec(content);
+    if (action) {
+      title = content.slice("# 任务研究：继续：".length, content.indexOf("\n"));
+      content = action[1]!;
+    }
+  }
+  if (record.source === "manual" && content.startsWith("# 本地资料：")) {
+    const header = /^# 本地资料：([^\n]+)\n\nSHA-256：[a-f\d]{64}\n\n(?:来源压缩包：[^\n]+\n包内路径：[^\n]+\n)?(?:正文分段：(\d+\/\d+)\n\n)?/u.exec(content);
+    if (header) {
+      title = header[2] ? `${header[1]}（${header[2]}）` : header[1];
+      content = content.slice(header[0].length);
+    }
+  }
+  const lines = content.trimStart().slice(0, 1200).trim().split(/\r?\n/u);
+  const first = (lines[0] ?? "").replace(/^#{1,6}\s+/u, "").trim();
+  const characters = [...(title || first || record.attachments?.[0]?.name || label)];
+  const shownTitle = characters.slice(0, 64).join("");
+  if (!title || first === title) lines.shift();
+  const summary = [...(characters.length > 64 ? [characters.slice(64).join("")] : []), ...lines].join(" ").replace(/\s+/gu, " ").trim();
+  const excerpt = [...summary.slice(0, 500)];
+  return {
+    title: characters.length > 64 ? `${shownTitle}…` : shownTitle,
+    summary: excerpt.length > 140 ? excerpt.slice(0, 140).join("") + "…" : summary,
+    source: label,
+  };
+}
+
+export function rawListView(space: SpaceId, name: string, page: RawHistoryPage, paged: boolean): HtmlEscapedString | Promise<HtmlEscapedString> {
+  const path = `/spaces/${encodeURIComponent(space)}/raw`;
+  const pageLink = (direction: "before" | "after", edge: RawRecord) =>
+    `${path}?${new URLSearchParams({ [direction]: String(edge.createdAt), id: edge.id })}`;
+  return html`<style>
+    .raw-history { table-layout:fixed; width:100%; margin-top:14px; }
+    .raw-history .raw-source { width:7em; }
+    .raw-history .raw-state { width:7em; }
+    .raw-history .raw-time { width:12em; }
+    .raw-history td { vertical-align:top; }
+    .raw-history .raw-main { position:relative; }
+    .raw-history .raw-title { font-weight:600; overflow-wrap:anywhere; }
+    .raw-history .raw-title::after { content:""; position:absolute; inset:0; }
+    .raw-history .raw-summary { color:var(--muted); font-size:13px; line-height:1.5; margin:3px 0 0; overflow-wrap:anywhere; }
+    .raw-history .raw-time, .raw-history .raw-source { color:var(--muted); }
+    .raw-history .raw-status { display:inline-block; background:var(--bg); border-radius:5px; padding:2px 7px; font-size:12px; }
+    .raw-history .raw-pending, .raw-history .raw-held { background:var(--warn-soft); color:var(--warn); }
+    .raw-history .raw-ingested { background:var(--ok-soft); color:#166534; }
+    .raw-history-pages { display:flex; flex-wrap:wrap; align-items:center; gap:16px; margin-top:16px; }
+    .raw-history-pages a { display:inline-flex; align-items:center; min-height:44px; }
+    @media (max-width:700px) {
+      .raw-space-name { display:none; }
+      .raw-history, .raw-history tbody { display:block; }
+      .raw-history thead { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+      .raw-history tbody tr { display:grid; grid-template-columns:minmax(0,1fr) auto; grid-template-areas:"source state" "main main" "time time"; align-items:center; gap:4px 12px; padding:12px 14px; border-bottom:1px solid var(--border); }
+      .raw-history tbody tr:last-child { border-bottom:0; }
+      .raw-history td { display:block; border:0; padding:0; min-width:0; }
+      .raw-history .raw-main { grid-area:main; min-height:44px; }
+      .raw-history .raw-source, .raw-history .raw-state, .raw-history .raw-time { width:auto; font-size:12px; }
+      .raw-history .raw-source { grid-area:source; }
+      .raw-history .raw-state { grid-area:state; justify-self:end; }
+      .raw-history .raw-time { grid-area:time; margin-top:4px; }
+      .raw-history .raw-title { display:flex; align-items:center; min-height:32px; color:#19365b; font-size:17px; line-height:1.45; }
+      .raw-history .raw-summary { margin:0; font-size:14px; }
+    }
+  </style><h1>原始条目<span class="raw-space-name"> · ${name}</span></h1>
+    ${page.records.length ? html`<table class="raw-history">
+      <thead><tr><th scope="col">内容</th><th scope="col" class="raw-source">来源</th><th scope="col" class="raw-state">状态</th><th scope="col" class="raw-time">记录时间</th></tr></thead>
+      <tbody>${page.records.map(record => {
+        const preview = rawListPreview(record);
+        const state = record.admission === "ready" ? (record.ingested ? "ingested" : "pending") : record.admission;
+        return html`<tr><td class="raw-main"><a class="raw-title" href="${path}/${encodeURIComponent(record.id)}">${preview.title}</a>
+          ${preview.summary ? html`<p class="raw-summary">${preview.summary}</p>` : ""}</td>
+          <td class="raw-source">${preview.source}</td><td class="raw-state"><span class="raw-status raw-${state}">${rawStatusLabel(record)}</span></td>
+          <td class="raw-time">${fmtTime(record.createdAt)}</td></tr>`;
+      })}</tbody></table>` : html`<p class="card muted">${paged ? "这个位置没有更多原始条目。" : "暂无原始条目。"}</p>`}
+    ${paged || page.hasOlder ? html`<nav class="raw-history-pages" aria-label="原始条目分页">
+      ${paged ? html`<a href="${path}">返回最新</a>` : ""}
+      ${page.hasNewer ? html`<a rel="prev" href="${pageLink("after", page.records[0]!)}">较新条目</a>` : ""}
+      ${page.hasOlder ? html`<a rel="next" href="${pageLink("before", page.records[page.records.length - 1]!)}">较早条目</a>` : ""}
+    </nav>` : ""}`;
 }
 
 export function rawGovernanceDetailView(
@@ -642,6 +739,7 @@ export function askView(
   result: AskResult | null,
   flashMsg?: string,
   feedbackRecorded = false,
+  display: { note?: string; historyUrl?: string } = {},
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const enc = encodeURIComponent(space);
   let answer: HtmlEscapedString | Promise<HtmlEscapedString> | string = "";
@@ -651,7 +749,7 @@ export function askView(
       : html`<span class="badge general">通用</span>`;
     const cites = result.citations.length
       ? html`<div class="muted" style="margin-top:8px">引用：${result.citations.map(
-          (c) => html`<a href="/spaces/${enc}/pages/${encodeURIComponent(c.slug)}">${c.title}</a>
+            (c) => html`<a href="/spaces/${encodeURIComponent(c.space ?? space)}/pages/${encodeURIComponent(c.slug)}">${c.title}</a>
             ${citationEvidenceView(c)} `,
         )}</div>`
       : "";
@@ -680,10 +778,14 @@ export function askView(
   }
   return html`<h1>向空间提问</h1>
     ${flash(flashMsg)}
-    <form method="get" action="/spaces/${enc}/ask" class="actions">
+    <form method="post" action="/spaces/${enc}/ask" class="actions">
       <input type="text" name="q" aria-label="问题" placeholder="问一个问题…" value="${question ?? ""}" />
-      <button type="submit">提问</button>
+      <button type="submit">${result ? "重新提问" : "提问"}</button>
     </form>
+    ${display.note ? html`<p role="status">${display.note}</p>` : ""}
+    ${display.historyUrl ? html`<script data-result-url="${display.historyUrl}">
+      history.replaceState(null, "", document.currentScript.dataset.resultUrl);
+    </script>` : ""}
     ${answer}`;
 }
 
@@ -1381,9 +1483,9 @@ export function workIndexView(
     { id: "other", title: "其他事项", rows: [] as ReturnType<typeof html>[] },
   ] as const;
   const states = {
-    awaiting_acceptance: { label: "待验收", link: "查看报告", group: groups[0] },
-    awaiting_approval: { label: "待审批", link: "处理审批", group: groups[0] },
-    blocked: { label: "受阻", link: "查看阻塞原因", group: groups[0] },
+    awaiting_acceptance: { ...workDecisionLabels.awaiting_acceptance, group: groups[0] },
+    awaiting_approval: { ...workDecisionLabels.awaiting_approval, group: groups[0] },
+    blocked: { ...workDecisionLabels.blocked, group: groups[0] },
     running: { label: "执行中", link: "查看进度", group: groups[1] },
     queued: { label: "排队中", link: "查看排队进度", group: groups[1] },
     normal: { label: "", link: "", group: groups[2] },
@@ -1424,6 +1526,33 @@ export function workIndexView(
 }
 
 /** Work context page: a compact operational journal with traceable evidence. */
+export interface EditorSubmission {
+  values: Record<string, unknown>;
+  message: string;
+  field?: string;
+  planConflict?: boolean;
+}
+
+function draftValue(draft: EditorSubmission | undefined, name: string, saved: string | number = ""): string {
+  const value = draft?.values[name];
+  return typeof value === "string" ? value : String(saved);
+}
+
+function editorError(draft: EditorSubmission | undefined, prefix: string) {
+  if (!draft) return "";
+  return html`<div class="form-error-summary" role="alert" tabindex="-1" autofocus>
+    ${draft.field ? html`<a href="#${prefix}-${draft.field}">${draft.message}</a>` : draft.message}
+  </div>`;
+}
+
+function invalidField(draft: EditorSubmission | undefined, field: string) {
+  return draft?.field === field ? html` aria-invalid="true" aria-describedby="editor-field-error"` : "";
+}
+
+function fieldHint(draft: EditorSubmission | undefined, field: string) {
+  return draft?.field === field ? html`<p class="field-error" id="editor-field-error">${draft.message}</p>` : "";
+}
+
 export function workItemsView(
   items: WorkItem[],
   selected: WorkItem | null,
@@ -1434,6 +1563,7 @@ export function workItemsView(
   coordination?: { currentIds: string[]; inputs: WorkInput[]; chatRuns: ChatRun[]; attention?: WorkAttention;
     taskRunBelongs?: (runId: string, actionId?: string) => boolean; unrelatedChatRunIds?: ReadonlySet<string>;
     plan?: ReturnType<import("@homeagent/core").KnowledgeEngine["getWorkPlanView"]> },
+  draft?: EditorSubmission,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const listItems = items.map((item) => html`
     <a class="item ${selected?.id === item.id ? "active" : ""}"
@@ -1443,17 +1573,18 @@ export function workItemsView(
     </a>`);
   const newActive = selected ? "" : "active";
   const formAction = selected ? `/work/${encodeURIComponent(selected.id)}` : "/work";
-  const spaceValue = selected?.space ?? spaces[0]?.id ?? "";
+  const spaceValue = selected?.space ?? draftValue(draft, "space", spaces[0]?.id);
   const spaceField = selected
-    ? html`<div class="field"><label>空间</label>
-        <input type="text" value="${selected.space}" disabled />
+    ? html`<div class="field"><label for="work-space">空间</label>
+        <input type="text" id="work-space" value="${selected.space}" disabled />
       </div>`
-    : html`<div class="field"><label>空间</label><select name="space" required>
+    : html`<div class="field"><label for="work-space">空间</label><select id="work-space" name="space" required${invalidField(draft, "space")}>
+        ${!spaces.some(space => space.id === spaceValue) ? html`<option value="" selected>请选择有效空间</option>` : ""}
         ${spaces.map((space) => html`<option value="${space.id}" ${space.id === spaceValue ? "selected" : ""}>
           ${space.name ?? space.id} · ${space.id}
         </option>`)}
-      </select></div>`;
-  const phase = selected?.phase ?? "active";
+      </select>${fieldHint(draft, "space")}</div>`;
+  const phase = draftValue(draft, "phase", selected?.phase ?? "active");
   const activation = selected && !coordination?.currentIds.includes(selected.id)
     ? html`<form method="post" action="/work/${encodeURIComponent(selected.id)}/activate" class="inline-form">
         <button type="submit" class="secondary">设为当前工作项</button>
@@ -1607,43 +1738,56 @@ export function workItemsView(
             })}</p>` : ""}</li>`)}</ol>
           <details><summary>最近的计划修订</summary>${coordination.plan.history.map(plan => html`<p>版本 ${plan.revision} · ${plan.reason} · ${plan.steps.length} 步</p>`)}</details>
         </details>` : "";
+  const stepSeparator = selected?.planRef ? "\n\n" : "\n";
   const editor = html`<section class="card work-editor">
+          ${editorError(draft, "work")}
+          ${draft?.planConflict && selected ? html`<details open><summary>当前已保存的事项 · 计划版本 ${selected.planRef?.revision}</summary>
+            <dl>${Object.entries({ 标题: selected.title, 阶段: WORK_PHASE_LABELS[selected.phase], 目标与范围: selected.brief,
+              当前进展: selected.summary, 阻塞项: selected.blockers.join("\n"), 下一步: selected.nextActions.join(stepSeparator),
+              Runbook: selected.runbook }).map(([label, value]) => html`<dt>${label}</dt><dd style="white-space:pre-wrap">${value || "（空）"}</dd>`)}
+            </dl></details>` : ""}
           <form method="post" action="${formAction}" class="stack">
-            ${selected?.planRef ? html`<input type="hidden" name="planRevision" value="${selected.planRef.revision}" /><input type="hidden" name="planProgress" value="${coordination?.plan?.progressToken}" />` : ""}
-            <div class="field"><label>标题</label>
-              <input type="text" name="title" value="${selected?.title ?? ""}" placeholder="例如：完成知识治理灰度" required maxlength="200" />
+            ${selected?.planRef ? html`<input type="hidden" name="planRevision" value="${draftValue(draft, "planRevision", selected.planRef.revision)}" /><input type="hidden" name="planProgress" value="${draftValue(draft, "planProgress", coordination?.plan?.progressToken)}" />` : ""}
+            ${draft?.planConflict ? html`<input type="hidden" name="reviewedPlanProgress" value="${coordination?.plan?.progressToken}" />` : ""}
+            <div class="field"><label for="work-title">标题</label>
+              <input type="text" id="work-title" name="title" value="${draftValue(draft, "title", selected?.title)}" placeholder="例如：完成知识治理灰度" required maxlength="200"${invalidField(draft, "title")} />
+              ${fieldHint(draft, "title")}
             </div>
             <div class="grid2">
               ${spaceField}
-              <div class="field"><label>阶段</label><select name="phase">
+              <div class="field"><label for="work-phase">阶段</label><select id="work-phase" name="phase"${invalidField(draft, "phase")}>
+                ${draft?.field === "phase" ? html`<option selected value="">请选择有效阶段</option>` : ""}
                 ${Object.entries(WORK_PHASE_LABELS).map(([value, label]) =>
                   html`<option value="${value}" ${phase === value ? "selected" : ""}>${label}</option>`) }
-              </select></div>
+              </select>${fieldHint(draft, "phase")}</div>
             </div>
-            <div class="field"><label>Brief <span class="hint">目标、范围与验收标准</span></label>
-              <textarea name="brief" placeholder="为什么做、做到什么程度算完成">${selected?.brief ?? ""}</textarea>
+            <div class="field"><label for="work-brief">Brief <span class="hint">目标、范围与验收标准</span></label>
+              <textarea id="work-brief" name="brief" placeholder="为什么做、做到什么程度算完成">${draftValue(draft, "brief", selected?.brief)}</textarea>
             </div>
-            <div class="field"><label>当前进展</label>
-              <textarea name="summary" placeholder="现在已经确认了什么">${selected?.summary ?? ""}</textarea>
+            <div class="field"><label for="work-summary">当前进展</label>
+              <textarea id="work-summary" name="summary" placeholder="现在已经确认了什么">${draftValue(draft, "summary", selected?.summary)}</textarea>
             </div>
             <div class="grid2">
               <div class="field"><label for="work-blockers">阻塞项 <span class="hint">每行一项</span></label>
-                <textarea id="work-blockers" name="blockers" placeholder="暂无">${selected?.blockers.join("\n") ?? ""}</textarea>
+                <textarea id="work-blockers" name="blockers" placeholder="暂无">${draftValue(draft, "blockers", selected?.blockers.join("\n"))}</textarea>
               </div>
-              <div class="field"><label>下一步 <span class="hint">${selected?.planRef ? "每段一步，空行分隔" : "每行一项"}</span></label>
-                <textarea name="nextActions" placeholder="下一件可执行的事">${selected?.nextActions.join(selected.planRef ? "\n\n" : "\n") ?? ""}</textarea>
+              <div class="field"><label for="work-nextActions">下一步 <span class="hint">${selected?.planRef ? "每段一步，空行分隔" : "每行一项"}</span></label>
+                <textarea id="work-nextActions" name="nextActions" placeholder="下一件可执行的事"${invalidField(draft, "nextActions")}>${draftValue(draft, "nextActions", selected?.nextActions.join(stepSeparator))}</textarea>
+                ${fieldHint(draft, "nextActions")}
               </div>
             </div>
-            <div class="field"><label>Runbook <span class="hint">已验证的操作步骤</span></label>
-              <textarea name="runbook" style="min-height:150px" placeholder="1. …">${selected?.runbook ?? ""}</textarea>
+            <div class="field"><label for="work-runbook">Runbook <span class="hint">已验证的操作步骤</span></label>
+              <textarea id="work-runbook" name="runbook" style="min-height:150px" placeholder="1. …">${draftValue(draft, "runbook", selected?.runbook)}</textarea>
             </div>
-            <div class="actions"><button type="submit">${selected ? "保存上下文" : "创建并设为当前"}</button></div>
+            <div class="actions">${draft?.planConflict ? html`<button type="submit" name="reviewedPlanRevision" value="${selected?.planRef?.revision}">保存核对后的草稿</button>`
+              : html`<button type="submit">${selected ? "保存上下文" : "创建并设为当前"}</button>`}</div>
           </form>
         </section>`;
   const chooser = html`<div class="listcol">
     <a class="item ${newActive}" href="/work?new=1"><div class="name">＋ 新建工作项</div>
       <div class="sub">开始一条新的工作线</div></a>${listItems}
   </div>`;
+  if (draft && selected) return html`<h1>编辑工作事项</h1>${editor}`;
   if (!selected || !attention) return html`<h1>建立工作项</h1>${flash(flashMsg)}
     <div class="split">${chooser}<div>${editor}</div></div>`;
 
@@ -1753,6 +1897,7 @@ export function tasksView(
   selected: Task | null,
   spaces: SpaceMeta[],
   flashMsg?: string,
+  draft?: EditorSubmission,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const spaceNames = new Map(spaces.map((space) => [space.id, spaceLabel(space)]));
   const listItems = tasks.map((t) => {
@@ -1767,16 +1912,21 @@ export function tasksView(
   const editing = selected;
   const formAction = editing ? `/tasks/${encodeURIComponent(editing.id)}` : "/tasks";
   const submitLabel = editing ? "保存" : "创建";
-  const nameVal = editing?.name ?? "";
-  const topicVal = editing?.topic ?? "";
-  const spaceVal = editing?.space ?? spaces[0]?.id ?? "";
-  const cadenceVal = editing?.cadence ?? "daily";
-  const hourVal = editing?.hour ?? 8;
-  const dayOfWeekVal = editing?.dayOfWeek ?? 1;
-  const enabledOn = editing ? editing.enabled : true;
-  const notifyOn = editing ? editing.notify : true;
-  const distillOn = editing ? editing.distillOnRun : true;
-  const timeoutMinutes = editing?.timeoutMinutes ?? DEFAULT_TASK_TIMEOUT_MINUTES;
+  const nameVal = draftValue(draft, "name", editing?.name);
+  const topicVal = draftValue(draft, "topic", editing?.topic);
+  const spaceVal = draftValue(draft, "space", editing?.space ?? spaces[0]?.id);
+  const cadenceVal = draftValue(draft, "cadence", editing?.cadence ?? "daily");
+  const hourVal = draftValue(draft, "hour", editing?.hour ?? 8);
+  const dayOfWeekVal = Number(draftValue(draft, "dayOfWeek", editing?.dayOfWeek ?? 1));
+  const timeoutMinutes = draftValue(draft, "timeoutMinutes", editing?.timeoutMinutes ?? DEFAULT_TASK_TIMEOUT_MINUTES);
+  function toggle(name: "enabled" | "notify" | "distillOnRun", label: string, hint: string) {
+    const checked = draft ? ["on", "true", "1"].includes(draftValue(draft, name)) : editing?.[name] ?? true;
+    return html`<label class="toggle-row task-switch-row" for="task-${name}">
+      <span><strong id="task-${name}-label">${label}</strong><span class="hint" id="task-${name}-hint">${hint}</span></span>
+      <span class="switch"><input id="task-${name}" type="checkbox" name="${name}" aria-labelledby="task-${name}-label"
+        aria-describedby="task-${name}-hint" ${checked ? "checked" : ""} /><span class="slider"></span></span>
+    </label>`;
+  }
 
   const spaceOptions = spaces.length
     ? spaces.map((s) => html`<option value="${s.id}" ${s.id === spaceVal ? "selected" : ""}>${s.name?.trim() || s.id}</option>`)
@@ -1793,6 +1943,7 @@ export function tasksView(
       <div>
         ${flash(flashMsg)}
         <form method="post" action="${formAction}" class="stack card">
+          ${editorError(draft, "task")}
           <div class="field">
             <label for="task-name">名称</label>
             <input type="text" id="task-name" name="name" value="${nameVal}" placeholder="例如：每日 AI 进展" required />
@@ -1803,47 +1954,40 @@ export function tasksView(
           </div>
           <div class="grid2">
             <div class="field">
-              <label>目标空间 <span class="hint">结果写入这里，用其 Agent</span></label>
-              <select name="space">${spaceOptions}</select>
+              <label for="task-space">目标空间 <span class="hint">结果写入这里，用其 Agent</span></label>
+              <select id="task-space" name="space"${invalidField(draft, "space")}>
+                ${draft && spaces.length > 0 && !spaces.some(space => space.id === spaceVal) ? html`<option value="" selected>请选择有效空间</option>` : ""}${spaceOptions}</select>
+              ${fieldHint(draft, "space")}
               ${spaces.length ? "" : html`<a href="/">查看首次连接指引</a>`}
             </div>
             <div class="field">
-              <label>周期</label>
-              <select name="cadence">
+              <label for="task-cadence">周期</label>
+              <select id="task-cadence" name="cadence">
                 ${TASK_CADENCES.map(
                   (c) => html`<option value="${c}" ${c === cadenceVal ? "selected" : ""}>${CADENCE_LABELS[c] ?? c}</option>`,
                 )}
               </select>
             </div>
             <div class="field">
-              <label>星期 <span class="hint">仅每周周期使用</span></label>
-              <select name="dayOfWeek">
+              <label for="task-weekday">星期 <span class="hint">仅每周周期使用</span></label>
+              <select id="task-weekday" name="dayOfWeek">
                 ${Object.entries(WEEKDAY_LABELS).map(([day, label]) =>
                   html`<option value="${day}" ${Number(day) === dayOfWeekVal ? "selected" : ""}>${label}</option>`
                 )}
               </select>
             </div>
             <div class="field">
-              <label>执行时间 <span class="hint">0-23，每天/每周周期使用</span></label>
-              <input type="number" min="0" max="23" name="hour" value="${hourVal}" />
+              <label for="task-hour">执行时间 <span class="hint">0-23，每天/每周周期使用</span></label>
+              <input id="task-hour" type="number" min="0" max="23" name="hour" value="${hourVal}" />
             </div>
             <div class="field">
-              <label>最长运行时间 <span class="hint">分钟，超时会终止 CLI 进程</span></label>
-              <input type="number" min="${MIN_TASK_TIMEOUT_MINUTES}" max="${MAX_TASK_TIMEOUT_MINUTES}" name="timeoutMinutes" value="${timeoutMinutes}" />
+              <label for="task-timeout">最长运行时间 <span class="hint">分钟，超时会终止 CLI 进程</span></label>
+              <input id="task-timeout" type="number" min="${MIN_TASK_TIMEOUT_MINUTES}" max="${MAX_TASK_TIMEOUT_MINUTES}" name="timeoutMinutes" value="${timeoutMinutes}" />
             </div>
           </div>
-          <div class="toggle-row">
-            <div><strong>启用</strong><div class="hint">关闭后调度器不会自动运行</div></div>
-            <label class="switch"><input type="checkbox" name="enabled" ${enabledOn ? "checked" : ""} /><span class="slider"></span></label>
-          </div>
-          <div class="toggle-row">
-            <div><strong>推送飞书</strong><div class="hint">完成后把摘要发到空间绑定的群/私聊</div></div>
-            <label class="switch"><input type="checkbox" name="notify" ${notifyOn ? "checked" : ""} /><span class="slider"></span></label>
-          </div>
-          <div class="toggle-row">
-            <div><strong>完成后立即提炼</strong><div class="hint">运行结束就把结果提炼成知识页（关闭则等夜间提炼）</div></div>
-            <label class="switch"><input type="checkbox" name="distillOnRun" ${distillOn ? "checked" : ""} /><span class="slider"></span></label>
-          </div>
+          ${toggle("enabled", "启用", "关闭后调度器不会自动运行")}
+          ${toggle("notify", "推送飞书", "完成后把摘要发到空间绑定的群/私聊")}
+          ${toggle("distillOnRun", "完成后立即提炼", "运行结束就把结果提炼成知识页（关闭则等夜间提炼）")}
           <div class="actions">
             <button type="submit">${submitLabel}</button>
             ${editing ? html`<a href="${formAction}">取消编辑</a>` : ""}
@@ -1997,6 +2141,8 @@ export function taskRunView(
     : "";
   const workLink = workContext ? `/work/${encodeURIComponent(workContext.item.id)}` : undefined;
   const active = ["awaiting_approval", "queued", "running"].includes(run.status);
+  const followChanges = active || waitingAutomaticRetry || notification?.status === "pending"
+    || (notification?.status === "failed" && notification.attempts < MAX_TASK_NOTIFICATION_ATTEMPTS);
   function primaryContent() {
     switch (run.status) {
       case "succeeded":
@@ -2029,7 +2175,7 @@ export function taskRunView(
       }
     }
   }
-  return html`<article class="task-run-detail">
+  return html`<article class="task-run-detail" data-task-run-snapshot="${JSON.stringify(taskRunRefreshState(run))}">
     <style>
       .task-run-detail { min-width:0; overflow-wrap:anywhere; }
       .task-run-detail .card { display:grid; gap:10px; min-width:0; }
@@ -2117,7 +2263,7 @@ export function taskRunView(
       ${run.error && (active || run.status === "succeeded") ? html`<div><strong>错误：</strong>${run.error}</div>` : ""}
       </div>
     </details>
-    ${active ? html`<script>${raw(taskRunRefreshScript())}</script>` : ""}
+    ${followChanges ? html`<script>${raw(taskRunRefreshScript())}</script>` : ""}
   </article>`;
 }
 
@@ -2437,7 +2583,7 @@ export function remindersView(
 
 // ---- Guided learning ------------------------------------------------------
 
-const LEARNING_STATUS_LABELS: Record<LearningPlan["status"], string> = {
+export const LEARNING_STATUS_LABELS: Record<LearningPlan["status"], string> = {
   active: "进行中",
   paused: "已暂停",
   completed: "已完成",
@@ -2928,7 +3074,7 @@ export function learningView(
           </section>
           <details class="plan-settings">
             <summary>计划设置与管理信息</summary>
-            <form method="post" action="/learning/${encodeURIComponent(selected.id)}" class="settings-sheet">
+            <div class="settings-sheet">
               <div class="settings-facts">
                 <span>来源：${source?.title ?? "来源已不可用"}</span>
                 <span>空间：${selected.space}</span>
@@ -2937,28 +3083,28 @@ export function learningView(
                 <span>类型：${selected.mode === "topic" ? "主题学习" : "材料阅读"}</span>
                 <span>状态：${LEARNING_STATUS_LABELS[selected.status]}</span>
               </div>
-              <div class="grid2">
+              <form method="post" action="/learning/${encodeURIComponent(selected.id)}" id="learning-settings" class="grid2">
                 <div class="field">
-                  <label>每天几点 <span class="hint">北京时间，0–23</span></label>
-                  <input type="number" min="0" max="23" name="hour" value="${selected.hour}" required />
+                  <label for="learning-hour">每天几点 <span class="hint">北京时间，0–23</span></label>
+                  <input id="learning-hour" type="number" min="0" max="23" name="hour" value="${selected.hour}" required />
                 </div>
                 ${selected.mode === "reading"
                   ? html`<div class="field">
-                      <label>每课字数 <span class="hint">500–8000 字</span></label>
-                      <input type="number" min="500" max="8000" name="dailyCharacters" value="${selected.dailyCharacters}" required />
+                      <label for="learning-characters">每课字数 <span class="hint">500–8000 字</span></label>
+                      <input id="learning-characters" type="number" min="500" max="8000" name="dailyCharacters" value="${selected.dailyCharacters}" required />
                     </div>`
                   : ""}
-              </div>
+              </form>
               <div class="actions">
-                <button type="submit">保存设置</button>
-                ${selected.status === "active"
-                  ? html`<button type="submit" class="secondary" formaction="/learning/${encodeURIComponent(selected.id)}/pause">暂停</button>`
-                  : selected.status === "paused"
-                    ? html`<button type="submit" class="secondary" formaction="/learning/${encodeURIComponent(selected.id)}/resume">恢复</button>`
-                    : ""}
-                <button type="submit" class="danger" formaction="/learning/${encodeURIComponent(selected.id)}/delete" onclick="return confirm('删除该学习计划？')">删除</button>
+                <button type="submit" form="learning-settings">保存设置</button>
+                ${selected.status !== "completed" ? html`<form method="post" action="/learning/${encodeURIComponent(selected.id)}/${selected.status === "active" ? "pause" : "resume"}">
+                  <button type="submit" class="secondary">${selected.status === "active" ? "暂停" : "恢复"}</button>
+                </form>` : ""}
+                <form method="post" action="/learning/${encodeURIComponent(selected.id)}/delete" onsubmit="return confirm('删除该学习计划？')">
+                  <button type="submit" class="danger">删除</button>
+                </form>
               </div>
-            </form>
+            </div>
           </details>
         </div>
       </article>`

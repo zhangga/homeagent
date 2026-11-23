@@ -28,6 +28,19 @@ export function belongsToAction(item: WorkItem, action: WorkAction, run: TaskRun
 const liveTaskStatuses = ["awaiting_approval", "running", "queued"] as const;
 const liveChatStatuses = ["running", "queued"] as const;
 
+export const workDecisionLabels = {
+  awaiting_approval: { label: "待审批", link: "处理审批" },
+  awaiting_acceptance: { label: "待验收", link: "查看报告" },
+  blocked: { label: "受阻", link: "查看阻塞原因" },
+} as const;
+
+export interface HomeDecision {
+  kind: keyof typeof workDecisionLabels;
+  title: string;
+  space: WorkItem["space"];
+  href: string;
+}
+
 function activeTaskAttention(run: TaskRun, description: string, action?: WorkAction): WorkAttention | undefined {
   if (!isTaskRunLaunchAdmitted(run) || run.finishedAt !== undefined) return;
   if (run.status !== "running" && run.status !== "queued" && run.status !== "awaiting_approval") return;
@@ -116,18 +129,38 @@ function groupedByItem<T extends { workItemId?: string }>(records: readonly T[])
   return groups;
 }
 
-export function workAttentionIndex(engine: KnowledgeEngine, items: WorkItem[]): Map<string, WorkAttention> {
+export function workAttentionIndex(engine: KnowledgeEngine, items: WorkItem[],
+  liveTasks = engine.taskRuns.list(undefined, liveTaskStatuses),
+  liveChats = engine.chatRuns.list(undefined, liveChatStatuses)): Map<string, WorkAttention> {
   const allActions = engine.workContinuations.list();
   const actions = groupedByItem(allActions);
   const actionIds = new Set(allActions.map(action => action.id));
-  const chats = groupedByItem(engine.chatRuns.list(undefined, liveChatStatuses));
-  const liveTasks = engine.taskRuns.list(undefined, liveTaskStatuses);
+  const chats = groupedByItem(liveChats);
   const plain = groupedByItem(liveTasks.filter(run => run.workItemId && !run.workActionId && !actionIds.has(run.taskId)));
   const tasks = new Map(liveTasks.map(run => [run.id, run]));
   // Only a current candidate (e.g. a completed Run awaiting acceptance) needs a historical lookup.
   const getRun = (id: string) => tasks.get(id) ?? engine.taskRuns.get(id);
   return new Map(items.map(item => [item.id, selectWorkAttention(item, actions.get(item.id) ?? [], getRun,
     chats.get(item.id), plain.get(item.id), () => engine.getWorkPlanWait(item.id))]));
+}
+
+export function homeDecisions(engine: KnowledgeEngine, liveTasks: TaskRun[], liveChats: ChatRun[]): HomeDecision[] {
+  const items = engine.workItems.list();
+  const attention = workAttentionIndex(engine, items, liveTasks, liveChats);
+  const decisions = new Map<string, HomeDecision>();
+  for (const item of items) {
+    const state = attention.get(item.id);
+    if (state?.href && (state.kind === "awaiting_acceptance" || state.kind === "awaiting_approval" || state.kind === "blocked")) {
+      decisions.set(state.href, { kind: state.kind, title: item.title, space: item.space, href: state.href });
+    }
+  }
+  for (const run of liveTasks) {
+    const approval = activeTaskAttention(run, run.taskName);
+    if (approval?.kind === "awaiting_approval" && approval.href && !decisions.has(approval.href)) {
+      decisions.set(approval.href, { kind: approval.kind, title: run.taskName, space: run.space, href: approval.href });
+    }
+  }
+  return [...decisions.values()];
 }
 
 export function workAttentionDetail(engine: KnowledgeEngine, item: WorkItem) {

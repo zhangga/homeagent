@@ -70,6 +70,7 @@ import type {
   InboundEvent,
   InboundMessage,
   LiveReplyHandle,
+  ReplyTarget,
 } from "@homeagent/connectors";
 import { extractAttachmentText } from "./attachment-extractor.ts";
 import { WorkAutomation } from "./work-automation.ts";
@@ -1276,6 +1277,7 @@ export class Orchestrator {
 
     let inputsCaptured = false;
     let capturedMessageRawId: string | undefined;
+    let capturedReplyTarget: ReplyTarget | undefined;
     let sourceSync: SourceSyncResult = { attempted: 0, succeeded: 0 };
     const captureInputs = async (): Promise<void> => {
       // A status check is already journaled in WorkInput. Its message, links and
@@ -1325,25 +1327,11 @@ export class Orchestrator {
         && interpretConversation(msg.text).disposition === "remember"
       ) {
         try {
-          const target = await this.connector.resolveReplyTarget(msg.messageId);
-          if (
-            target && (hasMessageImages(target.messageType, target.text) || isFileMessage(target.messageType))
-            && !this.messageWasRetracted(writeSpace, msg.chatId, target.messageId)
-          ) {
-            const alreadyStored = this.engine.registry.store(writeSpace).index()
-              .findRawsByMessageId(target.messageId, msg.chatId)
-              .some((raw) =>
-                raw.attachments?.some((attachment) => attachment.sourceDigest)
-            );
-            if (!alreadyStored || target.messageType === "post") {
-              markDurableMutation();
-              await this.syncAttachments(msg, writeSpace, {
-                messageId: target.messageId,
-                author: target.senderId ?? msg.senderId,
-                createdAt: target.createdAt,
-                text: target.text,
-              });
-            }
+          const target = await this.connector.resolveReplyTarget(msg.messageId, { fullText: true });
+          // A connector can resolve the parent id even when the original could not be read.
+          if (target && (target.text || target.messageType === "image" || isFileMessage(target.messageType))) {
+            capturedReplyTarget = target;
+            await this.syncReplyAttachments(msg, writeSpace, target, markDurableMutation);
           }
         } catch (err) {
           log.warn("reply attachment preservation failed", {
@@ -1547,17 +1535,17 @@ export class Orchestrator {
       markDurableMutation();
 
       return this.scheduleChatRun(msg, writeSpace, chatRun, signal =>
-        this.executeInputResponse(msg, writeSpace, chatRun.id, response, signal));
+        this.executeInputResponse(msg, writeSpace, chatRun.id, response, signal, capturedReplyTarget));
     });
   }
 
   private executeInputResponse(msg: InboundMessage, space: SpaceId, runId: string,
-    response: WorkInput["response"], signal: AbortSignal): Promise<void> {
+    response: WorkInput["response"], signal: AbortSignal, capturedReplyTarget?: ReplyTarget): Promise<void> {
     if (signal.aborted) return Promise.reject(signal.reason);
     if (response?.kind === "static") return this.completeChatRunAndSend(msg, runId, response.text);
     // Older queued inputs may have classified a punctuation-free check as a save.
     if (response?.kind === "remember" && storedRawStatusTopic(msg.text) === undefined) {
-      return this.completeRememberChatRun(msg, space, runId, response.text, signal);
+      return this.completeRememberChatRun(msg, space, runId, response.text, signal, capturedReplyTarget);
     }
     if (response?.kind === "work-plan" || response?.kind === "work-replan") return this.planChatWork(msg, space, runId, response, signal);
     return this.answer(msg, attribute(msg).readSpaces, space, runId,
@@ -2026,6 +2014,7 @@ export class Orchestrator {
     runId: string,
     notice: string,
     signal: AbortSignal,
+    capturedReplyTarget?: ReplyTarget,
   ): Promise<void> {
     const assertActive = (): void => {
       if (signal.aborted || this.engine.chatRuns.get(runId)?.status !== "running"
@@ -2040,11 +2029,15 @@ export class Orchestrator {
       await this.completeChatRunAndSend(msg, runId, receipt);
       return;
     }
-    let target;
-    try {
-      target = await this.connector.resolveReplyTarget?.(msg.messageId, { fullText: true });
-    } catch {
-      log.warn("remember reply target lookup failed", { runId });
+    let target = capturedReplyTarget;
+    if (!target) {
+      try {
+        target = await this.connector.resolveReplyTarget?.(msg.messageId, { fullText: true });
+      } catch {
+        log.warn("remember reply target lookup failed", { runId });
+      }
+      assertActive();
+      if (target) await this.syncReplyAttachments(msg, space, target);
     }
     assertActive();
     const targetId = target?.messageId ?? msg.parentMessageId;
@@ -2515,7 +2508,7 @@ export class Orchestrator {
       if (!messageId || messageId === msg.messageId) return { text: userText, images: [] };
       const source = target?.messageId === messageId ? target : undefined;
       return { text: userText, images: [], rawReplyTarget: {
-        space: writeSpace, chatId: msg.chatId, messageId, text: source?.text,
+        space: writeSpace, chatId: msg.chatId, messageId, text: source?.text, sourceCard: source?.sourceCard,
         fullText: !!source?.text && !source.textTruncated && !["image", "audio", "media", "file"].includes(source.messageType ?? ""),
       } };
     }
@@ -2872,6 +2865,23 @@ export class Orchestrator {
       attempted: msg.docLinks?.length ?? 0,
       succeeded,
     };
+  }
+
+  private async syncReplyAttachments(
+    msg: InboundMessage, space: SpaceId, target: ReplyTarget, markDurableMutation?: () => void,
+  ): Promise<void> {
+    if (!this.attachmentDownloader || !(hasMessageImages(target.messageType, target.text) || isFileMessage(target.messageType))
+      || this.messageWasRetracted(space, msg.chatId, target.messageId)) return;
+    const alreadyStored = this.engine.registry.store(space).index().findRawsByMessageId(target.messageId, msg.chatId)
+      .some(raw => raw.attachments?.some(attachment => attachment.sourceDigest));
+    if (alreadyStored && target.messageType !== "post") return;
+    markDurableMutation?.();
+    await this.syncAttachments(msg, space, {
+      messageId: target.messageId,
+      author: target.senderId ?? msg.senderId,
+      createdAt: target.createdAt,
+      text: target.text,
+    });
   }
 
   private async syncAttachments(

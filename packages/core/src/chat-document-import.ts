@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { MAX_MATERIAL_BYTES, MAX_MATERIAL_EXPANDED_BYTES, MAX_MATERIAL_FILES, type Attachment } from "@homeagent/shared";
+import { MAX_MATERIAL_BYTES, MAX_MATERIAL_EXPANDED_BYTES, MAX_MATERIAL_FILES, type Attachment, type RawRecord } from "@homeagent/shared";
 import { MAX_CHAT_IMPORT_BYTES } from "./chat-raw-import.ts";
 import { storedRawStatusTopic } from "./raw-query.ts";
 
@@ -33,11 +33,34 @@ function string(value: unknown, max: number): string {
   if (typeof value !== "string" || !value.trim() || value.length > max || /[\u0000-\u001f\u007f]/u.test(value)) invalid();
   return value;
 }
-function sourceUrl(value: unknown): string {
+export function documentSourceUrl(value: unknown): string {
   const url = new URL(string(value, 2_048));
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) invalid();
   url.hash = "";
   return url.href;
+}
+
+/** Unwrap the original body captured by source sync or by the document handoff. */
+export function documentRawSource(raw: RawRecord): { documentUrl: string; documentTitle?: string; content: string } | undefined {
+  const prefix = "# 来源资料：";
+  if (raw.source !== "doc" || !raw.content.startsWith(prefix)) return undefined;
+  const end = raw.content.indexOf("\n\n", prefix.length);
+  if (end < 0) return undefined;
+  let documentUrl: string;
+  try { documentUrl = documentSourceUrl(raw.content.slice(prefix.length, end)); }
+  catch { return undefined; }
+  const body = raw.content.slice(end + 2);
+  if (!/^doc-import-[a-f0-9]{64}$/u.test(raw.id)) return { documentUrl, content: body };
+  const boundary = body.indexOf(" -->\n\n");
+  if (body.startsWith("<!-- ") && boundary >= 5) {
+    try {
+      const meta = object(JSON.parse(body.slice(5, boundary)));
+      if (meta.format === "homeagent.document-source" && meta.version === 1 && meta.capture === "agent-submitted") {
+        return { documentUrl, documentTitle: string(meta.title, 500), content: body.slice(boundary + " -->\n\n".length) };
+      }
+    } catch { /* An unreadable import envelope cannot provide body evidence. */ }
+  }
+  return { documentUrl, content: "" };
 }
 
 /** Only saved user inputs select sources; page contents and model answers cannot. */
@@ -54,7 +77,7 @@ export function resolveDocumentImportRequest(inputs: string[]): string[] {
     for (const candidate of input.match(/https?:\/\/[^\s<>\[\]{}"'“”‘’「」《》，。！？；：、]+/gu) ?? []) {
       let trimmed = candidate.replace(/[,.!?;:]+$/u, "");
       while (trimmed.endsWith(")") && (trimmed.match(/\)/gu)?.length ?? 0) > (trimmed.match(/\(/gu)?.length ?? 0)) trimmed = trimmed.slice(0, -1);
-      try { current.push(sourceUrl(trimmed)); } catch { /* Not a source URL. */ }
+      try { current.push(documentSourceUrl(trimmed)); } catch { /* Not a source URL. */ }
     }
     if (current.length) urls = [...new Set(current)];
     const decline = /(?:不|不要|无需|不用|别)\s*(?:自动)?\s*(?:入库|收录|记录|保存)|(?:只|仅)\s*(?:保存|记录|导出)\s*(?:总结|摘要|本地|文件)/u.test(input);
@@ -118,7 +141,7 @@ export function readDocumentCapture(capture: DocumentCapture): CapturedDocument[
   let fileCount = 0;
   return value.documents.map(candidate => {
     const doc = object(candidate);
-    const url = sourceUrl(doc.url);
+    const url = documentSourceUrl(doc.url);
     if (!capture.urls.includes(url) || seen.has(url)) invalid();
     seen.add(url);
     const title = string(doc.title, 500);

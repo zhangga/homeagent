@@ -33,6 +33,18 @@ import { toMatchQuery, toSearchText } from "./tokenize.ts";
 
 export const MAX_SEARCH_RESULTS = 100;
 
+export interface RawHistoryCursor {
+  direction: "before" | "after";
+  createdAt: number;
+  id: string;
+}
+
+export interface RawHistoryPage {
+  records: RawRecord[];
+  hasNewer: boolean;
+  hasOlder: boolean;
+}
+
 export interface RawSearchFilters {
   /** Inclusive creation time and exclusive upper bound, in epoch milliseconds. */
   from?: number;
@@ -171,6 +183,7 @@ export class SpaceIndex {
       )
     `);
     this.db.run(`CREATE INDEX IF NOT EXISTS raw_ingested ON raw(ingested, created)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS raw_created_id ON raw(created, id)`);
     this.db.run(`CREATE INDEX IF NOT EXISTS raw_message ON raw(chat_id, message_id)`);
     this.db.run(`CREATE INDEX IF NOT EXISTS raw_chat_created ON raw(chat_id, created DESC)`);
     this.db.run(`CREATE INDEX IF NOT EXISTS raw_work_item ON raw(work_item_id, created DESC)`);
@@ -391,7 +404,7 @@ export class SpaceIndex {
   // ---- raw -----------------------------------------------------------------
 
   /** FTS projection of admitted Raw, including records not yet distilled into pages. */
-  searchRaw(query: string, limit = 20, filters: RawSearchFilters = {}): RawRecord[] {
+  searchRaw(query: string, limit = 20, filters: RawSearchFilters = {}, accept?: (raw: RawRecord) => boolean): RawRecord[] {
     const safeLimit = normalizeSearchLimit(limit);
     const match = toMatchQuery(query.slice(0, 4000));
     if (!safeLimit || (!match && query.trim().length > 0)) return [];
@@ -417,9 +430,24 @@ export class SpaceIndex {
       bindings.push(key === "chatName" ? normalizedRawSourceName(value) : value);
     }
     if (!match && bindings.length === 0) return [];
-    const statement = this.db.prepare(`SELECT r.* FROM ${match ? "raw_fts f JOIN raw r ON r.id = f.id" : "raw r"}
+    const ranked = `FROM ${match ? "raw_fts f JOIN raw r ON r.id = f.id" : "raw r"}
       WHERE ${predicates.join(" AND ")}
-      ORDER BY ${match ? "bm25(raw_fts), " : ""}r.created DESC, r.id LIMIT ?`);
+      ORDER BY ${match ? "bm25(raw_fts), " : ""}r.created DESC, r.id`;
+    if (accept) {
+      // Sort only keys. Step the same read cursor until enough eligible bodies
+      // have been found, materializing a single candidate at a time.
+      const ids = this.db.prepare<{ id: string }, Array<string | number>>(`SELECT r.id ${ranked}`);
+      try {
+        const results: RawRecord[] = [];
+        for (const { id } of ids.iterate(...bindings)) {
+          const raw = this.getRaw(id);
+          if (raw && accept(raw)) results.push(raw);
+          if (results.length === safeLimit) break;
+        }
+        return results;
+      } finally { ids.finalize(); }
+    }
+    const statement = this.db.prepare(`SELECT r.* ${ranked} LIMIT ?`);
     try {
       const rows = statement.all(...bindings, safeLimit) as Record<string, unknown>[];
       return rows.map(rowToRaw);
@@ -458,7 +486,8 @@ export class SpaceIndex {
     const chatImport = /^chat-import-[a-f0-9]{64}$/.test(id) && entry.source === "manual";
     const documentImport = /^doc-import-[a-f0-9]{64}$/.test(id) && entry.source === "doc";
     const messageImport = /^message-import-[a-f0-9]{64}$/.test(id) && entry.source === "message";
-    if ((!chatImport && !documentImport && !messageImport) || entry.workActionId || entry.admission) {
+    const localImport = /^local-import-[a-f0-9]{64}$/.test(id) && entry.source === "manual";
+    if ((!chatImport && !documentImport && !messageImport && !localImport) || entry.workActionId || entry.admission) {
       throw new Error("Invalid imported Raw capture");
     }
     // The journal may already have committed when a previous projection write failed.
@@ -471,7 +500,7 @@ export class SpaceIndex {
         throw new Error("Imported Raw version conflict");
       }
       const documentFiles = (raw: RawEntry) => raw.attachments?.map(file => [file.kind, file.ref, file.name, file.sourceDigest, file.sourceSizeBytes]);
-      if (documentImport && (existing.content !== entry.content || JSON.stringify(documentFiles(existing)) !== JSON.stringify(documentFiles(entry)))) {
+      if ((documentImport || localImport) && (existing.content !== entry.content || JSON.stringify(documentFiles(existing)) !== JSON.stringify(documentFiles(entry)))) {
         throw new Error("Imported document content conflict");
       }
       if (messageImport && existing.content !== entry.content) throw new Error("Imported message content conflict");
@@ -508,6 +537,27 @@ export class SpaceIndex {
       .query(`SELECT * FROM raw ${where} ORDER BY created ASC, id ASC ${limit}`)
       .all() as Record<string, unknown>[];
     return rows.map(rowToRaw);
+  }
+
+  /** Browse all admission states newest first, seeking from an exclusive record boundary. */
+  listRawHistory(limit: number, cursor?: RawHistoryCursor): RawHistoryPage {
+    const empty = { records: [], hasNewer: false, hasOlder: false };
+    if (!Number.isSafeInteger(limit) || limit < 1) return empty;
+    const newer = cursor?.direction === "after";
+    const order = newer ? "ASC" : "DESC";
+    const boundary = cursor ? `WHERE (created, id) ${newer ? ">" : "<"} (?, ?)` : "";
+    const args = cursor ? [cursor.createdAt, cursor.id, limit + 1] : [limit + 1];
+    const rows = this.db.query(`SELECT * FROM raw ${boundary} ORDER BY created ${order}, id ${order} LIMIT ?`)
+      .all(...args) as Record<string, unknown>[];
+    if (rows.length === 0) return empty;
+    const more = rows.length > limit;
+    if (more) rows.pop();
+    if (newer) rows.reverse();
+    const records = rows.map(rowToRaw);
+    const edge = newer ? records[records.length - 1]! : records[0]!;
+    const hasOpposite = !!cursor && !!this.db.query(`SELECT 1 FROM raw WHERE (created, id) ${newer ? "<" : ">"} (?, ?) LIMIT 1`)
+      .get(edge.createdAt, edge.id);
+    return { records, hasNewer: newer ? more : hasOpposite, hasOlder: newer ? hasOpposite : more };
   }
 
   getRaw(id: string): RawRecord | null {

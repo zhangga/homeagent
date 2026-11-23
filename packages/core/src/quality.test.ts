@@ -210,6 +210,24 @@ describe("QualityStore", () => {
     expect(restarted.trace(failure.id)).toEqual(failure);
   });
 
+  test("retains bounded question and answer excerpts with their original citation evidence after reopening", () => {
+    const dir = tempDir();
+    const store = new QualityStore(dir);
+    const evidence = { sourceCount: 2, latestSourceAt: 100, freshness: "recent" as const, complete: true };
+    const input = { spaces: ["team/oc_quality" as const], outcome: "succeeded" as const, source: "knowledge" as const,
+      question: "问".repeat(4_000), answer: "答".repeat(12_000), citations: [{ slug: "entities/team", title: "团队", evidence }], latencyMs: 1 };
+    const exact = store.recordTrace(input);
+    expect(exact.questionTruncated).toBeUndefined();
+    expect(exact.answerTruncated).toBeUndefined();
+    const clipped = store.recordTrace({ ...input, question: input.question + "？", answer: input.answer + "。" });
+    evidence.sourceCount = 5;
+    clipped.citations[0]!.evidence!.sourceCount = 100;
+    const expected = { question: input.question, answer: input.answer, questionTruncated: true, answerTruncated: true,
+      citations: [{ slug: "entities/team", title: "团队", evidence: { ...evidence, sourceCount: 2 } }] };
+    expect(store.trace(clipped.id)).toMatchObject(expected);
+    expect(new QualityStore(dir).trace(clipped.id)).toMatchObject(expected);
+  });
+
   test("accepts one validated feedback record per trace", () => {
     const store = new QualityStore(tempDir());
     const trace = store.recordTrace({
