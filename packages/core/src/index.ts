@@ -37,6 +37,7 @@ export * from "./traceability.ts";
 export * from "./local-agent-knowledge.ts";
 export * from "./knowledge-consumption-feedback.ts";
 export * from "./ask.ts";
+export { isReplyRawStatusTopic, storedRawStatusTopic } from "./raw-query.ts";
 export * from "./testing.ts";
 export * from "./governance.ts";
 export * from "./learning-content.ts";

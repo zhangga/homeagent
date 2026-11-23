@@ -48,6 +48,9 @@ test("recognizes the original request without requiring Raw terminology and hono
     expect(resolveDocumentImportRequest([`${text} ${url}`])).toEqual([]);
   }
   expect(resolveDocumentImportRequest([`记录完整内容 ${url}`, "继续补全"])).toEqual([url]);
+  const status = "帮我核对一下《工作周报｜11 月 16—22 日》是否已经保存到 HomeAgent。";
+  expect(resolveDocumentImportRequest([`记录完整内容 ${url}`, status])).toEqual([]);
+  expect(resolveDocumentImportRequest([`记录完整内容 ${url}`, status, "继续补全"])).toEqual([url]);
   expect(resolveDocumentImportRequest([`记录完整内容 ${url}`, "谢谢"])).toEqual([]);
   expect(resolveDocumentImportRequest([`记录完整内容 ${url}`, "不要入库", "继续"])).toEqual([]);
   expect(resolveDocumentImportRequest([`记录完整内容 ${url}`, "记录下飞书群 PST 最近一周聊天原文"])).toEqual([]);

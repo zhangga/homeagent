@@ -174,6 +174,8 @@ export interface SkillWarningView {
  */
 export interface AskResult {
   answer: string;
+  /** The host verified the result without invoking a model. */
+  answeredLocally?: true;
   source: "knowledge" | "general";
   /** Non-KB context boundary used for the answer; never contains the actual path. */
   context?: "agent-workdir" | "message-source";

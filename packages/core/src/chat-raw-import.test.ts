@@ -118,6 +118,24 @@ test("looking up already imported Raw never opens a new capture, including in a 
     .toEqual({ requestedName: "PST" });
 });
 
+test("ordinary questions about a title's storage status are local lookups, including in a capture topic", () => {
+  const title = "《工作周报｜11 月 16—22 日》";
+  const capture = "飞书群：PST 提炼最近两周";
+  for (const question of [`${title}是否已收录？`, `帮我核对一下${title}是否已经保存到 HomeAgent。`,
+    `本群有没有收录${title}？`, `HomeAgent 收录${title}了吗？`, `在知识库里查一下${title}是否已收录？`,
+    `${title}是否已被 HomeAgent 收录？`, "工作周报入库了吗？", "HomeAgent 有没有收录工作周报？"]) {
+    expect(requestsStoredRawQuery(question)).toBe(true);
+    expect(requestsChatRawImport(question)).toBe(false);
+    expect(resolveChatRawImportRequest([capture, question])).toBeUndefined();
+    expect(resolveChatRawImportRequest([capture, question, "继续提炼"])).toEqual({ requestedName: "PST" });
+  }
+  for (const other of [`请收录${title}`, `请把${title}保存到知识库`, `${title}是否已保存到网盘？`,
+    `能帮我收录${title}吗？`, `如果${title}没有收录，请保存下来`, "解释《周报是否已收录》这个标题",
+    "怎么判断文章是否已收录？", "先生成工作周报再确认是否已收录", "帮我汇总发布消息，并确认周报是否已收录"]) {
+    expect(requestsStoredRawQuery(other)).toBe(false);
+  }
+});
+
 test("named external source is saved only in the requesting Space with actual provenance", async () => {
   const { engine, capture, file, run } = fixture("飞书群：PST线上应急处理小组 提炼最近一周，并保存原始记录");
   expect(capture.instruction).toContain("不得用当前群替换目标群");

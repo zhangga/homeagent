@@ -40,9 +40,12 @@ import {
 } from "@homeagent/llm";
 import {
   resolveGroupParticipationLevel,
+  isReplyRawStatusTopic,
+  storedRawStatusTopic,
   isKnowledgeContentRef,
   isResolvedExecutionPlan,
   type AnswerOutcome,
+  type AskOptions,
   type AskFailureTrace,
   type ChatRun,
   type WorkInput,
@@ -72,7 +75,7 @@ import { extractAttachmentText } from "./attachment-extractor.ts";
 import { WorkAutomation } from "./work-automation.ts";
 import { newWorkTitle, routeWork, workControl, resolveSupplement, WORK_ROUTING_INSTRUCTION } from "./work-routing.ts";
 import { generateWorkPlan, isWorkPlanningCandidate, isWorkReplanningCandidate, WORK_PLANNING_INSTRUCTION, WORK_REPLANNING_INSTRUCTION } from "./work-planning.ts";
-import { splitMaterialText } from "@homeagent/shared";
+import { messageRawParts, splitMaterialText } from "@homeagent/shared";
 import { isLiveReplyTerminal, liveReplySnapshot } from "@homeagent/connectors";
 import { attribute } from "./attribution.ts";
 import { gate } from "./gateway.ts";
@@ -192,6 +195,7 @@ interface ConversationContext {
   text: string;
   images: DownloadedAttachment[];
   sourceContext?: boolean;
+  rawReplyTarget?: AskOptions["rawReplyTarget"];
 }
 
 interface SourceSyncResult {
@@ -576,7 +580,7 @@ export class Orchestrator {
     const binding = m.chatType === "group" ? this.activeGroupBinding(m.chatId) : undefined;
     // Existing automation and capture controls keep their original precedence and authorization.
     const ordinary = parseTaskCommand(m.text) || parseLearningCommand(m.text) || parseLearningAnswer(m.text)
-      || parseKnowledgeControl(m.text) || isReminderAutomationMessage(m.text)
+      || parseKnowledgeControl(m.text) || isReminderAutomationMessage(m.text) || storedRawStatusTopic(m.text) !== undefined
       || this.pendingReminderConfirmations.has(this.pendingReminderKey(m, input.space));
     const addressed = m.chatType === "p2p" || m.mentionsBot || binding?.responseMode === "all_messages";
     const route = ordinary || !addressed ? { operation: "chat" as const }
@@ -819,6 +823,7 @@ export class Orchestrator {
         text: retryText,
         messageId: previous.messageId,
         messageType: sourceInput?.message.messageType,
+        parentMessageId: sourceInput?.message.parentMessageId,
         mentionsBot: true,
         createdAt: previous.startedAt,
         ...this.topicMessageIdentity(previous.id),
@@ -2041,8 +2046,7 @@ export class Orchestrator {
         const body = target?.messageType && ["image", "file", "audio", "media"].includes(target.messageType)
           ? undefined : target?.text;
         if (body?.trim() && !target?.textTruncated && body.length <= MAX_MATERIAL_BYTES) {
-          const parts = splitMaterialText(body).map((content, index, chunks) => chunks.length === 1
-            ? content : `正文分段：${index + 1}/${chunks.length}\n\n${content}`);
+          const parts = messageRawParts(body);
           try {
             for (const content of parts) {
               assertActive();
@@ -2314,6 +2318,7 @@ export class Orchestrator {
           run.skillEvidence,
           {
             retrievalQuestion: userText,
+            rawReplyTarget: context.rawReplyTarget,
             referenceTime: run.rawId
               ? this.engine.registry.store(writeSpace).index().getRaw(run.rawId)?.createdAt ?? run.startedAt
               : run.startedAt,
@@ -2412,6 +2417,7 @@ export class Orchestrator {
       if (
         res.source === "general"
         && !res.context
+        && !storedRawStatusTopic(userText)
         && (await this.isColdStart(effectiveReadSpaces))
       ) {
         text = `${text}\n\n${coldStartNote()}`;
@@ -2419,7 +2425,7 @@ export class Orchestrator {
       if (signal?.aborted) {
         throw signal.reason instanceof Error ? signal.reason : new ChatRunCancelledError();
       }
-      text = withReplyModel(text, run, reportedModel);
+      text = withReplyModel(text, run, reportedModel, res.answeredLocally ? "static" : "model");
       const succeeded = this.engine.chatRuns.succeed(runId, {
         executionEvidence,
         finishedAt: Date.now(),
@@ -2461,13 +2467,15 @@ export class Orchestrator {
     writeSpace: SpaceId,
     allowRecentSourceFallback = true,
   ): Promise<ConversationContext> {
-    const currentSourceParts = this.storedReplySourceText(
+    const checkReply = isReplyRawStatusTopic(storedRawStatusTopic(userText));
+    const currentSourceParts = checkReply ? [] : this.storedReplySourceText(
       writeSpace,
       msg.chatId,
       msg.messageId,
     );
     if (
       !msg.parentMessageId
+      && !checkReply
       && !mayReferToConversationContext(userText)
       && currentSourceParts.length === 0
     ) {
@@ -2476,13 +2484,22 @@ export class Orchestrator {
     let target;
     if (this.connector.resolveReplyTarget) {
       try {
-        target = await this.connector.resolveReplyTarget(msg.messageId);
+        target = await this.connector.resolveReplyTarget(msg.messageId, checkReply ? { fullText: true } : undefined);
       } catch (err) {
         log.warn("conversation context resolution failed", {
           messageId: msg.messageId,
           err: String(err),
         });
       }
+    }
+    if (checkReply) {
+      const messageId = msg.parentMessageId ?? target?.messageId;
+      if (!messageId || messageId === msg.messageId) return { text: userText, images: [] };
+      const source = target?.messageId === messageId ? target : undefined;
+      return { text: userText, images: [], rawReplyTarget: {
+        space: writeSpace, chatId: msg.chatId, messageId, text: source?.text,
+        fullText: !!source?.text && !source.textTruncated && !["image", "audio", "media", "file"].includes(source.messageType ?? ""),
+      } };
     }
     if (!target) {
       if (

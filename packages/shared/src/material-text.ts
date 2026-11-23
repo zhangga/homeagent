@@ -175,3 +175,9 @@ export function splitMaterialText(text: string): string[] {
   }
   return chunks;
 }
+
+/** Stored representation of a quoted message, including its lossless part numbering. */
+export function messageRawParts(text: string): string[] {
+  return splitMaterialText(text).map((part, index, parts) => parts.length === 1
+    ? part : `正文分段：${index + 1}/${parts.length}\n\n${part}`);
+}

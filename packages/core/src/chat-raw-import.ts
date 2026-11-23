@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import type { Attachment, RawEntry, RawRecord, SpaceId } from "@homeagent/shared";
+import { storedRawStatusTopic } from "./raw-query.ts";
 
 export const MAX_CHAT_IMPORT_BYTES = 8 * 1024 * 1024;
 export const MAX_CHAT_IMPORT_MESSAGES = 1000;
@@ -96,11 +97,13 @@ function declinesRawPreservation(text: string): boolean {
 
 export function requestsChatRawImport(text: string): boolean {
   return text.length <= 20_000 && /群|聊天|飞书/u.test(text)
+    && !requestsStoredRawQuery(text)
     && (requestsRawPreservation(text) || requestsDefaultChatRawImport(text));
 }
 
 /** A lookup of stored evidence is not a new external-source capture. */
 export function requestsStoredRawQuery(text: string): boolean {
+  if (storedRawStatusTopic(text)) return true;
   return /\bRaw\b|原文|原话|原始记录|原始消息|聊天记录|说过|说的|发过|发的/iu.test(text)
     && /查询|检索|查找|查阅|查一下|找一下|找出|核验|摘录|给出|提供/iu.test(text)
     && /已(?:经)?(?:入库|收录|保存)|知识库|\bRaw\s*ID\b/iu.test(text);

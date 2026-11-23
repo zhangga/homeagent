@@ -1,8 +1,25 @@
 import { describe, expect, test } from "bun:test";
-import { planRawQuery } from "./raw-query.ts";
+import { planRawQuery, storedRawStatusTopic } from "./raw-query.ts";
 
 const now = Date.parse("2026-10-20T12:30:00+08:00");
 describe("Raw query planning", () => {
+  test("recognizes completed record checks, including a report named only in the reply", () => {
+    for (const text of ["这个报告记录下来了吗", "这个报告已经记下了吗？", "这个报告有没有记录下来？", "这个报告记下来了吗？"]) {
+      expect(storedRawStatusTopic(text)).toBe("这个报告");
+    }
+    expect(planRawQuery("《工作周报｜11 月 16—22 日》的全文是否已收录？", now).query).toBe("工作周报｜11 月 16—22 日");
+    for (const text of ["请把这个报告记录下来", "这个报告记录了哪些问题？", "可以帮我记录这个报告吗？", "检查这个报告是否记录了所有问题", "如果这份周报没收录就帮我保存"]) {
+      expect(storedRawStatusTopic(text)).toBeUndefined();
+    }
+  });
+  test("searches for the named report and keeps quoted dates in the title", () => {
+    const title = "2026-11-16 至 2026-11-22 工作周报";
+    const plan = planRawQuery(`帮我核对一下《${title}》是否已经保存到 HomeAgent。`, now);
+    expect(plan.query).toBe(title);
+    expect(plan.filters).toEqual({});
+    expect(planRawQuery("工作周报入库了吗？", now).query).toBe("工作周报");
+    expect(planRawQuery("HomeAgent 收录工作周报了吗？", now).query).toBe("工作周报");
+  });
   test("plans natural last-week author queries without keeping instruction words as keywords", () => {
     const plan = planRawQuery("在知识库找一下上周小王说过的发布结论", now);
     expect(plan.query).toBe("发布结论");

@@ -645,7 +645,7 @@ export async function ask(
   deps: AskDeps = {},
 ): Promise<AskResult> {
   const client = deps.client ?? gatewayClient;
-  if (requestsStoredRawQuery(question)) return askStoredRaw(stores, question, client, opts, opts.referenceTime ?? deps.now?.() ?? Date.now());
+  if (requestsStoredRawQuery(opts.retrievalQuestion ?? question)) return askStoredRaw(stores, question, client, opts, opts.referenceTime ?? deps.now?.() ?? Date.now());
   const toolExecution = deps.toolExecution === true && !opts.knowledgeOnly;
   const maxPages = opts.maxPages ?? DEFAULT_MAX_PAGES;
   const model = opts.model ?? config().model;

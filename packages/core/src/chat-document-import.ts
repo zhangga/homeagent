@@ -3,6 +3,7 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpat
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { MAX_MATERIAL_BYTES, MAX_MATERIAL_EXPANDED_BYTES, MAX_MATERIAL_FILES, type Attachment } from "@homeagent/shared";
 import { MAX_CHAT_IMPORT_BYTES } from "./chat-raw-import.ts";
+import { storedRawStatusTopic } from "./raw-query.ts";
 
 export interface DocumentCapture {
   file: string;
@@ -43,8 +44,12 @@ function sourceUrl(value: unknown): string {
 export function resolveDocumentImportRequest(inputs: string[]): string[] {
   let urls: string[] = [];
   let requested = false;
-  for (const input of inputs) {
+  for (const [index, input] of inputs.entries()) {
     if (input.length > 20_000) return [];
+    if (storedRawStatusTopic(input)) {
+      if (index === inputs.length - 1) return [];
+      continue;
+    }
     const current: string[] = [];
     for (const candidate of input.match(/https?:\/\/[^\s<>\[\]{}"'“”‘’「」《》，。！？；：、]+/gu) ?? []) {
       let trimmed = candidate.replace(/[,.!?;:]+$/u, "");

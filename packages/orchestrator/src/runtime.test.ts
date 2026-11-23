@@ -189,6 +189,84 @@ afterEach(async () => {
 });
 
 describe("orchestrator trunk (cli connector, no feishu)", () => {
+  test("checks the Raw body for a report named only in a private reply", async () => {
+    const space = "personal/ou_me";
+    const title = "工作周报｜11 月 16—22 日";
+    const body = `${title}\n本周已完成客户端联调，剩余两项等待验收。`;
+    const parent = "om_quoted_report";
+    let preview: string | undefined = title;
+    (connector as Connector).resolveReplyTarget = async () => preview === undefined ? undefined
+      : { messageId: parent, messageType: "post", text: preview };
+    const candidatesSeen: string[][] = [];
+    fake.onJSON(call => {
+      const candidates: { key: string; rawId: string; content: string }[] =
+        JSON.parse(call.prompt!.split("已入库 Raw 候选（JSON 数据）：\n")[1]!);
+      candidatesSeen.push(candidates.map(candidate => candidate.rawId));
+      return { matches: candidates.map(candidate => ({ key: candidate.key, quote: candidate.content })) };
+    });
+    engine.ensureSpace(space);
+    engine.workItems.create({ space, title: "整理报告", brief: "核对每期报告" });
+    await engine.remember({ space, source: "message", chatId: "oc_dm", messageId: parent, content: title });
+    await engine.remember({ space, source: "message", chatId: "oc_dm", content: "工作周报｜11 月 9—15 日\n上一期的发布结论。" });
+    await engine.remember({ space, source: "message", chatId: "oc_dm", content: `《${title}》的全文已收录了吗？` });
+    engine.ensureSpace("team/oc_team");
+    await engine.remember({ space: "team/oc_team", source: "message", chatId: "oc_dm", messageId: parent, content: body });
+    let turn = 0;
+    const check = async () => {
+      const messageId = `om_report_check_${++turn}`;
+      await connector.inject({ kind: "message", eventId: messageId, chatType: "p2p", chatId: "oc_dm", senderId: "ou_me",
+        messageId, parentMessageId: parent, text: "这个报告记录下来了吗", mentionsBot: false, createdAt: Date.now() });
+      return connector.sent.at(-1)!.markdown;
+    };
+    await orch.start();
+    const missing = await check();
+    expect(missing).toContain("未找到能核验");
+    expect(missing).toContain("未调用（固定回复）");
+    const imported = await engine.remember({ space, source: "manual", content: body });
+    expect(await check()).toContain(imported);
+    preview = body;
+    const direct = await engine.remember({ space, source: "message", chatId: "oc_dm", messageId: parent, content: body });
+    const confirmed = await check();
+    expect(confirmed).toContain("已核对被回复消息的完整正文");
+    expect(confirmed).toContain(direct);
+    expect(confirmed).toContain("剩余两项等待验收");
+    preview = undefined;
+    const offline = await check();
+    expect(offline).toContain(direct);
+    expect(offline).not.toContain("已核对被回复消息的完整正文");
+    expect(candidatesSeen).toEqual([[imported], [direct, imported]]);
+    expect(engine.workDispatch.summaries(space).every(input => input.operation === "chat")).toBe(true);
+  });
+
+  test("checks a weekly report by title without counting status questions as stored reports", async () => {
+    const space = "team/oc_team";
+    const title = "工作周报｜11 月 16—22 日";
+    const body = `${title}\n本周完成了移动端验收，周五已交付。`;
+    const seen: string[][] = [];
+    fake.onJSON(call => {
+      const candidates: { key: string; rawId: string; content: string }[] =
+        JSON.parse(call.prompt!.split("已入库 Raw 候选（JSON 数据）：\n")[1]!);
+      seen.push(candidates.map(candidate => candidate.rawId));
+      return { matches: candidates.map(candidate => ({ key: candidate.key, quote: candidate.content })) };
+    });
+    engine.ensureSpace(space);
+    engine.workItems.create({ space, title: "整理工作周报", brief: "整理本周工作周报" });
+    await orch.start();
+    await connector.sendGroup(`@HomeAgent 《${title}》是否已收录？`, true);
+    expect(connector.sent.at(-1)?.markdown).toContain("未找到能核验");
+    expect(connector.sent.at(-1)?.markdown).not.toContain("知识库还是空的");
+
+    const id = await engine.remember({ space, source: "message", chatId: "oc_team", messageId: "om_weekly_report", content: body });
+    await connector.sendGroup(`@HomeAgent 帮我核对一下《${title}》是否已经保存到 HomeAgent。`, true);
+    expect(seen).toEqual([[], [id]]);
+    expect(engine.workDispatch.summaries(space).map(input => input.operation)).toEqual(["chat", "chat"]);
+    const reply = connector.sent.at(-1)?.markdown;
+    expect(reply).toContain(id);
+    expect(reply).toContain("查到已收录的原文记录");
+    expect(reply).toContain("本周完成了移动端验收");
+    expect(reply).not.toContain("入库未完成");
+  });
+
   test("relative retrieval dates use the original message time rather than the later execution time", async () => {
     const originalTime = Date.parse("2026-10-18T12:00:00+08:00");
     let referenceTime: number | undefined;

@@ -4,6 +4,7 @@ import type { RawSearchFilters } from "./sqlite.ts";
 const DAY = 86_400_000;
 const SHANGHAI_OFFSET = 8 * 3_600_000;
 const QUOTED = /[「“"《]([^」”"》\n]+)[」”"》]/gu;
+const STATUS_LEAD = /^(?:(?:请问|请|麻烦|帮我|帮忙|想知道|确认|核实|核对|查看|检查|查询|查|看看)(?:一下|下)?[\s，,：:]*|(?:在)?(?:HomeAgent(?:\s*的?\s*知识库)?|知识库|本群|当前群|当前空间)(?:中|里)?[\s，,：:]*)+/iu;
 const DATE = /\b(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?/gu;
 const REQUEST_WORDS = /\bRaw\s*ID\b|\bRaw\b|HomeAgent|只使用|仅使用|只用|仅用|已(?:经)?(?:入库|收录|保存)|知识库(?:中|里|内)?|查找|查询|检索|查阅|查一下|找一下|找出|帮我找|核验|摘录|给出|提供|看看|请|原始记录|原始消息|聊天记录|原文|原话|消息时间|对应|关于|相关|记录|关键词\s*[:：]?|的/giu;
 
@@ -12,11 +13,50 @@ export interface RawQueryPlan {
   phrases: string[];
   filters: RawSearchFilters;
   conditions: string[];
+  storageTopic?: string;
 }
 
 function localDay(now: number): number { return Math.floor((now + SHANGHAI_OFFSET) / DAY) * DAY - SHANGHAI_OFFSET; }
 function dateLabel(at: number): string { return new Date(at + SHANGHAI_OFFSET).toISOString().slice(0, 10); }
 function maskQuoted(text: string): string { return text.replace(QUOTED, value => " ".repeat(value.length)); }
+
+const BODY_QUALIFIER = /(?:的)?(?:完整正文|完整内容|全文|正文)$/u;
+
+/** A pronoun needs a reply identity or an actual title before it can be searched. */
+export function isReplyRawStatusTopic(topic: string | undefined): boolean {
+  return !!topic && /^(?:[这那该](?:个|条|份|篇|则|本)?(?:工作周报|周报|日报|报告|文档|资料|文章|文件|附件|消息|内容)?|它|刚才|上面|全文|正文)$/u.test(topic);
+}
+
+/** Extract the subject of a storage-status question, keeping quoted title dates literal. */
+export function storedRawStatusTopic(text: string): string | undefined {
+  if (!/收录|入库|保存|记录|记下/u.test(text)) return undefined;
+  const request = text.trim().replace(/^(?:@\S+\s+)+/u, "");
+  const titles: string[] = [];
+  const outside = request.replace(QUOTED, title => {
+    titles.push(title);
+    return "";
+  }).trim();
+  const wording = outside.replace(STATUS_LEAD, "");
+  const status = [...wording.matchAll(/(?:(是否|是不是|有没(?:有)?)\s*)?(?:(已(?:经)?)\s*)?(?:被\s*(?:HomeAgent\s*)?)?(收录|入库|保存(?:下来)?|记录(?:下来|下)?|记下(?:来)?)(过|了)?/giu)].at(-1);
+  if (!status) return undefined;
+  const suffix = wording.slice(status.index + status[0].length).trim();
+  const ending = suffix.match(/(了)?(吗|么|没(?:有)?)?[？?。.!！]*$/u)!;
+  const [, whether, already, action, aspect] = status;
+  const [, completed, particle] = ending;
+  if (!whether && !(particle && (already || aspect || completed || particle.startsWith("没")))) return undefined;
+  const before = wording.slice(0, status.index).trim();
+  const after = suffix.slice(0, ending.index).trim();
+  const destination = /^(?:到|进|在|至)\s*(?:HomeAgent(?:\s*的?\s*知识库)?|知识库)(?:里|中)?$/iu.test(after);
+  if (after && !destination && (before || titles.length || /^(?:到|进|在|至)/u.test(after))) return undefined;
+  if (titles.length) return before.replace(BODY_QUALIFIER, "").trim() ? undefined : titles.join(" ");
+  const subject = before || (destination ? "" : after);
+  if (/[\n，,。！？?；;]|怎么|如何|为什么|如果|先.+再/u.test(subject)) return undefined;
+  // An unqualified file-save question may refer to a Workdir or another application.
+  if (action!.startsWith("保存") && !destination && !/HomeAgent|知识库|本群|当前群|当前空间/iu.test(outside)
+    && !/^(?:这|那|该)(?:个|份|篇)?(?:工作周报|周报|日报|报告|资料|文章)(?:的全文|的正文)?$/u.test(subject)) return undefined;
+  return subject.replace(BODY_QUALIFIER, "").trim() || subject || "这条";
+}
+
 function erase(text: string, at: number, length: number): string { return text.slice(0, at) + " ".repeat(length) + text.slice(at + length); }
 function quotedRanges(text: string): Array<{ start: number; end: number }> {
   return [...text.matchAll(QUOTED)].map(match => ({ start: match.index, end: match.index + match[0].length }));
@@ -42,7 +82,8 @@ function count(value: string): number {
 
 /** Deterministic, local-only planning; filters come solely from this user's query. */
 export function planRawQuery(question: string, now = Date.now()): RawQueryPlan {
-  let text = question;
+  const statusTopic = storedRawStatusTopic(question);
+  let text = statusTopic ?? question;
   const filters: RawSearchFilters = {};
   const conditions: string[] = [];
   const selector = (labels: string, accept: (value: string) => void) => {
@@ -136,5 +177,5 @@ export function planRawQuery(question: string, now = Date.now()): RawQueryPlan {
   if (filters.chatId || filters.chatName) conditions.push(`来源群：${filters.chatId ?? filters.chatName}`);
   if (filters.fileName) conditions.push(`文件名：${filters.fileName}`);
   if (filters.source) conditions.push(`来源类型：${filters.source}`);
-  return { query, phrases: phrases.length > 0 ? phrases : query.split(" ").filter(Boolean), filters, conditions };
+  return { query, phrases: phrases.length > 0 ? phrases : query.split(" ").filter(Boolean), filters, conditions, storageTopic: statusTopic };
 }
