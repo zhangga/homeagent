@@ -20,6 +20,16 @@ describe("Raw query planning", () => {
     expect(planRawQuery("工作周报入库了吗？", now).query).toBe("工作周报");
     expect(planRawQuery("HomeAgent 收录工作周报了吗？", now).query).toBe("工作周报");
   });
+  test("uses the document URL as a literal topic before or after a status check", () => {
+    const url = "https://example.feishu.cn/docx/xingqiao?from=share_link&date=2026-11-23";
+    for (const input of [url + " 是否已收录？", "这个文档收录了吗？\n" + url,
+      "查一下这个文档是否已收录 " + url, "《星桥周报》是否已收录？\n[打开周报](" + url + ")"]) {
+      expect(planRawQuery(input, now)).toMatchObject({ query: url, filters: {}, storageTopic: url });
+    }
+    for (const input of [url, "请把这个文档收录：" + url, "这个文档没收录就保存 " + url]) {
+      expect(storedRawStatusTopic(input)).toBeUndefined();
+    }
+  });
   test("plans natural last-week author queries without keeping instruction words as keywords", () => {
     const plan = planRawQuery("在知识库找一下上周小王说过的发布结论", now);
     expect(plan.query).toBe("发布结论");

@@ -23,10 +23,11 @@ jobs:
           - ubuntu-24.04
           - macos-15
     runs-on: ${{ matrix.os }}
-    env:
-      CLANG_MODULE_CACHE_PATH: ${{ runner.temp }}/homeagent-clang-cache
-      SWIFT_MODULECACHE_PATH: ${{ runner.temp }}/homeagent-swift-cache
     steps:
+      - name: Configure compiler module caches
+        run: |
+          echo "CLANG_MODULE_CACHE_PATH=$RUNNER_TEMP/homeagent-clang-cache" >> "$GITHUB_ENV"
+          echo "SWIFT_MODULECACHE_PATH=$RUNNER_TEMP/homeagent-swift-cache" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:

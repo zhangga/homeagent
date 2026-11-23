@@ -31,8 +31,12 @@ export function isReplyRawStatusTopic(topic: string | undefined): boolean {
 export function storedRawStatusTopic(text: string): string | undefined {
   if (!/收录|入库|保存|记录|记下/u.test(text)) return undefined;
   const request = text.trim().replace(/^(?:@\S+\s+)+/u, "");
+  // In a pasted question the source is often on the next line or after a colon.
+  // Parse the surrounding instruction first so an explicit save still runs.
+  const trailingLink = request.match(/(?:^|[\s：:，,？?。])(?:\[[^\]\n]*\]\()?(https?:\/\/[^\s<>()\[\]{}"'，。！？；：、]+)\)?[。！？]*$/iu);
+  const instruction = trailingLink ? request.slice(0, trailingLink.index).replace(/[\s：:，,]+$/u, "") : request;
   const titles: string[] = [];
-  const outside = request.replace(QUOTED, title => {
+  const outside = instruction.replace(QUOTED, title => {
     titles.push(title);
     return "";
   }).trim();
@@ -48,13 +52,15 @@ export function storedRawStatusTopic(text: string): string | undefined {
   const after = suffix.slice(0, ending.index).trim();
   const destination = /^(?:到|进|在|至)\s*(?:HomeAgent(?:\s*的?\s*知识库)?|知识库)(?:里|中)?$/iu.test(after);
   if (after && !destination && (before || titles.length || /^(?:到|进|在|至)/u.test(after))) return undefined;
-  if (titles.length) return before.replace(BODY_QUALIFIER, "").trim() ? undefined : titles.join(" ");
+  if (titles.length) return before.replace(BODY_QUALIFIER, "").trim() ? undefined : trailingLink?.[1] ?? titles.join(" ");
   const subject = before || (destination ? "" : after);
-  if (/[\n，,。！？?；;]|怎么|如何|为什么|如果|先.+再/u.test(subject)) return undefined;
+  // A shared document's URL can contain its own question mark or punctuation.
+  const prose = subject.replace(/https?:\/\/[^\s<>「」《》“”，。！？；]+/giu, "");
+  if (/[\n，,。！？?；;]|怎么|如何|为什么|如果|先.+再/u.test(prose)) return undefined;
   // An unqualified file-save question may refer to a Workdir or another application.
   if (action!.startsWith("保存") && !destination && !/HomeAgent|知识库|本群|当前群|当前空间/iu.test(outside)
     && !/^(?:这|那|该)(?:个|份|篇)?(?:工作周报|周报|日报|报告|资料|文章)(?:的全文|的正文)?$/u.test(subject)) return undefined;
-  return subject.replace(BODY_QUALIFIER, "").trim() || subject || "这条";
+  return trailingLink?.[1] ?? (subject.replace(BODY_QUALIFIER, "").trim() || subject || "这条");
 }
 
 function erase(text: string, at: number, length: number): string { return text.slice(0, at) + " ".repeat(length) + text.slice(at + length); }
@@ -83,6 +89,10 @@ function count(value: string): number {
 /** Deterministic, local-only planning; filters come solely from this user's query. */
 export function planRawQuery(question: string, now = Date.now()): RawQueryPlan {
   const statusTopic = storedRawStatusTopic(question);
+  if (statusTopic && /^https?:\/\/\S+$/iu.test(statusTopic)) {
+    const query = statusTopic.slice(0, 4000);
+    return { query, phrases: [query], filters: {}, conditions: [], storageTopic: statusTopic };
+  }
   let text = statusTopic ?? question;
   const filters: RawSearchFilters = {};
   const conditions: string[] = [];

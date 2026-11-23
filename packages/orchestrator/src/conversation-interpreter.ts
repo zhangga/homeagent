@@ -8,6 +8,8 @@
  * control commands.
  */
 
+import { storedRawStatusTopic } from "@homeagent/core";
+
 export type ConversationDisposition = "conversation" | "remember" | "chitchat";
 export type KnowledgeControl = "redistill";
 
@@ -62,6 +64,7 @@ export function normalizeConversationText(text: string): string {
 export function prefilterQuestion(text: string): boolean {
   const normalized = normalizeConversationText(text);
   if (/[?？]/u.test(normalized)) return true;
+  if (storedRawStatusTopic(normalized) !== undefined) return true;
 
   const compact = normalized
     .toLowerCase()

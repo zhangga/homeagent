@@ -115,7 +115,7 @@ export async function askStoredRaw(stores: SpaceStore[], question: string, clien
   const queues = reply ? [reply.records] : stores.map(store => {
     const raws = store.index().searchRaw(terms.query, MAX_RAW_CANDIDATES, plan.filters);
     if (!checkingStatus) return raws;
-    // Incoming questions are themselves captured as messages before lookup, including earlier checks.
+    // Older installations and imported chat histories can include previous status checks.
     const title = titleKey(terms.query);
     return raws.filter(raw => isStatusEvidence(raw) && hasBodyBeyondTitle(sourceText(raw).content, title));
   });

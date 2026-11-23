@@ -289,6 +289,10 @@ function hasMessageImages(messageType: string | undefined, text: string | undefi
   return messageType === "image" || (messageType === "post" && text !== undefined && containsInlineImage(text));
 }
 
+function isFileMessage(messageType: string | undefined): boolean {
+  return messageType === "file" || messageType === "audio" || messageType === "media";
+}
+
 export interface RuntimeOptions {
   /** Wake the existing continuation scheduler after durable plan delivery. */
   onWorkPlanReady?: (workItemId: string) => void;
@@ -825,7 +829,7 @@ export class Orchestrator {
         messageType: sourceInput?.message.messageType,
         parentMessageId: sourceInput?.message.parentMessageId,
         mentionsBot: true,
-        createdAt: previous.startedAt,
+        createdAt: sourceInput?.message.createdAt ?? previous.startedAt,
         ...this.topicMessageIdentity(previous.id),
       };
 
@@ -1274,7 +1278,9 @@ export class Orchestrator {
     let capturedMessageRawId: string | undefined;
     let sourceSync: SourceSyncResult = { attempted: 0, succeeded: 0 };
     const captureInputs = async (): Promise<void> => {
-      if (inputsCaptured) return;
+      // A status check is already journaled in WorkInput. Its message, links and
+      // attachments must not become evidence for the very question being asked.
+      if (inputsCaptured || storedRawStatusTopic(msg.text) !== undefined) return;
       inputsCaptured = true;
 
       // Always capture (收录 != 应答).
@@ -1302,7 +1308,7 @@ export class Orchestrator {
 
       if (
         decision.capture
-        && (hasMessageImages(msg.messageType, msg.text) || ["file", "audio", "media"].includes(msg.messageType ?? ""))
+        && (hasMessageImages(msg.messageType, msg.text) || isFileMessage(msg.messageType))
         && this.attachmentDownloader
         && (msg.messageType === "post" || !existingMessageRaws.some((raw) =>
           raw.attachments?.some((attachment) => attachment.sourceDigest)
@@ -1321,7 +1327,7 @@ export class Orchestrator {
         try {
           const target = await this.connector.resolveReplyTarget(msg.messageId);
           if (
-            target && (hasMessageImages(target.messageType, target.text) || ["file", "audio", "media"].includes(target.messageType ?? ""))
+            target && (hasMessageImages(target.messageType, target.text) || isFileMessage(target.messageType))
             && !this.messageWasRetracted(writeSpace, msg.chatId, target.messageId)
           ) {
             const alreadyStored = this.engine.registry.store(writeSpace).index()
@@ -1549,7 +1555,10 @@ export class Orchestrator {
     response: WorkInput["response"], signal: AbortSignal): Promise<void> {
     if (signal.aborted) return Promise.reject(signal.reason);
     if (response?.kind === "static") return this.completeChatRunAndSend(msg, runId, response.text);
-    if (response?.kind === "remember") return this.completeRememberChatRun(msg, space, runId, response.text, signal);
+    // Older queued inputs may have classified a punctuation-free check as a save.
+    if (response?.kind === "remember" && storedRawStatusTopic(msg.text) === undefined) {
+      return this.completeRememberChatRun(msg, space, runId, response.text, signal);
+    }
     if (response?.kind === "work-plan" || response?.kind === "work-replan") return this.planChatWork(msg, space, runId, response, signal);
     return this.answer(msg, attribute(msg).readSpaces, space, runId,
       response?.kind === "answer" ? response.question : interpretConversation(msg.text).text, signal);
@@ -2025,8 +2034,10 @@ export class Orchestrator {
       }
     };
     assertActive();
-    if (hasMessageImages(msg.messageType, msg.text) || (!msg.messageType && containsInlineImage(msg.text))) {
-      await this.completeChatRunAndSend(msg, runId, this.imageCaptureNotice(space, msg.chatId, msg.messageId));
+    const imageMessage = hasMessageImages(msg.messageType, msg.text) || (!msg.messageType && containsInlineImage(msg.text));
+    if (imageMessage || isFileMessage(msg.messageType)) {
+      const receipt = this.attachmentCaptureNotice(space, msg.chatId, msg.messageId, imageMessage ? "image" : "file");
+      await this.completeChatRunAndSend(msg, runId, receipt);
       return;
     }
     let target;
@@ -2040,11 +2051,12 @@ export class Orchestrator {
     if (targetId && targetId !== msg.messageId) {
       if (this.messageWasRetracted(space, msg.chatId, targetId)) {
         notice = "被回复的消息已撤回，未收录其正文。";
+      } else if (isFileMessage(target?.messageType)) {
+        notice = this.attachmentCaptureNotice(space, msg.chatId, targetId, "file");
       } else {
         const index = this.engine.registry.store(space).index();
         const existing = index.findRawsByMessageId(targetId, msg.chatId);
-        const body = target?.messageType && ["image", "file", "audio", "media"].includes(target.messageType)
-          ? undefined : target?.text;
+        const body = target?.messageType === "image" ? undefined : target?.text;
         if (body?.trim() && !target?.textTruncated && body.length <= MAX_MATERIAL_BYTES) {
           const parts = messageRawParts(body);
           try {
@@ -2082,11 +2094,11 @@ export class Orchestrator {
             : "被回复消息的正文未完成收录。";
         } else if (!target && existing.some(raw => raw.source === "message" && raw.admission === "ready")) {
           notice = "当前空间已有被回复消息的收录记录；本轮未能重新取得完整正文。";
-        } else if (!target?.messageType || !["image", "file", "audio", "media"].includes(target.messageType) || target.textTruncated) {
+        } else if (target?.messageType !== "image" || target.textTruncated) {
           notice = "未取得被回复消息的完整正文，尚未收录该正文。";
         }
         if (hasMessageImages(target?.messageType, target?.text)) {
-          const imageNotice = this.imageCaptureNotice(space, msg.chatId, targetId);
+          const imageNotice = this.attachmentCaptureNotice(space, msg.chatId, targetId, "image");
           notice = target?.messageType === "image" ? imageNotice : `${notice}\n\n${imageNotice}`;
         }
       }
@@ -2094,21 +2106,25 @@ export class Orchestrator {
     await this.completeChatRunAndSend(msg, runId, notice);
   }
 
-  private imageCaptureNotice(space: SpaceId, chatId: string, messageId: string): string {
+  private attachmentCaptureNotice(space: SpaceId, chatId: string, messageId: string, kind: "image" | "file"): string {
     const originals = new Set<string>();
     const extracted = new Set<string>();
     for (const raw of this.engine.registry.store(space).index().findRawsByMessageId(messageId, chatId)) {
       if (raw.admission !== "ready") continue;
       for (const attachment of raw.attachments ?? []) {
-        if (attachment.kind !== "image" || !attachment.sourceDigest) continue;
+        const attachmentKind = attachment.kind === "image" ? "image" : "file";
+        if (attachmentKind !== kind || !attachment.sourceDigest) continue;
         originals.add(attachment.ref);
         if (!raw.content.endsWith(`\n\n${ATTACHMENT_WITHOUT_TEXT}`)) extracted.add(attachment.ref);
       }
     }
-    if (originals.size === 0) return "未收录图片原件，也未提取到图片文字。";
-    if (extracted.size === 0) return `已保存 ${originals.size} 张图片原件，未能提取可检索的文字。`;
-    if (extracted.size === originals.size) return `已收录 ${originals.size} 张图片的原件和识别文字，可查询已入库原文。`;
-    return `已保存 ${originals.size} 张图片原件，其中 ${extracted.size} 张提取到了可检索的文字。`;
+    const image = kind === "image";
+    if (originals.size === 0) return image ? "未收录图片原件，也未提取到图片文字。" : "未保存附件原件，也未提取到可检索的正文。";
+    const unit = image ? "张" : "个";
+    const label = `${originals.size} ${unit}${image ? "图片" : "附件"}`;
+    if (extracted.size === 0) return `已保存 ${label}原件，未能提取可检索的文字。`;
+    if (extracted.size === originals.size) return `已收录 ${label}的原件和${image ? "识别文字" : "正文"}，可查询已入库原文。`;
+    return `已保存 ${label}原件，其中 ${extracted.size} ${unit}提取到了可检索的文字。`;
   }
 
   private async completeChatRunAndSend(
@@ -2320,8 +2336,8 @@ export class Orchestrator {
             retrievalQuestion: userText,
             rawReplyTarget: context.rawReplyTarget,
             referenceTime: run.rawId
-              ? this.engine.registry.store(writeSpace).index().getRaw(run.rawId)?.createdAt ?? run.startedAt
-              : run.startedAt,
+              ? this.engine.registry.store(writeSpace).index().getRaw(run.rawId)?.createdAt ?? msg.createdAt
+              : msg.createdAt,
             images: context.images.map((image) => ({ path: image.localPath })),
             fallbackContext: context.sourceContext ? "message-source" : undefined,
             signal,
@@ -2467,7 +2483,9 @@ export class Orchestrator {
     writeSpace: SpaceId,
     allowRecentSourceFallback = true,
   ): Promise<ConversationContext> {
-    const checkReply = isReplyRawStatusTopic(storedRawStatusTopic(userText));
+    const statusTopic = storedRawStatusTopic(userText);
+    const checkReply = isReplyRawStatusTopic(statusTopic);
+    if (statusTopic !== undefined && !checkReply) return { text: userText, images: [] };
     const currentSourceParts = checkReply ? [] : this.storedReplySourceText(
       writeSpace,
       msg.chatId,

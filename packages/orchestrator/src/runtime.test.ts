@@ -267,7 +267,100 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(reply).not.toContain("入库未完成");
   });
 
-  test("relative retrieval dates use the original message time rather than the later execution time", async () => {
+  test("a punctuation-free reply check never saves the question or quoted material, even on redelivery", async () => {
+    const space = "personal/ou_me";
+    engine.ensureSpace(space);
+    const parent = "om_unstored_report";
+    const body = "星桥工作周报\n本周完成联调。\n【图片】";
+    (connector as Connector).resolveReplyTarget = async () => ({ messageId: parent, messageType: "post", text: body });
+    const downloads: string[] = [];
+    orch = new Orchestrator({ engine, connector, llm: fake, attachmentDownloader: async messageId => {
+      downloads.push(messageId);
+      return [];
+    } });
+    await orch.start();
+    const message = { kind: "message" as const, eventId: "evt_check", chatType: "p2p" as const, chatId: "oc_dm",
+      senderId: "ou_me", messageId: "om_check", parentMessageId: parent, text: "收录这份资料了没", mentionsBot: false, createdAt: 100 };
+    await connector.inject(message);
+    await connector.inject({ ...message, eventId: "evt_check_redelivery" });
+    expect(connector.sent).toHaveLength(1);
+    expect(connector.sent[0]!.markdown).toContain("未找到能核验");
+    expect(engine.registry.store(space).index().listRaw({})).toEqual([]);
+    expect(downloads).toEqual([]);
+    const runs = engine.chatRuns.list(space);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.delivery.status).toBe("sent");
+    expect(runs[0]?.rawId).toBeUndefined();
+    expect(engine.workDispatch.summaries(space)).toHaveLength(1);
+
+    await connector.inject({ ...message, eventId: "evt_save", messageId: "om_save", text: "记录下来" });
+    expect(connector.sent.at(-1)?.markdown).toContain("已记下被回复消息的正文");
+    expect(engine.registry.store(space).index().findRawsByMessageId(parent, "oc_dm").map(raw => raw.content)).toContain(body);
+  });
+
+  test("a recovered legacy save plan for a status question only checks the quoted message", async () => {
+    const space = "personal/ou_me";
+    engine.ensureSpace(space);
+    const msg = { kind: "message" as const, eventId: "evt_legacy_check", chatType: "p2p" as const, chatId: "oc_dm",
+      senderId: "ou_me", messageId: "om_legacy_check", parentMessageId: "om_report", text: "收录这份资料了没", mentionsBot: false, createdAt: 100 };
+    const input = engine.workDispatch.accept({ connector: "cli", space, message: msg });
+    engine.workDispatch.update(input.id, input.revision, { state: "planned", operation: "chat",
+      plan: { space, input: msg.text, chatId: msg.chatId, messageId: msg.messageId, author: msg.senderId, trigger: "message",
+        executionPlan: engine.agentRunExecutionSnapshot(space).executionPlan, dispatchKey: input.id, launchAdmission: "pending" },
+      response: { kind: "remember", text: "好的，我记下了。" } });
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
+    (connector as Connector).resolveReplyTarget = async () => ({ messageId: "om_report", text: "验收周报\n本周联调完毕。" });
+    orch = new Orchestrator({ engine, connector, llm: fake });
+    await orch.start();
+    await connector.inject(msg);
+    expect(connector.sent).toHaveLength(1);
+    expect(connector.sent[0]!.markdown).toContain("未找到能核验");
+    expect(engine.registry.store(space).index().listRaw({})).toEqual([]);
+    expect(engine.workDispatch.get(input.id)?.state).toBe("settled");
+  });
+
+  test("checking a Feishu document link only reads existing Raw and sharing the link still captures it", async () => {
+    const space = "personal/ou_me";
+    const url = "https://example.feishu.cn/docx/xingqiao?from=share_link";
+    const passage = "本周完成两个版本的联调。";
+    const fetched: string[] = [];
+    (connector as Connector).resolveReplyTarget = async () => ({ messageId: "om_other", messageType: "image", text: "【图片】" });
+    const downloads: string[] = [];
+    fake.onJSON(call => {
+      if (!call.prompt?.includes("已入库 Raw 候选（JSON 数据）：\n")) return { relevant: false, slugs: [] };
+      const rows: { key: string; content: string }[] = JSON.parse(call.prompt.split("已入库 Raw 候选（JSON 数据）：\n")[1]!);
+      return { matches: rows.filter(row => row.content.includes(passage)).map(row => ({ key: row.key, quote: passage })) };
+    });
+    orch = new Orchestrator({ engine, connector, llm: fake, docFetcher: async link => {
+      fetched.push(link);
+      return "# 星桥工作周报\n" + passage;
+    }, attachmentDownloader: async messageId => { downloads.push(messageId); return []; } });
+    await orch.start();
+    const send = (id: string, text: string) => connector.inject({ kind: "message", eventId: id, chatType: "p2p", chatId: "oc_dm",
+      senderId: "ou_me", messageId: id, parentMessageId: "om_other", docLinks: [url], text, mentionsBot: false, createdAt: Date.now() });
+    await send("om_empty_check", "这个文档收录了吗？\n" + url);
+    expect(connector.sent.at(-1)?.markdown).toContain("未找到能核验");
+    expect(fetched).toEqual([]);
+    expect(downloads).toEqual([]);
+    if (engine.registry.has(space)) expect(engine.registry.store(space).index().listRaw({})).toEqual([]);
+
+    await send("om_share", url);
+    const index = engine.registry.store(space).index();
+    const shared = index.findRawsByMessageId("om_share", "oc_dm");
+    expect(shared.some(raw => raw.source === "message")).toBe(true);
+    const doc = shared.find(raw => raw.source === "doc")!;
+    expect(doc.content).toContain(passage);
+    await send("om_second_check", "查一下这个文档是否已收录 " + url);
+    expect(connector.sent.at(-1)?.markdown).toContain(doc.id);
+    expect(fetched).toEqual([url]);
+    expect(index.listRaw({})).toHaveLength(shared.length);
+  });
+
+  test.each([
+    ["在知识库找一下上周小王说过的发布结论", true],
+    ["上周的工作周报是否已收录", false],
+  ] as const)("relative retrieval dates use the original message time: %s", async (text, captured) => {
     const originalTime = Date.parse("2026-10-18T12:00:00+08:00");
     let referenceTime: number | undefined;
     engine.askWithExecutionPlan = async (_spaces, _question, _plan, _evidence, opts) => {
@@ -276,9 +369,10 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     };
     await orch.start();
     await connector.inject({ kind: "message", eventId: "relative-raw-time", chatType: "group", chatId: "oc_team", senderId: "ou_me",
-      text: "在知识库找一下上周小王说过的发布结论", messageId: "om_relative_raw", mentionsBot: true, createdAt: originalTime });
+      text, messageId: "om_relative_raw", mentionsBot: true, createdAt: originalTime });
     expect(referenceTime).toBe(originalTime);
-    expect(engine.registry.store("team/oc_team").index().findRawsByMessageId("om_relative_raw", "oc_team")[0]?.createdAt).toBe(originalTime);
+    if (captured) expect(engine.registry.store("team/oc_team").index().findRawsByMessageId("om_relative_raw", "oc_team")[0]?.createdAt).toBe(originalTime);
+    else expect(engine.chatRuns.list("team/oc_team")[0]?.rawId).toBeUndefined();
     expect(connector.sent.at(-1)?.markdown).toContain("查到已入库原文");
   });
   test("card callbacks are dispatched once without message capture or model invocation", async () => {
@@ -5203,6 +5297,61 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     const stored = engine.getRawSource("team/oc_team", raw!.id, 0);
     expect(new Uint8Array(await Bun.file(stored!.path).arrayBuffer())).toEqual(original);
     expect(existsSync(attachmentDir)).toBe(false);
+    expect(connector.sent.at(-1)?.markdown).toContain("已保存 1 个附件原件，未能提取可检索的文字");
+  });
+
+  test("replying to save a PDF reports download failure, then acknowledges the saved original on retry", async () => {
+    const space = "personal/ou_me";
+    const messageId = "om_report_pdf";
+    const attachment = { kind: "pdf" as const, ref: "file_report", name: "验收报告.pdf" };
+    const localPath = join(dir, "report.pdf");
+    writeFileSync(localPath, "report fixture");
+    await engine.remember({ space, source: "message", chatId: "oc_dm", messageId,
+      content: "【文件：验收报告.pdf】", attachments: [attachment] });
+    (connector as Connector).resolveReplyTarget = async () => ({
+      messageId, messageType: "file", text: "【文件：验收报告.pdf】",
+    });
+    let attempts = 0;
+    orch = new Orchestrator({
+      engine, connector, llm: fake,
+      attachmentDownloader: async id => {
+        expect(id).toBe(messageId);
+        return ++attempts === 1 ? [] : [{ attachment, localPath, sizeBytes: 14, cleanup() {} }];
+      },
+      attachmentExtractor: async () => "本周已完成验收。",
+    });
+    await orch.start();
+    const save = (id: string) => connector.inject({
+      kind: "message", eventId: id, chatType: "p2p", chatId: "oc_dm", senderId: "ou_me",
+      messageId: id, parentMessageId: messageId, messageType: "text", text: "保存这份附件", mentionsBot: false, createdAt: Date.now(),
+    });
+    const saved = () => engine.registry.store(space).index().findRawsByMessageId(messageId, "oc_dm")
+      .filter(raw => raw.attachments?.some(file => file.sourceDigest));
+    await save("om_missing");
+    expect(saved()).toHaveLength(0);
+    expect(connector.sent.at(-1)?.markdown).toContain("未保存附件原件");
+    await save("om_retry");
+    expect(saved()).toHaveLength(1);
+    expect(await Bun.file(engine.getRawSource(space, saved()[0]!.id, 0)!.path).text()).toBe("report fixture");
+    expect(connector.sent.at(-1)?.markdown).toContain("已收录 1 个附件的原件和正文");
+    await save("om_repeat");
+    expect(attempts).toBe(2);
+    expect(saved()).toHaveLength(1);
+    expect(connector.sent.at(-1)?.markdown).toContain("已收录 1 个附件的原件和正文");
+  });
+
+  test.each(["file", "audio", "media"])("a direct %s capture reports the missing original", async messageType => {
+    orch = new Orchestrator({ engine, connector, llm: fake, attachmentDownloader: async () => [] });
+    await orch.start();
+    await connector.inject({
+      kind: "message", eventId: "direct-attachment", chatType: "p2p", chatId: "oc_dm", senderId: "ou_me",
+      messageId: "om_direct", messageType, text: "保存这份附件", mentionsBot: false, createdAt: Date.now(),
+    });
+    const raws = engine.registry.store("personal/ou_me").index().findRawsByMessageId("om_direct", "oc_dm");
+    expect(raws).toHaveLength(1);
+    expect(raws[0]?.content).toBe("保存这份附件");
+    expect(raws[0]?.attachments).toEqual([]);
+    expect(connector.sent.at(-1)?.markdown).toContain("未保存附件原件");
   });
 
   test("attachment download failure leaves the original message captured", async () => {
