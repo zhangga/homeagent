@@ -2,7 +2,7 @@
  * Local agent-CLI providers (mew's "provider" concept, adapted to a single
  * machine). mew routes a task to a provider running on some Device; homeagent
  * has no remote devices, so a "provider" here is an agent CLI installed on THIS
- * machine (claude / codex / trae-cli). This module is the single choke point for
+ * machine (claude / codex / agy / trae-cli). This module is the single choke point for
  * all CLI provider traffic — like gateway.ts is for the network gateway.
  *
  * Two responsibilities:
@@ -57,10 +57,10 @@ import { createSkillLoader, type SkillLoader } from "./skill-loader.ts";
 const log = logger.child("providers");
 
 /** Stable provider ids. "gateway" is the built-in network provider (elsewhere). */
-export type ProviderId = "gateway" | "claude" | "codex" | "trae-cli";
+export type ProviderId = "gateway" | "claude" | "codex" | "agy" | "trae-cli";
 
 export type UsageCostBasis = "reported" | "estimated" | "unavailable";
-export type UsageSource = "claude-json" | "codex-jsonl" | "trae-text" | "gateway" | "legacy-text";
+export type UsageSource = "claude-json" | "codex-jsonl" | "agy-jsonl" | "trae-text" | "gateway" | "legacy-text";
 
 /** Provider usage counters preserve provenance and leave unavailable values absent. */
 export interface CompletionUsage {
@@ -184,7 +184,7 @@ interface CliSpec {
   /** binary looked up on PATH */
   bin: string;
   /** managed-install override used by the standalone desktop application */
-  envBin: "CODEX_BIN" | "CLAUDE_BIN" | "TRAE_BIN";
+  envBin: "CODEX_BIN" | "CLAUDE_BIN" | "AGY_BIN" | "TRAE_BIN";
   /** args that print a version quickly and exit */
   versionArgs: string[];
   /** curated model ids this provider commonly offers (mew shows these per-provider) */
@@ -310,7 +310,7 @@ export function providerSkillReference(
 ): string | undefined {
   const normalized = normalizeProviderSkills([skill])[0];
   if (!normalized) return undefined;
-  if (id === "claude") return `/${normalized}`;
+  if (id === "claude" || id === "agy") return `/${normalized}`;
   if (id === "codex") return `$${normalized}`;
   if (id === "trae-cli") return normalized;
   return undefined;
@@ -1198,6 +1198,7 @@ export interface DetectedProvider {
  * The fixed set of known local agent CLIs (per product decision). Invocation
  * modes are verified against the installed CLIs:
  *   - claude   : `claude -p "<prompt>" [--model m] [--append-system-prompt s]`
+ *   - agy      : `agy --input-format stream-json --output-format stream-json [--model m]`
  *   - trae-cli : `trae-cli exec "<prompt>" [-m model]`
  *   - codex    : `codex exec "<prompt>" [-m model]` (Codex CLI non-interactive)
  */
@@ -1385,6 +1386,53 @@ const KNOWN: CliSpec[] = [
       // than through Windows' lossy npm .cmd argument forwarding.
       if (nativeSession?.mode === "fork") args.push("fork", nativeSession.id, "-");
       else args.push("--", "-");
+      return args;
+    },
+  },
+  {
+    id: "agy",
+    name: "Antigravity CLI",
+    bin: "agy",
+    envBin: "AGY_BIN",
+    versionArgs: ["--version"],
+    models: [
+      "gemini-4-neon-medium",
+      "gemini-4-neon-high",
+      "gemini-4-neon-xhigh",
+      "gemini-4-neon-low",
+      "gemini-4-carbon-high",
+      "gemini-4-carbon-medium",
+      "gemini-4-carbon-low",
+      "gemini-4-hydrogen-medium",
+      "gemini-4-hydrogen-high",
+      "gemini-4-hydrogen-xhigh",
+      "gemini-4-hydrogen-low",
+      "gemini-pro-orchestrator-neon",
+      "gemini-pro-orchestrator",
+      "gemini-3.7-flash-high",
+      "gemini-3.7-flash-medium",
+      "gemini-3.1-pro-high",
+    ],
+    buildRun: ({ model, execution, outputSchemaPath }) => {
+      // Headless stream-json sends the prompt over stdin so message bodies
+      // never enter argv and real-time step/tool progress plus usage stay
+      // machine-readable across platforms.
+      const args = [
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--disable-slash-commands",
+      ];
+      if (!execution || execution.permission === "read-only") {
+        args.push("--mode", "plan", "--sandbox");
+      } else if (execution.permission === "write") {
+        args.push("--mode", "accept-edits", "--sandbox");
+      } else {
+        args.push("--dangerously-skip-permissions");
+      }
+      if (model) args.push("--model", model);
+      if (outputSchemaPath) args.push("--json-schema", outputSchemaPath);
       return args;
     },
   },
@@ -2093,6 +2141,22 @@ export async function preflightProviderNativeSession(
   }
 }
 
+/** Every Antigravity CLI flag required by headless streaming execution. */
+const AGY_ORDINARY_REQUIRED_FLAGS = [
+  "--input-format",
+  "--output-format",
+  "--disable-slash-commands",
+  "--model",
+  "--mode",
+  "--sandbox",
+  "--dangerously-skip-permissions",
+] as const;
+
+function missingAgyOrdinaryFlags(help: string): string[] {
+  const flags = new Set(help.match(/--?[a-zA-Z][a-zA-Z0-9-]*/gu) ?? []);
+  return AGY_ORDINARY_REQUIRED_FLAGS.filter((flag) => !flags.has(flag));
+}
+
 function missingClaudeOrdinaryFlags(help: string): string[] {
   const flags = new Set(help.match(/--?[a-zA-Z][a-zA-Z0-9-]*/gu) ?? []);
   return CLAUDE_ORDINARY_REQUIRED_FLAGS.filter((flag) => !flags.has(flag));
@@ -2220,6 +2284,104 @@ function claudeProgressObserver(observer: NonNullable<RunInput["onProgress"]>): 
     for (const progress of parse(line)) {
       try { await observer(progress); } catch {
         log.warn("provider progress observer failed", { provider: "claude" });
+      }
+    }
+  };
+}
+
+function agyToolType(name: string): PublicRunTool["type"] {
+  if (name === "run_command" || name === "command_status" || name === "send_command_input") return "command";
+  if ([
+    "read_file",
+    "view_file",
+    "view_file_outline",
+    "view_code_item",
+    "list_dir",
+    "find_by_name",
+    "grep_search",
+  ].includes(name)) return "file-read";
+  if ([
+    "write_file",
+    "write_to_file",
+    "edit_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+  ].includes(name)) return "file-change";
+  if (name === "search_web" || name === "read_url_content" || name === "browser") return "web-search";
+  if (name.startsWith("mcp_") || name.startsWith("mcp__")) return "mcp";
+  return "other";
+}
+
+/** Only public assistant text and tool metadata cross the progress boundary. */
+export function createAgyProgressParser(): (line: string, at?: number) => ProviderProgressEvent[] {
+  const textByStep = new Map<number, string>();
+  const startedTools = new Set<number>();
+  return (line, at = Date.now()) => {
+    if (!line.trim() || line.length > 1_048_576) return [];
+    let raw: unknown;
+    try { raw = JSON.parse(line); } catch { return []; }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+    const event = raw as Record<string, unknown>;
+    if (event.event === "init") {
+      return [{ kind: "phase", at, title: "Provider 会话已建立", phase: "provider", visibility: "operator" }];
+    }
+    if (event.event === "step_update" && event.step_update && typeof event.step_update === "object" && !Array.isArray(event.step_update)) {
+      const step = event.step_update as Record<string, unknown>;
+      const stepIndex = typeof step.step_index === "number" && Number.isSafeInteger(step.step_index) ? step.step_index : -1;
+      const state = typeof step.state === "string" ? step.state : "";
+      const stepType = typeof step.step_type === "string" ? step.step_type : "";
+      if (stepType === "agent_response") {
+        const delta = typeof step.text_delta === "string" ? step.text_delta : "";
+        const previous = stepIndex >= 0 ? (textByStep.get(stepIndex) ?? "") : "";
+        const combined = (previous + delta).slice(0, 1_048_576);
+        if (state === "ACTIVE") {
+          if (stepIndex >= 0 && textByStep.size < 2_000) textByStep.set(stepIndex, combined);
+          return [];
+        }
+        if (state === "DONE") {
+          if (stepIndex >= 0) textByStep.delete(stepIndex);
+          if (combined.trim()) {
+            return [{ kind: "assistant_snapshot", at, title: "Agent 进度说明", phase: "answer", visibility: "public", delta: combined }];
+          }
+        }
+        return [];
+      }
+      if (stepType === "tool") {
+        const toolInfo = step.tool_info && typeof step.tool_info === "object" && !Array.isArray(step.tool_info)
+          ? step.tool_info as Record<string, unknown>
+          : undefined;
+        const rawName = typeof step.tool_name === "string" ? step.tool_name
+          : typeof toolInfo?.name === "string" ? toolInfo.name : "";
+        const type = agyToolType(rawName);
+        if (state === "ACTIVE") {
+          if (stepIndex >= 0 && startedTools.has(stepIndex)) return [];
+          if (stepIndex >= 0 && startedTools.size < 2_000) startedTools.add(stepIndex);
+          return [{ kind: "tool", at, title: "工具开始执行", phase: "tool", visibility: "public", tool: { type, status: "running" } }];
+        }
+        if (state === "DONE") {
+          if (stepIndex >= 0) startedTools.delete(stepIndex);
+          const failed = Boolean(toolInfo?.error);
+          return [{ kind: "tool", at, title: failed ? "工具执行失败" : "工具执行完成", phase: "tool", visibility: "public", tool: { type, status: failed ? "failed" : "completed" } }];
+        }
+      }
+      return [];
+    }
+    if (event.event === "result" && event.result && typeof event.result === "object" && !Array.isArray(event.result)) {
+      const result = event.result as Record<string, unknown>;
+      if (result.status === "SUCCESS") {
+        return [{ kind: "phase", at, title: "Provider 执行完成", phase: "provider", visibility: "public" }];
+      }
+    }
+    return [];
+  };
+}
+
+function agyProgressObserver(observer: NonNullable<RunInput["onProgress"]>): (line: string) => Promise<void> {
+  const parse = createAgyProgressParser();
+  return async line => {
+    for (const progress of parse(line)) {
+      try { await observer(progress); } catch {
+        log.warn("provider progress observer failed", { provider: "agy" });
       }
     }
   };
@@ -2511,6 +2673,44 @@ export async function detectProviders(timeoutMs = 6000, options: ProviderDetecti
           });
           continue;
         }
+        if (spec.id === "agy") {
+          let helpProbe: Awaited<ReturnType<typeof runCmd>>;
+          try {
+            helpProbe = await runCmd(bin, ["--help"], timeoutMs);
+          } catch (err) {
+            out.push({
+              ...base(spec, bin),
+              available: false,
+              detail: `普通对话能力探测失败（${String(err).slice(0, 40)}）`,
+            });
+            continue;
+          }
+          if (helpProbe.timedOut) {
+            out.push({ ...base(spec, bin), available: false, detail: "普通对话能力探测超时" });
+            continue;
+          }
+          if (helpProbe.code !== 0) {
+            out.push({
+              ...base(spec, bin),
+              available: false,
+              detail: `普通对话能力探测失败（退出码 ${helpProbe.code}）`,
+            });
+            continue;
+          }
+          const missingFlags = missingAgyOrdinaryFlags(
+            `${helpProbe.stdout}\n${helpProbe.stderr}`,
+          );
+          if (missingFlags.length > 0) {
+            out.push({
+              ...base(spec, bin),
+              available: false,
+              detail: `普通对话不可用：缺少 ${missingFlags.join("、")}`,
+            });
+            continue;
+          }
+          out.push({ ...base(spec, bin), available: true, detail: version });
+          continue;
+        }
         if (spec.id !== "claude") {
           out.push({ ...base(spec, bin), available: true, detail: version });
           continue;
@@ -2617,8 +2817,8 @@ export function isCliProvider(id: string): id is ProviderId {
 }
 
 /** True when ordinary Chat/dream/learning can run in the provider's restricted mode. */
-export function providerSupportsOrdinaryCompletion(id: string): id is "claude" | "codex" {
-  return id === "claude" || id === "codex";
+export function providerSupportsOrdinaryCompletion(id: string): id is "claude" | "codex" | "agy" {
+  return id === "claude" || id === "codex" || id === "agy";
 }
 
 /**
@@ -2820,6 +3020,45 @@ function strictCodexOutputSchema(value: unknown): unknown {
   return normalized;
 }
 
+function stageAgyOutputSchema(schema: Record<string, unknown>): {
+  schemaPath: string;
+  cleanup: () => void;
+} {
+  const serialized = JSON.stringify(schema);
+  if (Buffer.byteLength(serialized, "utf8") > MAX_CODEX_OUTPUT_SCHEMA_BYTES) {
+    throw new Error("provider output schema exceeds the supported size");
+  }
+  const directory = mkdtempSync(join(tmpdir(), "homeagent-agy-schema-"));
+  const schemaPath = join(directory, "output-schema.json");
+  try {
+    writeFileSync(schemaPath, `${serialized}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  } catch (error) {
+    try {
+      rmdirSync(directory);
+    } catch {
+      // Preserve the staging failure if best-effort cleanup also fails.
+    }
+    throw error;
+  }
+  return {
+    schemaPath,
+    cleanup: () => {
+      let failed = false;
+      try {
+        unlinkSync(schemaPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") failed = true;
+      }
+      try {
+        rmdirSync(directory);
+      } catch {
+        failed = true;
+      }
+      if (failed) log.warn("Antigravity output schema cleanup failed");
+    },
+  };
+}
+
 function stageCodexOutputSchema(schema: Record<string, unknown>): {
   schemaPath: string;
   outputPath: string;
@@ -2930,6 +3169,7 @@ export async function runProviderDetailed(
   }
   let isolationContext: CodexNativeIsolationContext | undefined;
   let stagedSchema: ReturnType<typeof stageCodexOutputSchema> | undefined;
+  let stagedAgySchema: ReturnType<typeof stageAgyOutputSchema> | undefined;
   let stagedSkillInputs: StagedProviderSkillInputs | undefined;
   const metadata: ProviderExecutionMetadata | undefined = policy ? {
     executionMode: policy.mode,
@@ -3012,6 +3252,9 @@ export async function runProviderDetailed(
     stagedSchema = id === "codex" && prepared.outputSchema
       ? stageCodexOutputSchema(prepared.outputSchema)
       : undefined;
+    stagedAgySchema = id === "agy" && prepared.outputSchema
+      ? stageAgyOutputSchema(prepared.outputSchema)
+      : undefined;
     const providerInput: PreparedRunInput = {
       ...prepared,
       nativeSkillReadRoot: stagedSkillInputs.readRoot,
@@ -3032,16 +3275,24 @@ export async function runProviderDetailed(
             outputLastMessagePath: stagedSchema.outputPath,
           }
         : {}),
+      ...(stagedAgySchema
+        ? { outputSchemaPath: stagedAgySchema.schemaPath }
+        : {}),
     };
     const args = spec.buildRun(providerInput);
     if (policy?.mode === "local-full-access") validateCodexFullAccessWorkdir(prepared);
+    const stdinPayload = id === "agy"
+      ? `${JSON.stringify({ event: "user", message: { content: prepared.prompt } })}\n`
+      : id === "claude" || id === "codex"
+        ? prepared.prompt
+        : undefined;
     const { code, stdout, stderr, timedOut, aborted, completedProcessStopped } = await runCmd(
       bin,
       args,
       timeoutMs,
       signal,
       prepared.execution?.workdir ?? prepared.workdir,
-      id === "claude" || id === "codex" ? prepared.prompt : undefined,
+      stdinPayload,
       input.acquireExecutionPermit,
       policy?.mode === "local-full-access" || stagedSkillInputs.loader ? () => {
         if (policy?.mode === "local-full-access") {
@@ -3060,7 +3311,8 @@ export async function runProviderDetailed(
       },
       input.onProgress
         ? id === "codex" ? (line) => publishCodexProgress(line, input.onProgress!)
-          : id === "claude" ? claudeProgressObserver(input.onProgress) : undefined
+          : id === "claude" ? claudeProgressObserver(input.onProgress)
+          : id === "agy" ? agyProgressObserver(input.onProgress) : undefined
         : undefined,
       prepared.larkProfile,
       id === "codex" && stagedSchema ? {
@@ -3105,7 +3357,21 @@ export async function runProviderDetailed(
           );
         }
       }
-      const detail = id === "claude" && input.onProgress ? "stream execution failed" : providerFailureDetail(stdout, stderr);
+      if (id === "agy") {
+        const parsed = parseAgyResult(stdout);
+        if (parsed) {
+          throw new ProviderRunError(
+            id,
+            `provider ${id} exited ${code}: ${input.onProgress ? (sanitizedProviderDiagnostic(stderr) ?? "stream execution failed") : providerFailureDetail(stdout, stderr)}`,
+            parsed.usage,
+          );
+        }
+      }
+      const detail = id === "claude" && input.onProgress
+        ? "stream execution failed"
+        : id === "agy" && input.onProgress
+          ? (sanitizedProviderDiagnostic(stderr) ?? "stream execution failed")
+          : providerFailureDetail(stdout, stderr);
       throw new Error(`provider ${id} exited ${code}: ${detail}`);
     }
     if (id === "claude") {
@@ -3131,6 +3397,11 @@ export async function runProviderDetailed(
         parsed ?? unavailableResult(stdout, "legacy-text"),
       );
     }
+    if (id === "agy") {
+      const parsed = parseAgyResult(stdout);
+      if (!parsed) throw new Error("provider agy did not return a final result");
+      return validateNativeSessionResult(prepared.nativeSession, parsed);
+    }
     return unavailableResult(stdout, "trae-text");
   } catch (error) {
     if (metadata && error instanceof ProviderPreparationError && error.evidence.stage === "native-session"
@@ -3139,6 +3410,7 @@ export async function runProviderDetailed(
     throw error;
   } finally {
     stagedSchema?.cleanup();
+    stagedAgySchema?.cleanup();
     isolationContext?.cleanup();
     await stagedSkillInputs?.cleanup();
     if (metadata) input.onExecutionEvidence?.({
@@ -3387,6 +3659,100 @@ function parseCodexResult(
   };
 }
 
+function parseAgyResult(stdout: string): ProviderRunResult | undefined {
+  let resultObj: Record<string, unknown> | undefined;
+  let model: string | undefined;
+  let parsedNativeSessionId: string | undefined;
+
+  for (const line of stdout.split(/\r?\n/u)) {
+    if (!line.trim() || line.length > 1_048_576) continue;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const event = raw as Record<string, unknown>;
+    if (event.event === "init") {
+      parsedNativeSessionId = nativeSessionId(event.conversation_id) ?? parsedNativeSessionId;
+      if (event.init && typeof event.init === "object" && !Array.isArray(event.init)) {
+        model = publicModelId((event.init as Record<string, unknown>).model) ?? model;
+      }
+      continue;
+    }
+    if (event.event === "result" && event.result && typeof event.result === "object" && !Array.isArray(event.result)) {
+      resultObj = event.result as Record<string, unknown>;
+      parsedNativeSessionId = nativeSessionId(resultObj.conversation_id) ?? parsedNativeSessionId;
+      model = publicModelId(resultObj.model) ?? model;
+    }
+  }
+
+  if (!resultObj) {
+    try {
+      const candidate: unknown = JSON.parse(stdout.trim());
+      if (
+        candidate
+        && typeof candidate === "object"
+        && !Array.isArray(candidate)
+        && typeof (candidate as Record<string, unknown>).status === "string"
+      ) {
+        resultObj = candidate as Record<string, unknown>;
+        parsedNativeSessionId = nativeSessionId(resultObj.conversation_id) ?? parsedNativeSessionId;
+        model = publicModelId(resultObj.model) ?? model;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
+  if (!resultObj) return undefined;
+
+  const rawUsage = resultObj.usage && typeof resultObj.usage === "object" && !Array.isArray(resultObj.usage)
+    ? resultObj.usage as Record<string, unknown>
+    : {};
+  const usage: CompletionUsage = {
+    inputTokens: nonNegativeNumber(rawUsage.input_tokens),
+    cachedInputTokens: nonNegativeNumber(rawUsage.cache_read_tokens),
+    outputTokens: nonNegativeNumber(rawUsage.output_tokens),
+    reasoningTokens: nonNegativeNumber(rawUsage.thinking_tokens),
+    costBasis: "unavailable",
+    source: "agy-jsonl",
+  };
+  for (const key of Object.keys(usage) as (keyof CompletionUsage)[]) {
+    if (usage[key] === undefined) delete usage[key];
+  }
+
+  const status = typeof resultObj.status === "string" && resultObj.status.trim()
+    ? resultObj.status.trim()
+    : "ERROR";
+  if (status !== "SUCCESS") {
+    const detail = structuredFailureDetail(resultObj.error);
+    throw new ProviderRunError(
+      "agy",
+      `provider agy returned ${status}${detail ? `: ${detail}` : ""}`,
+      usage,
+    );
+  }
+
+  let text: string | undefined;
+  if (typeof resultObj.response === "string" && resultObj.response.trim().length > 0) {
+    text = resultObj.response.trim();
+  } else if (resultObj.structured_output !== undefined) {
+    text = JSON.stringify(resultObj.structured_output);
+  } else if (typeof resultObj.response === "string") {
+    text = "";
+  }
+  if (text === undefined) return undefined;
+
+  return {
+    text,
+    usage,
+    ...(model ? { model } : {}),
+    nativeSessionId: parsedNativeSessionId,
+  };
+}
+
 /** Normalize provider timeout detection across traces, metrics, and user notices. */
 export function isProviderTimeoutError(error: unknown): boolean {
   return /timed?\s*out|timeout|超时/iu.test(String(error));
@@ -3397,7 +3763,7 @@ export function isProviderCapacityError(error: unknown): boolean {
 }
 
 export function isProviderLoginExpiredError(error: unknown): boolean {
-  return /refresh token was revoked|could not be refreshed|please log out and sign in again|\b401\b[^\n]*unauthorized|invalid_grant/iu.test(String(error));
+  return /refresh token was revoked|could not be refreshed|please log out and sign in again|\b401\b[^\n]*unauthorized|invalid_grant|\bauthentication required\b/iu.test(String(error));
 }
 
 /**

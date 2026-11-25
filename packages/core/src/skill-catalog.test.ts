@@ -42,7 +42,7 @@ describe("SkillCatalog", () => {
       {
         kind: "shared-agents",
         path: join(dir, ".agents", "skills"),
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       },
       {
         kind: "codex-user",
@@ -63,6 +63,21 @@ describe("SkillCatalog", () => {
         kind: "claude-marketplace",
         path: join(dir, ".claude", "plugins", "marketplaces"),
         providerIds: ["claude"],
+      },
+      {
+        kind: "agy-user",
+        path: join(dir, ".gemini", "config", "skills"),
+        providerIds: ["agy"],
+      },
+      {
+        kind: "agy-cli",
+        path: join(dir, ".gemini", "antigravity-cli", "skills"),
+        providerIds: ["agy"],
+      },
+      {
+        kind: "agy-plugin",
+        path: join(dir, ".gemini", "config", "plugins"),
+        providerIds: ["agy"],
       },
       {
         kind: "trae-user",
@@ -101,6 +116,12 @@ describe("SkillCatalog", () => {
       "claude-plugin",
       "claude-marketplace",
     ]);
+    expect(providerSkillRootKinds("agy")).toEqual([
+      "agy-cli",
+      "agy-user",
+      "shared-agents",
+      "agy-plugin",
+    ]);
     expect(providerSkillRootKinds("trae-cli")).toEqual([
       "trae-user",
       "shared-agents",
@@ -126,7 +147,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: join(dir, "skills"),
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
     }).refresh();
 
@@ -137,7 +158,7 @@ describe("SkillCatalog", () => {
       relativeDir: "code-review",
       name: "code-review",
       description: "Review code through observable behavior.",
-      providerIds: ["claude", "codex", "trae-cli"],
+      providerIds: ["claude", "codex", "agy", "trae-cli"],
       skillFile: join(skillDir, "SKILL.md"),
       skillFileHash: new Bun.CryptoHasher("sha256").update(skillFile).digest("hex"),
       status: "available",
@@ -158,7 +179,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: join(dir, "skills"),
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
     }).refresh();
 
@@ -183,7 +204,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: join(dir, "skills"),
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
     }).refresh();
 
@@ -213,7 +234,7 @@ describe("SkillCatalog", () => {
         {
           kind: "shared-agents",
           path: join(dir, "shared"),
-          providerIds: ["claude", "codex", "trae-cli"],
+          providerIds: ["claude", "codex", "agy", "trae-cli"],
         },
       ],
     }).refresh();
@@ -280,7 +301,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
       limits: { maxFileBytes: 100 },
     }).refresh();
@@ -313,7 +334,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
       limits: { maxSkills: 1 },
     }).refresh();
@@ -340,7 +361,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
       limits: { maxTotalBytes: firstFileBytes },
     }).refresh();
@@ -364,7 +385,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
       limits: { maxEntries: 3 },
     }).refresh();
@@ -388,7 +409,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
     }).refresh();
 
@@ -410,12 +431,12 @@ describe("SkillCatalog", () => {
         {
           kind: "shared-agents",
           path: root,
-          providerIds: ["claude", "codex", "trae-cli"],
+          providerIds: ["claude", "codex", "agy", "trae-cli"],
         },
         {
           kind: "shared-agents",
           path: root,
-          providerIds: ["claude", "codex", "trae-cli"],
+          providerIds: ["claude", "codex", "agy", "trae-cli"],
         },
       ],
     }).refresh();
@@ -443,7 +464,7 @@ describe("SkillCatalog", () => {
         {
           kind: "shared-agents",
           path: join(dir, "shared"),
-          providerIds: ["claude", "codex", "trae-cli"],
+          providerIds: ["claude", "codex", "agy", "trae-cli"],
         },
         {
           kind: "codex-user",
@@ -490,7 +511,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
     });
     const source = catalog.refresh().sources[0]!;
@@ -531,7 +552,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
     });
 
@@ -582,7 +603,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
     });
     const source = catalog.refresh().sources[0]!;
@@ -616,7 +637,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
     });
     const source = catalog.refresh().sources[0]!;
@@ -650,7 +671,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
     });
     const source = catalog.refresh().sources[0]!;
@@ -727,7 +748,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
     });
     catalog.refresh();
@@ -765,7 +786,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
       limits: { maxFileBytes: 100 },
     });
@@ -806,7 +827,7 @@ describe("SkillCatalog", () => {
         {
           kind: "shared-agents",
           path: join(dir, "shared"),
-          providerIds: ["claude", "codex", "trae-cli"],
+          providerIds: ["claude", "codex", "agy", "trae-cli"],
         },
         {
           kind: "codex-user",
@@ -848,7 +869,7 @@ describe("SkillCatalog", () => {
         {
           kind: "shared-agents",
           path: join(dir, "shared"),
-          providerIds: ["claude", "codex", "trae-cli"],
+          providerIds: ["claude", "codex", "agy", "trae-cli"],
         },
         {
           kind: "codex-user",
@@ -882,7 +903,7 @@ describe("SkillCatalog", () => {
       roots: [{
         kind: "shared-agents",
         path: root,
-        providerIds: ["claude", "codex", "trae-cli"],
+        providerIds: ["claude", "codex", "agy", "trae-cli"],
       }],
       cacheTtlMs: 50,
       now: () => now,

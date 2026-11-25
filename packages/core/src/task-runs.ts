@@ -286,7 +286,7 @@ function isSkillName(value: unknown): value is string {
 function isSourceKey(value: unknown): value is string {
   return typeof value === "string"
     && value.length <= 600
-    && /^(?:shared-agents|codex-user|codex-plugin|codex-vendor|claude-user|claude-plugin|claude-marketplace|trae-user):[^\u0000-\u001f\\]+$/u.test(
+    && /^(?:shared-agents|codex-user|codex-plugin|codex-vendor|claude-user|claude-plugin|claude-marketplace|agy-user|agy-cli|agy-plugin|trae-user):[^\u0000-\u001f\\]+$/u.test(
       value,
     );
 }

@@ -264,7 +264,7 @@ function validTraceExecution(value: unknown): value is AnswerTraceExecution {
       && item.agentRevisionId.length <= 200
     ))
     && (item.provider === undefined
-      || ["gateway", "claude", "codex", "trae-cli"].includes(item.provider))
+      || ["gateway", "claude", "codex", "agy", "trae-cli"].includes(item.provider))
     && (item.model === undefined || (
       typeof item.model === "string" && item.model.length > 0 && item.model.length <= 200
     ))

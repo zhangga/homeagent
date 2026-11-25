@@ -1,6 +1,6 @@
 /**
  * A CLI-backed LlmClient. Instead of the network gateway, all LLM work is run
- * through a local agent CLI (claude / codex / trae-cli) via runProvider(). This
+ * through a local agent CLI (claude / codex / agy / trae-cli) via runProvider(). This
  * is the only LLM path in homeagent — there is no network-API fallback.
  *
  *   - complete(): the CLI's stdout is the answer text.

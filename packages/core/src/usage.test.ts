@@ -197,6 +197,34 @@ describe("run usage aggregation", () => {
     })).toBeFalse();
   });
 
+  test("accepts Antigravity CLI usage provenance in aggregated run usage", () => {
+    const accumulator = new RunUsageAccumulator();
+    accumulator.record({
+      inputTokens: 500,
+      cachedInputTokens: 200,
+      outputTokens: 120,
+      reasoningTokens: 40,
+      costBasis: "unavailable",
+      source: "agy-jsonl",
+    });
+
+    const usage = accumulator.snapshot();
+    expect(usage).toEqual({
+      calls: 1,
+      knownTokenCalls: 1,
+      unknownTokenCalls: 0,
+      knownCostCalls: 0,
+      unknownCostCalls: 1,
+      inputTokens: 500,
+      cachedInputTokens: 200,
+      outputTokens: 120,
+      reasoningTokens: 40,
+      costBasis: "unavailable",
+      sources: ["agy-jsonl"],
+    });
+    expect(isAggregatedRunUsage(usage)).toBeTrue();
+  });
+
   test("does not trust malformed usage attached to a provider error", async () => {
     const calls: Array<Parameters<RunUsageAccumulator["record"]>[0]> = [];
     const failed: LlmClient = {

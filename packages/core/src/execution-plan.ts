@@ -62,7 +62,7 @@ export function isLocalExecutionReference(value: unknown): value is LocalExecuti
 }
 
 function isProviderId(value: unknown): value is ProviderId {
-  return ["gateway", "claude", "codex", "trae-cli"].includes(String(value));
+  return ["gateway", "claude", "codex", "agy", "trae-cli"].includes(String(value));
 }
 
 export function isProviderExecution(value: unknown): value is ProviderExecution {

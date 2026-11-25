@@ -41,6 +41,7 @@ const COST_BASES = new Set<AggregatedCostBasis>([
 const USAGE_SOURCES = new Set<CompletionUsage["source"]>([
   "claude-json",
   "codex-jsonl",
+  "agy-jsonl",
   "trae-text",
   "gateway",
   "legacy-text",

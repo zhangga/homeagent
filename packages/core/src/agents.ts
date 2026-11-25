@@ -93,7 +93,7 @@ export interface Agent {
   model: string;
   /** Codex reasoning effort; empty string means "inherit the Codex default". */
   reasoningEffort: CodexReasoningEffort | "";
-  /** local agent CLI to run (claude / codex / trae-cli) */
+  /** local agent CLI to run (claude / codex / agy / trae-cli) */
   provider: ProviderId;
   /** Space type this Agent may be assigned to. */
   visibility: AgentVisibility;
@@ -222,7 +222,7 @@ function normalizeModel(raw?: string): string {
 
 export function isAgentSkillSourceKey(value: string): boolean {
   return value.length <= 600
-    && /^(?:shared-agents|codex-user|codex-plugin|codex-vendor|claude-user|claude-plugin|claude-marketplace|trae-user):[^\u0000-\u001f\\]+$/u.test(
+    && /^(?:shared-agents|codex-user|codex-plugin|codex-vendor|claude-user|claude-plugin|claude-marketplace|agy-user|agy-cli|agy-plugin|trae-user):[^\u0000-\u001f\\]+$/u.test(
       value,
     );
 }

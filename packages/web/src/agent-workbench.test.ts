@@ -128,6 +128,7 @@ describe("Agent create defaults", () => {
     expect(view.generatedNames).toEqual({
       claude: "Claude Code Agent",
       codex: "Codex Agent (2)",
+      agy: "Antigravity CLI Agent",
       "trae-cli": "Trae CLI Agent",
     });
     expect(view.automaticName).toBe(true);

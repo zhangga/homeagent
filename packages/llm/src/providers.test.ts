@@ -20,6 +20,7 @@ import { providerPreparationFailure, ProviderPreparationError, SKILL_STAGING_MAX
 import type { ProviderExecutionEvidence } from "./execution-evidence.ts";
 import {
   codexProgressEventFromLine,
+  createAgyProgressParser,
   createClaudeProgressParser,
   codexReasoningEffortsForModel,
   curatedProviderModels,
@@ -29,10 +30,12 @@ import {
   isCliProvider,
   isCodexReasoningEffortSupported,
   isPersistedCodexReasoningEffortSupported,
+  isProviderLoginExpiredError,
   isProviderNativeSessionParentMissingError,
   prepareProviderCodexHome,
   providerFailureDetail,
   providerSkillReference,
+  providerSupportsOrdinaryCompletion,
   preflightProviderNativeSession,
   ProviderRunError,
   runProvider,
@@ -3562,6 +3565,7 @@ describe("provider detection", () => {
     const keys = [
       "HOMEAGENT_CODEX_BIN",
       "HOMEAGENT_CLAUDE_BIN",
+      "HOMEAGENT_AGY_BIN",
       "HOMEAGENT_TRAE_BIN",
     ] as const;
     const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
@@ -3574,6 +3578,7 @@ describe("provider detection", () => {
       expect(detected.map(({ id, bin }) => ({ id, bin }))).toEqual([
         { id: "claude", bin },
         { id: "codex", bin },
+        { id: "agy", bin },
         { id: "trae-cli", bin },
       ]);
       const defaultRun = await runProvider(
@@ -4626,7 +4631,7 @@ describe("provider detection", () => {
   test("detects the fixed known CLIs and reports availability", async () => {
     const list = await detectProviders(8000);
     const ids = list.map((p) => p.id).sort();
-    expect(ids).toEqual(["claude", "codex", "trae-cli"]);
+    expect(ids).toEqual(["agy", "claude", "codex", "trae-cli"]);
     // every entry carries a boolean available + a detail string
     for (const p of list) {
       expect(typeof p.available).toBe("boolean");
@@ -4638,6 +4643,7 @@ describe("provider detection", () => {
   test("isCliProvider recognizes known ids, rejects gateway/unknown", () => {
     expect(isCliProvider("claude")).toBe(true);
     expect(isCliProvider("codex")).toBe(true);
+    expect(isCliProvider("agy")).toBe(true);
     expect(isCliProvider("trae-cli")).toBe(true);
     // "gateway" is the built-in network provider, not a local CLI
     expect(isCliProvider("gateway")).toBe(false);
@@ -4686,6 +4692,8 @@ describe("provider detection", () => {
     // no "gateway" key — providers are CLIs only
     expect(m.gateway).toBeUndefined();
     expect(m["trae-cli"]).toContain("openrouter-3o");
+    expect(m.agy).toContain("gemini-4-neon-medium");
+    expect(m.agy).toContain("gemini-pro-orchestrator-neon");
     expect(m.codex).toEqual([
       "gpt-6.2-sol",
       "gpt-6.2-astra",
@@ -4697,5 +4705,260 @@ describe("provider detection", () => {
     expect(m.claude?.length).toBeGreaterThan(0);
     // provider lists are not all identical
     expect(m.claude).not.toEqual(m["trae-cli"]);
+    expect(m.agy).not.toEqual(m.codex);
+  });
+
+  test("Antigravity CLI detection verifies required headless streaming flags", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ha-agy-detect-"));
+    const previous = process.env.HOMEAGENT_AGY_BIN;
+    const writeAgyStub = (name: string, helpText: string) => {
+      const script = join(directory, `${name}.mjs`);
+      writeFileSync(
+        script,
+        [
+          "const args = process.argv.slice(2);",
+          "if (args.includes('--version')) { console.log('agy 1.6.0'); process.exit(0); }",
+          `if (args.includes('--help')) { console.log(${JSON.stringify(helpText)}); process.exit(0); }`,
+          "process.exit(1);",
+        ].join("\n"),
+        "utf8",
+      );
+      const bin = join(directory, process.platform === "win32" ? `${name}.cmd` : name);
+      writeFileSync(
+        bin,
+        process.platform === "win32"
+          ? `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`
+          : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`,
+        "utf8",
+      );
+      if (process.platform !== "win32") chmodSync(bin, 0o755);
+      return bin;
+    };
+    try {
+      process.env.HOMEAGENT_AGY_BIN = writeAgyStub(
+        "agy-ok",
+        "Usage: agy [flags]\n--input-format --output-format --disable-slash-commands --model --mode --sandbox --dangerously-skip-permissions",
+      );
+      const ready = (await detectProviders(2_000)).find((item) => item.id === "agy");
+      expect(ready).toMatchObject({
+        id: "agy",
+        name: "Antigravity CLI",
+        available: true,
+        detail: "agy 1.6.0",
+      });
+
+      process.env.HOMEAGENT_AGY_BIN = writeAgyStub(
+        "agy-old",
+        "Usage: agy [flags]\n--output-format --model --mode --sandbox",
+      );
+      const incomplete = (await detectProviders(2_000)).find((item) => item.id === "agy");
+      expect(incomplete?.available).toBe(false);
+      expect(incomplete?.detail).toContain("缺少");
+      expect(incomplete?.detail).toContain("--input-format");
+      expect(incomplete?.detail).toContain("--disable-slash-commands");
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_AGY_BIN;
+      else process.env.HOMEAGENT_AGY_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Antigravity CLI sends prompts over stream-json stdin, maps permissions, and parses usage and progress", async () => {
+    const directory = realpathSync(mkdtempSync(join(tmpdir(), "ha-agy-run-")));
+    const previous = process.env.HOMEAGENT_AGY_BIN;
+    const script = join(directory, "agy-stub.mjs");
+    writeFileSync(
+      script,
+      [
+        "import { readFileSync } from 'node:fs';",
+        "const args = process.argv.slice(2);",
+        "const chunks = [];",
+        "for await (const chunk of process.stdin) chunks.push(chunk);",
+        "const stdin = Buffer.concat(chunks).toString('utf8').trim();",
+        "const parsedInput = JSON.parse(stdin);",
+        "const schemaIdx = args.indexOf('--json-schema');",
+        "const schemaText = schemaIdx >= 0 ? readFileSync(args[schemaIdx + 1], 'utf8').trim() : null;",
+        "const modelIdx = args.indexOf('--model');",
+        "const model = modelIdx >= 0 ? args[modelIdx + 1] : 'gemini-4-neon-medium';",
+        "const payload = { args, input: parsedInput, schema: schemaText ? JSON.parse(schemaText) : null };",
+        "console.log(JSON.stringify({ event: 'init', conversation_id: '11111111-2222-4333-8444-555555555555', init: { cwd: process.cwd(), model } }));",
+        "console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'SECRET_CMD' } } } }));",
+        "console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: 1, state: 'DONE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', output: 'SECRET_OUTPUT' } } }));",
+        "console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: 2, state: 'ACTIVE', step_type: 'agent_response', text_delta: '第一段' } }));",
+        "console.log(JSON.stringify({ event: 'step_update', step_update: { step_index: 2, state: 'DONE', step_type: 'agent_response', text_delta: '说明' } }));",
+        "console.log(JSON.stringify({ event: 'result', result: { conversation_id: '11111111-2222-4333-8444-555555555555', status: 'SUCCESS', response: JSON.stringify(payload), duration_seconds: 1.2, num_turns: 1, usage: { input_tokens: 1200, output_tokens: 340, thinking_tokens: 90, cache_read_tokens: 800, total_tokens: 1540 } } }));",
+      ].join("\n"),
+      "utf8",
+    );
+    const bin = join(directory, process.platform === "win32" ? "agy.cmd" : "agy");
+    writeFileSync(
+      bin,
+      process.platform === "win32"
+        ? `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`
+        : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`,
+      "utf8",
+    );
+    if (process.platform !== "win32") chmodSync(bin, 0o755);
+
+    try {
+      process.env.HOMEAGENT_AGY_BIN = bin;
+      expect(providerSupportsOrdinaryCompletion("agy")).toBe(true);
+      expect(providerSkillReference("agy", "code-review")).toBe("/code-review");
+      expect(isProviderLoginExpiredError(new Error("provider agy returned ERROR: authentication required"))).toBe(true);
+
+      const progress: Array<{ kind: string; delta?: string; tool?: { type: string; status: string } }> = [];
+      const ordinary = await runProviderDetailed("agy", {
+        prompt: "SECRET_PROMPT_BODY",
+        model: "gemini-4-neon-high",
+        onProgress: (event) => { progress.push(event); },
+      }, 5_000);
+      const observedOrdinary = JSON.parse(ordinary.text) as {
+        args: string[];
+        input: { event: string; message: { content: string } };
+      };
+      expect(observedOrdinary.args).toEqual([
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--disable-slash-commands",
+        "--mode",
+        "plan",
+        "--sandbox",
+        "--model",
+        "gemini-4-neon-high",
+      ]);
+      expect(observedOrdinary.args.join(" ")).not.toContain("SECRET_PROMPT_BODY");
+      expect(observedOrdinary.input).toEqual({
+        event: "user",
+        message: { content: "SECRET_PROMPT_BODY" },
+      });
+      expect(ordinary.model).toBe("gemini-4-neon-high");
+      expect(ordinary.usage).toEqual({
+        inputTokens: 1200,
+        cachedInputTokens: 800,
+        outputTokens: 340,
+        reasoningTokens: 90,
+        costBasis: "unavailable",
+        source: "agy-jsonl",
+      });
+      expect(JSON.stringify(progress)).not.toContain("SECRET_");
+      expect(progress.filter((item) => item.kind === "tool").map((item) => item.tool)).toEqual([
+        { type: "command", status: "running" },
+        { type: "command", status: "completed" },
+      ]);
+      expect(progress.find((item) => item.kind === "assistant_snapshot")?.delta).toBe("第一段说明");
+
+      const writeRun = await runProviderDetailed("agy", {
+        prompt: "edit files",
+        execution: { permission: "write", workdir: directory, skills: ["code-review"] },
+        outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+      }, 5_000);
+      const observedWrite = JSON.parse(writeRun.text) as {
+        args: string[];
+        input: { message: { content: string } };
+        schema: Record<string, unknown>;
+      };
+      expect(observedWrite.args).toContain("--mode");
+      expect(observedWrite.args).toContain("accept-edits");
+      expect(observedWrite.args).toContain("--sandbox");
+      expect(observedWrite.args).toContain("--json-schema");
+      const schemaPath = observedWrite.args[observedWrite.args.indexOf("--json-schema") + 1]!;
+      expect(existsSync(schemaPath)).toBe(false);
+      expect(observedWrite.schema).toEqual({
+        type: "object",
+        properties: { ok: { type: "boolean" } },
+        required: ["ok"],
+      });
+      expect(observedWrite.input.message.content).toContain("/code-review");
+
+      const fullRun = await runProviderDetailed("agy", {
+        prompt: "run full",
+        execution: { permission: "full", workdir: directory, skills: [] },
+      }, 5_000);
+      const observedFull = JSON.parse(fullRun.text) as { args: string[] };
+      expect(observedFull.args).toContain("--dangerously-skip-permissions");
+      expect(observedFull.args).not.toContain("--sandbox");
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_AGY_BIN;
+      else process.env.HOMEAGENT_AGY_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Antigravity CLI surfaces structured ERROR results with reported usage", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ha-agy-err-"));
+    const previous = process.env.HOMEAGENT_AGY_BIN;
+    const script = join(directory, "agy-err.mjs");
+    writeFileSync(
+      script,
+      [
+        "console.log(JSON.stringify({ event: 'result', result: { conversation_id: '', status: 'ERROR', response: '', error: 'authentication required', usage: { input_tokens: 15, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0 } } }));",
+        "process.exit(1);",
+      ].join("\n"),
+      "utf8",
+    );
+    const bin = join(directory, process.platform === "win32" ? "agy.cmd" : "agy");
+    writeFileSync(
+      bin,
+      process.platform === "win32"
+        ? `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`
+        : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`,
+      "utf8",
+    );
+    if (process.platform !== "win32") chmodSync(bin, 0o755);
+
+    try {
+      process.env.HOMEAGENT_AGY_BIN = bin;
+      let caught: unknown;
+      try {
+        await runProviderDetailed("agy", { prompt: "hi" }, 5_000);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ProviderRunError);
+      const runError = caught as ProviderRunError;
+      expect(runError.provider).toBe("agy");
+      expect(runError.message).toContain("provider agy returned ERROR: authentication required");
+      expect(runError.usage).toEqual({
+        inputTokens: 15,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        costBasis: "unavailable",
+        source: "agy-jsonl",
+      });
+    } finally {
+      if (previous === undefined) delete process.env.HOMEAGENT_AGY_BIN;
+      else process.env.HOMEAGENT_AGY_BIN = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("Antigravity CLI progress parser maps tools and omits sensitive details", () => {
+    const parse = createAgyProgressParser();
+    expect(parse(JSON.stringify({ event: "init", init: { cwd: "/private/path", model: "gemini-4-neon-high" } }), 10)).toEqual([
+      { kind: "phase", at: 10, title: "Provider 会话已建立", phase: "provider", visibility: "operator" },
+    ]);
+    expect(parse(JSON.stringify({
+      event: "step_update",
+      step_update: { step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "read_file", tool_info: { parameters: { Path: "SECRET_FILE" } } },
+    }), 11)).toEqual([
+      { kind: "tool", at: 11, title: "工具开始执行", phase: "tool", visibility: "public", tool: { type: "file-read", status: "running" } },
+    ]);
+    // Duplicate ACTIVE updates for the same step_index do not double-count.
+    expect(parse(JSON.stringify({
+      event: "step_update",
+      step_update: { step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "read_file" },
+    }), 12)).toEqual([]);
+    const failed = parse(JSON.stringify({
+      event: "step_update",
+      step_update: { step_index: 1, state: "DONE", step_type: "tool", tool_name: "read_file", tool_info: { error: { type: "denied", message: "SECRET_ERR" } } },
+    }), 13);
+    expect(failed).toEqual([
+      { kind: "tool", at: 13, title: "工具执行失败", phase: "tool", visibility: "public", tool: { type: "file-read", status: "failed" } },
+    ]);
+    expect(JSON.stringify(failed)).not.toContain("SECRET_");
+    expect(parse("not-json")).toEqual([]);
   });
 });

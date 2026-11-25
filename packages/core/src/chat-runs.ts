@@ -564,7 +564,7 @@ function leaseMatchesSession(
 }
 
 function isProviderId(value: unknown): value is ProviderId {
-  return ["gateway", "claude", "codex", "trae-cli"].includes(String(value));
+  return ["gateway", "claude", "codex", "agy", "trae-cli"].includes(String(value));
 }
 
 function isRunPriority(value: unknown): value is RunPriority {

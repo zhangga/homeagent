@@ -16,8 +16,9 @@ export function askFailure(error: unknown, provider?: string): AskFailure {
     return { message: "当前模型繁忙，请稍后重试这个问题。" };
   }
   const codexAuthUnavailable = /provider codex authentication is unavailable/i.test(diagnostic);
-  if (isProviderLoginExpiredError(error) || codexAuthUnavailable || /\bnot (?:logged|signed) in\b|\b(?:login|log in|sign in) required\b/i.test(diagnostic)) {
+  if (isProviderLoginExpiredError(error) || codexAuthUnavailable || /\bnot (?:logged|signed) in\b|\b(?:login|log in|sign in|authentication) required\b/i.test(diagnostic)) {
     const action = provider === "codex" || codexAuthUnavailable ? "请在本机执行 codex login，完成后重试这个问题。"
+      : provider === "agy" ? "请在本机执行 agy 完成登录，完成后重试这个问题。"
       : "请在本机重新登录当前回答助手所用的 AI 服务，完成后重试这个问题。";
     return { message: "当前 AI 服务需要重新登录。" + action };
   }

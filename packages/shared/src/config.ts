@@ -55,7 +55,7 @@ export interface Config {
   /** days to retain distilled raw messages; 0 keeps them forever */
   rawRetentionDays: number;
   /**
-   * Default local agent CLI (provider id: claude / codex / trae-cli) used when a
+   * Default local agent CLI (provider id: claude / codex / agy / trae-cli) used when a
    * space's agent doesn't specify one. All LLM work (ask + dream) runs through a
    * CLI; there is no network-API fallback.
    */

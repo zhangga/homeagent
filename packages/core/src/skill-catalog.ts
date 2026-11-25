@@ -25,6 +25,9 @@ export type SkillRootKind =
   | "claude-user"
   | "claude-plugin"
   | "claude-marketplace"
+  | "agy-user"
+  | "agy-cli"
+  | "agy-plugin"
   | "trae-user";
 
 export interface SkillRoot {
@@ -215,7 +218,7 @@ export function defaultSkillRoots(
     {
       kind: "shared-agents",
       path: join(homeDirectory, ".agents", "skills"),
-      providerIds: ["claude", "codex", "trae-cli"],
+      providerIds: ["claude", "codex", "agy", "trae-cli"],
     },
     {
       kind: "codex-user",
@@ -236,6 +239,21 @@ export function defaultSkillRoots(
       kind: "claude-marketplace",
       path: join(homeDirectory, ".claude", "plugins", "marketplaces"),
       providerIds: ["claude"],
+    },
+    {
+      kind: "agy-user",
+      path: join(homeDirectory, ".gemini", "config", "skills"),
+      providerIds: ["agy"],
+    },
+    {
+      kind: "agy-cli",
+      path: join(homeDirectory, ".gemini", "antigravity-cli", "skills"),
+      providerIds: ["agy"],
+    },
+    {
+      kind: "agy-plugin",
+      path: join(homeDirectory, ".gemini", "config", "plugins"),
+      providerIds: ["agy"],
     },
     {
       kind: "trae-user",
@@ -278,6 +296,7 @@ const providerRootPrecedence: Record<ProviderId, readonly SkillRootKind[]> = {
   gateway: [],
   codex: ["codex-user", "shared-agents", "codex-plugin", "codex-vendor"],
   claude: ["claude-user", "shared-agents", "claude-plugin", "claude-marketplace"],
+  agy: ["agy-cli", "agy-user", "shared-agents", "agy-plugin"],
   "trae-cli": ["trae-user", "shared-agents"],
 };
 

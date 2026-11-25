@@ -15,7 +15,7 @@ export function withReplyModel(
   reportedModel?: string,
   replyKind: "model" | "static" = "model",
 ): string {
-  const provider = { codex: "Codex", claude: "Claude Code", "trae-cli": "TRAE CLI", gateway: "LLM 网关" }[run.provider ?? ""] ?? "CLI";
+  const provider = { codex: "Codex", claude: "Claude Code", agy: "Antigravity CLI", "trae-cli": "TRAE CLI", gateway: "LLM 网关" }[run.provider ?? ""] ?? "CLI";
   const actual = publicModelId(reportedModel);
   const configured = publicModelId(run.model);
   const model = actual ? `\`${actual}\`（Provider 返回）`

@@ -53,6 +53,12 @@ test("reply model caption distinguishes reported models, frozen configuration, a
     .toBe("> 本次模型：Codex · `gpt-5.6-sol`（本次运行配置）\n> 推理等级：CLI 默认（未确认具体等级）\n\n回答");
   expect(withReplyModel("回答", { provider: "codex" }))
     .toBe("> 本次模型：Codex · CLI 默认（未返回具体型号）\n> 推理等级：CLI 默认（未确认具体等级）\n\n回答");
+  expect(withReplyModel("回答", { provider: "agy", model: "gemini-4-neon-high" }, "gemini-4-neon-high"))
+    .toBe("> 本次模型：Antigravity CLI · `gemini-4-neon-high`（Provider 返回）\n\n回答");
+  expect(withReplyModel("回答", { provider: "agy", model: "gemini-4-carbon-medium" }))
+    .toBe("> 本次模型：Antigravity CLI · `gemini-4-carbon-medium`（本次运行配置）\n\n回答");
+  expect(withReplyModel("回答", { provider: "agy" }))
+    .toBe("> 本次模型：Antigravity CLI · CLI 默认（未返回具体型号）\n\n回答");
 });
 
 test("model metadata stays bounded and cannot inject reply markup", () => {

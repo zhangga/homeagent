@@ -134,7 +134,9 @@ describe("guided setup view", () => {
         login: { state: "idle", message: "尚未连接" },
       },
     });
-    expect(missing).toContain("先连接 Claude Code 或 Codex");
+    expect(missing).toContain("先连接一个 AI CLI");
+    expect(missing).toContain("Antigravity CLI");
+    expect(missing).toContain("https://antigravity.google/cli/install.sh");
     expect(missing).toContain("npm install -g @openai/codex");
     expect(missing).toContain("npm install -g @anthropic-ai/claude-code");
     expect(missing).toContain("重新检测");

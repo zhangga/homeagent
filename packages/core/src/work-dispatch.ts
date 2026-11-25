@@ -83,7 +83,7 @@ function valid(input: WorkInput): boolean {
     && optional(input.bindingId) && optional(input.workItemId) && optional(input.runId)
     && (input.operation === undefined || ["chat", "chat-recovery", "new", "followup", "status", "cancel", "pause", "resume", "clarify"].includes(input.operation))
     && (input.routing === undefined || (input.routing.version === 1
-      && (input.routing.provider === undefined || ["gateway", "claude", "codex", "trae-cli"].includes(input.routing.provider))
+      && (input.routing.provider === undefined || ["gateway", "claude", "codex", "agy", "trae-cli"].includes(input.routing.provider))
       && optional(input.routing.model, 200) && bounded(input.routing.instruction, 20_000)
       && (input.routing.reasoningEffort === undefined || ["minimal", "low", "medium", "high", "xhigh"].includes(input.routing.reasoningEffort))
       && Number.isSafeInteger(input.routing.maxTokens) && input.routing.maxTokens > 0

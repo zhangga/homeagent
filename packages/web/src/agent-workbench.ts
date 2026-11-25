@@ -278,6 +278,7 @@ const MAX_SKILLS_LENGTH = 4_000;
 const AGENT_BASE_NAMES = {
   claude: "Claude Code Agent",
   codex: "Codex Agent",
+  agy: "Antigravity CLI Agent",
   "trae-cli": "Trae CLI Agent",
 } as const;
 
@@ -304,6 +305,7 @@ export function generatedAgentNames(
   return {
     claude: generatedAgentName("claude", agents),
     codex: generatedAgentName("codex", agents),
+    agy: generatedAgentName("agy", agents),
     "trae-cli": generatedAgentName("trae-cli", agents),
   };
 }

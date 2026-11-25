@@ -285,11 +285,12 @@ function aiStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedS
         ${codexLoginSetup(input, true)}
         ${advancedProviderSetup(taskOnlyAvailable)}`;
     }
-    return html`<div class="eyebrow">02 · AI</div><h1 class="setup-title">先连接 Claude Code 或 Codex</h1>
-      <p class="lede">请在这台机器上安装并登录任一 Provider CLI，然后回来重新检测。HomeAgent 只使用服务 PATH 中的程序，不会把 Provider 安装到数据目录。</p>
+    return html`<div class="eyebrow">02 · AI</div><h1 class="setup-title">先连接一个 AI CLI</h1>
+      <p class="lede">请在这台机器上安装并登录任一受支持的 Provider CLI，然后回来重新检测。HomeAgent 只使用服务 PATH 中的程序，不会把 Provider 安装到数据目录。</p>
       <div class="choice-grid">
         <div class="choice"><strong>Codex</strong><small>安装后可通过下方设置流程连接 ChatGPT</small><div class="command">npm install -g @openai/codex</div></div>
         <div class="choice"><strong>Claude Code</strong><small>普通聊天和任务可使用 Skills，提炼与后台学习使用 no-tools 模式</small><div class="command">npm install -g @anthropic-ai/claude-code && claude auth login</div></div>
+        <div class="choice"><strong>Antigravity CLI</strong><small>安装并交互登录一次后可用于普通聊天、任务与知识提炼</small><div class="command">curl -fsSL https://antigravity.google/cli/install.sh | bash && agy</div></div>
       </div>
       ${taskOnlyAvailable.length > 0 ? html`<p class="muted">已检测到 ${taskOnlyAvailable.map((provider) => provider.name).join("、")}，但它目前只能用于显式任务。</p>` : ""}
       <form method="post" action="/setup/providers/refresh" class="actions"><button class="primary-action">重新检测</button></form>
