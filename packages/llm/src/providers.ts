@@ -52,6 +52,7 @@ import type { ImageInput } from "./gateway.ts";
 import { codexExecutionEvidenceFromLine, collectCodexExecutionEvidence, type ProviderExecutionEvidence, type ProviderExecutionMetadata } from "./execution-evidence.ts";
 import { ProviderPreparationError, SKILL_STAGING_MAX_BYTES, NATIVE_SESSION_ISSUE_LABELS, type NativeSessionIssue } from "./provider-preparation.ts";
 import { resolveCodexExecutionPolicy, type CodexExecutionMode } from "./codex-execution-policy.ts";
+import { ambientCodexHome, readLocalCodexTransportConfig } from "./codex-transport-config.ts";
 import { createSkillLoader, type SkillLoader } from "./skill-loader.ts";
 
 const log = logger.child("providers");
@@ -185,6 +186,8 @@ interface CliSpec {
   bin: string;
   /** managed-install override used by the standalone desktop application */
   envBin: "CODEX_BIN" | "CLAUDE_BIN" | "AGY_BIN" | "TRAE_BIN";
+  /** Official default install paths checked when the binary is not yet in the inherited PATH. */
+  defaultBinPaths?: (source?: NodeJS.ProcessEnv, userHome?: string) => string[];
   /** args that print a version quickly and exit */
   versionArgs: string[];
   /** curated model ids this provider commonly offers (mew shows these per-provider) */
@@ -264,6 +267,8 @@ interface PreparedRunInput extends RunInput {
   nativeSkillLoader?: SkillLoader;
   /** Authentication cache selected by a no-completion status probe. */
   codexCredentialStore?: "file" | "keyring";
+  /** Transport-only `-c` overrides read from the user's ambient Codex config. */
+  codexTransportArgs?: readonly string[];
 }
 
 export class UnsupportedImageInputError extends Error {
@@ -903,6 +908,7 @@ const CODEX_TOOL_ENVIRONMENT_KEYS = process.platform === "win32"
 export function providerChildEnvironment(
   source: NodeJS.ProcessEnv = process.env,
   larkProfile?: string,
+  extraEnv?: Record<string, string>,
 ): Record<string, string> {
   const normalized = new Map<string, string>();
   for (const [key, value] of Object.entries(source)) {
@@ -924,6 +930,12 @@ export function providerChildEnvironment(
   // repopulate omitted environment values. Empty allows CLI default discovery
   // only when HomeAgent has not selected an app yet.
   environment.LARKSUITE_CLI_PROFILE = profile ?? "";
+  if (extraEnv) {
+    const reserved = new Set(Object.keys(environment).map(key => key.toUpperCase()));
+    for (const [key, value] of Object.entries(extraEnv)) {
+      if (!reserved.has(key.toUpperCase())) environment[key] = value;
+    }
+  }
   return environment;
 }
 
@@ -1286,6 +1298,7 @@ const KNOWN: CliSpec[] = [
       nativeSkillReadRoot,
       nativeSkillLoader,
       codexCredentialStore,
+      codexTransportArgs,
       outputSchemaPath,
       outputLastMessagePath,
       larkProfile,
@@ -1362,6 +1375,7 @@ const KNOWN: CliSpec[] = [
         args.push("--disable", feature);
       }
       if (reasoningEffort) args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
+      if (codexTransportArgs?.length) args.push(...codexTransportArgs);
       if (execution?.webSearch || execution?.research) args.push("--search");
       // Codex 0.147+ scopes these isolation flags to the `exec` subcommand.
       // Keeping them before `exec` makes the CLI exit during argument parsing.
@@ -1394,6 +1408,16 @@ const KNOWN: CliSpec[] = [
     name: "Antigravity CLI",
     bin: "agy",
     envBin: "AGY_BIN",
+    defaultBinPaths: (source = process.env, userHome = homedir()) => {
+      if (process.platform === "win32") {
+        const localAppData = source.LOCALAPPDATA?.trim() || join(userHome, "AppData", "Local");
+        return [
+          join(localAppData, "agy", "bin", "agy.exe"),
+          join(userHome, ".local", "bin", "agy.exe"),
+        ];
+      }
+      return [join(userHome, ".local", "bin", "agy")];
+    },
     versionArgs: ["--version"],
     models: [
       "gemini-4-neon-medium",
@@ -1523,7 +1547,9 @@ async function selectCodexCredentialStore(bin: string, timeoutMs: number, signal
 async function assertCodexFullAccessCapability(bin: string, timeoutMs: number, signal: AbortSignal | undefined, workdir: string): Promise<void> {
   const capability = await codexNativeSessionsCapability(bin, timeoutMs, signal, undefined, workdir);
   if (!capability.available) throw new ProviderPreparationError({ stage: "native-session", reason: capability.issue ?? "native-cli-unavailable" });
-  if (!await selectCodexCredentialStore(bin, timeoutMs, signal)) throw new CodexAuthenticationUnavailableError();
+  if (!await selectCodexCredentialStore(bin, timeoutMs, signal) && !readLocalCodexTransportConfig().selfContainedAuth) {
+    throw new CodexAuthenticationUnavailableError();
+  }
 }
 
 function codexCredentialStoreKey(bin: string): string {
@@ -2464,6 +2490,7 @@ async function runCmd(
   onStdoutLine?: (line: string) => void | Promise<void>,
   larkProfile?: string,
   completion?: CommandCompletion,
+  extraEnv?: Record<string, string>,
 ): Promise<{
   code: number | null;
   stdout: string;
@@ -2481,7 +2508,7 @@ async function runCmd(
   }
   let unregister: (() => void) | undefined;
   const spawn = () => Bun.spawn([bin, ...args], {
-    cwd, env: providerChildEnvironment(process.env, larkProfile), stdout: "pipe", stderr: "pipe",
+    cwd, env: providerChildEnvironment(process.env, larkProfile, extraEnv), stdout: "pipe", stderr: "pipe",
     stdin: stdin === undefined ? "ignore" : "pipe",
   });
   let proc: ReturnType<typeof spawn>;
@@ -2614,7 +2641,7 @@ export async function detectProviders(timeoutMs = 6000, options: ProviderDetecti
           } catch {
             // Keep probing: the keyring store may still hold usable credentials.
           }
-          if (!await selectCodexCredentialStore(bin, timeoutMs)) {
+          if (!await selectCodexCredentialStore(bin, timeoutMs) && !readLocalCodexTransportConfig().selfContainedAuth) {
             out.push({
               ...base(spec, bin),
               available: false,
@@ -2788,7 +2815,17 @@ export async function detectProviders(timeoutMs = 6000, options: ProviderDetecti
 }
 
 function providerBin(spec: CliSpec): string {
-  return brandedEnv(process.env, spec.envBin)?.trim() || spec.bin;
+  const configured = brandedEnv(process.env, spec.envBin)?.trim();
+  if (configured) return configured;
+  if (Bun.which(spec.bin)) return spec.bin;
+  for (const candidate of spec.defaultBinPaths?.() ?? []) {
+    try {
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {
+      // Missing or inaccessible fallback candidate; keep scanning.
+    }
+  }
+  return spec.bin;
 }
 
 /** Opaque diagnostic cache key. No processes, credential contents, or user diagnostics. */
@@ -2804,6 +2841,7 @@ export function codexPreparationIdentity(): string {
   };
   return createHash("sha256").update(JSON.stringify([bin, metadata(resolved), home,
     metadata(join(home, "auth.json")), metadata(join(home, "config.toml")),
+    metadata(join(ambientCodexHome(), "config.toml")),
     process.env.PATH, process.env.PATHEXT])).digest("hex");
 }
 
@@ -3255,6 +3293,7 @@ export async function runProviderDetailed(
     stagedAgySchema = id === "agy" && prepared.outputSchema
       ? stageAgyOutputSchema(prepared.outputSchema)
       : undefined;
+    const codexTransport = id === "codex" ? readLocalCodexTransportConfig() : undefined;
     const providerInput: PreparedRunInput = {
       ...prepared,
       nativeSkillReadRoot: stagedSkillInputs.readRoot,
@@ -3264,6 +3303,7 @@ export async function runProviderDetailed(
         ? {
             codexCredentialStore:
               codexCredentialStoreByBin.get(codexCredentialStoreKey(bin)) ?? "file",
+            ...(codexTransport?.args.length ? { codexTransportArgs: codexTransport.args } : {}),
           }
         : {}),
       ...(isolationContext
@@ -3328,6 +3368,7 @@ export async function runProviderDetailed(
           catch { return false; }
         },
       } : undefined,
+      codexTransport?.env,
     );
     if (id === "codex") {
       collectedEvidence = collectCodexExecutionEvidence(stdout);

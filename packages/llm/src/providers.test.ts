@@ -4763,6 +4763,62 @@ describe("provider detection", () => {
     }
   });
 
+  test("Antigravity CLI detection falls back to official default install path when not in inherited PATH", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "ha-agy-default-bin-"));
+    const previousBin = process.env.HOMEAGENT_AGY_BIN;
+    const previousLocalAppData = process.env.LOCALAPPDATA;
+    const previousHome = process.env.HOME;
+    const previousPath = process.env.PATH;
+    try {
+      delete process.env.HOMEAGENT_AGY_BIN;
+      const installDir = process.platform === "win32"
+        ? join(directory, "agy", "bin")
+        : join(directory, ".local", "bin");
+      mkdirSync(installDir, { recursive: true });
+      const script = join(directory, "agy-default.mjs");
+      writeFileSync(
+        script,
+        [
+          "const args = process.argv.slice(2);",
+          "if (args.includes('--version')) { console.log('1.5.17'); process.exit(0); }",
+          "if (args.includes('--help')) { console.log('--input-format --output-format --disable-slash-commands --model --mode --sandbox --dangerously-skip-permissions'); process.exit(0); }",
+          "process.exit(1);",
+        ].join("\n"),
+        "utf8",
+      );
+      if (process.platform === "win32") {
+        // Point LOCALAPPDATA to our temp dir with a real agy.exe stub is not
+        // needed when Bun.which is empty; verify with a compiled or copied exe
+        // only on POSIX, and on Windows verify LOCALAPPDATA fallback via a file
+        // probe that triggers execution at the fallback path (not $PATH error).
+        const stubExe = join(installDir, "agy.exe");
+        writeFileSync(stubExe, "stub", "utf8");
+        process.env.LOCALAPPDATA = directory;
+        process.env.PATH = join(directory, "empty-path");
+        const detected = (await detectProviders(2_000)).find((item) => item.id === "agy");
+        expect(detected?.bin).toBe(stubExe);
+      } else {
+        const stubBin = join(installDir, "agy");
+        writeFileSync(stubBin, `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`, "utf8");
+        chmodSync(stubBin, 0o755);
+        process.env.HOME = directory;
+        process.env.PATH = join(directory, "empty-path");
+        const detected = (await detectProviders(2_000)).find((item) => item.id === "agy");
+        expect(detected).toMatchObject({ id: "agy", bin: stubBin, available: true, detail: "1.5.17" });
+      }
+    } finally {
+      if (previousBin === undefined) delete process.env.HOMEAGENT_AGY_BIN;
+      else process.env.HOMEAGENT_AGY_BIN = previousBin;
+      if (previousLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+      else process.env.LOCALAPPDATA = previousLocalAppData;
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("Antigravity CLI sends prompts over stream-json stdin, maps permissions, and parses usage and progress", async () => {
     const directory = realpathSync(mkdtempSync(join(tmpdir(), "ha-agy-run-")));
     const previous = process.env.HOMEAGENT_AGY_BIN;
@@ -4960,5 +5016,142 @@ describe("provider detection", () => {
     ]);
     expect(JSON.stringify(failed)).not.toContain("SECRET_");
     expect(parse("not-json")).toEqual([]);
+  });
+
+  test("forwards active ambient Codex model_provider routing and env_key while keeping CODEX_HOME and tool shells isolated", async () => {
+    const keys = [
+      "HOMEAGENT_CODEX_BIN",
+      "HOMEAGENT_CODEX_HOME",
+      "CODEX_HOME",
+      "APIROUTER_API_KEY",
+      "UNRELATED_HOST_SECRET",
+    ] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-codex-api-routing-")));
+    const ambientHome = join(root, "ambient-codex");
+    const providerHome = join(root, "provider-codex");
+    const script = join(root, "capture-codex.js");
+    const bin = join(root, process.platform === "win32" ? "codex.cmd" : "codex");
+    try {
+      mkdirSync(ambientHome, { recursive: true });
+      mkdirSync(providerHome, { recursive: true });
+      writeFileSync(join(ambientHome, "config.toml"), [
+        'model_provider = "apirouter"',
+        'notify = ["notify.exe", "turn-ended"]',
+        "[model_providers.apirouter]",
+        'name = "apirouter"',
+        'base_url = "https://api.gameaigc.cn/v1"',
+        'wire_api = "responses"',
+        'env_key = "APIROUTER_API_KEY"',
+        "requires_openai_auth = true",
+      ].join("\n"), "utf8");
+      writeFileSync(
+        script,
+        [
+          "const payload = {",
+          "  args: process.argv.slice(2),",
+          "  codexHome: process.env.CODEX_HOME,",
+          "  apiRouterKey: process.env.APIROUTER_API_KEY,",
+          "  unrelated: process.env.UNRELATED_HOST_SECRET,",
+          "};",
+          'console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(payload) } }));',
+        ].join("\n"),
+        "utf8",
+      );
+      writeFileSync(
+        bin,
+        process.platform === "win32"
+          ? `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`
+          : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`,
+        "utf8",
+      );
+      if (process.platform !== "win32") chmodSync(bin, 0o755);
+
+      process.env.HOMEAGENT_CODEX_BIN = bin;
+      process.env.HOMEAGENT_CODEX_HOME = providerHome;
+      process.env.CODEX_HOME = ambientHome;
+      process.env.APIROUTER_API_KEY = "router-live-sentinel";
+      process.env.UNRELATED_HOST_SECRET = "host-secret-sentinel";
+
+      const output = await runProviderDetailed("codex", {
+        prompt: "ping",
+        model: "gpt-6.2-sol",
+      }, 5_000);
+      const observed = JSON.parse(output.text) as {
+        args: string[];
+        codexHome?: string;
+        apiRouterKey?: string;
+        unrelated?: string;
+      };
+      const execIndex = observed.args.indexOf("exec");
+      expect(execIndex).toBeGreaterThan(0);
+      const beforeExec = observed.args.slice(0, execIndex);
+      expect(beforeExec).toContain('model_provider="apirouter"');
+      expect(beforeExec).toContain(
+        'model_providers.apirouter={name="apirouter",base_url="https://api.gameaigc.cn/v1",wire_api="responses",env_key="APIROUTER_API_KEY",requires_openai_auth=true}',
+      );
+      expect(observed.args.join(" ")).not.toContain("router-live-sentinel");
+      expect(observed.args.join(" ")).not.toContain("notify.exe");
+      expect(observed.args.slice(execIndex)).toEqual([
+        "exec", "--ephemeral", "--strict-config", "--ignore-user-config", "--ignore-rules",
+        "--json", "--sandbox", "read-only", "--skip-git-repo-check", "-m", "gpt-6.2-sol", "--", "-",
+      ]);
+      // Shell tool environment stays locked to CODEX_TOOL_ENVIRONMENT_KEYS without the API key.
+      const includeOnly = beforeExec.find((arg) => arg.startsWith("shell_environment_policy.include_only="));
+      expect(includeOnly).toBeDefined();
+      expect(includeOnly).not.toContain("APIROUTER_API_KEY");
+      expect(observed.codexHome).toBe(providerHome);
+      expect(observed.apiRouterKey).toBe("router-live-sentinel");
+      expect(observed.unrelated).toBeUndefined();
+    } finally {
+      for (const key of keys) {
+        const value = previous[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("detects Codex as available when a custom model_provider has self-contained non-OpenAI auth", async () => {
+    const keys = [
+      "HOMEAGENT_CODEX_BIN",
+      "HOMEAGENT_CODEX_HOME",
+      "CODEX_HOME",
+      "CUSTOM_CODEX_API_KEY",
+    ] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "ha-codex-self-contained-auth-")));
+    const ambientHome = join(root, "ambient-codex");
+    const providerHome = join(root, "provider-codex");
+    try {
+      mkdirSync(ambientHome, { recursive: true });
+      writeFileSync(join(ambientHome, "config.toml"), [
+        'model_provider = "custom_api"',
+        "[model_providers.custom_api]",
+        'name = "custom_api"',
+        'base_url = "https://proxy.example/v1"',
+        'wire_api = "responses"',
+        'env_key = "CUSTOM_CODEX_API_KEY"',
+        "requires_openai_auth = false",
+      ].join("\n"), "utf8");
+      process.env.HOMEAGENT_CODEX_BIN = writeCodexStatusProvider(root, "codex-self-auth", 1);
+      process.env.HOMEAGENT_CODEX_HOME = providerHome;
+      process.env.CODEX_HOME = ambientHome;
+      process.env.CUSTOM_CODEX_API_KEY = "custom-api-key-sentinel";
+
+      const codex = (await detectProviders(5_000)).find((provider) => provider.id === "codex");
+      expect(codex).toEqual(expect.objectContaining({
+        id: "codex",
+        available: true,
+      }));
+    } finally {
+      for (const key of keys) {
+        const value = previous[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

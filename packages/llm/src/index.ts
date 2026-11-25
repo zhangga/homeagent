@@ -3,6 +3,7 @@ export * from "./budget.ts";
 export * from "./pricing.ts";
 export * from "./providers.ts";
 export * from "./codex-model-settings.ts";
+export * from "./codex-transport-config.ts";
 export * from "./execution-evidence.ts";
 export * from "./provider-preparation.ts";
 export * from "./codex-execution-policy.ts";
