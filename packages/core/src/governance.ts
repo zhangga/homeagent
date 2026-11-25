@@ -58,6 +58,7 @@ import {
 import {
   MAX_CHAT_RUN_HISTORY_PER_AGENT,
   isChatRun,
+  portableChatDelivery,
   type ChatRun,
 } from "./chat-runs.ts";
 import {
@@ -140,7 +141,8 @@ export const MULTITASK_SPACE_ARCHIVE_VERSION = 21 as const;
 export const WORK_PLAN_SPACE_ARCHIVE_VERSION = 22 as const;
 export const WORK_RECOVERY_SPACE_ARCHIVE_VERSION = 23 as const;
 export const WORK_DELEGATION_SPACE_ARCHIVE_VERSION = 24 as const;
-export const SPACE_ARCHIVE_VERSION = WORK_DELEGATION_SPACE_ARCHIVE_VERSION;
+export const CHAT_REPLY_FILE_SPACE_ARCHIVE_VERSION = 25 as const;
+export const SPACE_ARCHIVE_VERSION = CHAT_REPLY_FILE_SPACE_ARCHIVE_VERSION;
 
 export interface RawSourceFileArchive {
   digest: string;
@@ -273,7 +275,7 @@ export interface SpaceArchiveV23 extends Omit<SpaceArchiveV22, "version"> {
   version: typeof WORK_RECOVERY_SPACE_ARCHIVE_VERSION;
 }
 export interface SpaceArchiveV24 extends Omit<SpaceArchiveV23, "version"> {
-  version: typeof WORK_DELEGATION_SPACE_ARCHIVE_VERSION;
+  version: typeof SPACE_ARCHIVE_VERSION;
 }
 export type SpaceArchive = SpaceArchiveV24;
 
@@ -1220,13 +1222,15 @@ function parseChatRun(
       : legacy.usage,
   };
   if (!isChatRun(normalized)) throw new Error(`chatRuns[${index}] is invalid`);
+  if (version < CHAT_REPLY_FILE_SPACE_ARCHIVE_VERSION && (normalized.delivery.attachmentUnavailable || normalized.delivery.replyFile)) {
+    throw new Error("chat attachment delivery requires archive v25");
+  }
   if (normalized.space !== space) {
     throw new Error(`chatRuns[${index}].space does not match archive space`);
   }
   if (normalized.status === "queued" || normalized.status === "running") {
     throw new Error(`chatRuns[${index}] cannot restore an active record`);
   }
-  const { liveReply: _localLiveReply, messageId: _localMessageId, ...portableDelivery } = normalized.delivery;
 
   return {
     id: nonemptyText(normalized.id, `chatRuns[${index}].id`),
@@ -1262,7 +1266,7 @@ function parseChatRun(
     retryOf: normalized.retryOf,
     priority: normalized.priority,
     status: normalized.status,
-    delivery: portableDelivery,
+    delivery: portableChatDelivery(normalized.delivery),
     queuedAt: normalized.queuedAt,
     startedAt: normalized.startedAt,
     runStartedAt: normalized.runStartedAt,
@@ -2025,6 +2029,7 @@ export function parseSpaceArchive(value: unknown): SpaceArchive {
       && version !== WORK_PLAN_SPACE_ARCHIVE_VERSION
       && version !== WORK_RECOVERY_SPACE_ARCHIVE_VERSION
       && version !== WORK_DELEGATION_SPACE_ARCHIVE_VERSION
+      && version !== CHAT_REPLY_FILE_SPACE_ARCHIVE_VERSION
     )
   ) {
     throw new Error("unsupported space archive format or version");

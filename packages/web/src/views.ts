@@ -7,6 +7,10 @@
 import { html, raw } from "hono/html";
 import { randomUUID } from "node:crypto";
 import { materialUploadScript } from "./material-import-view.ts";
+import { materialProgressScript } from "./material-progress.ts";
+import { citedPageList, type CitedPage } from "./material-citations.ts";
+import { firstTaskSchedulePreview } from "./task-schedule-preview.ts";
+import type { AskFailure } from "./ask-failure.ts";
 import { taskRunRefreshScript, taskRunRefreshState } from "./task-run-refresh.ts";
 import { belongsToAction, selectWorkAttention, workDecisionLabels, type HomeDecision, type WorkAttention } from "./work-attention.ts";
 import type { HtmlEscapedString } from "hono/utils/html";
@@ -40,6 +44,7 @@ import type {
   KnowledgePageTrace,
   RawGovernanceDetail,
   RawHistoryPage,
+  SpaceIndex,
   QuarantineRecord,
   AnswerFeedbackReview,
   QualitySnapshot,
@@ -61,8 +66,10 @@ import {
   MIN_TASK_TIMEOUT_MINUTES,
   isKnowledgeContentRef,
   rawSourceText,
+  tokenize,
   resolveGroupParticipationLevel,
   MAX_TASK_NOTIFICATION_ATTEMPTS,
+  SPACE_ARCHIVE_VERSION,
   TASK_CADENCES,
   learningProgress,
   skillWarningViews,
@@ -95,6 +102,7 @@ import {
 } from "./feishu-provisioning-view.ts";
 import { safeLarkVerificationUrl } from "./verification-url.ts";
 import { learningMarkdownHtml } from "./learning-markdown.ts";
+import { knowledgeMarkdownHtml } from "./knowledge-markdown.ts";
 import { dreamRunsPanel } from "./dream-progress-view.ts";
 import type { DreamRunSnapshot } from "@homeagent/core";
 
@@ -266,6 +274,7 @@ export function spaceDetailView(
   agents: Agent[] = [],
   flashMsg?: string,
   topLevelMapLinks?: string[],
+  importResults?: HtmlEscapedString,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const topLevelMapSlugs = new Set(topLevelMapLinks ?? []);
   const maps = pages.filter((page) =>
@@ -329,6 +338,8 @@ export function spaceDetailView(
       <a href="/spaces/${enc}/quarantine" class="${counts.failed ? "has-failures" : "muted"}">提炼失败（${counts.failed}）</a>
     </div>
     ${flash(flashMsg)}
+    ${importResults ?? ""}
+    ${spaceSearchForm(space)}
     <div class="space-controls">
       <a class="btn" href="/spaces/${enc}/ask">向空间提问</a>
       <details>
@@ -352,11 +363,13 @@ export function spaceDetailView(
             </label>
             <button type="submit">导入资料</button>
             <a href="/health#dream-runs">查看提炼任务</a>
+            <a data-material-recent="/spaces/${enc}" hidden>上次导入回执</a>
           </div>
         </form>
         <p role="status" data-material-status></p>
         <div data-material-results></div>
         ${materialUploadScript}
+        ${materialProgressScript}
       </details>
       <a class="btn secondary" href="/spaces/${enc}/raw">原始条目（${counts.raw}）</a>
     </div>
@@ -520,28 +533,26 @@ export function pageView(
     <td>${source.admission === "ready" ? "已准入" : source.admission}</td>
   </tr>`) ?? [];
   const evidence = trace && isKnowledgeContentRef(page)
-    ? html`<h2>证据链与时效性</h2>
-      <div class="card">
+    ? html`<details class="card knowledge-details"><summary>证据链与时效性</summary>
         <div><strong>${freshnessLabel}</strong> · 最新证据：${fmtTime(trace.latestEvidenceAt)} ·
           ${trace.sourceCount} 条 Raw · 证据链${trace.complete ? "完整" : "不完整"}</div>
         <p class="muted">时效等级依据最新 Raw 的记录时间计算，只表示证据新旧，不代表事实自动失效。</p>
         ${evidenceRows.length > 0
-          ? html`<table>
+          ? html`<div class="knowledge-scroll"><table>
               <tr><th>Raw</th><th>来源</th><th>记录时间</th><th>作者</th><th>准入</th></tr>
               ${evidenceRows}
-            </table>`
+            </table></div>`
           : html`<div class="empty">没有可读取的 Raw 证据。</div>`}
         ${trace.missingSourceIds.length > 0
           ? html`<p class="muted">缺失来源：${trace.missingSourceIds.join("、")}</p>`
           : ""}
         ${trace.truncated ? html`<p class="muted">证据链较长，此处只显示前 100 条。</p>` : ""}
-      </div>`
+      </details>`
     : "";
   const governance = page.type === "map"
-    ? html`<h2>导航页说明</h2>
-      <div class="card muted">这是系统自动生成的导航页，会随知识页变化增量更新；请在其链接的知识页上进行纠错或治理。</div>`
-    : html`<h2>人工治理</h2>
-      <div class="card">
+    ? html`<details class="card knowledge-details"><summary>导航页说明</summary>
+      <p class="muted">这是系统自动生成的导航页，会随知识页变化增量更新；请在其链接的知识页上进行纠错或治理。</p></details>`
+    : html`<details class="card knowledge-details"><summary>人工治理</summary>
         <div class="actions">
           <form method="post" action="/spaces/${enc}/pages/regenerate" class="inline-form">
             <input type="hidden" name="slug" value="${page.slug}" />
@@ -560,18 +571,36 @@ export function pageView(
           </div>
           <button type="submit">提交人工纠错</button>
         </form>
-      </div>`;
-  return html`<h1>${page.title} <span class="tag">${page.type}</span></h1>
+      </details>`;
+  return html`<style>
+    .knowledge-reading { max-width:78ch; line-height:1.75; overflow-wrap:anywhere; }
+    .knowledge-reading > :first-child { margin-top:0; }
+    .knowledge-reading > :last-child { margin-bottom:0; }
+    .knowledge-reading blockquote { margin-left:0; padding-left:1em; border-left:3px solid var(--border); }
+    .knowledge-reading pre, .knowledge-scroll { max-width:100%; overflow-x:auto; }
+    .knowledge-reading pre { padding:12px; background:var(--bg); }
+    .knowledge-body { overflow-x:auto; }
+    .knowledge-details { overflow-wrap:anywhere; }
+    .knowledge-details > summary { cursor:pointer; font-weight:600; }
+    .knowledge-details[open] > summary { margin-bottom:12px; }
+  </style>
+    <h1>${page.title}</h1>
     ${flash(flashMsg)}
-    <div class="card">
-      <div class="muted">slug：${page.slug} · 更新：${fmtTime(page.updatedAt)}</div>
+    ${page.summary ? html`<p class="subtitle">${page.summary}</p>` : ""}
+    <p class="muted">更新于 ${fmtTime(page.updatedAt)}
+      ${isKnowledgeContentRef(page) ? html` · <a href="#knowledge-sources">${page.sources.length} 条原始来源</a>
+        ${trace ? html` · ${freshnessLabel}${trace.complete ? "" : " · 证据链不完整"}` : ""}` : ""}</p>
+    <article class="card knowledge-reading knowledge-body" aria-label="正文">${knowledgeMarkdownHtml(space, page)}</article>
+    ${isKnowledgeContentRef(page) || page.sources.length ? html`<section id="knowledge-sources" aria-label="原始来源">
+      <h2>原始来源</h2><p class="muted">${page.sources.length ? sourceLinks : "此页尚无原始来源。"}</p>
+      ${evidence}</section>` : ""}
+    <details class="card knowledge-details"><summary>页面信息</summary>
+      <div class="muted">类型：${page.type} · slug：${page.slug}</div>
       ${aliases}${links}
-      <div style="margin-top:8px">${tags}</div>
-      <div class="muted" style="margin-top:8px">来源 raw：${sourceLinks}</div>
-    </div>
-    <h2>正文</h2>
-    <div class="contentbox">${page.content}</div>
-    ${evidence}
+      ${tags.length ? html`<div style="margin-top:8px">${tags}</div>` : ""}
+    </details>
+    <details class="card knowledge-details"><summary>查看 Markdown 原文</summary>
+      <pre class="contentbox">${page.content}</pre></details>
     ${governance}`;
 }
 
@@ -616,7 +645,73 @@ function rawListPreview(record: RawRecord) {
     title: characters.length > 64 ? `${shownTitle}…` : shownTitle,
     summary: excerpt.length > 140 ? excerpt.slice(0, 140).join("") + "…" : summary,
     source: label,
+    body: content,
   };
+}
+
+export const SPACE_SEARCH_QUERY_LIMIT = 500;
+const SPACE_SEARCH_RESULT_LIMIT = 20;
+
+function spaceSearchForm(space: SpaceId, query = "") {
+  return html`<style>
+    .space-search-form { display:flex; gap:8px; margin:12px 0 16px; }
+    .space-search-form input { flex:1; min-width:0; min-height:44px; }
+    .space-search-form button { flex:none; }
+    .space-search-hit { overflow-wrap:anywhere; }
+    .space-search-hit p { margin:4px 0; }
+  </style><form method="post" action="/spaces/${encodeURIComponent(space)}/search" role="search" class="space-search-form">
+    <input type="text" name="q" aria-label="本空间关键词" placeholder="输入关键词，查知识页或原始资料"
+      maxlength="${SPACE_SEARCH_QUERY_LIMIT}" value="${query}" required />
+    <button type="submit">搜本空间</button></form>`;
+}
+
+/** FTS ranks tokenized copies. Show a contiguous passage from the readable source. */
+function searchExcerpt(content: string, query: string, fallback = "") {
+  const lower = content.toLowerCase();
+  let matchAt = lower.indexOf(query.toLowerCase());
+  if (matchAt < 0) {
+    for (const term of new Set(tokenize(query))) {
+      matchAt = lower.indexOf(term);
+      if (matchAt >= 0) break;
+    }
+  }
+  const body = matchAt < 0 && fallback ? fallback : content;
+  let start = Math.max(0, matchAt - 45);
+  if (start > 0 && /[\uDC00-\uDFFF]/u.test(body.charAt(start))) start--;
+  let end = start + 180;
+  if (/[\uD800-\uDBFF]/u.test(body.charAt(end - 1))) end++;
+  return (start ? "…" : "") + body.slice(start, end).replace(/\s+/gu, " ").trim() + (end < body.length ? "…" : "");
+}
+
+export function spaceSearchView(space: SpaceId, index: SpaceIndex, query: string, invalid = false) {
+  const form = spaceSearchForm(space, query.slice(0, SPACE_SEARCH_QUERY_LIMIT));
+  if (invalid) return html`<h1>搜本空间</h1>${form}<p role="alert">关键词最多 ${SPACE_SEARCH_QUERY_LIMIT} 个字符，请缩短后再搜。</p>`;
+  if (!query) return html`<h1>搜本空间</h1>${form}<p class="muted">请输入要查找的关键词。</p>`;
+  const limit = SPACE_SEARCH_RESULT_LIMIT;
+  const pages = index.search(query, limit + 1, { contentOnly: true });
+  const records = index.searchRaw(query, limit + 1);
+  const base = `/spaces/${encodeURIComponent(space)}`;
+  const section = (label: string, rows: ReturnType<typeof html>[], total: number) => html`
+    <section><h2>${label}（${total > limit ? `${limit}+` : total}）</h2>
+      ${rows.length ? html`<ul class="collection-list">${rows}</ul>` : html`<p class="muted">没有匹配的${label}。</p>`}
+      ${total > limit ? html`<p class="muted">显示最相关的 ${limit} 条，可细化关键词。</p>` : ""}
+    </section>`;
+  if (!pages.length && !records.length) return html`<h1>搜本空间</h1>${form}
+    <p class="empty">本空间没有匹配的知识页或原始资料。可以试试文件名、主题或原文中的关键词。</p>`;
+  const pageRows = pages.slice(0, limit).map(hit => {
+    const page = index.getPage(hit.slug)!;
+    return html`<li><div class="space-search-hit"><a href="${base}/pages/${encodeURIComponent(hit.slug)}">${hit.title}</a>
+      <p>${searchExcerpt(page.content, query, page.summary)}</p></div></li>`;
+  });
+  const rawRows = records.slice(0, limit).map(record => {
+    const preview = rawListPreview(record);
+    const source = record.source === "manual" && record.content.startsWith("# 本地资料：") ? "本地文件" : preview.source;
+    const excerpt = searchExcerpt(preview.body, query, preview.summary);
+    return html`<li><div class="space-search-hit"><a href="${base}/raw/${encodeURIComponent(record.id)}">${preview.title}</a>
+      <span class="collection-meta">${source} · ${rawStatusLabel(record)} · ${fmtTime(record.createdAt)}</span>
+      ${excerpt && excerpt !== preview.title ? html`<p>${excerpt}</p>` : ""}</div></li>`;
+  });
+  return html`<h1>搜本空间</h1>${form}${section("知识页", pageRows, pages.length)}${section("原始资料", rawRows, records.length)}`;
 }
 
 export function rawListView(space: SpaceId, name: string, page: RawHistoryPage, paged: boolean): HtmlEscapedString | Promise<HtmlEscapedString> {
@@ -676,6 +771,7 @@ export function rawGovernanceDetailView(
   space: SpaceId,
   detail: RawGovernanceDetail,
   flashMsg?: string,
+  materialProgress?: HtmlEscapedString,
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const enc = encodeURIComponent(space);
   const rawId = encodeURIComponent(detail.raw.id);
@@ -709,6 +805,9 @@ export function rawGovernanceDetailView(
         <button type="submit">重新提炼这条记录</button>
       </form>`
     : "";
+  const relatedPages = html`${materialProgress ?? ""}${materialProgress ? materialProgressScript : ""}<h2>关联知识页（${detail.pages.length}）</h2>
+    ${pageRows.length ? html`<ul>${pageRows}</ul>` : html`<div class="empty">当前没有知识页引用这条原始记录。</div>`}`;
+  const imported = detail.raw.id.startsWith("local-import-");
   return html`<h1>原始记录详情</h1>
     <p class="subtitle">${detail.raw.id}</p>
     ${flash(flashMsg)}
@@ -720,6 +819,7 @@ export function rawGovernanceDetailView(
       </div>
       ${redistillControl}
     </div>
+    ${imported ? relatedPages : ""}
     <h2>完整内容</h2>
     <div class="contentbox">${detail.raw.content}</div>
     ${agentResponse}
@@ -727,10 +827,7 @@ export function rawGovernanceDetailView(
     ${attachmentRows.length > 0
       ? html`<ul>${attachmentRows}</ul>`
       : html`<div class="empty">没有附件。</div>`}
-    <h2>关联知识页（${detail.pages.length}）</h2>
-    ${pageRows.length > 0
-      ? html`<ul>${pageRows}</ul>`
-      : html`<div class="empty">当前没有知识页引用这条原始记录。</div>`}`;
+    ${imported ? "" : relatedPages}`;
 }
 
 export function askView(
@@ -739,7 +836,7 @@ export function askView(
   result: AskResult | null,
   flashMsg?: string,
   feedbackRecorded = false,
-  display: { note?: string; historyUrl?: string } = {},
+  display: { note?: string; historyUrl?: string; failure?: AskFailure } = {},
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const enc = encodeURIComponent(space);
   let answer: HtmlEscapedString | Promise<HtmlEscapedString> | string = "";
@@ -778,10 +875,30 @@ export function askView(
   }
   return html`<h1>向空间提问</h1>
     ${flash(flashMsg)}
-    <form method="post" action="/spaces/${enc}/ask" class="actions">
+    ${display.failure ? html`<div class="card" role="alert">${display.failure.message}
+      ${display.failure.settingsLink ? html`<a href="/settings" target="_blank" rel="noopener">打开设置</a>` : ""}</div>` : ""}
+    <form method="post" action="/spaces/${enc}/ask" class="actions" data-ask-form>
+      <input type="hidden" name="submissionId" value="${randomUUID()}" />
       <input type="text" name="q" aria-label="问题" placeholder="问一个问题…" value="${question ?? ""}" />
-      <button type="submit">${result ? "重新提问" : "提问"}</button>
+      <button type="submit">${display.failure ? "重试这个问题" : result ? "重新提问" : "提问"}</button>
     </form>
+    <span role="status" data-ask-status></span>
+    <script>{
+      const form = document.querySelector('[data-ask-form]');
+      const button = form.querySelector('button[type=submit]');
+      const status = document.querySelector('[data-ask-status]');
+      form.addEventListener('submit', event => {
+        if (button.disabled) { event.preventDefault(); return; }
+        button.disabled = true;
+        form.setAttribute('aria-busy', 'true');
+        status.textContent = '正在回答…';
+      });
+      window.addEventListener('pageshow', () => {
+        button.disabled = false;
+        form.removeAttribute('aria-busy');
+        status.textContent = '';
+      });
+    }</script>
     ${display.note ? html`<p role="status">${display.note}</p>` : ""}
     ${display.historyUrl ? html`<script data-result-url="${display.historyUrl}">
       history.replaceState(null, "", document.currentScript.dataset.resultUrl);
@@ -1156,7 +1273,7 @@ export function governanceView(
     </div>
     <div class="card">
       <h2 style="margin-top:0">恢复空间</h2>
-      <p class="muted">接受 homeagent.space v1–v23 归档；v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录，v19 包含按 SHA-256 校验的完整原文件，v20 保留 Agent 执行模式意图但不包含本机完全访问确认，v21 保留多事项及默认焦点，v22 增加不可变计划版本、步骤身份及动作关联，v23 保留遇阻修订来源，不恢复本机分派队列、计划回执门禁和执行准入；已有同名空间不会被覆盖。</p>
+      <p class="muted">接受 homeagent.space v1–v${SPACE_ARCHIVE_VERSION} 归档。v2 包含阅读计划，v3 包含主题路线与多来源材料，v4 包含知识人工治理审计，v5 包含任务运行历史，v6 包含运行时限与通知状态，v7 包含精确 Skill 绑定，v8 包含 Chat Run 历史，v9 包含运行队列，v10 包含冻结执行计划，v11 包含 Agent 发布历史与任务审批审计，v12 包含审批期限与通知审计，v13 包含运行用量、失败分类与自动重试审计，v14 包含 Chat 评测 Trace 与已结束重评审计，v15 包含工作上下文、续作动作/checkpoint/策略及其证据关联，v16 包含 WorkAction Raw 的待验收、已准入与已排除状态，v17 包含系统生成的分层知识地图，v18 包含本地 Agent 知识消费反馈及处置记录，v19 包含按 SHA-256 校验的完整原文件，v20 保留 Agent 执行模式意图但不包含本机完全访问确认，v21 保留多事项及默认焦点，v22 增加不可变计划版本、步骤身份及动作关联，v23 保留遇阻修订来源，v24 保留工作委派，v25 标记未随归档保存的待投递回答附件。恢复时不导入本机分派队列、计划回执门禁和执行准入。已有同名空间不会被覆盖。</p>
       <form method="post" action="/governance/restore" enctype="multipart/form-data" class="actions">
         <input type="file" name="archive" accept="application/json,.json" required />
         <button type="submit">上传并恢复</button>
@@ -1929,7 +2046,7 @@ export function tasksView(
   }
 
   const spaceOptions = spaces.length
-    ? spaces.map((s) => html`<option value="${s.id}" ${s.id === spaceVal ? "selected" : ""}>${s.name?.trim() || s.id}</option>`)
+    ? spaces.map((s) => html`<option${!editing && s.chatId ? html` data-chat-bound` : ""} value="${s.id}" ${s.id === spaceVal ? "selected" : ""}>${s.name?.trim() || s.id}</option>`)
     : [html`<option value="">还没有知识空间</option>`];
 
   return html`<h1>${editing ? "编辑任务设置" : "新建研究任务"}</h1>
@@ -1988,6 +2105,7 @@ export function tasksView(
           ${toggle("enabled", "启用", "关闭后调度器不会自动运行")}
           ${toggle("notify", "推送飞书", "完成后把摘要发到空间绑定的群/私聊")}
           ${toggle("distillOnRun", "完成后立即提炼", "运行结束就把结果提炼成知识页（关闭则等夜间提炼）")}
+          ${editing ? "" : firstTaskSchedulePreview}
           <div class="actions">
             <button type="submit">${submitLabel}</button>
             ${editing ? html`<a href="${formAction}">取消编辑</a>` : ""}
@@ -2049,6 +2167,7 @@ export function taskRunView(
   queue?: RunQueueInfo,
   workContext?: { action: WorkAction; item: WorkItem },
   localAuthorization?: string,
+  citedPages?: CitedPage[],
 ): HtmlEscapedString | Promise<HtmlEscapedString> {
   const workAcceptance = workContext?.action.acceptances?.find(
     (acceptance) => acceptance.taskRunId === run.id,
@@ -2135,7 +2254,7 @@ export function taskRunView(
   const output = html`<div class="task-run-text">${run.output || run.summary || "本次运行没有保存输出正文。"}</div>
     ${run.outputTruncated ? html`<div class="muted">输出过长，运行记录仅保留前 100,000 个字符。</div>` : ""}`;
   const rawHref = run.rawId ? `/spaces/${encodeURIComponent(run.space)}/raw/${encodeURIComponent(run.rawId)}` : undefined;
-  const pagesWritten = run.pagesWritten === undefined ? "" : html`<div class="muted">写入知识页：${run.pagesWritten}</div>`;
+  const pagesWritten = run.pagesWritten === undefined ? "" : html`<div class="muted">本批次提炼共写入知识页：${run.pagesWritten}</div>`;
   const queuePosition = queue
     ? html`<div><strong>队列位置：</strong>第 ${queue.position} 位 · 已等待 ${Math.round(queue.waitedMs / 1000)} 秒</div>`
     : "";
@@ -2148,6 +2267,7 @@ export function taskRunView(
       case "succeeded":
         return html`<h2>运行输出</h2>${output}
           ${rawHref ? html`<a href="${rawHref}">查看原始记录</a>` : ""}
+          ${citedPages ? html`<h3>引用本次报告的知识页</h3>${citedPageList(`/spaces/${encodeURIComponent(run.space)}`, citedPages, "目前没有知识页引用本次报告。")}` : ""}
           ${pagesWritten}
           ${workAcceptance ? html`<a href="#task-run-acceptance">查看工作动作验收</a>` : ""}`;
       case "awaiting_approval":
@@ -2331,6 +2451,7 @@ export function chatRunView(
     || (
       run.status === "succeeded"
       && run.delivery.status !== "sent"
+      && !run.delivery.attachmentUnavailable
       && Boolean(run.output)
       && !deliveryActive
     );
@@ -2404,6 +2525,7 @@ export function chatRunView(
         ${chatRunText(run.error.message, "chat-run-full-error", "完整原因")}</div>` : ""}
       ${run.delivery.error ? html`<div><strong>${deliveryActive ? "上次投递错误" : "投递错误"}</strong>
         ${chatRunText(run.delivery.error, "chat-run-full-delivery-error", "完整投递错误")}</div>` : ""}
+      ${run.delivery.attachmentUnavailable ? html`<p>这份空间归档保留了回答正文，原附件未随归档保存。需要附件时，请在原会话重新请求生成并发送。</p>` : ""}
       <div id="chat-run-actions" class="actions">${cancellable && !cancelling ? html`<form method="post" action="${runPath}/cancel" class="inline-form"
         onsubmit="return confirm('取消这次对话运行？')"><button type="submit" class="secondary">取消运行</button></form>` : ""}${retryable
         ? html`<form method="post" action="${runPath}/retry" class="inline-form">

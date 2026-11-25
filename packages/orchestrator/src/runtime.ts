@@ -20,6 +20,7 @@
  * per-space serialization still applies underneath.
  */
 import type { SpaceId } from "@homeagent/shared";
+import { createHash } from "node:crypto";
 import {
   AI_OPERATION_TIMEOUT_MS,
   AI_ROUTING_MAX_TOKENS,
@@ -40,6 +41,8 @@ import {
 } from "@homeagent/llm";
 import {
   resolveGroupParticipationLevel,
+  replyFileIntent,
+  namesReplyFile,
   isReplyRawStatusTopic,
   storedRawStatusTopic,
   isKnowledgeContentRef,
@@ -90,6 +93,8 @@ import {
   type KnowledgeControl,
 } from "./conversation-interpreter.ts";
 import { formatAnswer, withReplyModel } from "./format.ts";
+import { citationNumber, citationReply, citationSourceLinks } from "./answer-citations.ts";
+import { chatRecoveryAvailable, chatRecoveryCommand, chatRecoveryTarget, ordinaryFeishuSource, type ChatRecoveryOperation } from "./feishu-chat-recovery.ts";
 import {
   GROUP_REMINDER_AUTOMATION_DENIAL,
   coldStartNote,
@@ -107,6 +112,8 @@ import {
   REMINDER_TIME_CLARIFICATION,
   formatReminderTime,
   handleReminderMessage,
+  handleReminderNotificationReply,
+  reminderNotificationReply,
   isReminderAutomationMessage,
   needsReminderInference,
   parseReminderRequest,
@@ -433,7 +440,8 @@ export class Orchestrator {
       void this.processWorkEvents().catch(() => log.warn("工作事件处理暂未完成"));
     }, 1_000);
     try {
-      await this.connector.start(event => event.kind !== "message" || (event.chatType === "group" && !this.activeGroupBinding(event.chatId))
+      await this.connector.start(event => event.kind === "card_action" && event.actionValue.action === "homeagent.chat-recovery"
+        ? this.receive(event) : event.kind !== "message" || (event.chatType === "group" && !this.activeGroupBinding(event.chatId))
         ? this.processEvent(event) : this.receive(event));
     } catch (error) {
       clearInterval(this.dispatchTimer);
@@ -471,6 +479,9 @@ export class Orchestrator {
   /** A transport acknowledgement is returned only after atomic intake persistence. */
   private receive(event: InboundEvent): { completion: Promise<void> } {
     if (this.stopping) throw new Error("Message intake is stopping");
+    if (event.kind === "card_action" && event.actionValue.action === "homeagent.chat-recovery") {
+      return this.receiveChatCard(event);
+    }
     if (event.kind !== "message" || (event.chatType === "group" && !this.activeGroupBinding(event.chatId))) {
       return { completion: this.processEvent(event) };
     }
@@ -480,8 +491,9 @@ export class Orchestrator {
     const acceptedBefore = this.inputFor(event);
     if (acceptedBefore) this.intakeDuplicates++;
     let input: WorkInput;
-    try { input = this.engine.workDispatch.accept({ connector: this.connector.name,
-      appId: this.activeFeishuAppId, space: attribute(event).writeSpace, message: event,
+    const space = attribute(event).writeSpace;
+    try { input = acceptedBefore ?? this.engine.workDispatch.accept({ connector: this.connector.name,
+      appId: this.activeFeishuAppId, space, message: event, chatRecovery: this.chatRecoveryForMessage(event, space),
       bindingId: event.chatType === "group" ? this.activeGroupBinding(event.chatId)?.executionScopeEpoch : undefined }); }
     catch (error) { this.intakeFailures++; throw error; }
     return { completion: this.dispatchInput(input) };
@@ -501,7 +513,7 @@ export class Orchestrator {
     // Reserve topic order before asynchronous source preparation begins.
     const m = input.message;
     const control = ["status", "cancel", "pause", "resume", "clarify"].includes(input.operation ?? "");
-    const key = control || input.state === "waiting" ? `control:${input.id}` : m.chatType === "group"
+    const key = control || input.chatRecovery || input.state === "waiting" ? `control:${input.id}` : m.chatType === "group"
       ? `topic:${input.space}:${m.chatId}:${m.rootMessageId ?? m.messageId}`
       : input.workItemId && input.operation !== "chat" ? `work:${input.workItemId}` : `input:${input.id}`;
     const pending = this.serializer.run(key, async () => {
@@ -518,7 +530,12 @@ export class Orchestrator {
             return;
           }
         }
-        if (control) {
+        if (current.chatRecovery) {
+          this.engine.workDispatch.update(current.id, current.revision, { state: "preparing" });
+          const { runId, operation, attempts, cardMessageId } = current.chatRecovery;
+          const feedback = await this.recoverFromFeishu(runId, operation, attempts, m.chatId, m.senderId, cardMessageId);
+          if (feedback) await this.workReceipt(current.id, feedback);
+        } else if (control) {
           await this.controlWork(current);
         } else if (current.state === "waiting") {
           await this.workReceipt(current.id, current.operation === "followup"
@@ -530,7 +547,7 @@ export class Orchestrator {
           if (run.status === "queued") {
             const { space, response } = current;
             await this.scheduleChatRun(m, space, run, signal => this.executeInputResponse(m, space, run.id, response, signal));
-          } else if (run.status === "succeeded" && run.delivery.status !== "sent" && run.output) {
+          } else if (run.status === "succeeded" && run.delivery.status !== "sent" && run.output && await this.canResendStoredAnswer(run)) {
             await this.send(m, run.output, run.id);
           }
         } else {
@@ -548,7 +565,7 @@ export class Orchestrator {
         const failed = this.engine.workDispatch.get(input.id);
         if (!failed || failed.state === "cancelled") return;
         if (!failed.plan) this.engine.workDispatch.update(failed.id, failed.revision, {
-          state: !failed.routing && !control && !this.seen.has(`message:${m.chatId}\u0000${m.messageId}`) ? "received" : "interrupted",
+          state: !failed.routing && !failed.chatRecovery && !control && !this.seen.has(`message:${m.chatId}\u0000${m.messageId}`) ? "received" : "interrupted",
         });
         else if (failed.runId) {
           const run = this.engine.chatRuns.get(failed.runId);
@@ -579,13 +596,40 @@ export class Orchestrator {
     return !!binding && binding.spaceId === input.space && binding.executionScopeEpoch === input.bindingId;
   }
 
+  private chatRecoveryForMessage(m: InboundMessage, space: SpaceId): WorkInput["chatRecovery"] {
+    const operation = this.connector.name === "feishu" ? chatRecoveryCommand(m.text) : undefined;
+    if (!operation) return undefined;
+    const all = this.engine.chatRuns.list(space).filter(run => run.chatId === m.chatId);
+    const candidates = all.flatMap(run => {
+      const source = this.recoverySource(run);
+      return source ? [{ run, source }] : [];
+    });
+    const direct = new Set(all.filter(run => m.parentMessageId
+      && [run.messageId, run.delivery.liveReply?.messageId, run.delivery.messageId].includes(m.parentMessageId)).map(run => run.id));
+    // A reply to another message (including a Task receipt) must not select
+    // an unrelated question just because both appeared under the same root.
+    const eligible = direct.size || (m.parentMessageId && m.parentMessageId !== m.rootMessageId)
+      ? candidates.filter(({ run }) => direct.has(run.id)) : candidates;
+    const target = chatRecoveryTarget(m, eligible);
+    if (!target && m.chatType === "group" && !m.mentionsBot && this.activeGroupBinding(m.chatId)?.responseMode !== "all_messages") {
+      const ownTopic = m.rootMessageId && candidates.some(({ source }) => source.message.senderId === m.senderId
+        && (source.message.rootMessageId ?? source.message.messageId) === m.rootMessageId
+        && (!source.message.threadId || !m.threadId || source.message.threadId === m.threadId));
+      if (!ownTopic) return undefined;
+    }
+    return { operation, ...(target ? { runId: target.id, attempts: target.delivery.attempts } : {}) };
+  }
+
   private routeInput(input: WorkInput): WorkInput {
     if (input.operation || input.plan) return input;
     const m = input.message;
     const binding = m.chatType === "group" ? this.activeGroupBinding(m.chatId) : undefined;
     // Existing automation and capture controls keep their original precedence and authorization.
     const ordinary = parseTaskCommand(m.text) || parseLearningCommand(m.text) || parseLearningAnswer(m.text)
-      || parseKnowledgeControl(m.text) || isReminderAutomationMessage(m.text) || storedRawStatusTopic(m.text) !== undefined
+      || (this.connector.name === "feishu" && replyFileIntent(m.text, m.chatType) === "send")
+      || (this.connector.name === "feishu" && citationNumber(m.text) !== undefined)
+      || parseKnowledgeControl(m.text) || reminderNotificationReply(this.engine, input.space, m, this.activeFeishuAppId, binding?.executionScopeEpoch)
+      || isReminderAutomationMessage(m.text, { engine: this.engine, space: input.space, message: m }) || storedRawStatusTopic(m.text) !== undefined
       || this.pendingReminderConfirmations.has(this.pendingReminderKey(m, input.space));
     const addressed = m.chatType === "p2p" || m.mentionsBot || binding?.responseMode === "all_messages";
     const route = ordinary || !addressed ? { operation: "chat" as const }
@@ -709,7 +753,7 @@ export class Orchestrator {
     let input = this.engine.workDispatch.get(inputId)!;
     if (input.receipt?.status === "sent") return;
     input = this.engine.workDispatch.update(input.id, input.revision, { receipt: { text, status: "pending" } });
-    const receipt = await this.connector.reply({ chatId: input.message.chatId, replyToMessageId: input.message.messageId,
+    const receipt = await this.connector.reply({ chatId: input.message.chatId, replyToMessageId: input.chatRecovery?.cardMessageId ?? input.message.messageId,
       idempotencyKey: `${input.id}:receipt`, markdown: text,
       inThread: this.activeGroupBinding(input.message.chatId)?.replyInThread ?? false });
     // Operational projections do not advance or invalidate a Provider-native conversation.
@@ -801,14 +845,87 @@ export class Orchestrator {
    * without re-running the model; provider failures create a new linked Run.
    */
   async retryChatRun(runId: string): Promise<ChatRun> {
+    return this.retryFrozenChatRun(runId);
+  }
+
+  private recoverySource(run: ChatRun): WorkInput | undefined {
+    const id = run.sourceInputId ?? run.dispatchKey;
+    const source = id ? this.engine.workDispatch.get(id) : undefined;
+    return ordinaryFeishuSource(run, source, this.activeFeishuAppId ?? "") && this.inputBindingCurrent(source)
+      && !this.messageWasRetracted(source.space, source.message.chatId, source.message.messageId) ? source : undefined;
+  }
+
+  private receiveChatCard(event: CardActionEvent): { completion: Promise<void> } {
+    const { operation, runId, attempts } = event.actionValue;
+    if (this.connector.name !== "feishu" || event.actionTag !== "button" || typeof runId !== "string" || runId.length > 180
+      || (operation !== "retry" && operation !== "resend") || typeof attempts !== "number" || !Number.isSafeInteger(attempts) || attempts < 0) {
+      return { completion: Promise.resolve() };
+    }
+    const run = this.engine.chatRuns.get(runId);
+    const source = run && this.recoverySource(run);
+    if (!source || !run || run.chatId !== event.chatId || run.delivery.liveReply?.messageId !== event.messageId) {
+      return { completion: Promise.resolve() };
+    }
+    if (run.author !== event.operatorId) return { completion: this.connector.reply({ chatId: event.chatId, replyToMessageId: event.messageId,
+      inThread: this.activeGroupBinding(event.chatId)?.replyInThread ?? false, idempotencyKey: `card:${event.eventId}`,
+      markdown: "只有原提问人可以操作这次回答。" }).then(() => {}) };
+    const id = createHash("sha256").update(event.eventId).digest("hex");
+    const message: InboundMessage = { kind: "message", messageType: "card_action", eventId: event.eventId,
+      messageId: `chat_control_${id}`, chatType: source.message.chatType, chatId: event.chatId, senderId: event.operatorId,
+      rootMessageId: source.message.rootMessageId ?? source.message.messageId, parentMessageId: event.messageId,
+      text: operation === "retry" ? "重试这次" : "补发回答", mentionsBot: true, createdAt: event.createdAt };
+    const input = this.engine.workDispatch.accept({ connector: "feishu", appId: source.appId, bindingId: source.bindingId,
+      space: source.space, message, chatRecovery: { operation, runId, attempts, cardMessageId: event.messageId } });
+    return { completion: this.dispatchInput(input) };
+  }
+
+  private async recoverFromFeishu(runId: string | undefined, operation: ChatRecoveryOperation, attempts: number | undefined,
+    chatId: string, actor: string, cardId?: string): Promise<string | undefined> {
+    const unavailable = "请由原提问人在原话题回复那条问题、失败提示或过程卡，再发送「重试这次」或「补发回答」。";
+    if (!runId) return unavailable;
+    const check = (run: ChatRun) => !!this.recoverySource(run) && run.chatId === chatId && run.author === actor
+      && (!cardId || cardId === run.delivery.liveReply?.messageId);
+    const target = this.engine.chatRuns.get(runId);
+    if (!target || !check(target)) return unavailable;
+    try {
+      if (operation === "resend" && target.outputTruncated && target.delivery.status !== "sent") {
+        return "这次只保留了回答节选，无法补发完整回答。请重新发送原问题。";
+      }
+      if (operation === "resend" && target.status === "succeeded" && target.delivery.status === "pending"
+        && this.engine.runScheduler.isRunning(target.id)) return "正在投递这次回答，请稍后查看原话题。";
+      if (operation === "retry") {
+        const child = this.engine.chatRuns.list(target.space).find(run => run.retryOf === target.id);
+        if (child) return child.status === "succeeded" && child.delivery.status === "sent" ? "这次问题已经重新回答并发送。"
+          : child.status === "running" || child.status === "queued" ? "这次问题已经在重试。"
+          : "这次已经重试过。请回复最近一次重试的过程卡或失败提示，再选择「重试这次」或「补发回答」。";
+      }
+      if (operation === "resend" && target.status !== "succeeded") return "还没有生成可补发的回答。执行失败时可回复「重试这次」。";
+      if (operation === "retry" && target.status === "succeeded") return target.delivery.status === "sent"
+        ? "这次回答已经发送。" : "回答已经生成。请回复「补发回答」发送已保存的结果。";
+      if (target.status === "queued" || target.status === "running") return "这次回答仍在处理中。";
+      const result = await this.retryFrozenChatRun(runId, { check, operation, attempts });
+      if (result.status === "succeeded" && result.delivery.status === "pending") return "回答的送达状态待确认，请先查看原话题。";
+      if (result.id === runId && operation === "retry") return "这次运行的状态已变化，请查看最近的过程卡。";
+      if (result.id === runId && result.delivery.status === "sent" && target.delivery.status === "sent") return "这次回答已经发送。";
+      return undefined;
+    } catch {
+      return "这次操作未能完成，请查看原话题的最新状态。";
+    }
+  }
+
+  private async retryFrozenChatRun(runId: string, control?: { check: (run: ChatRun) => boolean;
+    operation: ChatRecoveryOperation; attempts?: number }): Promise<ChatRun> {
     const previousForKey = this.engine.chatRuns.get(runId);
     const topic = this.engine.chatRuns.topicNativeSessionForRun(runId);
-    return this.serializer.run(
-      topic ? `topic:${previousForKey!.space}:${topic.chatId}:${topic.rootMessageId}`
-        : previousForKey?.workItemId ? `work:${previousForKey.workItemId}` : `chat:${previousForKey?.chatId ?? "retry"}`,
-      async () => {
+    const key = topic && previousForKey ? `topic:${previousForKey.space}:${topic.chatId}:${topic.rootMessageId}`
+      : previousForKey?.workItemId ? `work:${previousForKey.workItemId}` : `chat:${previousForKey?.chatId ?? "retry"}`;
+    return this.serializer.run(key, async () => {
       const previous = this.engine.chatRuns.get(runId);
       if (!previous) throw new Error(`unknown chat run: ${runId}`);
+      if (control && !control.check(previous)) throw new Error("Chat recovery binding changed");
+      if (control && (control.attempts !== previous.delivery.attempts || previous.delivery.status === "sent" && control.operation === "resend")) return previous;
+      if (control?.operation === "retry" && chatRecoveryAvailable(previous) !== "retry") return previous;
+      if (control?.operation === "resend" && previous.status !== "succeeded") return previous;
       const sourceInputId = previous.sourceInputId ?? previous.dispatchKey;
       const sourceInput = sourceInputId ? this.engine.workDispatch.get(sourceInputId) : undefined;
       if (sourceInputId && (!sourceInput || sourceInput.space !== previous.space)) throw new Error("Chat Run source input is missing");
@@ -829,6 +946,8 @@ export class Orchestrator {
         messageId: previous.messageId,
         messageType: sourceInput?.message.messageType,
         parentMessageId: sourceInput?.message.parentMessageId,
+        rootMessageId: sourceInput?.message.rootMessageId,
+        threadId: sourceInput?.message.threadId,
         mentionsBot: true,
         createdAt: sourceInput?.message.createdAt ?? previous.startedAt,
         ...this.topicMessageIdentity(previous.id),
@@ -839,19 +958,9 @@ export class Orchestrator {
         && previous.delivery.status !== "sent"
         && previous.output
       ) {
-        if (previous.rawId) {
-          const detail = await this.engine.getRawGovernanceDetail(
-            previous.space,
-            previous.rawId,
-          );
-          if (detail?.raw.agentResponse === previous.output) {
-            this.engine.chatRuns.deliverySent(
-              previous.id,
-              detail.raw.agentRespondedAt ?? Date.now(),
-            );
-            return this.engine.chatRuns.get(previous.id)!;
-          }
-        }
+        if (previous.delivery.attachmentUnavailable) throw new Error("原回答需要的附件仅保存在原机器，无法完整补发。");
+        if (!await this.canResendStoredAnswer(previous)) return this.engine.chatRuns.get(previous.id)!;
+        if (control && !control.check(previous)) throw new Error("Chat recovery binding changed");
         const topic = this.engine.chatRuns.topicNativeSessionForRun(previous.id);
         if (previous.topicNativeSessionExpected && !topic) {
           throw new Error(
@@ -871,6 +980,8 @@ export class Orchestrator {
       if (!["failed", "cancelled", "timed_out"].includes(previous.status)) {
         throw new Error("chat run is not retryable");
       }
+      const child = this.engine.chatRuns.list(previous.space).find(run => run.retryOf === previous.id);
+      if (child) return child;
       if (!previous.executionPlan) {
         throw new Error(
           "Chat Run has no immutable execution plan; refusing to retry with live Agent state.",
@@ -894,13 +1005,24 @@ export class Orchestrator {
           : this.answer(msg, readSpaces, writeSpace, retry.id, retryText, signal)
       );
       return this.engine.chatRuns.get(retry.id)!;
-      },
-    );
+    });
   }
 
   /** Process one event. Exposed for tests; connectors call it via start(). */
   enqueue(event: InboundEvent): Promise<void> {
     try { return this.receive(event).completion; } catch (error) { return Promise.reject(error); }
+  }
+
+  private async canResendStoredAnswer(run: ChatRun): Promise<boolean> {
+    if (!run.output || run.outputTruncated || run.delivery.status === "sent") return false;
+    if (run.rawId) {
+      const detail = await this.engine.getRawGovernanceDetail(run.space, run.rawId);
+      if (detail?.raw.agentResponse === run.output && (!run.delivery.replyFile?.attachToAnswer || run.delivery.replyFile.delivered)) {
+        this.engine.chatRuns.deliverySent(run.id, detail.raw.agentRespondedAt ?? Date.now());
+        return false;
+      }
+    }
+    return run.delivery.status === "failed" || run.delivery.attempts === 0;
   }
 
   private processEvent(event: InboundEvent): Promise<void> {
@@ -1220,6 +1342,16 @@ export class Orchestrator {
     // confirmation/cancellation bypasses group @ gating, but group creation is
     // still re-authorized immediately before its durable mutation.
     const reminderControlNow = Date.now();
+    if (reminderNotificationReply(this.engine, writeSpace, msg, this.activeFeishuAppId, groupBinding?.executionScopeEpoch)) {
+      return this.withThinking(msg, async () => {
+        if (!await this.authorizeGroupAutomation(msg, GROUP_REMINDER_AUTOMATION_DENIAL)) return;
+        const bindingId = msg.chatType === "group" ? this.activeGroupBinding(msg.chatId)?.executionScopeEpoch : undefined;
+        const target = reminderNotificationReply(this.engine, writeSpace, msg, this.activeFeishuAppId, bindingId);
+        if (!target) return this.send(msg, "这条提醒已经处理。");
+        markDurableMutation();
+        await this.send(msg, handleReminderNotificationReply(this.engine, msg, target));
+      });
+    }
     const pendingReminderControl = ["确认", "确认创建", "取消", "取消创建"]
       .includes(reminderControlText(msg.text))
       && this.pendingReminderConfirmations.has(this.pendingReminderKey(msg, writeSpace));
@@ -1240,7 +1372,7 @@ export class Orchestrator {
     // Authorize before capture, proactive-participation inference, reminder
     // inference, or any ReminderStore mutation.
     if (
-      isReminderAutomationMessage(msg.text)
+      isReminderAutomationMessage(msg.text, { engine: this.engine, space: writeSpace, message: msg })
       && !await this.authorizeGroupAutomation(
         msg,
         GROUP_REMINDER_AUTOMATION_DENIAL,
@@ -1273,6 +1405,16 @@ export class Orchestrator {
     if (knowledgeControl) {
       if (!decision.respond) return;
       return this.withThinking(msg, () => this.handleKnowledgeControl(msg, writeSpace, knowledgeControl));
+    }
+
+    const evidenceNumber = this.connector.name === "feishu" ? citationNumber(msg.text) : undefined;
+    if (evidenceNumber !== undefined) {
+      const reply = citationReply(this.engine, writeSpace, msg, evidenceNumber, this.activeFeishuAppId ?? "", groupBinding?.executionScopeEpoch, !decision.respond);
+      if (reply) return this.send(msg, reply);
+    }
+    if (this.connector.name === "feishu" && replyFileIntent(msg.text, msg.chatType) === "send") {
+      const handled = await this.sendPreviousFile(msg, writeSpace, decision.respond);
+      if (handled) return;
     }
 
     let inputsCaptured = false;
@@ -1419,6 +1561,9 @@ export class Orchestrator {
             space: writeSpace,
             chatId: msg.chatId,
             actorId: msg.senderId,
+            quotedLesson: this.connector.name === "feishu" && msg.parentMessageId
+              ? { appId: this.activeFeishuAppId ?? "", bindingId: groupBinding?.executionScopeEpoch, messageId: msg.parentMessageId }
+              : undefined,
           });
           await this.send(msg, reply);
         } catch (err) {
@@ -1669,7 +1814,7 @@ export class Orchestrator {
       : undefined;
     const routedInput = this.inputFor(msg);
     if (!retrySource && routedInput?.state === "cancelled") throw new Error("Work input was cancelled");
-    const workItemId = rawWorkItemId ?? retrySource?.workItemId
+    const workItemId = retrySource ? retrySource.workItemId : rawWorkItemId
       ?? (routedInput ? routedInput.workItemId : this.engine.workItems.currentForSpace(writeSpace)?.id);
     const retryTopic = retrySource
       ? this.engine.chatRuns.topicNativeSessionForRun(retrySource.id)
@@ -1746,6 +1891,10 @@ export class Orchestrator {
         }))
       : this.engine.chatRuns.start(plan);
     if (workItemId) this.engine.workItems.attachChatRun(workItemId, run.id);
+    if (retrySource && this.connector.name === "feishu" && retrySource.delivery.liveReply) {
+      this.recordRunEvent({ runId: retrySource.id, at: run.queuedAt, kind: "phase.completed", visibility: "operator", phase: "queue",
+        status: "succeeded", title: "已创建重试运行" });
+    }
     this.recordRunEvent({ runId: run.id, at: run.queuedAt, kind: "run.queued", visibility: "public", phase: "queue", status: "pending", title: "请求已进入队列" });
     const liveReplyCreate = this.startLiveReply(msg, run.id).finally(() => {
       if (this.liveReplyCreates.get(run.id) === liveReplyCreate) this.liveReplyCreates.delete(run.id);
@@ -1791,10 +1940,12 @@ export class Orchestrator {
         }),
         execute: async () => {
           if (this.stopping) throw new ChatRunDeferredError("Queued work retained for restart");
-          if (run.dispatchKey) {
-            const input = this.engine.workDispatch.get(run.dispatchKey);
+          const sourceId = run.dispatchKey ?? run.sourceInputId;
+          if (sourceId) {
+            const input = this.engine.workDispatch.get(sourceId);
             if (this.messageWasRetracted(writeSpace, msg.chatId, msg.messageId)) return;
-            if (!input || !this.inputBindingCurrent(input) || input.state === "cancelled") throw new Error("Work input is no longer executable");
+            if (!input || input.appId !== (this.activeFeishuAppId ?? "") || input.connector !== this.connector.name
+              || !this.inputBindingCurrent(input) || input.state === "cancelled") throw new Error("Work input is no longer executable");
           }
           if (!this.engine.chatRuns.begin(run.id)) {
             throw new Error(`queued chat run is no longer active: ${run.id}`);
@@ -1955,7 +2106,9 @@ export class Orchestrator {
         if (failed) this.recordTerminalRunEvent(run.id, "failed", failed.finishedAt ?? Date.now(), failed.error?.message);
         continue;
       }
+      const original = run.sourceInputId ? this.engine.workDispatch.get(run.sourceInputId) : undefined;
       const msg: InboundMessage = {
+        ...original?.message,
         kind: "message",
         eventId: `chat-resume:${run.id}`,
         chatType: run.space.startsWith("team/") ? "group" : "p2p",
@@ -1964,20 +2117,21 @@ export class Orchestrator {
           ?? (run.space.startsWith("personal/")
             ? run.space.slice("personal/".length)
             : "unknown"),
-        text: run.input,
+        text: original?.message.text ?? run.input,
         messageId: run.messageId,
         mentionsBot: true,
-        createdAt: run.startedAt,
+        createdAt: original?.message.createdAt ?? run.startedAt,
         ...this.topicMessageIdentity(run.id),
       };
       const { readSpaces } = attribute(msg);
       this.recordRunEvent({ runId: run.id, at: Date.now(), kind: "run.recovered", visibility: "public", phase: "queue", status: "pending", title: "已恢复排队任务" });
-      const interpretation = interpretConversation(run.input);
+      const interpretation = interpretConversation(msg.text);
       const pending = this.scheduleChatRun(
         msg,
         run.space,
         run,
-        (signal) => interpretation.disposition === "conversation"
+        (signal) => original?.response ? this.executeInputResponse(msg, run.space, run.id, original.response, signal)
+          : interpretation.disposition === "conversation"
           ? this.answer(
               msg,
               readSpaces,
@@ -2180,7 +2334,7 @@ export class Orchestrator {
     try {
       const handle = await this.connector.createLiveReply(
         this.liveReplyTarget(msg, runId),
-        liveReplySnapshot(runId, this.engine.runEvents.list(runId)),
+        this.chatCardSnapshot(runId),
       );
       this.liveReplies.set(runId, handle);
       this.engine.chatRuns.setLiveReply(runId, {
@@ -2223,7 +2377,7 @@ export class Orchestrator {
         const handle = this.liveReplies.get(runId)
           ?? (persisted ? { messageId: persisted.messageId, cardId: persisted.cardId, revision: persisted.revision } : undefined);
         if (!handle || !this.connector.updateLiveReply) return;
-        const snapshot = liveReplySnapshot(runId, this.engine.runEvents.list(runId));
+        const snapshot = this.chatCardSnapshot(runId);
         const next = await this.connector.updateLiveReply(handle, snapshot);
         this.liveReplies.set(runId, next);
         this.engine.chatRuns.setLiveReply(runId, {
@@ -2280,12 +2434,22 @@ export class Orchestrator {
     if (!handle || !this.connector.finalizeLiveReply) return false;
     await this.connector.finalizeLiveReply(
       handle,
-      liveReplySnapshot(runId, this.engine.runEvents.list(runId)),
+      this.chatCardSnapshot(runId),
     );
     this.liveReplies.delete(runId);
     this.liveReplyDirty.delete(runId);
     this.liveReplyNextAt.delete(runId);
     return true;
+  }
+  private chatCardSnapshot(runId: string) {
+    const snapshot = liveReplySnapshot(runId, this.engine.runEvents.list(runId));
+    const run = this.engine.chatRuns.get(runId);
+    const action = run && chatRecoveryAvailable(run);
+    if (run && action && this.connector.name === "feishu" && this.recoverySource(run)
+      && (action !== "retry" || !this.engine.chatRuns.list(run.space).some(child => child.retryOf === run.id))) {
+      snapshot.recovery = { action, attempts: run.delivery.attempts };
+    }
+    return snapshot;
   }
   private async answer(
     msg: InboundMessage,
@@ -2309,7 +2473,12 @@ export class Orchestrator {
       let failureTrace: AskFailureTrace | undefined;
       const rawImport = this.engine.prepareChatRawImport(runId);
       const documentImport = this.engine.prepareChatDocumentImport(runId);
-      const captureInstruction = [rawImport?.instruction, documentImport?.instruction].filter(Boolean).join("\n\n");
+      const fileIntent = this.connector.name === "feishu" ? replyFileIntent(userText, msg.chatType) : undefined;
+      const replyCapture = fileIntent === "make" || fileIntent === "make-and-send"
+        ? this.engine.prepareChatReplyFile(runId, fileIntent === "make-and-send") : undefined;
+      const captureInstruction = [rawImport?.instruction, documentImport?.instruction, replyCapture?.instruction,
+        fileIntent === "make-and-send" && !replyCapture ? "本轮没有可用于生成并交付附件的可写 Workdir，请说明现有结果，不要声称文件已发送。" : undefined,
+      ].filter(Boolean).join("\n\n");
       let reportedModel: string | undefined;
       let res;
       try {
@@ -2420,9 +2589,16 @@ export class Orchestrator {
       }
       // Cold-start honesty (Q3): if general and the KB is essentially empty, add a
       // gentle nudge to feed knowledge.
-      let text = formatAnswer(res, userText);
+      const answerTrace = res.traceId ? this.engine.answerTrace(res.traceId) : undefined;
+      const feishu = this.connector.name === "feishu" ? {
+        links: answerTrace ? citationSourceLinks(this.engine, writeSpace, answerTrace) : [],
+        pages: answerTrace?.retrievalPages,
+      } : undefined;
+      let text = formatAnswer(res, userText, feishu);
       if (rawImport) text += `\n\n${await rawImport.finish(signal)}`;
       if (documentImport) text += `\n\n${await documentImport.finish(signal)}`;
+      const replyFile = replyCapture?.finish();
+      if (fileIntent === "make-and-send" && !replyFile) text += "\n\n本次未取得可核验的最终文件，未附上附件。";
       if (
         res.source === "general"
         && !res.context
@@ -2436,11 +2612,12 @@ export class Orchestrator {
       }
       text = withReplyModel(text, run, reportedModel, res.answeredLocally ? "static" : "model");
       const succeeded = this.engine.chatRuns.succeed(runId, {
+        replyFile,
         executionEvidence,
         finishedAt: Date.now(),
         output: text,
         traceId: res.traceId,
-        usage: res.traceId ? this.engine.answerTrace(res.traceId)?.usage : undefined,
+        usage: answerTrace?.usage,
         nativeSessionId: res.nativeSessionId,
       });
       if (!succeeded) return;
@@ -3000,13 +3177,122 @@ export class Orchestrator {
     }
   }
 
+  private async uploadedReplyFile(runId: string): Promise<string> {
+    return this.serializer.run(`file-upload:${runId}`, async () => {
+      this.verifyReplyFileTarget(runId);
+      const file = this.engine.chatRuns.get(runId)!.delivery.replyFile!;
+      if (file.fileKey) return file.fileKey;
+      if (!this.connector.uploadReplyFile) throw new Error("当前连接不支持上传附件。");
+      const key = await this.connector.uploadReplyFile(file.name, this.engine.readReplyFile(runId));
+      this.verifyReplyFileTarget(runId);
+      this.engine.chatRuns.recordReplyFileUpload(runId, file.digest, key);
+      return key;
+    });
+  }
+
+  private verifyReplyFileTarget(runId: string): void {
+    const run = this.engine.chatRuns.get(runId);
+    const inputId = run?.sourceInputId ?? run?.dispatchKey;
+    const input = inputId ? this.engine.workDispatch.get(inputId) : undefined;
+    if (!input || input.connector !== this.connector.name || input.appId !== (this.activeFeishuAppId ?? "") || !this.inputBindingCurrent(input)) {
+      throw new Error("原会话的飞书连接已变化。");
+    }
+    this.engine.verifyReplyFileAccess(runId);
+  }
+
+  private async sendPreviousFile(msg: InboundMessage, space: SpaceId, addressed: boolean): Promise<boolean> {
+    const request = this.inputFor(msg);
+    if (!request || !this.inputBindingCurrent(request)) return false;
+    const runs = this.engine.chatRuns.list(space).filter(run => run.chatId === msg.chatId);
+    const direct = runs.filter(run => !!msg.parentMessageId && [run.messageId, run.delivery.messageId, run.delivery.liveReply?.messageId].includes(msg.parentMessageId));
+    if (!addressed && !direct.some(run => [run.delivery.messageId, run.delivery.liveReply?.messageId].includes(msg.parentMessageId))) return false;
+    const matches = (direct.length ? direct : runs).filter(run => {
+      const file = run.delivery.replyFile;
+      const inputId = run.sourceInputId ?? run.dispatchKey;
+      const source = inputId ? this.engine.workDispatch.get(inputId) : undefined;
+      if (run.author !== msg.senderId || run.status !== "succeeded" || !file || !source || !namesReplyFile(msg.text, file.name) || source.connector !== "feishu"
+        || source.appId !== (this.activeFeishuAppId ?? "") || !this.inputBindingCurrent(source)) return false;
+      const root = source.message.rootMessageId ?? source.message.messageId;
+      if (!direct.length && msg.parentMessageId && msg.parentMessageId !== msg.rootMessageId) return false;
+      if (msg.rootMessageId) return root === msg.rootMessageId || (direct.length > 0 && msg.rootMessageId === run.delivery.messageId);
+      return direct.length > 0 || msg.chatType === "p2p";
+    });
+    if (matches.length !== 1) {
+      // Sending an existing document can already be an Agent/tool task. Without
+      // a reference to our generated result, leave that ordinary path intact.
+      if (!matches.length && !direct.length && !/(?:刚[刚才]?|上[一轮次条]|前面|之前|已(?:经)?生成|本次生成)/u.test(msg.text)) return false;
+      await this.workReceipt(request.id, "请回复生成该文件的那条回答，并写明要发送的文件名。该回答需要保留本轮生成的可核验文件。");
+      return true;
+    }
+    const run = matches[0]!;
+    await this.serializer.run(`file-delivery:${run.id}`, async () => {
+      const current = this.engine.chatRuns.get(run.id);
+      const file = current?.delivery.replyFile;
+      if (!file) return;
+      if (file.delivered) { await this.workReceipt(request.id, `「${file.name}」已作为附件送达本会话。`); return; }
+      if (file.requestPending || (file.attachToAnswer && current.delivery.status === "pending" && current.delivery.attempts)) {
+        await this.workReceipt(request.id, "上次附件投递结果待核实，请先查看原话题。");
+        return;
+      }
+      try {
+        if (file.attachToAnswer && run.output && !run.outputTruncated) {
+          const source = this.engine.workDispatch.get((run.sourceInputId ?? run.dispatchKey)!);
+          if (!source || !this.inputBindingCurrent(source)) return;
+          await this.sendMarkdown(source.message, run.output, run.id);
+          return;
+        }
+        const key = await this.uploadedReplyFile(run.id);
+        this.verifyReplyFileTarget(run.id);
+        this.engine.chatRuns.setReplyFileRequestPending(run.id, key, true);
+        try {
+          await this.connector.reply({ chatId: msg.chatId, replyToMessageId: msg.messageId, attachmentKey: key,
+            markdown: run.outputTruncated && file.attachToAnswer ? "这是你要的文件。原回答只保留了节选，本次仅补发文件。" : "这是你要的文件。",
+            inThread: this.activeGroupBinding(msg.chatId)?.replyInThread ?? false,
+            idempotencyKey: `${run.id}:requested-file` });
+        } catch (error) {
+          this.engine.chatRuns.setReplyFileRequestPending(run.id, key, false);
+          throw error;
+        }
+        this.engine.chatRuns.markReplyFileDelivered(run.id, key);
+      } catch {
+        await this.workReceipt(request.id, "未能确认附件送达。请核对原文件和飞书连接后，回复原回答再试一次。");
+      }
+    });
+    return true;
+  }
+
   private async send(
+    msg: InboundMessage,
+    markdown: string,
+    chatRunId?: string,
+  ): Promise<void> {
+    if (!chatRunId || !this.engine.chatRuns.get(chatRunId)?.delivery.replyFile?.attachToAnswer) return this.sendMarkdown(msg, markdown, chatRunId);
+    await this.serializer.run(`file-delivery:${chatRunId}`, async () => {
+      const run = this.engine.chatRuns.get(chatRunId);
+      if (!run || run.delivery.replyFile?.delivered || (run.delivery.status === "pending" && run.delivery.attempts > 0)) return;
+      await this.sendMarkdown(msg, markdown, chatRunId);
+    });
+  }
+
+  private async sendMarkdown(
     msg: InboundMessage,
     markdown: string,
     chatRunId?: string,
   ): Promise<void> {
     // Recheck immediately before outbound delivery so an administrator can
     // disconnect a group while a slow answer is being generated.
+    const originalRun = chatRunId ? this.engine.chatRuns.get(chatRunId) : undefined;
+    const sourceInputId = originalRun?.sourceInputId ?? originalRun?.dispatchKey;
+    if (originalRun && sourceInputId) {
+      const source = this.engine.workDispatch.get(sourceInputId);
+      if (!source || source.appId !== (this.activeFeishuAppId ?? "") || source.connector !== this.connector.name || !this.inputBindingCurrent(source)) {
+        this.engine.chatRuns.deliveryFailed(originalRun.id, "Original chat binding is unavailable.");
+        return;
+      }
+    }
+    if (this.connector.name === "feishu" && originalRun && chatRecoveryAvailable(originalRun) === "retry" && this.recoverySource(originalRun)) {
+      markdown += "\n\n回复这条消息「重试这次」，可按原问题和当时的配置重新执行。";
+    }
     const groupBinding = msg.chatType === "group"
       ? this.activeGroupBinding(msg.chatId)
       : undefined;
@@ -3028,6 +3314,8 @@ export class Orchestrator {
       );
     }
     const inThread = groupBinding?.replyInThread ?? false;
+    const delivery = chatRunId ? this.engine.chatRuns.get(chatRunId)?.delivery : undefined;
+    if (delivery?.status === "sent" || (delivery?.status === "pending" && delivery.attempts > 0)) return;
     if (
       chatRunId
       && !this.engine.chatRuns.startDeliveryAttempt(chatRunId, Date.now())
@@ -3052,6 +3340,8 @@ export class Orchestrator {
         chatId: msg.chatId,
         replyToMessageId: msg.messageId,
         idempotencyKey: chatRunId ? `${chatRunId}:final` : `source:${msg.messageId}`,
+        ...(chatRunId && this.engine.chatRuns.get(chatRunId)?.delivery.replyFile?.attachToAnswer
+          ? { attachmentKey: await this.uploadedReplyFile(chatRunId) } : {}),
         markdown,
         inThread,
       });

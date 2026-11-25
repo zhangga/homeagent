@@ -26,6 +26,7 @@ describe("QualityStore", () => {
       source: "knowledge",
       answer: "Alice",
       citations: [{ slug: "people/alice", title: "Alice", space: "team/oc_quality" }],
+      retrievalPages: [{ slug: "people/alice", space: "team/oc_quality", contentHash: "source", revision: "a".repeat(64) }],
       latencyMs: 10,
       createdAt: 1_000,
     });
@@ -39,6 +40,17 @@ describe("QualityStore", () => {
 
     expect(archive).toEqual({ traces: [trace], reruns: [] });
     expect(target.trace(trace.id)).toEqual(trace);
+  });
+
+  test("accepts legacy retrieval evidence and rejects malformed page revisions without replacing it", () => {
+    const dir = tempDir();
+    const store = new QualityStore(dir);
+    const legacy = store.recordTrace({ spaces: ["team/oc_quality"], question: "发布流程", outcome: "succeeded",
+      citations: [], latencyMs: 10, retrievalPages: [{ slug: "concepts/release", space: "team/oc_quality", contentHash: "old" }] });
+    for (const revision of ["", "g".repeat(64), "a".repeat(65)]) {
+      expect(() => store.recordTrace({ ...legacy, retrievalPages: [{ ...legacy.retrievalPages![0]!, revision }] })).toThrow();
+    }
+    expect(new QualityStore(dir).trace(legacy.id)).toEqual(legacy);
   });
 
   test("exports closed rerun audits and candidate traces but excludes active reruns", () => {
@@ -208,6 +220,20 @@ describe("QualityStore", () => {
     const restarted = new QualityStore(dir);
     expect(restarted.trace(success.id)).toEqual(success);
     expect(restarted.trace(failure.id)).toEqual(failure);
+  });
+
+  test("a replayable form trace cannot replace another completed attempt", () => {
+    const dir = tempDir();
+    const store = new QualityStore(dir);
+    const input = {
+      submissionTraceId: "answer_" + "c".repeat(64), spaces: ["personal/operator" as const],
+      question: "什么时候交接？", outcome: "failed" as const, citations: [], latencyMs: 25,
+    };
+    const first = store.recordTrace(input);
+    expect(first.id).toBe(input.submissionTraceId);
+    expect(() => store.recordTrace({ ...input, question: "其他问题" })).toThrow();
+    expect(() => store.recordTrace({ ...input, submissionTraceId: "malformed" })).toThrow();
+    expect(new QualityStore(dir).trace(first.id)).toEqual(first);
   });
 
   test("retains bounded question and answer excerpts with their original citation evidence after reopening", () => {

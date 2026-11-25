@@ -20,7 +20,7 @@ export interface WorkRoutingPlan {
 }
 
 export type WorkInputState = "received" | "preparing" | "waiting" | "planned" | "dispatched" | "settled" | "interrupted" | "cancelled";
-export type WorkOperation = "chat" | "new" | "followup" | "status" | "cancel" | "pause" | "resume" | "clarify";
+export type WorkOperation = "chat" | "chat-recovery" | "new" | "followup" | "status" | "cancel" | "pause" | "resume" | "clarify";
 export interface WorkInput {
   version: 1;
   id: string;
@@ -34,6 +34,8 @@ export interface WorkInput {
   state: WorkInputState;
   workItemId?: string;
   operation?: WorkOperation;
+  /** Target resolved at intake. A delayed control must never select a newer conversation. */
+  chatRecovery?: { operation: "retry" | "resend"; runId?: string; attempts?: number; cardMessageId?: string };
   routing?: WorkRoutingPlan;
   plan?: StartChatRunInput;
   response?: { kind: "answer"; question: string }
@@ -52,6 +54,7 @@ export interface AcceptWorkInput {
   bindingId?: string;
   space: SpaceId;
   message: WorkMessage;
+  chatRecovery?: WorkInput["chatRecovery"];
 }
 
 export type WorkInputSummary = Omit<WorkInput, "message" | "plan" | "response" | "routing" | "receipt"> & {
@@ -78,7 +81,7 @@ function valid(input: WorkInput): boolean {
   return input.version === 1 && ID.test(input.id) && isSpaceId(input.space)
     && bounded(input.connector) && typeof input.appId === "string" && input.appId.length <= 512
     && optional(input.bindingId) && optional(input.workItemId) && optional(input.runId)
-    && (input.operation === undefined || ["chat", "new", "followup", "status", "cancel", "pause", "resume", "clarify"].includes(input.operation))
+    && (input.operation === undefined || ["chat", "chat-recovery", "new", "followup", "status", "cancel", "pause", "resume", "clarify"].includes(input.operation))
     && (input.routing === undefined || (input.routing.version === 1
       && (input.routing.provider === undefined || ["gateway", "claude", "codex", "trae-cli"].includes(input.routing.provider))
       && optional(input.routing.model, 200) && bounded(input.routing.instruction, 20_000)
@@ -94,6 +97,13 @@ function valid(input: WorkInput): boolean {
     && bounded(m.senderId) && bounded(m.messageId) && finite(m.createdAt)
     && typeof m.mentionsBot === "boolean" && typeof m.text === "string" && m.text.length <= MAX_WORK_INPUT_CHARACTERS
     && optional(m.threadId) && optional(m.rootMessageId) && optional(m.parentMessageId) && optional(m.messageType)
+    && (input.operation === "chat-recovery" ? !!input.chatRecovery && input.connector === "feishu"
+      && ["retry", "resend"].includes(input.chatRecovery.operation)
+      && (input.chatRecovery.cardMessageId === undefined || (bounded(input.chatRecovery.cardMessageId) && !!input.chatRecovery.runId
+        && input.chatRecovery.cardMessageId === m.parentMessageId))
+      && (input.chatRecovery.runId === undefined ? input.chatRecovery.attempts === undefined
+        : bounded(input.chatRecovery.runId) && Number.isSafeInteger(input.chatRecovery.attempts) && input.chatRecovery.attempts! >= 0)
+      : input.chatRecovery === undefined)
     && (m.docLinks === undefined || (Array.isArray(m.docLinks) && m.docLinks.length <= 200 && m.docLinks.every(url => bounded(url, 16_384))))
     && workInputId(input) === input.id
     && (input.presentedItemIds === undefined || (Array.isArray(input.presentedItemIds) && input.presentedItemIds.length <= 200 && input.presentedItemIds.every(id => bounded(id))))
@@ -157,7 +167,8 @@ export class WorkDispatchStore {
     const previous = this.get(id);
     // Platform redelivery may change metadata. It must never overwrite accepted content.
     if (previous) return previous;
-    return this.commit({ ...structuredClone(input), appId: input.appId ?? "", version: 1, id,
+    return this.commit({ ...structuredClone(input), ...(input.chatRecovery ? { operation: "chat-recovery" as const } : {}),
+      appId: input.appId ?? "", version: 1, id,
       sequence: this.sequence + 1, revision: 1, state: "received", updatedAt: Date.now() });
   }
 
@@ -187,9 +198,12 @@ export class WorkDispatchStore {
   }
 
   update(id: string, expectedRevision: number, change: Partial<Pick<WorkInput,
-    "state" | "workItemId" | "operation" | "routing" | "plan" | "response" | "runId" | "presentedItemIds" | "receipt">>): WorkInput {
+    "state" | "workItemId" | "operation" | "chatRecovery" | "routing" | "plan" | "response" | "runId" | "presentedItemIds" | "receipt">>): WorkInput {
     const input = this.get(id);
     if (!input || input.revision !== expectedRevision) throw new Error("Work input revision conflict");
+    if (input.chatRecovery && "chatRecovery" in change && JSON.stringify(input.chatRecovery) !== JSON.stringify(change.chatRecovery)) {
+      throw new Error("Chat recovery target is immutable");
+    }
     if (input.plan && "plan" in change && JSON.stringify(input.plan) !== JSON.stringify(change.plan)) {
       throw new Error("Work input plan is immutable");
     }

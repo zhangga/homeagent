@@ -894,6 +894,7 @@ export function buildAgentWorkbench(input: BuildAgentWorkbenchInput): AgentWorkb
             || (
               run.status === "succeeded"
               && run.delivery.status !== "sent"
+              && !run.delivery.attachmentUnavailable
               && Boolean(run.output)
             ),
         };

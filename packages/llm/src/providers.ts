@@ -3392,6 +3392,14 @@ export function isProviderTimeoutError(error: unknown): boolean {
   return /timed?\s*out|timeout|超时/iu.test(String(error));
 }
 
+export function isProviderCapacityError(error: unknown): boolean {
+  return /selected model is at capacity/iu.test(String(error));
+}
+
+export function isProviderLoginExpiredError(error: unknown): boolean {
+  return /refresh token was revoked|could not be refreshed|please log out and sign in again|\b401\b[^\n]*unauthorized|invalid_grant/iu.test(String(error));
+}
+
 /**
  * A native preflight rejected the configuration or could not prove isolation.
  * Callers must fail closed, not substitute a stateless or broader-permission call.

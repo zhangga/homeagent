@@ -96,21 +96,22 @@ describe("ChatRunStore", () => {
     expect(store.topicInputsThroughRun(standalone.id)).toEqual(["普通消息"]);
   });
 
-  test("reads v6 history without inventing mode evidence and writes new metadata as v9", () => {
+  test.each([6, 9])("reads plain v%s history without inventing delivery or mode evidence and writes v10", version => {
     const path = join(dir, "config", "chat-runs.json");
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify({ version: 6, runs: {
+    writeFileSync(path, JSON.stringify({ version, runs: {
       legacy: { id: "legacy", space: SPACE, input: "legacy", trigger: "message", priority: "interactive",
         queuedAt: 100, startedAt: 100, status: "queued", delivery: { status: "pending", attempts: 0 } },
     }, topicNativeSessionPlans: {}, topicNativeSessions: {} }));
     const store = new ChatRunStore(dir);
+    expect(store.get("legacy")?.delivery.replyFile).toBeUndefined();
     expect(store.get("legacy")?.executionEvidence).toBeUndefined();
     store.fail("legacy", { finishedAt: 110, error: { kind: "provider_unavailable", message: "not started" }, executionEvidence: {
       truncated: false, calls: [{ source: "codex-jsonl", events: [], truncated: false, execution: {
         executionMode: "local-full-access", sandboxCheck: "not-applicable", effectiveSandbox: "danger-full-access", process: "not-started", model: "unknown",
       } }],
     } });
-    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(9);
+    expect(JSON.parse(readFileSync(path, "utf8")).version).toBe(10);
     expect(new ChatRunStore(dir).get("legacy")?.executionEvidence?.calls[0]?.execution?.sandboxCheck).toBe("not-applicable");
   });
   test("execution evidence survives reopen and cannot be mutated or polluted", () => {
@@ -248,7 +249,7 @@ describe("ChatRunStore", () => {
     expect(new ChatRunStore(dir).get(run.id)?.executionPlan).toEqual(executionPlan);
     expect(new ChatRunStore(dir).get(run.id)?.timeoutMs).toBe(7 * 60_000);
     expect(JSON.parse(readFileSync(join(dir, "config", "chat-runs.json"), "utf8")).version)
-      .toBe(9);
+      .toBe(10);
   });
 
   test.each([6, 7])("reuses a successfully delivered Feishu topic session after its Chat Run commit (v%s)", (version) => {
@@ -1440,7 +1441,7 @@ describe("ChatRunStore", () => {
     const path = join(dir, "config", "chat-runs.json");
     mkdirSync(dirname(path), { recursive: true });
     const future = JSON.stringify({
-      version: 10,
+      version: 11,
       runs: { future_run: { privateFutureState: "preserve-me" } },
     });
     writeFileSync(path, future, "utf8");

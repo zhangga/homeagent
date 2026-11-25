@@ -31,6 +31,8 @@ export interface DreamOptions {
 }
 
 export interface AskOptions {
+  /** Stable quality trace identity for a replayable web form submission. */
+  submissionTraceId?: string;
   /** Current user request before host-attached reply/source context; only this text may set retrieval filters. */
   retrievalQuestion?: string;
   /** Host-resolved reply in the originating chat. Its text identifies the source, never storage evidence. */

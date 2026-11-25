@@ -352,6 +352,31 @@ describe("learning command handling", () => {
     expect(engine.learning.currentSession(second.id)).toBeUndefined();
   });
 
+  test("a quoted follow-up picks its exact lesson among same-name plans, and a rollover during grading leaves the new lesson alone", async () => {
+    const first = seedAwaitingPlan(engine, "ou_me", "读书");
+    const second = seedAwaitingPlan(engine, "ou_me", "读书");
+    const lesson = engine.learning.currentSession(second.id)!;
+    const receipt = { appId: "cli_school", messageId: "om_second_plan_follow" };
+    engine.learning.markFollowedUp(lesson.id, 4, receipt);
+    const context = { space: second.space, actorId: "ou_me", chatId: second.chatId, quotedLesson: receipt };
+    const before = llm.calls.length;
+    expect(await handleLearningAnswer(engine, "[其他计划] 我读完了", context)).toContain("指定的计划不同");
+    expect(llm.calls).toHaveLength(before);
+    llm.onJSON(() => {
+      engine.learning.advanceUnanswered(second.id, lesson.id, 5);
+      const next = engine.learning.prepareSession(second.id, { startOffset: 4, endOffset: 7, sectionTitle: "第二章",
+        excerpt: "新章节", guide: "导读", preparedAt: 6 })!;
+      engine.learning.markDelivered(next.id, 7, { ...receipt, messageId: "om_next_lesson" });
+      return { feedback: "## 回应点评\n尚需复习\n\n## 需要澄清\n举例\n\n## 今日总结\n复习\n\n## 下一步\n继续",
+        mastery: "review", nextFocus: "给出一个例子" };
+    });
+    const response = await handleLearningAnswer(engine, "[读书] 我的答案", context);
+    expect(response).toContain("第 1 课，这一课已归档");
+    expect(response).toContain("第 2 课");
+    expect(engine.learning.currentSession(second.id)?.status).toBe("awaiting_reply");
+    expect(engine.learning.currentSession(first.id)?.status).toBe("awaiting_reply");
+  });
+
   test("adjusts the next lesson only with an explicit bounded request", async () => {
     const plan = seedAwaitingPlan(engine, "ou_me", "读书计划");
     llm.queueJSON({

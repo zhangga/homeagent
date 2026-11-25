@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { isSpaceId, type SpaceId } from "@homeagent/shared";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
+import { isFeishuDeliveryReceipt, sameFeishuDeliveryReceipt, type FeishuDeliveryReceipt } from "./feishu-delivery-receipt.ts";
 
 export type ReminderStatus = "scheduled" | "completed" | "cancelled";
 
@@ -36,6 +37,8 @@ export interface Reminder {
   status: ReminderStatus;
   sourceMessageId?: string;
   lastNotifiedAt?: number;
+  /** Local Feishu receipts for direct replies, excluded from Space archives. */
+  notificationReceipts?: FeishuDeliveryReceipt[];
   completedAt?: number;
   cancelledAt?: number;
   createdAt: number;
@@ -58,6 +61,11 @@ interface RemindersFile {
 }
 
 const MIN_REPEAT_MS = 60_000;
+const MAX_NOTIFICATION_RECEIPTS = 4096;
+
+function copyReminder(reminder: Reminder): Reminder {
+  return { ...reminder, ...(reminder.notificationReceipts && { notificationReceipts: reminder.notificationReceipts.map(r => ({ ...r })) }) };
+}
 
 function finite(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
@@ -103,7 +111,10 @@ export class ReminderStore {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as RemindersFile;
       for (const [id, reminder] of Object.entries(parsed.reminders ?? {})) {
         if (!validStoredReminder(reminder) || reminder.id !== id) continue;
-        reminders.set(id, { ...reminder });
+        const { notificationReceipts, ...record } = reminder;
+        const receipts = Array.isArray(notificationReceipts)
+          ? notificationReceipts.slice(-MAX_NOTIFICATION_RECEIPTS).filter(isFeishuDeliveryReceipt) : [];
+        reminders.set(id, { ...record, ...(receipts.length && { notificationReceipts: receipts }) });
       }
     } catch {
       // A corrupt optional config file must not prevent HomeAgent from starting.
@@ -149,7 +160,7 @@ export class ReminderStore {
   /** Persist a detached candidate before making it visible to readers. */
   private commit<T>(change: (candidate: Map<string, Reminder>) => T): T {
     const candidate = new Map(
-      [...this.reminders].map(([id, reminder]) => [id, { ...reminder }]),
+      [...this.reminders].map(([id, reminder]) => [id, copyReminder(reminder)]),
     );
     const result = change(candidate);
     this.persist(candidate);
@@ -158,13 +169,21 @@ export class ReminderStore {
   }
 
   list(): Reminder[] {
-    return [...this.reminders.values()].sort(
+    return [...this.reminders.values()].map(copyReminder).sort(
       (a, b) => a.nextTriggerAt - b.nextTriggerAt || a.createdAt - b.createdAt,
     );
   }
 
   get(id: string): Reminder | undefined {
-    return this.reminders.get(id);
+    const reminder = this.reminders.get(id);
+    return reminder && copyReminder(reminder);
+  }
+
+  fromNotification(space: SpaceId, chatId: string, creatorId: string, receipt: FeishuDeliveryReceipt): Reminder | undefined {
+    const matching = [...this.reminders.values()].filter(reminder =>
+      reminder.space === space && reminder.chatId === chatId && reminder.creatorId === creatorId
+      && reminder.lastNotifiedAt !== undefined && reminder.notificationReceipts?.some(r => sameFeishuDeliveryReceipt(r, receipt)));
+    return matching.length === 1 ? copyReminder(matching[0]!) : undefined;
   }
 
   has(id: string): boolean {
@@ -208,7 +227,7 @@ export class ReminderStore {
     };
     return this.commit((candidate) => {
       candidate.set(reminder.id, reminder);
-      return reminder;
+      return copyReminder(reminder);
     });
   }
 
@@ -228,20 +247,28 @@ export class ReminderStore {
     );
   }
 
-  markNotified(id: string, at = Date.now()): Reminder | undefined {
+  markNotified(id: string, at = Date.now(), receipt?: FeishuDeliveryReceipt | void, occurrenceAt?: number): Reminder | undefined {
     const reminder = this.reminders.get(id);
     if (!reminder || reminder.status !== "scheduled") return undefined;
     return this.commit((candidate) => {
       const updated = candidate.get(id)!;
       updated.lastNotifiedAt = at;
       updated.updatedAt = at;
+      if (isFeishuDeliveryReceipt(receipt)) {
+        const receipts = updated.notificationReceipts ?? [];
+        if (!receipts.some(r => sameFeishuDeliveryReceipt(r, receipt))) {
+          updated.notificationReceipts = [...receipts, { ...receipt }].slice(-MAX_NOTIFICATION_RECEIPTS);
+        }
+      }
+      // The user may have postponed this occurrence while the transport was sending it.
+      if (occurrenceAt !== undefined && updated.nextTriggerAt !== occurrenceAt) return copyReminder(updated);
       if (updated.untilConfirmed && updated.repeatEveryMs) {
         updated.nextTriggerAt = at + updated.repeatEveryMs;
       } else {
         updated.status = "completed";
         updated.completedAt = at;
       }
-      return updated;
+      return copyReminder(updated);
     });
   }
 
@@ -253,9 +280,10 @@ export class ReminderStore {
     return this.commit((candidate) => {
       const updated = candidate.get(id)!;
       updated.status = "completed";
+      delete updated.notificationReceipts;
       updated.completedAt = at;
       updated.updatedAt = at;
-      return updated;
+      return copyReminder(updated);
     });
   }
 
@@ -269,26 +297,31 @@ export class ReminderStore {
       updated.status = "cancelled";
       updated.cancelledAt = at;
       updated.updatedAt = at;
-      return updated;
+      return copyReminder(updated);
     });
   }
 
-  snooze(id: string, actorId: string, nextTriggerAt: number, at = Date.now()): Reminder | undefined {
+  snooze(id: string, actorId: string, nextTriggerAt: number, at = Date.now(), receipt?: FeishuDeliveryReceipt): Reminder | undefined {
     const reminder = this.reminders.get(id);
+    const deliveredOneShot = reminder?.status === "completed" && !reminder.untilConfirmed
+      && reminder.completedAt === reminder.lastNotifiedAt && receipt !== undefined
+      && reminder.notificationReceipts?.some(r => sameFeishuDeliveryReceipt(r, receipt));
     if (
       !reminder
       || reminder.creatorId !== actorId
-      || reminder.status !== "scheduled"
-      || !finite(nextTriggerAt)
+      || (reminder.status !== "scheduled" && !deliveredOneShot)
+      || !Number.isFinite(new Date(nextTriggerAt).getTime())
       || nextTriggerAt <= at
     ) {
       return undefined;
     }
     return this.commit((candidate) => {
       const updated = candidate.get(id)!;
+      updated.status = "scheduled";
+      delete updated.completedAt;
       updated.nextTriggerAt = nextTriggerAt;
       updated.updatedAt = at;
-      return updated;
+      return copyReminder(updated);
     });
   }
 
@@ -305,9 +338,9 @@ export class ReminderStore {
     }
     if (reminders.length === 0) return [];
     return this.commit((candidate) => reminders.map((reminder) => {
-      const copy = { ...reminder };
+      const copy = copyReminder(reminder);
       candidate.set(copy.id, copy);
-      return copy;
+      return copyReminder(copy);
     }));
   }
 

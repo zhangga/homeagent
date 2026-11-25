@@ -210,6 +210,8 @@ async function run(
     attachmentHelper: runtimePaths.attachmentHelper,
   });
   let workContinuationScheduler: WorkContinuationScheduler | undefined;
+  const activeFeishuAppId = feishuStartup.status.state === "ready" && feishuStartup.status.verified
+    ? feishuStartup.status.appId : undefined;
   const orchestrator = new Orchestrator({
     engine,
     connector,
@@ -219,10 +221,7 @@ async function run(
       });
     },
     onCardAction: event => taskApprovals.handle(event),
-    activeFeishuAppId:
-      feishuStartup.status.state === "ready" && feishuStartup.status.verified
-        ? feishuStartup.status.appId
-        : undefined,
+    activeFeishuAppId,
     docFetcher: (link) => isByteTechArticleUrl(link)
       ? byteTechArticleFetcher.fetch(link)
       : connector.fetchDocWithImages(link),
@@ -244,9 +243,7 @@ async function run(
         engine,
         space,
         chatId,
-        feishuStartup.status.state === "ready" && feishuStartup.status.verified
-          ? feishuStartup.status.appId
-          : undefined,
+        activeFeishuAppId,
       )
     ) {
       throw new Error(`Feishu group is not connected: ${space}`);
@@ -257,9 +254,11 @@ async function run(
     chatId: string,
     text: string,
     idempotencyKey?: string,
-  ): Promise<void> => {
+  ) => {
     assertFeishuDeliveryAllowed(space, chatId);
-    await connector.notice(chatId, text, { idempotencyKey });
+    const bindingId = space?.startsWith("team/") ? engine.feishuBindings.activeByChatId(chatId)?.executionScopeEpoch : undefined;
+    const receipt = await connector.notice(chatId, text, { idempotencyKey });
+    if (receipt && activeFeishuAppId) return { messageId: receipt.messageId, appId: activeFeishuAppId, bindingId };
   };
 
   // Push a task's summary to its space-bound feishu chat (shared by the task
@@ -347,10 +346,8 @@ async function run(
         ? { botName: cfg.feishuBotName, botOpenId: cfg.feishuBotOpenId }
         : undefined,
     runtimeStatus: () => connector.health(),
-    sendTestMessage: (chatId, text) =>
-      sendFeishuNotice(`team/${chatId}`, chatId, text),
-    sendConfirmationPrompt: (chatId) =>
-      connector.notice(chatId, FEISHU_GROUP_CONFIRMATION_PROMPT),
+    sendTestMessage: async (chatId, text) => { await sendFeishuNotice(`team/${chatId}`, chatId, text); },
+    sendConfirmationPrompt: async (chatId) => { await connector.notice(chatId, FEISHU_GROUP_CONFIRMATION_PROMPT); },
     persistConnectionDisabledAppId: (appId) => {
       saveSettings({ feishuConnectionDisabledAppId: appId }, cfg.dataDir);
     },
@@ -375,8 +372,7 @@ async function run(
       ? { botName: cfg.feishuBotName, botOpenId: cfg.feishuBotOpenId }
       : undefined,
     feishuIntegration,
-    onIntegrationTest: async (chatId, text) =>
-      sendFeishuNotice(`team/${chatId}`, chatId, text),
+    onIntegrationTest: async (chatId, text) => { await sendFeishuNotice(`team/${chatId}`, chatId, text); },
     onTaskRun: async (_taskId, run) => {
       await notifyTaskDone(run);
     },
@@ -482,17 +478,14 @@ async function run(
   // 7. guided-learning scheduler. A prepared lesson remains retryable until
   // Feishu accepts it; an accepted lesson then waits for the learner's answer.
   learningScheduler = new LearningScheduler(engine, {
-    notify: async (plan, _source, session, skillWarnings, deliveryKey) => {
-      await sendFeishuNotice(
+    notify: (plan, _source, session, skillWarnings, deliveryKey) =>
+      sendFeishuNotice(
         plan.space,
         plan.chatId,
         learningNotification(plan, session, skillWarnings),
         deliveryKey,
-      );
-    },
-    followUp: async (plan, _session, message, deliveryKey) => {
-      await sendFeishuNotice(plan.space, plan.chatId, message, deliveryKey);
-    },
+      ),
+    followUp: (plan, _session, message, deliveryKey) => sendFeishuNotice(plan.space, plan.chatId, message, deliveryKey),
   });
   await learningScheduler.start();
   log.info("learning scheduler started");
@@ -501,7 +494,7 @@ async function run(
   // accepts the outbound message, so transient failures remain retryable.
   reminderScheduler = new ReminderScheduler(engine, {
     notify: async (reminder, message, deliveryKey) => {
-      await sendFeishuNotice(reminder.space, reminder.chatId, message, deliveryKey);
+      return sendFeishuNotice(reminder.space, reminder.chatId, message, deliveryKey);
     },
   });
   await reminderScheduler.start();
@@ -526,6 +519,7 @@ async function run(
     contain("learning scheduler", () => learningScheduler.stop());
     contain("reminder scheduler", () => reminderScheduler.stop());
     contain("web server", () => server.stop(true));
+    await engine.stopMaterialDreams();
     try {
       await orchestrator.stop();
     } catch (err) {

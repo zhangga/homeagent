@@ -4,6 +4,13 @@ import { parseReminderRequest } from "./reminder-commands.ts";
 const NOW = new Date("2026-07-15T12:00:00+08:00").getTime(); // Wednesday
 
 describe("parseReminderRequest", () => {
+  test("distinguishes a dated instruction from questions about existing reminders", () => {
+    expect(parseReminderRequest("明天上午 9 点提醒一下我查看会议安排", NOW)?.title).toBe("查看会议安排");
+    for (const question of ["明天有哪些提醒？", "明天会提醒我什么？", "查看明天提醒我的事项"]) {
+      expect(parseReminderRequest(question, NOW)).toBeUndefined();
+    }
+  });
+
   test("resolves a weekday period in Asia/Shanghai with an explicit displayed default", () => {
     expect(parseReminderRequest("@agent 周日上午提醒我去茶饼斋", NOW)).toEqual({
       title: "去茶饼斋",

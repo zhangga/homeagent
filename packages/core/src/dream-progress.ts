@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { DreamMetrics, DreamReport, RawRecord, SpaceId } from "@homeagent/shared";
 
 export type DreamStage = "queued" | "preparing" | "analyzing" | "extracting" | "generating" | "saving" | "indexing";
@@ -24,6 +24,7 @@ export interface DreamRunSnapshot extends DreamProgress {
   id: string;
   space: SpaceId;
   trigger: DreamTrigger;
+  materialImport?: { batch: string; rawIds: string[] };
   batch?: { index: number; total: number };
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
   queuedAt: number;
@@ -32,6 +33,11 @@ export interface DreamRunSnapshot extends DreamProgress {
   updatedAt: number;
   stageStartedAt: number;
   errorCount: number;
+}
+
+/** A retry may only replace the exact set of import attempts shown on the receipt. */
+export function materialDreamRevision(runs: DreamRunSnapshot[]): string {
+  return runs.length ? createHash("sha256").update(runs.map(run => run.id).sort().join(",")).digest("hex") : "pending";
 }
 
 /** Metadata only: never copy Raw bodies, prompts or provider diagnostics into progress. */
@@ -49,11 +55,12 @@ export class DreamRunTracker {
 
   constructor(private readonly now: () => number = Date.now) {}
 
-  enqueue(space: SpaceId, trigger: DreamTrigger, batch?: DreamRunSnapshot["batch"]): string {
+  enqueue(space: SpaceId, trigger: DreamTrigger, batch?: DreamRunSnapshot["batch"], materialImport?: DreamRunSnapshot["materialImport"]): string {
     const at = this.now();
     const id = `dream_${randomUUID()}`;
     this.runs.set(id, {
       id, space, trigger, ...(batch ? { batch: { ...batch } } : {}),
+      ...(materialImport ? { materialImport: structuredClone(materialImport) } : {}),
       status: "queued", stage: "queued", queuedAt: at, updatedAt: at, stageStartedAt: at,
       errorCount: 0, pagesWritten: 0, pagesCompleted: 0, pagesFailed: 0, processedRaw: 0,
     });

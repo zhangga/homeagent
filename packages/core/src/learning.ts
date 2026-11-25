@@ -11,6 +11,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { isSpaceId, type SpaceId } from "@homeagent/shared";
+import { isFeishuDeliveryReceipt, sameFeishuDeliveryReceipt, type FeishuDeliveryReceipt } from "./feishu-delivery-receipt.ts";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
 import {
   normalizeLearningResource,
@@ -180,6 +181,8 @@ export interface LearningSession {
   routeAdjustment?: string;
   preparedAt: number;
   deliveredAt?: number;
+  /** Local receipts for the lesson and its scheduled follow-ups. */
+  replyReceipts?: FeishuDeliveryReceipt[];
   lastFollowUpAt?: number;
   followUpCount?: number;
   nextLessonRequest?: string;
@@ -680,6 +683,8 @@ function validSession(value: unknown): value is LearningSession {
     && (session.routeAdjustment === undefined || typeof session.routeAdjustment === "string")
     && finite(session.preparedAt)
     && (session.deliveredAt === undefined || finite(session.deliveredAt))
+    && (session.replyReceipts === undefined || (Array.isArray(session.replyReceipts) && session.replyReceipts.length <= 4
+      && session.replyReceipts.every(isFeishuDeliveryReceipt)))
     && (session.lastFollowUpAt === undefined || finite(session.lastFollowUpAt))
     && (session.followUpCount === undefined
       || (finite(session.followUpCount) && Number.isInteger(session.followUpCount) && session.followUpCount >= 0))
@@ -749,7 +754,16 @@ function cloneSource(source: LearningSource): LearningSource {
 }
 
 function cloneSession(session: LearningSession): LearningSession {
-  return { ...session };
+  return { ...session, ...(session.replyReceipts ? { replyReceipts: session.replyReceipts.map(receipt => ({ ...receipt })) } : {}) };
+}
+
+function addLearningReceipt(session: LearningSession, receipt: FeishuDeliveryReceipt): boolean {
+  if (!isFeishuDeliveryReceipt(receipt)) throw new Error("Invalid learning delivery receipt");
+  const receipts = session.replyReceipts ?? [];
+  if (receipts.some(r => sameFeishuDeliveryReceipt(r, receipt))) return false;
+  if (receipts.length >= 4) throw new Error("Too many learning delivery receipts");
+  session.replyReceipts = [...receipts, { messageId: receipt.messageId, appId: receipt.appId, bindingId: receipt.bindingId }];
+  return true;
 }
 
 function cloneMap<T>(values: Map<string, T>, clone: (value: T) => T): Map<string, T> {
@@ -865,12 +879,31 @@ export class LearningPlanStore {
   sessionsForPlan(planId: string): LearningSession[] {
     return [...this.sessions.values()]
       .filter((session) => session.planId === planId)
-      .sort((a, b) => a.sequence - b.sequence);
+      .sort((a, b) => a.sequence - b.sequence).map(cloneSession);
   }
 
   currentSession(planId: string): LearningSession | undefined {
     const sessionId = this.plans.get(planId)?.currentSessionId;
-    return sessionId ? this.sessions.get(sessionId) : undefined;
+    const session = sessionId ? this.sessions.get(sessionId) : undefined;
+    return session ? cloneSession(session) : undefined;
+  }
+
+  /** Known receipts from another binding or owner must never fall back to another learner's current assessment. */
+  lessonForReply(space: SpaceId, chatId: string, actorId: string, receipt: FeishuDeliveryReceipt): {
+    known: boolean; session?: LearningSession;
+  } {
+    let match: LearningSession | undefined;
+    let known = false;
+    for (const session of this.sessions.values()) {
+      if (!session.replyReceipts?.some(r => r.messageId === receipt.messageId)) continue;
+      known = true;
+      if (!session.replyReceipts.some(r => sameFeishuDeliveryReceipt(r, receipt))) continue;
+      const plan = this.plans.get(session.planId);
+      if (!plan || plan.space !== space || plan.chatId !== chatId || plan.creatorId !== actorId) continue;
+      if (match) return { known };
+      match = session;
+    }
+    return match ? { known, session: cloneSession(match) } : { known };
   }
 
   create(input: LearningPlanInput, now = Date.now()): LearningPlan {
@@ -1168,7 +1201,7 @@ export class LearningPlanStore {
       || (plan.mode === "topic" && plan.profile?.status === "assessing")
     ) return undefined;
     const current = this.currentSession(planId);
-    if (current && ["prepared", "awaiting_reply"].includes(current.status)) return current;
+    if (current && ["prepared", "awaiting_reply"].includes(current.status)) return cloneSession(current);
     const sectionTitle = input.sectionTitle.trim();
     const excerpt = input.excerpt.trim();
     const guide = input.guide.trim();
@@ -1204,34 +1237,54 @@ export class LearningPlanStore {
     this.persist(candidatePlans, this.sources, candidateSessions);
     this.plans = candidatePlans;
     this.sessions = candidateSessions;
-    return session;
+    return cloneSession(session);
   }
 
-  markDelivered(sessionId: string, deliveredAt = Date.now()): LearningSession | undefined {
+  /** A lesson can close while its push is in flight. Keep its delivered message bound to the closed lesson. */
+  private retainClosedReceipt(session: LearningSession, receipt: FeishuDeliveryReceipt | void): void {
+    if (!receipt || (session.status !== "skipped" && session.status !== "completed")) return;
+    const copy = cloneSession(session);
+    if (!addLearningReceipt(copy, receipt)) return;
+    const sessions = new Map(this.sessions).set(session.id, copy);
+    this.persist(this.plans, this.sources, sessions);
+    this.sessions = sessions;
+  }
+
+  markDelivered(sessionId: string, deliveredAt = Date.now(), receipt?: FeishuDeliveryReceipt | void): LearningSession | undefined {
     const session = this.sessions.get(sessionId);
-    if (!session || session.status !== "prepared" || !finite(deliveredAt)) return undefined;
+    if (!session || !finite(deliveredAt)) return undefined;
+    if (session.status !== "prepared") {
+      this.retainClosedReceipt(session, receipt);
+      return undefined;
+    }
     const candidatePlans = cloneMap(this.plans, clonePlan);
     const candidateSessions = cloneMap(this.sessions, cloneSession);
     const updatedSession = candidateSessions.get(sessionId)!;
     updatedSession.status = "awaiting_reply";
     updatedSession.deliveredAt = deliveredAt;
+    if (receipt) addLearningReceipt(updatedSession, receipt);
     const updatedPlan = candidatePlans.get(updatedSession.planId)!;
     updatedPlan.lastDeliveredAt = deliveredAt;
     updatedPlan.updatedAt = deliveredAt;
     this.persist(candidatePlans, this.sources, candidateSessions);
     this.plans = candidatePlans;
     this.sessions = candidateSessions;
-    return updatedSession;
+    return cloneSession(updatedSession);
   }
 
-  markFollowedUp(sessionId: string, followedUpAt = Date.now()): LearningSession | undefined {
+  markFollowedUp(sessionId: string, followedUpAt = Date.now(), receipt?: FeishuDeliveryReceipt | void): LearningSession | undefined {
     const session = this.sessions.get(sessionId);
     if (
-      !session || session.status !== "awaiting_reply" || !finite(followedUpAt)
+      !session || !finite(followedUpAt)
       || (session.deliveredAt !== undefined && followedUpAt < session.deliveredAt)
     ) return undefined;
+    if (session.status !== "awaiting_reply") {
+      this.retainClosedReceipt(session, receipt);
+      return undefined;
+    }
     const candidateSessions = cloneMap(this.sessions, cloneSession);
     const updatedSession = candidateSessions.get(sessionId)!;
+    if (receipt && !addLearningReceipt(updatedSession, receipt)) return cloneSession(session);
     updatedSession.lastFollowUpAt = followedUpAt;
     updatedSession.followUpCount = (updatedSession.followUpCount ?? 0) + 1;
     this.persist(this.plans, this.sources, candidateSessions);
@@ -1260,7 +1313,7 @@ export class LearningPlanStore {
     const adjustNextLesson = input.adjustNextLesson === true;
     const nextLessonRequest = input.nextLessonRequest?.trim();
     if (
-      !session || !plan || session.status !== "awaiting_reply" || !learnerReply || !feedback
+      !session || !plan || plan.currentSessionId !== sessionId || session.status !== "awaiting_reply" || !learnerReply || !feedback
       || !finite(input.completedAt)
       || (input.mastery !== undefined
         && (!["review", "ready"].includes(input.mastery) || !nextFocus))
@@ -1299,7 +1352,7 @@ export class LearningPlanStore {
     this.persist(candidatePlans, this.sources, candidateSessions);
     this.plans = candidatePlans;
     this.sessions = candidateSessions;
-    return updatedSession;
+    return cloneSession(updatedSession);
   }
 
   update(
@@ -1374,7 +1427,7 @@ export class LearningPlanStore {
     this.persist(candidatePlans, this.sources, candidateSessions);
     this.plans = candidatePlans;
     this.sessions = candidateSessions;
-    return updatedSession;
+    return cloneSession(updatedSession);
   }
 
   advanceUnanswered(
@@ -1447,6 +1500,12 @@ export class LearningPlanStore {
   }
 
   exportBySpace(space: SpaceId): LearningArchive {
+    const archive = this.localSnapshotBySpace(space);
+    for (const session of archive.sessions) delete session.replyReceipts;
+    return archive;
+  }
+
+  localSnapshotBySpace(space: SpaceId): LearningArchive {
     const plans = this.listBySpace(space).map(clonePlan);
     const planIds = new Set(plans.map((plan) => plan.id));
     const sourceIds = new Set(plans.map((plan) => plan.sourceId));
@@ -1518,7 +1577,7 @@ export class LearningPlanStore {
     }
   }
 
-  restore(archive: LearningArchive): LearningPlan[] {
+  restore(archive: LearningArchive, localSnapshot = false): LearningPlan[] {
     this.assertCanRestore(archive);
     if (archive.plans.length === 0) return [];
 
@@ -1529,7 +1588,9 @@ export class LearningPlanStore {
       candidateSources.set(source.id, cloneSource(source));
     }
     for (const session of archive.sessions) {
-      candidateSessions.set(session.id, cloneSession(session));
+      const copy = cloneSession(session);
+      if (!localSnapshot) delete copy.replyReceipts;
+      candidateSessions.set(session.id, copy);
     }
     const restored = archive.plans.map((plan) => {
       const copy = clonePlan(plan);

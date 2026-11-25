@@ -609,6 +609,43 @@ describe("LearningPlanStore", () => {
     }));
   });
 
+  test("lesson and follow-up receipts survive reopening, bind to their original identities and stay local", () => {
+    const store = new LearningPlanStore(dir);
+    const plan = createPlan(store);
+    const session = store.prepareSession(plan.id, { startOffset: 0, endOffset: 4, sectionTitle: "第一课",
+      excerpt: "课程原文", guide: "导读", preparedAt: NOW })!;
+    const receipt = { appId: "cli_school", bindingId: "binding_1", messageId: "om_lesson" };
+    expect(() => store.markDelivered(session.id, NOW, { ...receipt, messageId: "x".repeat(513) })).toThrow();
+    expect(new LearningPlanStore(dir).currentSession(plan.id)?.status).toBe("prepared");
+    store.markDelivered(session.id, NOW, receipt);
+    const followUp = { ...receipt, messageId: "om_follow" };
+    store.markFollowedUp(session.id, NOW + 1, followUp);
+    expect(store.markFollowedUp(session.id, NOW + 1, followUp)?.followUpCount).toBe(1);
+    store.advanceUnanswered(plan.id, session.id, NOW + 2);
+    const delayed = { ...receipt, messageId: "om_in_flight" };
+    expect(store.markFollowedUp(session.id, NOW + 3, delayed)).toBeUndefined();
+    const reopened = new LearningPlanStore(dir);
+    expect(reopened.lessonForReply(plan.space, plan.chatId, plan.creatorId, delayed).session?.status).toBe("skipped");
+    const match = reopened.lessonForReply(plan.space, plan.chatId, plan.creatorId, followUp).session!;
+    expect(match.id).toBe(session.id);
+    match.replyReceipts![0]!.messageId = "om_modified";
+    expect(reopened.lessonForReply(plan.space, plan.chatId, plan.creatorId, receipt).session?.id).toBe(session.id);
+    for (const other of [{ ...receipt, appId: "other" }, { ...receipt, bindingId: "new_epoch" }]) {
+      expect(reopened.lessonForReply(plan.space, plan.chatId, plan.creatorId, other)).toEqual({ known: true });
+    }
+    expect(reopened.lessonForReply("team/another", plan.chatId, plan.creatorId, receipt)).toEqual({ known: true });
+    expect(reopened.lessonForReply(plan.space, "other_chat", plan.creatorId, receipt)).toEqual({ known: true });
+    expect(reopened.lessonForReply(plan.space, plan.chatId, "other_actor", receipt)).toEqual({ known: true });
+    const snapshot = reopened.localSnapshotBySpace(plan.space);
+    expect(reopened.exportBySpace(plan.space).sessions[0]?.replyReceipts).toBeUndefined();
+    reopened.removeBySpace(plan.space);
+    reopened.restore(snapshot);
+    expect(reopened.lessonForReply(plan.space, plan.chatId, plan.creatorId, receipt)).toEqual({ known: false });
+    reopened.removeBySpace(plan.space);
+    reopened.restore(snapshot, true);
+    expect(reopened.lessonForReply(plan.space, plan.chatId, plan.creatorId, receipt).session?.id).toBe(session.id);
+  });
+
   test("advances progress only after an awaiting lesson is completed", () => {
     const store = new LearningPlanStore(dir);
     const plan = createPlan(store);

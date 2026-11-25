@@ -3,7 +3,7 @@
  * tweak). The plan calls out coldStartNote (Q3): the honest nudge appended when answering from general
  *     knowledge while the space's knowledge base is still empty.
  */
-import { isProviderTimeoutError, providerPreparationFailure, NATIVE_SESSION_ISSUE_LABELS, EXECUTION_POLICY_ISSUE_LABELS } from "@homeagent/llm";
+import { isProviderCapacityError, isProviderLoginExpiredError, isProviderTimeoutError, providerPreparationFailure, NATIVE_SESSION_ISSUE_LABELS, EXECUTION_POLICY_ISSUE_LABELS } from "@homeagent/llm";
 
 /**
  * Shown when a message can't be answered because no runnable LLM provider is
@@ -111,17 +111,13 @@ export function providerNotice(error: unknown): string {
   if (/cannot provide a no-tools execution mode/i.test(message)) {
     return NO_TOOLS_MODE_NOTICE;
   }
-  if (/selected model is at capacity/i.test(message)) {
+  if (isProviderCapacityError(error)) {
     return MODEL_CAPACITY_NOTICE;
   }
   if (/provider codex native session isolation is unavailable/i.test(message)) {
     return NATIVE_SESSION_UNAVAILABLE_NOTICE;
   }
-  if (
-    /refresh token was revoked|could not be refreshed|please log out and sign in again/i
-      .test(message)
-    || /\b401\b[^\n]*unauthorized|invalid_grant/i.test(message)
-  ) {
+  if (isProviderLoginExpiredError(error)) {
     return PROVIDER_LOGIN_EXPIRED_NOTICE;
   }
   return isProviderTimeoutError(error) ? providerTimeoutNotice(error) : NO_PROVIDER_NOTICE;

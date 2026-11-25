@@ -540,6 +540,7 @@ describe("ask pipeline", () => {
           space: personalSpace,
           slug: "entities/alice",
           contentHash: "h",
+          revision: expect.stringMatching(/^[0-9a-f]{64}$/),
         }],
       });
     } finally {
@@ -572,6 +573,7 @@ describe("ask pipeline", () => {
         space: SPACE,
         slug: "entities/alice",
         contentHash: "sha256-source-alice",
+        revision: expect.stringMatching(/^[0-9a-f]{64}$/),
       }],
     });
   });

@@ -43,12 +43,12 @@ test("Run stores expose only nonterminal local grant references, including queue
   expect(new TaskRunStore(dir).get(pending.id)?.executionPlan).toEqual(taskPlan);
 });
 
-test("Chat v9 freezes authorization and imports only inert terminal archive plans", () => {
+test("Chat v10 freezes authorization and imports only inert terminal archive plans", () => {
   const store = new ChatRunStore(dir);
   const plan = full("chat");
   const input = { space, input: "fixture", trigger: "message" as const, agentId: "agent_fixture", executionPlan: plan, startedAt: 1 };
   const run = store.start(input);
-  expect(JSON.parse(readFileSync(join(dir, "config", "chat-runs.json"), "utf8")).version).toBe(9);
+  expect(JSON.parse(readFileSync(join(dir, "config", "chat-runs.json"), "utf8")).version).toBe(10);
   expect(new ChatRunStore(dir).get(run.id)?.executionPlan).toEqual(plan);
   expect(() => store.start({ ...input, executionPlan: full("task") })).toThrow();
   expect(() => store.start({ ...input, space: "team/other" })).toThrow();

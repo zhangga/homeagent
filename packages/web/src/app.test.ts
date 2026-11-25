@@ -15,7 +15,9 @@ import {
 import {
   KnowledgeEngine,
   FakeLlm,
+  NoProviderError,
   SkillCatalog,
+  SPACE_ARCHIVE_VERSION,
   knowledgePageRevision,
   refreshDigest,
 } from "@homeagent/core";
@@ -163,6 +165,38 @@ describe("web backend (read-only)", () => {
     });
     expect((await app.request("/chats/runs/missing/status")).status).toBe(404);
     expect((await createWebApp({ engine, adminToken: "private-admin" }).request(path)).status).toBe(401);
+  });
+
+  test("a restored reply requiring an unavailable attachment keeps its text visible and cannot be resent as text", async () => {
+    const agent = engine.agents.create({ name: "档案中的助手", provider: "claude" });
+    const legacyText = {
+      id: "chat_archived_text", space: SPACE, agentId: agent.id, input: "请总结会议", output: "原回答正文。",
+      priority: "interactive", trigger: "message", status: "succeeded", startedAt: 1, queuedAt: 1, finishedAt: 2,
+      delivery: { status: "failed", attempts: 1, error: "连接中断" },
+    } as const;
+    const withFile = { ...legacyText, id: "chat_archived_attachment", input: "请把总结作为附件发到群里",
+      delivery: { ...legacyText.delivery, attachmentUnavailable: true } } as const;
+    engine.chatRuns.restore([legacyText, withFile]);
+    const retried: string[] = [];
+    const retryApp = createWebApp({ engine, onChatRunRetry: async id => {
+      retried.push(id);
+      return engine.chatRuns.deliverySent(id, 3)!;
+    } });
+    const filePath = `/chats/runs/${withFile.id}`;
+    const textPath = `/chats/runs/${legacyText.id}`;
+    const detail = await (await retryApp.request(filePath)).text();
+    expect(detail).toContain(withFile.output);
+    expect(detail).toContain("原附件未随归档保存");
+    expect(detail).not.toContain(`action="${filePath}/retry"`);
+    const history = await (await retryApp.request(`/agents/${agent.id}`)).text();
+    expect(history).toContain(`href="${filePath}"`);
+    expect(history).not.toContain(`action="${filePath}/retry"`);
+    expect(history).toContain(`action="${textPath}/retry"`);
+    const unavailable = await retryApp.request(`${filePath}/retry`, { method: "POST" });
+    expect(decodeURIComponent(unavailable.headers.get("location") ?? "")).toContain("原附件未随归档保存");
+    await retryApp.request(`${textPath}/retry`, { method: "POST" });
+    expect(retried).toEqual([legacyText.id]);
+    expect(engine.chatRuns.get(withFile.id)?.delivery.status).toBe("failed");
   });
 
   test("a stale retry during the first Chat delivery does not dispatch again", async () => {
@@ -1793,6 +1827,142 @@ describe("web backend (read-only)", () => {
     expect(body).toContain('value="citation_error"');
   });
 
+  test("duplicate Space question submissions share a provider call and reopen the same answer after restart", async () => {
+    const space = "team/oc_submission";
+    const path = `/spaces/${encodeURIComponent(space)}/ask`;
+    engine.ensureSpace(space);
+    fake.onText(() => "交接已安排。");
+    const formId = async (url: string) => {
+      const html = await (await app.request(url)).text();
+      const id = html.match(/name="submissionId" value="([^"]+)"/u)?.[1];
+      expect(id).toBeDefined();
+      return id!;
+    };
+    const post = (submissionId: string, q = "几点交接？") => app.request(path, {
+      method: "POST", body: new URLSearchParams({ q, submissionId }),
+    });
+    const id = await formId(path);
+    const [first, duplicate] = await Promise.all([post(id), post(id)]);
+    expect(first.status).toBe(303);
+    const location = first.headers.get("location")!;
+    expect(duplicate.headers.get("location")).toBe(location);
+    expect(fake.calls).toHaveLength(1);
+
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
+    app = createWebApp({ engine });
+    expect((await post(id)).headers.get("location")).toBe(location);
+    expect(fake.calls).toHaveLength(1);
+    expect((await post(id, "换个问题？")).headers.get("location")).not.toBe(location);
+    const next = await formId(location);
+    expect(next).not.toBe(id);
+    expect((await post(next)).headers.get("location")).not.toBe(location);
+    expect(fake.calls).toHaveLength(3);
+    engine.ensureSpace("team/oc_different");
+    const other = await app.request("/spaces/team%2Foc_different/ask", {
+      method: "POST", body: new URLSearchParams({ q: "几点交接？", submissionId: id }),
+    });
+    expect(other.headers.get("location")).toStartWith("/spaces/team%2Foc_different/ask?traceId=answer_");
+    expect(fake.calls).toHaveLength(4);
+  });
+
+  test("duplicate failed submissions reopen the same failure and a fresh form can retry", async () => {
+    const space = "team/oc_submission_failure";
+    const path = `/spaces/${encodeURIComponent(space)}/ask`;
+    engine.ensureSpace(space);
+    fake.onText(() => { throw new Error("HTTP 429"); });
+    const post = (submissionId?: string) => app.request(path, {
+      method: "POST", body: new URLSearchParams({ q: "几点交接？", ...(submissionId ? { submissionId } : {}) }),
+    });
+    const id = crypto.randomUUID();
+    const failed = await post(id);
+    const location = failed.headers.get("location")!;
+    expect((await post(id)).headers.get("location")).toBe(location);
+    const page = await (await app.request(location)).text();
+    expect(page).toContain("当前模型繁忙");
+    expect(fake.calls).toHaveLength(1);
+    const retryId = page.match(/name="submissionId" value="([^"]+)"/u)![1]!;
+    fake.onText(() => "已完成");
+    expect((await post(retryId)).headers.get("location")).not.toBe(location);
+    // Older forms omit the token. Concurrent sends share work, a later explicit send still works.
+    const [one, two] = await Promise.all([post(), post()]);
+    expect(one.headers.get("location")).toBe(two.headers.get("location"));
+    expect(fake.calls).toHaveLength(3);
+    expect((await post()).headers.get("location")).not.toBe(one.headers.get("location"));
+    expect(fake.calls).toHaveLength(4);
+  });
+
+  test("a busy configured Agent keeps the question for reopening and retry without exposing the provider diagnostic", async () => {
+    const space = "team/oc_busy";
+    engine.ensureSpace(space);
+    const agent = engine.agents.create({ name: "问答", provider: "claude", visibility: "Team" });
+    engine.updateSpaceMeta(space, { agentId: agent.id });
+    const path = `/spaces/${encodeURIComponent(space)}/ask`;
+    const q = "周五几点交接？";
+    fake.onText(() => { throw new Error("Selected model is at capacity. private-diagnostic"); });
+    const post = () => app.request(path, { method: "POST", body: new URLSearchParams({ q }) });
+    const response = await post();
+    expect(response.status).toBe(303);
+    const location = response.headers.get("location")!;
+    expect(location).toStartWith(path + "?traceId=answer_");
+    const calls = fake.calls.length;
+    expect(calls).toBeGreaterThan(0);
+    for (const view of [await app.request(location), await app.request(location)]) {
+      const body = await view.text();
+      expect(body).toContain("当前模型繁忙");
+      expect(body).toContain(`value="${q}"`);
+      expect(body).toContain("重试这个问题");
+      expect(body).not.toContain("缺少可用的回答 Agent");
+      expect(body).not.toContain("private-diagnostic");
+    }
+    expect(fake.calls.length).toBe(calls);
+    expect((await app.request(location.replace(encodeURIComponent(space), encodeURIComponent(SPACE)))).status).toBe(404);
+    fake.onText(() => "交接安排已更新。");
+    const retried = await post();
+    expect(retried.status).toBe(303);
+    expect(fake.calls.length).toBeGreaterThan(calls);
+  });
+
+  test("space ask errors direct only known configuration failures to settings", async () => {
+    const ask = spyOn(engine, "ask");
+    const path = `/spaces/${encodeURIComponent(SPACE)}/ask`;
+    try {
+      for (const [error, message] of [
+        [new Error("401 Unauthorized private-diagnostic"), "需要重新登录"],
+        [new Error("HTTP 429 private-diagnostic"), "当前模型繁忙"],
+        [new Error("provider codex authentication is unavailable"), "codex login"],
+        [new Error("provider timed out after 9000ms"), "本次回答超时"],
+        [new Error("unexpected private-diagnostic"), "这次提问未能完成"],
+        [new NoProviderError(SPACE), "本空间缺少可用的回答 Agent"],
+      ] as const) {
+        ask.mockRejectedValueOnce(error);
+        const submitted = await app.request(path, { method: "POST", body: new URLSearchParams({ q: "交接时间？" }) });
+        expect(submitted.status).toBe(303);
+        const body = await (await app.request(submitted.headers.get("location")!)).text();
+        expect(body).toContain('value="交接时间？"');
+        expect(body).toContain(message);
+        expect(body.includes("打开设置</a>")).toBe(error instanceof NoProviderError);
+        expect(body).not.toContain("private-diagnostic");
+      }
+    } finally { ask.mockRestore(); }
+  });
+
+  test("a question remains editable if the failed attempt cannot be saved", async () => {
+    const ask = spyOn(engine, "ask").mockRejectedValue(new Error("HTTP 429"));
+    const save = spyOn(engine.quality, "recordTrace").mockImplementation(() => { throw new Error("unavailable"); });
+    try {
+      const path = `/spaces/${encodeURIComponent(SPACE)}/ask`;
+      const response = await app.request(path, { method: "POST", body: new URLSearchParams({ q: "这周怎么交接？" }) });
+      const body = await response.text();
+      expect(body).toContain("当前模型繁忙");
+      expect(body).toContain('value="这周怎么交接？"');
+      expect(body).toContain("本次问题未保存");
+      const reopened = await app.request(response.headers.get("content-location")!);
+      expect(await reopened.text()).toContain("没有可重开的回答记录");
+      expect(ask).toHaveBeenCalledTimes(1);
+    } finally { save.mockRestore(); ask.mockRestore(); }
+  });
+
   test("space question submissions redirect to a saved answer; only an explicit new submission asks again", async () => {
     const path = `/spaces/${encodeURIComponent(SPACE)}/ask`;
     const question = "谁负责后端？";
@@ -1855,12 +2025,15 @@ describe("web backend (read-only)", () => {
       fake.onJSON(call => "relevant" in (call.schema as { properties: object }).properties
         ? { relevant: true, slugs: ["entities/alice"] }
         : { answer: "这次回答仍然完整。", grounded: true, usedSlugs: ["entities/alice"], gaps: [] });
-      const response = await app.request(path, { method: "POST", body: new URLSearchParams({ q: "谁负责后端？" }) });
+      const submissionId = crypto.randomUUID();
+      const post = () => app.request(path, { method: "POST", body: new URLSearchParams({ q: "谁负责后端？", submissionId }) });
+      const response = await post();
       const body = await response.text();
       expect(body).toContain("这次回答仍然完整。");
       expect(body).toContain("本次回答未保存");
       expect(body).not.toContain('name="traceId"');
       const calls = fake.calls.length;
+      expect(await (await post()).text()).toContain("这次提问已处理");
       const reopened = await app.request(response.headers.get("content-location")!);
       expect(await reopened.text()).toContain("没有可重开的回答记录");
       expect(fake.calls.length).toBe(calls);
@@ -2423,8 +2596,13 @@ describe("management backend (read-write)", () => {
     form.set("distillNow", "on");
     const response = await app.request(`/spaces/${encodeURIComponent(SPACE)}/materials`, { method: "POST", body: form });
     expect(response.status).toBe(302);
-    expect(decodeURIComponent(response.headers.get("location")!)).toContain("完成提炼：写入 1 个知识页");
+    expect(decodeURIComponent(response.headers.get("location")!)).toContain("可查看后台提炼进度");
+    await engine.waitForMaterialDreams();
     expect(decodeURIComponent(response.headers.get("location")!)).toContain("2 个文本文件");
+    const receipt = await (await app.request(response.headers.get("location")!)).text();
+    const links = /aria-label="本次导入的关联知识页">([\s\S]*?)<\/section>/u.exec(receipt)?.[1];
+    expect(links).toContain("archive.zip");
+    expect(links?.match(/\/pages\/concepts%2Fzip-knowledge/gu)).toHaveLength(1);
     expect(sourceIds).toHaveLength(2);
     expect((await engine.getPage(SPACE, "concepts/zip-knowledge"))?.sources).toEqual(sourceIds);
     const imported = engine.registry.store(SPACE).index().listRaw({}).filter((raw) => raw.source === "manual");
@@ -2463,7 +2641,8 @@ describe("management backend (read-write)", () => {
     })))], "threads.zip"));
     form.set("distillNow", "on");
     const response = await app.request(`/spaces/${encodeURIComponent(SPACE)}/materials`, { method: "POST", body: form });
-    expect(decodeURIComponent(response.headers.get("location")!)).toContain("完成提炼");
+    expect(decodeURIComponent(response.headers.get("location")!)).toContain("可查看后台提炼进度");
+    await engine.waitForMaterialDreams();
     expect(batchSizes).toEqual([40, 6]);
     const pending = engine.registry.store(SPACE).index().listRaw({ onlyPending: true });
     expect(pending).toHaveLength(1);
@@ -2634,7 +2813,8 @@ describe("management backend (read-write)", () => {
 
     expect([302, 303]).toContain(imported.status);
     expect(decodeURIComponent(imported.headers.get("location") ?? ""))
-      .toContain("资料已导入并完成提炼：写入 1 个知识页");
+      .toContain("资料已导入，可查看后台提炼进度");
+    await engine.waitForMaterialDreams();
     expect(await engine.getPage(SPACE, "concepts/release-gate")).toEqual(
       expect.objectContaining({ sources: [importedRawId] }),
     );
@@ -2789,7 +2969,8 @@ describe("management backend (read-write)", () => {
     form.set("material", new File([original], "complete.txt"));
     form.set("distillNow", "on");
     const response = await app.request(`/spaces/${encodeURIComponent(SPACE)}/materials`, { method: "POST", body: form });
-    expect(decodeURIComponent(response.headers.get("location")!)).toContain("资料已导入并完成提炼");
+    expect(decodeURIComponent(response.headers.get("location")!)).toContain("资料已导入，可查看后台提炼进度");
+    await engine.waitForMaterialDreams();
     expect([...planned]).toEqual(markers);
     expect([...generated]).toEqual(markers);
     const page = await engine.getPage(SPACE, "sources/complete-material");
@@ -2853,7 +3034,9 @@ describe("management backend (read-write)", () => {
     const governanceBody = await governance.text();
     expect(governanceBody).toContain("数据治理");
     expect(governanceBody).toContain("原始消息保留");
-    expect(governanceBody).toContain("homeagent.space v1–v23");
+    expect(governanceBody).toContain(`homeagent.space v1–v${SPACE_ARCHIVE_VERSION}`);
+    expect(governanceBody).toContain("v24 保留工作委派");
+    expect(governanceBody).toContain("v25 标记未随归档保存的待投递回答附件");
     expect(governanceBody).toContain("v17 包含系统生成的分层知识地图");
     expect(governanceBody).toContain("v18 包含本地 Agent 知识消费反馈及处置记录");
     expect(governanceBody).toContain("v19 包含按 SHA-256 校验的完整原文件");
@@ -2867,7 +3050,7 @@ describe("management backend (read-write)", () => {
     expect(JSON.parse(archiveText)).toEqual(
       expect.objectContaining({
         format: "homeagent.space",
-        version: 24,
+        version: SPACE_ARCHIVE_VERSION,
         sourceFiles: [],
         agentKnowledgeFeedback: [],
         agentRevisions: [],
@@ -6391,12 +6574,20 @@ describe("management backend (read-write)", () => {
     expect(index).toContain(`href="/tasks/${created!.id}"`);
     expect(index).toContain('href="/tasks?new=1"');
     expect(index).not.toContain('name="topic"');
-    expect(await (await app.request("/tasks?new=1")).text()).toContain('name="topic"');
+    const createPage = await (await app.request("/tasks?new=1")).text();
+    expect(createPage).toContain('name="topic"');
+    expect(createPage).toContain("data-first-run");
+    const hourlyPreview = await app.request("/tasks/first-run?cadence=hourly&hour=8&day=1");
+    expect(await hourlyPreview.text()).toBe("下次调度检查时");
+    const dailyPreview = await app.request("/tasks/first-run?cadence=daily&hour=20&day=1");
+    expect(await dailyPreview.text()).toContain("20:00");
+    expect((await app.request("/tasks/first-run?cadence=daily&hour=24&day=1")).status).toBe(400);
 
     const path = `/tasks/${encodeURIComponent(created!.id)}`;
     expect(res.headers.get("location")).toStartWith(`${path}?ok=`);
     const overview = await (await app.request(res.headers.get("location")!)).text();
     expect(overview).toContain("大模型进展");
+    expect(overview).toContain("首次预计运行");
     expect(overview).toContain('name="expectedTaskPreview"');
     expect(overview).toContain(`href="${path}?edit=1"`);
     expect(overview).not.toContain('name="topic"');

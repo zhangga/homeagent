@@ -8,7 +8,7 @@ import { SkillCatalog } from "./skill-catalog.ts";
 import { RawJournal } from "./raw-journal.ts";
 import { parseSpaceArchive } from "./governance.ts";
 import * as durable from "./durable-file.ts";
-import { chatRawImportId, chatRawSourceScope, createChatRawCapture, isChatRawScopeSkip, MAX_CHAT_IMPORT_BYTES, MAX_CHAT_IMPORT_MESSAGES, MAX_CHAT_IMPORT_TEXT, parseChatRawImport, readChatRawCapture, requestsChatRawImport, requestsStoredRawQuery, resolveChatRawImportRequest } from "./chat-raw-import.ts";
+import { chatRawImportId, chatRawSourceScope, chatRawSourceUrl, createChatRawCapture, isChatRawScopeSkip, MAX_CHAT_IMPORT_BYTES, MAX_CHAT_IMPORT_MESSAGES, MAX_CHAT_IMPORT_TEXT, parseChatRawImport, readChatRawCapture, requestsChatRawImport, requestsStoredRawQuery, resolveChatRawImportRequest } from "./chat-raw-import.ts";
 
 const space = "team/oc_capture" as const;
 let dir: string;
@@ -22,6 +22,14 @@ function manifest() {
       threadId: "omt_source", rootMessageId: "om_root", url: "https://applink.feishu.cn/client/message/open?messageId=om_source",
       attachments: [{ kind: "file", ref: "file_large", name: "2GB日志.zip", sizeBytes: 2 * 1024 ** 3 }] }] };
 }
+test("the evidence link is a captured permalink for this exact imported message", () => {
+  const entry = parseChatRawImport(JSON.stringify(manifest()), space, "oc_capture").entries[0]!;
+  const raw = { ...entry, id: chatRawImportId(space, "oc_capture", "om_source"), admission: "ready" as const, createdAt: 1500, ingested: false };
+  expect(chatRawSourceUrl(raw)).toBe(manifest().messages[0]!.url);
+  expect(chatRawSourceUrl({ ...raw, messageId: "om_another" })).toBeUndefined();
+  expect(chatRawSourceUrl({ ...raw, source: "message" })).toBeUndefined();
+});
+
 function fixture(input = "飞书群：本群 提炼最近一周，并记录相关的原始数据") {
   const dataDir = join(dir, "data"), workdir = join(dir, "work"); mkdirSync(workdir);
   const engine = new KnowledgeEngine({ dataDir, skillCatalog: new SkillCatalog({ roots: [] }), runProvider: async () => { throw new Error("No provider calls expected"); } });

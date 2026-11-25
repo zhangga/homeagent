@@ -293,6 +293,18 @@ export function chatRawSourceName(raw: RawRecord): string | undefined {
   return undefined;
 }
 
+/** Read only a URL captured with this exact source message. */
+export function chatRawSourceUrl(raw: RawRecord): string | undefined {
+  if (!isChatSourceSnapshot(raw)) return undefined;
+  try {
+    const metadata = object(JSON.parse(raw.content.split("\n", 2)[1]!));
+    if (metadata.format !== "homeagent.chat-source" || metadata.chatId !== raw.chatId || metadata.messageId !== raw.messageId) return undefined;
+    const url = new URL(string(metadata.url, 2048));
+    if (url.protocol === "https:" && !url.username && !url.password) return url.href;
+  } catch { /* The source can still be quoted when it has no usable permalink. */ }
+  return undefined;
+}
+
 export function normalizedRawSourceName(name: string): string {
   return name.normalize("NFKC").replace(/\s+/gu, "").toLowerCase();
 }

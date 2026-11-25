@@ -226,6 +226,14 @@ export function buildLiveReplyCard(snapshot: LiveReplySnapshot): Record<string, 
     elements: [],
   };
   const elements: Record<string, unknown>[] = [processPanel];
+  if (snapshot.recovery) {
+    elements.push({
+      tag: "button", type: "primary_filled", text: { tag: "plain_text",
+        content: snapshot.recovery.action === "retry" ? "重试这次" : "补发回答" },
+      behaviors: [{ type: "callback", value: { action: "homeagent.chat-recovery",
+        runId: snapshot.runId, operation: snapshot.recovery.action, attempts: snapshot.recovery.attempts } }],
+    });
+  }
   if (snapshot.detailUrl) {
     elements.push({
       tag: "button", type: "primary_filled", width: "fill", text: { tag: "plain_text", content: "查看详细执行" },

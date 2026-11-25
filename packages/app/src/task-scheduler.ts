@@ -12,6 +12,7 @@
 import { logger } from "@homeagent/shared";
 import {
   TaskAlreadyRunningError,
+  nextTaskScheduleAt,
   skillWarningViews,
   type KnowledgeEngine,
   type StartedTaskRun,
@@ -19,7 +20,7 @@ import {
   type TaskRun,
 } from "@homeagent/core";
 import { formatSkillWarnings } from "@homeagent/orchestrator";
-import { localHour, dayKey, type RuntimeLoopHealth } from "./scheduler.ts";
+import type { RuntimeLoopHealth } from "./scheduler.ts";
 
 const log = logger.child("task-scheduler");
 
@@ -32,50 +33,8 @@ export const DEFAULT_TASK_SCHEDULE: TaskScheduleConfig = {
   tickMs: 15 * 60 * 1000,
 };
 
-/**
- * Decide whether a task should run now. Runs when enabled AND:
- *   - hourly/daily and never run before, OR
- *   - hourly: last run >= ~1h ago, OR
- *   - daily: at/after its hour and not yet run today, OR
- *   - weekly: this week's configured weekday/hour has passed, the task already
- *     existed at that time, and it has not run since.
- */
 export function shouldRunTask(task: Task, now: Date): boolean {
-  if (!task.enabled) return false;
-
-  if (task.cadence === "hourly") {
-    if (task.lastRunAt === undefined) return true;
-    return now.getTime() - task.lastRunAt >= 3600_000;
-  }
-
-  if (task.cadence === "daily") {
-    if (task.lastRunAt === undefined) return true;
-    if (localHour(now) >= task.hour) {
-      return dayKey(new Date(task.lastRunAt)) !== dayKey(now);
-    }
-    return false;
-  }
-
-  const scheduledAt = weeklyScheduleAt(now, task.dayOfWeek, task.hour);
-  return now.getTime() >= scheduledAt
-    && task.createdAt <= scheduledAt
-    && (task.lastRunAt === undefined || task.lastRunAt < scheduledAt);
-}
-
-/** This week's configured weekly occurrence as an instant in Asia/Shanghai. */
-function weeklyScheduleAt(now: Date, dayOfWeek: number, hour: number): number {
-  const localDate = new Date(`${dayKey(now)}T00:00:00Z`);
-  const jsWeekday = localDate.getUTCDay();
-  const isoWeekday = jsWeekday === 0 ? 7 : jsWeekday;
-  localDate.setUTCDate(
-    localDate.getUTCDate() - (isoWeekday - 1) + (dayOfWeek - 1),
-  );
-  return Date.UTC(
-    localDate.getUTCFullYear(),
-    localDate.getUTCMonth(),
-    localDate.getUTCDate(),
-    hour - 8,
-  );
+  return task.enabled && nextTaskScheduleAt(task, now.getTime()) <= now.getTime();
 }
 
 /** Called after a successful run when the task opts into notifications. */

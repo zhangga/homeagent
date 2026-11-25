@@ -872,26 +872,38 @@ describe("FeishuConnector outbound", () => {
     expect(commands).toEqual([]);
   });
 
-  test("notice uses +messages-send with chat-id", async () => {
+  test("notice returns its message receipt and sends the body through stdin", async () => {
     const spawner = new FakeSpawner();
     const commands: string[][] = [];
     connector = new FeishuConnector({
       spawner,
-      runCommand: async (cmd) => {
+      runCommand: async (cmd, options) => {
         commands.push(cmd);
-        return "{}";
+        expect(options?.stdin).toBe("欢迎语");
+        return JSON.stringify({ data: { message_id: "om_lesson" } });
       },
     });
-    await connector.notice("oc_group", "欢迎语", {
+    expect(await connector.notice("oc_group", "欢迎语", {
       idempotencyKey: "ha-appr-run_approval",
-    });
+    })).toEqual({ messageId: "om_lesson" });
     const cmd = commands[0]!;
     expect(cmd).toContain("+messages-send");
     expect(cmd).toContain("--chat-id");
     expect(cmd).toContain("oc_group");
-    expect(cmd).toContain("欢迎语");
+    expect(cmd).toContain("--json");
+    expect(cmd).not.toContain("欢迎语");
     expect(cmd).toContain("--idempotency-key");
     expect(cmd).toContain("ha-appr-run_approval");
+  });
+
+  test("successful notice without a usable message id does not send twice", async () => {
+    let attempts = 0;
+    connector = new FeishuConnector({ spawner: new FakeSpawner(), runCommand: async () => {
+      attempts++;
+      return "Message sent";
+    } });
+    expect(await connector.notice("oc_group", "课程")).toBeUndefined();
+    expect(attempts).toBe(1);
   });
 
   test("notice propagates delivery failures so durable callers can retry", async () => {

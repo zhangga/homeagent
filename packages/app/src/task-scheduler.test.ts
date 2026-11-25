@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -157,8 +157,23 @@ describe("shouldRunTask", () => {
     expect(shouldRunTask(task({ enabled: false }), T10)).toBe(false);
   });
 
-  test("never-run task runs", () => {
+  test("a never-run daily task catches up after its scheduled hour", () => {
     expect(shouldRunTask(task({ lastRunAt: undefined }), T10)).toBe(true);
+  });
+
+  test("a new daily task first runs at the configured Shanghai hour, even after an earlier manual run", () => {
+    const afternoon = new Date("2026-07-06T14:00:00+08:00");
+    const evening = new Date("2026-07-06T20:00:00+08:00");
+    const daily = task({ createdAt: afternoon.getTime(), hour: 20 });
+    expect(shouldRunTask(daily, afternoon)).toBe(false);
+    expect(shouldRunTask(daily, evening)).toBe(true);
+    expect(shouldRunTask(daily, new Date("2026-07-07T07:00:00+08:00"))).toBe(true);
+    expect(shouldRunTask({ ...daily, lastRunAt: afternoon.getTime() }, evening)).toBe(true);
+    expect(shouldRunTask({ ...daily, lastRunAt: evening.getTime() }, T23)).toBe(false);
+    const late = { ...daily, createdAt: evening.getTime() + 1 };
+    expect(shouldRunTask(late, T23)).toBe(false);
+    expect(shouldRunTask(late, new Date("2026-07-07T19:59:59+08:00"))).toBe(false);
+    expect(shouldRunTask(late, new Date("2026-07-07T20:00:00+08:00"))).toBe(true);
   });
 
   test("daily: past hour + not run today -> run; already today -> skip", () => {
@@ -233,11 +248,20 @@ describe("TaskScheduler.tick", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test("runs a due task and fires notify on success", async () => {
-    const t = engine.tasks.create({ name: "调研", space: SPACE, topic: "x", notify: true })!;
+  test("a daily task created in the afternoon sends its first summary at the evening slot", async () => {
+    const clock = spyOn(Date, "now").mockReturnValue(new Date("2026-07-06T14:00:00+08:00").getTime());
+    let t: Task;
+    try {
+      t = engine.tasks.create({ name: "调研", space: SPACE, topic: "x", cadence: "daily", hour: 20, notify: true })!;
+    } finally {
+      clock.mockRestore();
+    }
     const notified: string[] = [];
     const sched = new TaskScheduler(engine, { notify: (task) => void notified.push(task.id) });
-    const ran = await sched.tick("test", T10);
+    expect(await sched.tick("afternoon", new Date("2026-07-06T14:15:00+08:00"))).toEqual([]);
+    expect(engine.listTaskRuns(t.id)).toHaveLength(0);
+    expect(notified).toEqual([]);
+    const ran = await sched.tick("evening", new Date("2026-07-06T20:00:00+08:00"));
     expect(ran).toContain(t.id);
     expect(notified).toContain(t.id);
     expect(engine.tasks.get(t.id)?.lastStatus).toBe("ok");
@@ -265,6 +289,7 @@ describe("TaskScheduler.tick", () => {
     engine.ensureSpace(SECOND_SPACE);
     const first = engine.tasks.create({
       name: "慢任务",
+      cadence: "hourly",
       space: SPACE,
       topic: "first",
       notify: true,
@@ -272,6 +297,7 @@ describe("TaskScheduler.tick", () => {
     })!;
     const second = engine.tasks.create({
       name: "独立任务",
+      cadence: "hourly",
       space: SECOND_SPACE,
       topic: "second",
       notify: true,
@@ -422,6 +448,7 @@ describe("TaskScheduler.tick", () => {
     });
     const independent = engine.tasks.create({
       name: "independent due task",
+      cadence: "hourly",
       space: SECOND_SPACE,
       topic: "independent due topic",
       notify: true,
@@ -514,6 +541,7 @@ describe("TaskScheduler.tick", () => {
   test("persists a notification failure and retries it on a later tick", async () => {
     const t = engine.tasks.create({
       name: "通知恢复",
+      cadence: "hourly",
       space: SPACE,
       topic: "x",
       notify: true,
@@ -637,6 +665,7 @@ describe("TaskScheduler.tick", () => {
     engine.updateSpaceMeta(SPACE, { agentId: agent.id });
     const t = engine.tasks.create({
       name: "same-tick approval",
+      cadence: "hourly",
       space: SPACE,
       topic: "notify without waiting for another cadence",
       distillOnRun: false,
@@ -678,6 +707,7 @@ describe("TaskScheduler.tick", () => {
     engine.ensureSpace(SPACE);
     const task = engine.tasks.create({
       name: "single-flight",
+      cadence: "hourly",
       space: SPACE,
       topic: "x",
       distillOnRun: false,

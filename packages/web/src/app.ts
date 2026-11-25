@@ -97,8 +97,13 @@ import {
 } from "./setup.ts";
 import { localMaterialRawContent, prepareLocalMaterialGroups, type PreparedLocalMaterial } from "./local-materials.ts";
 import { materialReceiptView, type MaterialReceipt } from "./material-import-view.ts";
+import { materialProgressView, materialProgressScript } from "./material-progress.ts";
+import { importedPagesView, localImportRawId, materialBatchPattern, materialSourcesQuery, readMaterialSources, type MaterialSources } from "./material-citations.ts";
 import { dreamRunsFragment } from "./dream-progress-view.ts";
 import { taskOverviewView, taskPreviewKey } from "./task-overview-view.ts";
+import { taskScheduleTime } from "./task-schedule-preview.ts";
+import { askFailure, type AskFailure } from "./ask-failure.ts";
+import { SpaceAskSubmissions } from "./ask-submission.ts";
 import { taskRunRefreshState } from "./task-run-refresh.ts";
 import { homeDecisions, workAttentionDetail, workAttentionIndex } from "./work-attention.ts";
 import { restartingView, setupLayout, setupView } from "./setup-view.ts";
@@ -126,6 +131,8 @@ import {
   type SettingsFieldErrors,
   type SettingsFormValues,
   spaceDetailView,
+  SPACE_SEARCH_QUERY_LIMIT,
+  spaceSearchView,
   spaceGovernanceView,
   spaceListView,
   chatRunView,
@@ -443,6 +450,7 @@ export function createWebApp(opts: WebOptions): Hono {
   const instanceId = randomUUID();
   const localExecutionCsrfToken = randomUUID();
   const localAgentKnowledge = new LocalAgentKnowledge(engine);
+  const spaceAskSubmissions = new SpaceAskSubmissions(engine);
 
   if (opts.adminToken) {
     const token = opts.adminToken;
@@ -1526,6 +1534,8 @@ export function createWebApp(opts: WebOptions): Hono {
     const meta = engine.registry.get(space);
     const title = meta?.name?.trim() || space;
     const topLevelMapLinks = (await engine.getPage(space, "index"))?.links;
+    const batch = c.req.query("materialBatch");
+    const imported = batch ? readMaterialSources(space, index, batch, c.req.queries("file") ?? []) : [];
     return c.html(
       await layout(
         title,
@@ -1538,6 +1548,7 @@ export function createWebApp(opts: WebOptions): Hono {
           engine.agents.list(),
           c.req.query("ok") ?? undefined,
           topLevelMapLinks,
+          imported.length ? await materialResults(space, batch!, imported, c.req.query("distill") === "1") : undefined,
         ),
         "spaces",
       ),
@@ -1557,6 +1568,38 @@ export function createWebApp(opts: WebOptions): Hono {
     return c.redirect(`/spaces/${encodeURIComponent(space)}?ok=${encodeURIComponent("已保存空间 Agent")}`);
   });
 
+  async function materialResults(space: SpaceId, batch: string, files: MaterialSources[], immediate: boolean) {
+    const base = `/spaces/${encodeURIComponent(space)}`;
+    const citations = engine.registry.store(space).index().knowledgePagesForRawGroups(files.map(file => file.rawIds));
+    const progress = immediate ? await materialProgressView(engine, space, batch, files) : undefined;
+    if (files.some(file => file.total !== undefined && file.rawIds.length < file.total)) {
+      return materialReceiptView(base, batch, files.map(file => ({ ...file, total: file.total ?? file.rawIds.length,
+        expansionBudget: file.expansionBudget ?? 0 })), "", immediate, citations, progress);
+    }
+    return progress ?? importedPagesView(base, files, citations);
+  }
+
+  app.get("/spaces/:space/materials/progress", async c => {
+    const space = parseSpace(c.req.param("space"));
+    if (!space || !engine.registry.has(space)) return c.notFound();
+    const batch = c.req.query("materialBatch") ?? "";
+    const files = readMaterialSources(space, engine.registry.store(space).index(), batch, c.req.queries("file") ?? []);
+    if (!files.length) return c.notFound();
+    c.header("cache-control", "no-store");
+    return c.html(await materialProgressView(engine, space, batch, files));
+  });
+
+  app.post("/spaces/:space/materials/distill", async c => {
+    const space = parseSpace(c.req.param("space"));
+    if (!space || !engine.registry.has(space)) return c.notFound();
+    const batch = c.req.query("materialBatch") ?? "";
+    const files = readMaterialSources(space, engine.registry.store(space).index(), batch, c.req.queries("file") ?? []);
+    const after = str(await c.req.parseBody(), "after");
+    if (!files.length || !/^(?:pending|[a-f0-9]{64})$/u.test(after)) return c.text("导入回执无效", 400);
+    engine.queueMaterialDream(space, batch, files.filter(file => !file.total || file.rawIds.length === file.total).flatMap(file => file.rawIds), after);
+    return c.redirect(`/spaces/${encodeURIComponent(space)}?${materialSourcesQuery(batch, files, true)}`, 303);
+  });
+
   app.post("/spaces/:space/materials", async (c) => {
     const space = parseSpace(c.req.param("space"));
     if (!space || !engine.registry.has(space)) return c.notFound();
@@ -1566,7 +1609,7 @@ export function createWebApp(opts: WebOptions): Hono {
     const retry = body.materialSlot !== undefined;
     const slot = Number(body.materialSlot);
     const budget = Number(body.materialBudget);
-    if (typeof batch !== "string" || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/iu.test(batch)
+    if (typeof batch !== "string" || !materialBatchPattern.test(batch)
       || (retry && (!Number.isInteger(slot) || slot < 0 || slot >= 20 || !Number.isSafeInteger(budget) || budget < 0
         || typeof body.materialIdentity !== "string" || !/^[a-f0-9]{64}$/u.test(body.materialIdentity) || Array.isArray(body.material)))) {
       return c.text("导入回执无效", 400);
@@ -1584,59 +1627,43 @@ export function createWebApp(opts: WebOptions): Hono {
     const rawIds: string[] = [];
     const materials: PreparedLocalMaterial[] = [];
     const rows: MaterialReceipt[] = [];
+    const scheduledIds = new Set(engine.listDreamRuns(space).filter(run => run.materialImport?.batch === batch)
+      .flatMap(run => run.materialImport!.rawIds));
     for (const [index, group] of groups.entries()) {
       const original = group.materials[0]!;
       const identity = createHash("sha256").update(JSON.stringify([original.name, original.digest])).digest("hex");
-      const row: MaterialReceipt = { name: original.name, slot: retry ? slot : index, identity, expansionBudget: group.expansionBudget, confirmed: 0, total: group.materials.length };
+      const row: MaterialReceipt = { name: original.name, slot: retry ? slot : index, identity, expansionBudget: group.expansionBudget, rawIds: [], total: group.materials.length };
       if (retry && identity !== body.materialIdentity) return c.text("请选择回执中对应的原文件", 400);
       rows.push(row);
-      const fileIds: string[] = [];
       let workItemId: string | undefined;
       try {
+        const partIds = group.materials.map((_, part) => localImportRawId(space, batch, row.slot, identity, part));
+        const index = engine.registry.store(space).index();
+        const previouslyScheduled = scheduledIds.size ? index.importedFileNames(partIds.filter(id => scheduledIds.has(id))) : undefined;
         for (const [part, material] of group.materials.entries()) {
-          const key = createHash("sha256").update(JSON.stringify([space, batch, row.slot, identity, part])).digest("hex");
-          const id = await engine.rememberFile(
+          const localImportId = partIds[part]!;
+          const id = previouslyScheduled?.has(localImportId) ? localImportId : await engine.rememberFile(
             { space, source: "manual", author: LOCAL_GOVERNANCE_ACTOR, workItemId, content: localMaterialRawContent(material) },
             { attachment: { kind: "file", ref: `sha256:${material.digest}`, name: material.name }, bytes: material.bytes },
-            { localImportId: `local-import-${key}`, useCurrentWorkItem: part === 0 },
+            { localImportId, useCurrentWorkItem: part === 0 },
           );
-          fileIds.push(id);
-          row.firstId ??= id;
-          row.confirmed++;
-          if (part === 0 && group.materials.length > 1) workItemId = engine.registry.store(space).index().getRaw(id)?.workItemId;
+          row.rawIds.push(id);
+          if (part === 0 && group.materials.length > 1) workItemId = index.getRaw(id)?.workItemId;
         }
-        for (const id of fileIds) rawIds.push(id);
+        for (const id of row.rawIds) rawIds.push(id);
         for (const material of group.materials) materials.push(material);
       } catch {
         // A failed projection can follow a committed journal write. A retry
         // with the same file identity repairs it without creating another Raw.
       }
     }
-    const uploadCount = rows.filter(row => row.confirmed === row.total).length;
+    const uploadCount = rows.filter(row => row.rawIds.length === row.total).length;
     const label = uploadCount === 1 ? "资料" : `${uploadCount} 份资料`;
     let detail = "等待提炼";
-    let completedDream = false;
     const distillNow = checkbox(body, "distillNow");
     if (distillNow && rawIds.length) {
-      try {
-        const model = engine.agentForSpace(space)?.model || undefined;
-        let pagesWritten = 0;
-        const errors: string[] = [];
-        // ZIP members can exceed one Dream batch. Keep each call at the existing 40-Raw size.
-        for (let start = 0; start < rawIds.length; start += 40) {
-          const report = await engine.runDreamCycle(space, {
-            rawIds: rawIds.slice(start, start + 40), model, trigger: "import",
-            batch: { index: Math.floor(start / 40) + 1, total: Math.ceil(rawIds.length / 40) },
-          });
-          pagesWritten += report.pagesWritten;
-          errors.push(...report.errors);
-          if (errors.length > 0) break;
-        }
-        completedDream = errors.length === 0;
-        detail = completedDream ? `完成提炼：写入 ${pagesWritten} 个知识页` : "立即提炼未完成，请查看提炼任务";
-      } catch {
-        detail = "立即提炼失败，请查看提炼任务";
-      }
+      engine.queueMaterialDream(space, batch, rawIds);
+      detail = "可查看后台提炼进度";
     }
     const archiveMessages = materials
       .filter((material) => !material.archive && material.name.toLowerCase().endsWith(".zip"))
@@ -1647,18 +1674,24 @@ export function createWebApp(opts: WebOptions): Hono {
     const unreadable = materials.filter(material => !material.archive && material.content === null).length;
     if (unreadable > 0) detail += `；${unreadable} 份资料未提取到正文，原文件已完整保存`;
     if (uploadCount < rows.length || (body.materialBatch && (rows.length > 1 || retry))) {
-      const receipt = materialReceiptView(spaceUrl, batch, rows, uploadCount ? detail : "", distillNow);
+      const index = engine.registry.store(space).index();
+      const descriptors = Array.isArray(body.materialReturn) ? body.materialReturn : [body.materialReturn];
+      const previous = retry ? readMaterialSources(space, index, batch, descriptors.filter((v): v is string => typeof v === "string")) : [];
+      const receiptRows = previous.some(file => file.slot === slot && file.identity === rows[0]?.identity)
+        ? previous.map(file => file.slot === slot ? rows[0]! : { ...file, total: file.total ?? file.rawIds.length,
+          expansionBudget: file.expansionBudget ?? 0 }) : rows;
+      const citations = index.knowledgePagesForRawGroups(receiptRows.map(row => row.rawIds));
+      const progress = distillNow ? await materialProgressView(engine, space, batch, receiptRows) : undefined;
+      const receipt = materialReceiptView(spaceUrl, batch, receiptRows, uploadCount ? detail : "", distillNow, citations, progress);
       return c.html(c.req.header("X-Material-Receipt") === "fragment" ? await receipt :
-        await layout("资料导入回执", [{ label: "空间", href: spaceUrl }, { label: "资料导入回执" }], receipt, "spaces"));
+        await layout("资料导入回执", [{ label: "空间", href: spaceUrl }, { label: "资料导入回执" }], html`${receipt}${materialProgressScript}`, "spaces"));
     }
     const destination = rawIds.length === 1
       ? `/spaces/${encodeURIComponent(space)}/raw/${encodeURIComponent(rawIds[0]!)}`
       : `/spaces/${encodeURIComponent(space)}`;
-    const message = distillNow ? `${label}已导入${completedDream ? "并" : "，但"}${detail}`
-      : `${uploadCount === 1 ? "资料已导入" : `已导入 ${label}`}，${detail}`;
-    return c.redirect(
-      `${destination}?ok=${encodeURIComponent(message)}`,
-    );
+    const message = `${uploadCount === 1 ? "资料已导入" : `已导入 ${label}`}，${detail}`;
+    const receiptQuery = rawIds.length > 1 || distillNow ? "&" + materialSourcesQuery(batch, rows, distillNow).toString() : "";
+    return c.redirect(`${destination}?ok=${encodeURIComponent(message)}${receiptQuery}`);
   });
 
   app.get("/spaces/:space/governance", async (c) => {
@@ -1846,6 +1879,9 @@ export function createWebApp(opts: WebOptions): Hono {
     if (!space || !engine.registry.has(space)) return c.notFound();
     const detail = await engine.getRawGovernanceDetail(space, c.req.param("id"));
     if (!detail) return c.notFound();
+    const batch = c.req.query("materialBatch");
+    const files = batch && c.req.query("distill") === "1"
+      ? readMaterialSources(space, engine.registry.store(space).index(), batch, c.req.queries("file") ?? []) : [];
     return c.html(
       await layout(
         `原始记录 · ${space}`,
@@ -1859,6 +1895,7 @@ export function createWebApp(opts: WebOptions): Hono {
           space,
           detail,
           c.req.query("ok") ?? undefined,
+          files.some(file => file.rawIds.includes(detail.raw.id)) ? await materialProgressView(engine, space, batch!, files) : undefined,
         ),
         "spaces",
       ),
@@ -1957,67 +1994,73 @@ export function createWebApp(opts: WebOptions): Hono {
     return c.redirect(`/spaces/${encodeURIComponent(space)}/quarantine?ok=${encodeURIComponent(message)}`);
   });
 
+  app.on(["GET", "POST"], "/spaces/:space/search", async (c) => {
+    const space = parseSpace(c.req.param("space"));
+    if (!space || !engine.registry.has(space)) return c.notFound();
+    const name = engine.registry.get(space)?.name?.trim() || space;
+    const query = c.req.method === "POST" ? str(await c.req.parseBody(), "q").trim() : "";
+    const invalid = query.length > SPACE_SEARCH_QUERY_LIMIT;
+    c.header("Cache-Control", "no-store");
+    return c.html(await layout(`搜本空间 · ${name}`,
+      [{ label: "首页", href: "/" }, { label: name, href: `/spaces/${encodeURIComponent(space)}` }, { label: "搜本空间" }],
+      await spaceSearchView(space, engine.registry.store(space).index(), query, invalid), "spaces"), invalid ? 400 : 200);
+  });
+
   app.on(["GET", "POST"], "/spaces/:space/ask", async (c) => {
     const space = parseSpace(c.req.param("space"));
     if (!space || !engine.registry.has(space)) return c.notFound();
+    c.header("Cache-Control", "no-store");
     const spaceName = engine.registry.get(space)?.name?.trim() || space;
     const askPath = `/spaces/${encodeURIComponent(space)}/ask`;
     const traceId = c.req.query("traceId");
     let q: string | null = null;
     let result: AskResult | null = null;
     let feedbackRecorded = false;
+    let failure: AskFailure | undefined;
     let note: string | undefined;
     let historyUrl: string | undefined;
     if (traceId !== undefined) {
       const trace = engine.answerTrace(traceId);
-      if (
-        !trace
-        || !trace.spaces.includes(space)
-        || trace.outcome !== "succeeded"
-        || !trace.source
-        || trace.answer === undefined
-      ) return c.notFound();
+      if (!trace || !trace.spaces.includes(space)) return c.notFound();
       q = trace.question;
-      result = {
-        answer: trace.answer,
-        source: trace.source,
-        citations: trace.citations,
-        traceId: trace.id,
-      };
+      if (trace.outcome === "succeeded" && trace.source && trace.answer !== undefined) {
+        result = { answer: trace.answer, source: trace.source, citations: trace.citations, traceId: trace.id };
+        feedbackRecorded = engine.quality.feedbackFor(trace.id) !== undefined;
+      } else if (trace.spaces.length === 1 && (trace.outcome === "failed" || trace.outcome === "timed_out")) {
+        failure = askFailure(trace.outcome === "timed_out" ? "timeout" : trace.error, trace.execution?.provider);
+      } else return c.notFound();
       if (trace.questionTruncated || trace.answerTruncated) {
         note = "本页显示本机保存的节选。如需重新提问，请先核对或补全问题。";
       }
-      feedbackRecorded = engine.quality.feedbackFor(trace.id) !== undefined;
     } else if (c.req.query("unsaved") === "1") {
       note = "上次提问没有可重开的回答记录。可在此重新提问。";
     } else {
       const posted = c.req.method === "POST";
-      q = posted ? str(await c.req.parseBody(), "q") : c.req.query("q") ?? null;
+      const body = posted ? await c.req.parseBody() : undefined;
+      q = body ? str(body, "q") : c.req.query("q") ?? null;
       if (q?.trim()) {
-        const agent = engine.agentForSpace(space);
-        try {
-          result = await engine.ask([space], q, {
-            model: agent?.model || undefined,
-            instruction: agent?.instruction || undefined,
-          });
-          const trace = result.traceId ? engine.answerTrace(result.traceId) : undefined;
-          if (trace && trace.spaces.includes(space) && trace.outcome === "succeeded" && trace.answer !== undefined) {
-            historyUrl = `${askPath}?traceId=${encodeURIComponent(trace.id)}`;
-            if (posted && !trace.questionTruncated && !trace.answerTruncated) return c.redirect(historyUrl, 303);
-            if (trace.questionTruncated || trace.answerTruncated) {
-              note = "此处已显示本次完整回答。重新打开时只能查看本机保存的节选。";
-            }
-          } else {
-            historyUrl = `${askPath}?unsaved=1`;
-            note = "本次回答未保存，重新打开后无法找回。请在离开前复制需要的内容。";
+        const submissionId = body?.submissionId;
+        if (submissionId !== undefined && (typeof submissionId !== "string"
+          || !/^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/iu.test(submissionId))) {
+          return c.text("提问表单标识无效，请重新打开提问页。", 400);
+        }
+        const submission = await spaceAskSubmissions.submit(space, q, submissionId);
+        const trace = submission.traceId ? engine.answerTrace(submission.traceId) : undefined;
+        result = submission.result ?? null;
+        failure = submission.failure;
+        const savedAnswer = trace?.outcome === "succeeded" && trace.source && trace.answer !== undefined;
+        const savedFailure = trace?.spaces.length === 1 && (trace.outcome === "failed" || trace.outcome === "timed_out");
+        if (trace && trace.spaces.includes(space) && (savedAnswer || savedFailure)) {
+          historyUrl = `${askPath}?traceId=${encodeURIComponent(trace.id)}`;
+          if (posted && (submission.reopened || (!trace.questionTruncated && !trace.answerTruncated))) return c.redirect(historyUrl, 303);
+          if (trace.questionTruncated || trace.answerTruncated) {
+            note = failure ? "此处已显示完整问题。重新打开时只能查看本机保存的节选。"
+              : "此处已显示本次完整回答。重新打开时只能查看本机保存的节选。";
           }
-        } catch {
+        } else {
           historyUrl = `${askPath}?unsaved=1`;
-          result = {
-            answer: "⚠️ 无法作答：本空间没有可用的回答 Agent。请在 Integrations 指定 Agent 或在设置里配置默认 CLI。",
-            source: "general" as const,
-            citations: [],
-          };
+          note = failure ? "本次问题未保存，重新打开前请复制需要保留的内容。"
+            : "本次回答未保存，重新打开后无法找回。请在离开前复制需要的内容。";
         }
       }
     }
@@ -2032,7 +2075,7 @@ export function createWebApp(opts: WebOptions): Hono {
           result,
           c.req.query("ok") ?? undefined,
           feedbackRecorded,
-          { note, historyUrl },
+          { note, historyUrl, failure },
         ),
         "spaces",
       ),
@@ -2664,6 +2707,7 @@ export function createWebApp(opts: WebOptions): Hono {
     try {
       if (run.status === "succeeded") {
         if (run.delivery.status === "sent") return back("回答已经发送");
+        if (run.delivery.attachmentUnavailable) return back("原附件未随归档保存，无法补发这条回答");
         let pending = chatDeliveryRetries.get(runId);
         if (!pending) {
           if (chatDeliveryActive(run)) return back("回答正在投递，请稍后查看");
@@ -3000,6 +3044,19 @@ export function createWebApp(opts: WebOptions): Hono {
     return c.html(await layout("研究任务", crumbs, await view, "tasks"));
   });
 
+  app.get("/tasks/first-run", (c) => {
+    const cadence = c.req.query("cadence");
+    const hour = c.req.query("hour") ?? "";
+    const day = c.req.query("day") ?? "";
+    if ((cadence !== "daily" && cadence !== "weekly" && cadence !== "hourly")
+      || !/^\d{1,2}$/.test(hour) || Number(hour) > 23 || !/^[1-7]$/.test(day)) {
+      return c.text("请选择有效的周期和时间。", 400);
+    }
+    const now = Date.now();
+    c.header("Cache-Control", "no-store");
+    return c.text(taskScheduleTime({ cadence, hour: Number(hour), dayOfWeek: Number(day), createdAt: now }, now));
+  });
+
   app.get("/tasks/runs/:runId/status", (c) => {
     c.header("Cache-Control", "no-store");
     const run = engine.getTaskRun(c.req.param("runId"));
@@ -3022,6 +3079,8 @@ export function createWebApp(opts: WebOptions): Hono {
       ? { action, item }
       : undefined;
     const managedTask = engine.tasks.get(run.taskId);
+    const citations = run.status === "succeeded" && run.rawId && engine.registry.has(run.space)
+      ? engine.registry.store(run.space).index().knowledgePagesForRawGroups([[run.rawId]])[0] : undefined;
     return c.html(
       await layout(
         "运行详情",
@@ -3043,6 +3102,7 @@ export function createWebApp(opts: WebOptions): Hono {
           engine.runScheduler.queueInfo(run.id),
           workContext,
           localExecutionRunStatus(engine, run.space, run.agentId, run.executionPlan, "task"),
+          citations,
         ),
         workContext ? "work" : "tasks",
       ),

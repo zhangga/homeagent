@@ -7,6 +7,7 @@
 import type { AskResult, SkillWarningView } from "@homeagent/shared";
 import { publicModelId } from "@homeagent/shared";
 import { CODEX_REASONING_EFFORTS } from "@homeagent/llm";
+import { citationDate, citationTitle } from "./answer-citations.ts";
 
 export function withReplyModel(
   markdown: string,
@@ -62,7 +63,7 @@ export function formatSkillWarnings(
     : "";
 }
 
-function citationEvidenceText(citation: AskResult["citations"][number]): string {
+function citationEvidenceText(citation: AskResult["citations"][number], feishu = false): string {
   const evidence = citation.evidence;
   if (!evidence) return "";
   const parts: string[] = [];
@@ -71,7 +72,8 @@ function citationEvidenceText(citation: AskResult["citations"][number]): string 
     && Number.isFinite(evidence.latestSourceAt)
     && Math.abs(evidence.latestSourceAt) <= 8_640_000_000_000_000
   ) {
-    parts.push(`最新证据：${new Date(evidence.latestSourceAt).toISOString().slice(0, 10)}`);
+    const day = feishu ? citationDate(evidence.latestSourceAt) : new Date(evidence.latestSourceAt).toISOString().slice(0, 10);
+    parts.push(`最新证据：${day}`);
   }
   const freshnessLabel = {
     recent: "证据较新",
@@ -81,7 +83,7 @@ function citationEvidenceText(citation: AskResult["citations"][number]): string 
   }[evidence.freshness];
   if (freshnessLabel) parts.push(freshnessLabel);
   if (Number.isInteger(evidence.sourceCount) && evidence.sourceCount >= 0) {
-    parts.push(`${evidence.sourceCount} 条 Raw`);
+    parts.push(`${evidence.sourceCount} 条${feishu ? "来源" : " Raw"}`);
   }
   if (!evidence.complete) parts.push("证据链不完整");
   return parts.length > 0 ? `（${parts.join(" · ")}）` : "";
@@ -95,20 +97,43 @@ function noticeKey(text: string): string {
     .replace(/[。.!！?？;；]+$/gu, "");
 }
 
-export function formatAnswer(res: AskResult, question?: string): string {
-  const parts: string[] = [res.answer.trim()];
+export function formatAnswer(res: AskResult, question?: string, feishu?: {
+  links: Array<string | undefined>;
+  pages?: ReadonlyArray<{ slug: string; space: string }>;
+}): string {
+  let answer = res.answer.trim();
+  if (feishu && res.source === "knowledge" && res.citations.length) {
+    const numbers = new Map<string, number>();
+    res.citations.forEach((citation, index) => {
+      const positions = feishu.pages?.map((page, position) => ({ page, position })).filter(({ page }) => page.slug === citation.slug);
+      if ((positions?.length ?? 0) > 1) {
+        const original = positions?.find(({ page }) => page.space === citation.space);
+        if (original) numbers.set(`source-${original.position + 1}`, index + 1);
+      } else numbers.set(citation.slug, index + 1);
+    });
+    answer = answer.replace(/(`{3,}[\s\S]*?`{3,}|~{3,}[\s\S]*?~{3,}|`+[^`\n]*`+)|\[\[([^\]|\n]+)(?:\|([^\]\n]+))?\]\]/gu,
+      (original, code: string | undefined, slug: string, alias: string | undefined) => {
+        const number = code ? undefined : numbers.get(slug);
+        return number ? `${citationTitle(alias || res.citations[number - 1]!.title)}〔${number}〕` : original;
+      });
+  }
+  const parts: string[] = [answer];
 
   if (res.source === "knowledge" && res.citations.length > 0) {
-    const list = res.citations.map((citation) => {
+    const list = res.citations.map((citation, index) => {
       const scope = citation.space?.startsWith("personal/")
         ? "个人空间"
         : citation.space?.startsWith("team/")
           ? "群空间"
           : undefined;
       const title = scope ? `${citation.title}（${scope}）` : citation.title;
+      if (feishu) {
+        const url = feishu.links[index];
+        return `${index + 1}. ${citationTitle(title)}${citationEvidenceText(citation, true)}${url ? ` · [打开来源](${url})` : ""}`;
+      }
       return `[[${citation.slug}|${title}]]${citationEvidenceText(citation)}`;
-    }).join("、");
-    parts.push("", `— 依据：${list}`);
+    }).join(feishu ? "\n" : "、");
+    parts.push("", feishu ? `**依据**\n${list}\n\n回复这条回答说「看依据 1」可查看来源摘录。` : `— 依据：${list}`);
   }
 
   if (!res.context && res.gaps && res.gaps.length > 0) {

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { html } from "hono/html";
 import type { SpaceMeta, Task, TaskRun } from "@homeagent/core";
 import { flash, fmtTime, taskCadenceLabel, taskRunDuration, taskRunStatus, taskRunTrigger } from "./views.ts";
+import { taskScheduleTime } from "./task-schedule-preview.ts";
 
 export function taskPreviewKey(task: Pick<Task, "space" | "topic">): string {
   return createHash("sha256").update(JSON.stringify([task.space, task.topic])).digest("hex");
@@ -40,6 +41,7 @@ export function taskOverviewView(task: Task, space: SpaceMeta | undefined, runs:
     <header><div><h1>${task.name}</h1><p class="task-context">
       ${space ? html`<a href="/spaces/${encodeURIComponent(space.id)}">${space.name?.trim() || space.id}</a>` : task.space}
       <span>${taskCadenceLabel(task)}</span><span>${task.enabled ? "定时已启用" : "定时已停用"}</span>
+      ${task.enabled ? html`<span>${task.lastRunAt === undefined ? "首次" : "下次"}预计运行：${taskScheduleTime(task, Date.now())}</span>` : ""}
     </p></div><a class="btn secondary" href="${base}?edit=1">编辑设置</a></header>
     <section class="card task-topic-card" aria-labelledby="task-topic-heading">
       <h2 id="task-topic-heading">已保存的研究主题</h2>

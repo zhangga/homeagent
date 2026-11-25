@@ -1,7 +1,7 @@
 /** Proactive delivery loop for durable user reminders. */
 import { createHash } from "node:crypto";
 import { logger } from "@homeagent/shared";
-import type { KnowledgeEngine, Reminder } from "@homeagent/core";
+import type { FeishuDeliveryReceipt, KnowledgeEngine, Reminder } from "@homeagent/core";
 import type { RuntimeLoopHealth } from "./scheduler.ts";
 
 const log = logger.child("reminder-scheduler");
@@ -19,7 +19,7 @@ export type ReminderNotify = (
   reminder: Reminder,
   message: string,
   idempotencyKey: string,
-) => void | Promise<void>;
+) => void | FeishuDeliveryReceipt | Promise<void | FeishuDeliveryReceipt>;
 
 export function reminderIdempotencyKey(reminder: Reminder): string {
   const digest = createHash("sha256")
@@ -35,7 +35,7 @@ export function reminderNotification(reminder: Reminder): string {
     const confirmation = reminder.title.startsWith("确认")
       ? reminder.title
       : `确认${reminder.title}`;
-    lines.push("", `回复并 @我“${confirmation}”即可停止重复提醒。`);
+    lines.push("", `直接回复这条通知“收到”，或 @我“${confirmation}”，即可停止重复提醒。`);
   }
   return lines.join("\n");
 }
@@ -114,7 +114,7 @@ export class ReminderScheduler {
               if (!this.notify) {
                 throw new Error("reminder notification transport is unavailable");
               }
-              await this.notify(
+              return this.notify(
                 current,
                 reminderNotification(current),
                 reminderIdempotencyKey(current),

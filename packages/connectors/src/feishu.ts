@@ -93,6 +93,15 @@ function nestedStringField(
   return undefined;
 }
 
+function messageReceipt(output: string): OutboundReceipt | undefined {
+  // Legacy CLI output can omit the receipt after a successful send.
+  try {
+    const messageId = nestedStringField(JSON.parse(output), new Set(["message_id"]));
+    if (messageId && /^[a-zA-Z0-9_-]{1,512}$/u.test(messageId)) return { messageId };
+  } catch { /* A missing receipt must not cause another delivery. */ }
+  return undefined;
+}
+
 function parseFeishuJson(raw: string, context: string): unknown {
   try {
     return JSON.parse(raw);
@@ -124,6 +133,7 @@ export interface CommandOptions {
   terminationGraceMs?: number;
   /** sensitive command input passed through a pipe, never argv */
   stdin?: string;
+  stdinBytes?: Uint8Array;
   /** per-command environment overlay */
   env?: Record<string, string>;
   /** maximum stdout/stderr bytes retained in memory; streams are still drained */
@@ -597,6 +607,14 @@ export class FeishuConnector implements Connector {
   async finalizeLiveReply(handle: LiveReplyHandle, snapshot: LiveReplySnapshot): Promise<void> {
     await this.updateLiveReply(handle, snapshot);
   }
+  async uploadReplyFile(name: string, bytes: Uint8Array): Promise<string> {
+    const result = await this.runCommand([this.larkBin, "im", "files", "create", "--as", "bot", "--file", "file=-",
+      "--data", JSON.stringify({ file_type: "stream", file_name: name }), "--json"], { stdinBytes: bytes });
+    const key = nestedStringField(parseFeishuJson(result, "Feishu file upload"), new Set(["file_key"]));
+    if (!key || !/^file_[a-zA-Z0-9_-]{1,250}$/u.test(key)) throw new Error("Feishu upload did not return a file key");
+    return key;
+  }
+
   async reply(out: OutboundReply): Promise<void | OutboundReceipt> {
     const idempotencyKey = replyIdempotencyKey(out);
     const cmd = [
@@ -609,17 +627,13 @@ export class FeishuConnector implements Connector {
       "-",
     ];
     if (out.replyToMessageId) cmd.push("--message-id", out.replyToMessageId);
+    if (out.attachmentKey) cmd.push("--attachment", out.attachmentKey);
     if (out.inThread) cmd.push("--reply-in-thread");
     if (idempotencyKey) cmd.push("--idempotency-key", idempotencyKey);
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         const output = await this.runCommand(cmd, { stdin: formatFeishuLocalFileLinks(out.markdown) });
-        // A missing/changed response shape cannot turn successful delivery into a retry.
-        try {
-          const messageId = nestedStringField(JSON.parse(output), new Set(["message_id"]));
-          if (messageId && /^[a-zA-Z0-9_-]{1,512}$/u.test(messageId)) return { messageId };
-        } catch { /* Legacy CLI output does not always include a JSON receipt. */ }
-        return;
+        return messageReceipt(output);
       } catch (err) {
         if (attempt === 1) {
           log.warn("reply attempt failed; retrying", {
@@ -644,7 +658,7 @@ export class FeishuConnector implements Connector {
     chatId: string,
     markdown: string,
     opts: NoticeOptions = {},
-  ): Promise<void> {
+  ): Promise<void | OutboundReceipt> {
     // A notice is a standalone message to a chat (not a reply). Uses the
     // +messages-send shortcut with --chat-id.
     const cmd = [
@@ -656,13 +670,14 @@ export class FeishuConnector implements Connector {
       "--chat-id",
       chatId,
       "--markdown",
-      formatFeishuLocalFileLinks(markdown),
+      "-",
+      "--json",
     ];
     if (opts.idempotencyKey) {
       cmd.push("--idempotency-key", opts.idempotencyKey.slice(0, 50));
     }
     try {
-      await this.runCommand(cmd);
+      return messageReceipt(await this.runCommand(cmd, { stdin: formatFeishuLocalFileLinks(markdown) }));
     } catch (err) {
       log.error("notice failed", { err: String(err) });
       throw err;
@@ -999,11 +1014,12 @@ export async function runFeishuCommandResult(
     cwd: opts?.cwd,
     stdout: "pipe",
     stderr: "pipe",
-    stdin: opts.stdin === undefined ? "ignore" : "pipe",
+    stdin: opts.stdin === undefined && !opts.stdinBytes ? "ignore" : "pipe",
     env,
   });
-  if (opts.stdin !== undefined && proc.stdin && typeof proc.stdin !== "number") {
-    proc.stdin.write(opts.stdin);
+  const input = opts.stdinBytes ?? opts.stdin;
+  if (input !== undefined && proc.stdin && typeof proc.stdin !== "number") {
+    proc.stdin.write(input);
     proc.stdin.end();
   }
   const stdout = collectStream(proc.stdout, opts.maxCapturedBytes);

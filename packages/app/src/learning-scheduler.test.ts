@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CliConnector, type Connector } from "@homeagent/connectors";
+import { Orchestrator } from "@homeagent/orchestrator";
 import {
   FakeLlm,
   KnowledgeEngine,
@@ -192,6 +194,45 @@ describe("LearningScheduler", () => {
     ]);
   });
 
+  test("a reply to yesterday's Feishu push after restart leaves today's lesson awaiting the correct answer", async () => {
+    const created = seedPlan(engine);
+    const appId = "cli_school";
+    llm.queueText("理解第一章").queueText("理解第二章");
+    const scheduler = new LearningScheduler(engine, {
+      notify: (_plan, _source, session) => ({ appId, messageId: `om_lesson_${session.sequence}` }),
+    });
+    await scheduler.tick("first lesson", NOW);
+    await scheduler.tick("second lesson", new Date("2026-07-16T10:00:00+08:00"));
+    expect(engine.learning.exportBySpace(created.space).sessions.some(session => session.replyReceipts)).toBe(false);
+    engine.close();
+    engine = new KnowledgeEngine({ dataDir: dir, llm });
+    const cli = new CliConnector();
+    const connector: Connector = { name: "feishu", start: handler => cli.start(handler), stop: () => cli.stop(),
+      notice: (chat, text) => cli.notice(chat, text), reply: out => cli.reply(out) };
+    const orch = new Orchestrator({ connector, engine, activeFeishuAppId: appId, llm });
+    const submit = (messageId: string, parentMessageId: string) => cli.inject({ kind: "message", eventId: messageId, messageId,
+      chatType: "p2p", chatId: created.chatId, senderId: created.creatorId, text: `学习回答：[${created.name}] 我的理解`,
+      parentMessageId, mentionsBot: false, createdAt: Date.now() });
+    await orch.start();
+    try {
+      const before = llm.calls.length;
+      await submit("om_answer_old", "om_lesson_1");
+      expect(cli.sent.at(-1)?.markdown).toContain("第 1 课，这一课已归档");
+      expect(cli.sent.at(-1)?.markdown).toContain("第 2 课");
+      await submit("om_answer_unknown", "om_unknown");
+      expect(cli.sent.at(-1)?.markdown).toContain("另发一条消息");
+      expect(llm.calls).toHaveLength(before);
+      expect(engine.learning.currentSession(created.id)?.status).toBe("awaiting_reply");
+      llm.queueJSON({ feedback: "## 回应点评\n需要复习\n\n## 需要澄清\n概念\n\n## 今日总结\n复习\n\n## 下一步\n继续",
+        mastery: "review", nextFocus: "联系实际例子" });
+      await submit("om_answer_current", "om_lesson_2");
+      expect(cli.sent.at(-1)?.markdown).toContain("第 2 课反馈");
+      expect(engine.learning.sessionsForPlan(created.id).map(session => session.status)).toEqual(["skipped", "completed"]);
+      await submit("om_answer_again", "om_lesson_2");
+      expect(cli.sent.at(-1)?.markdown).toContain("这一课已完成");
+    } finally { await orch.stop(); }
+  });
+
   test("retries the same prepared lesson after delivery failure", async () => {
     const created = seedPlan(engine);
     llm.queueText("## 今日目标\n理解第一章");
@@ -228,9 +269,11 @@ describe("LearningScheduler", () => {
     const scheduler = new LearningScheduler(engine, {
       notify: async (_plan, _source, _session, _warnings, deliveryKey: string) => {
         attemptedKeys.push(deliveryKey);
-        if (acceptedKeys.has(deliveryKey)) return;
-        acceptedKeys.add(deliveryKey);
-        physicalDeliveries += 1;
+        if (!acceptedKeys.has(deliveryKey)) {
+          acceptedKeys.add(deliveryKey);
+          physicalDeliveries += 1;
+        }
+        return { appId: "cli_school", messageId: "om_accepted_once" };
       },
     });
 
@@ -239,6 +282,7 @@ describe("LearningScheduler", () => {
     expect(attemptedKeys).toEqual([expect.any(String), attemptedKeys[0]]);
     expect(attemptedKeys[0]).toMatch(/^ha-lesson-/);
     expect(physicalDeliveries).toBe(1);
+    expect(engine.learning.currentSession(created.id)?.replyReceipts).toEqual([{ appId: "cli_school", messageId: "om_accepted_once" }]);
   });
 
   test("persists a friendly follow-up only after successful delivery", async () => {

@@ -2785,6 +2785,29 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(engine.registry.store("personal/ou_me").index().countRaw(true)).toBe(1);
   });
 
+  test("first-use private chat examples recall the saved note before the first Dream cycle", async () => {
+    const note = "记住：我的试用笔记叫《周五交接》。";
+    const question = "查一下已收录的原文，我的「试用笔记」叫什么名字？";
+    fake.onJSON(call => {
+      const candidates: { key: string; content: string }[] =
+        JSON.parse(call.prompt!.split("已入库 Raw 候选（JSON 数据）：\n")[1]!);
+      return { matches: candidates.filter(record => record.content.includes("周五交接"))
+        .map(record => ({ key: record.key, quote: record.content })) };
+    });
+    await orch.start();
+    await connector.sendP2P(note);
+    expect(connector.sent.at(-1)?.markdown).toContain("记下");
+    const index = engine.registry.store("personal/ou_me").index();
+    const record = index.searchRaw("试用笔记", 1)[0]!;
+    expect(record.content).toContain("周五交接");
+    expect(record.ingested).toBeFalse();
+
+    await connector.sendP2P(question);
+    const reply = connector.sent.at(-1)?.markdown;
+    expect(reply).toContain(record.id);
+    expect(reply).toContain("周五交接");
+  });
+
   test("a long message with a trailing addressed memory command is captured and acknowledged", async () => {
     engine.askWithExecutionPlan = async () => {
       throw new Error("explicit memory must not reach the answer model");
@@ -2923,6 +2946,22 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     ]);
   });
 
+  test("the reminder page's tomorrow example creates once and tomorrow's agenda reads it", async () => {
+    await orch.start();
+    await connector.sendP2P("明天上午 9 点提醒我开会");
+    expect(connector.sent.at(-1)?.markdown).toContain("已创建提醒：开会");
+    const [meeting] = engine.reminders.list();
+    const tomorrow = new Date(Date.now() + (24 + 8) * 3600_000);
+    expect(meeting?.triggerAt).toBe(Date.UTC(tomorrow.getUTCFullYear(), tomorrow.getUTCMonth(), tomorrow.getUTCDate(), 1));
+    await connector.sendP2P("明天有哪些提醒？");
+    expect(connector.sent.at(-1)?.markdown).toContain("明天的安排");
+    expect(connector.sent.at(-1)?.markdown).toContain("开会");
+    expect(engine.reminders.list()).toHaveLength(1);
+    await connector.sendP2P("把开会的提醒延后2小时");
+    expect(connector.sent.at(-1)?.markdown).toContain("11:00");
+    expect(engine.reminders.get(meeting!.id)?.nextTriggerAt).toBe(meeting!.triggerAt + 2 * 3600_000);
+  });
+
   test("asking for the coming week lists scheduled reminders instead of searching the wiki", async () => {
     grantGroupAdministrator();
     const now = Date.now();
@@ -2967,6 +3006,32 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     expect(engine.reminders.get(reminder.id)?.status).toBe("completed");
     expect(connector.sent.at(-1)?.markdown).toContain("已完成提醒");
     expect(connector.sent.at(-1)?.markdown).toContain("确认去大同");
+  });
+
+  test("a standalone explicit confirmation still completes the only own reminder in this chat", async () => {
+    const space = "personal/ou_me", chatId = "oc_dm", now = Date.now();
+    const create = (title: string, chat = chatId) => engine.reminders.create({ space, chatId: chat,
+      title, creatorId: "ou_me", triggerAt: now, untilConfirmed: true, repeatEveryMs: 600_000 }, now)!;
+    const first = create("寄件");
+    engine.reminders.markNotified(first.id, now); // Including legacy deliveries without a message ID.
+    const otherChat = create("取件", "oc_different_dm");
+    await orch.start();
+    await connector.sendP2P("收到");
+    await connector.inject({ kind: "message", chatType: "p2p", chatId, senderId: "ou_me", text: "确认",
+      messageId: "om_ack_other", parentMessageId: "om_unrelated", eventId: "event_ack_other", mentionsBot: true, createdAt: now });
+    expect(engine.reminders.get(first.id)?.status).toBe("scheduled");
+    await connector.sendP2P("确认");
+    expect(engine.reminders.get(first.id)?.status).toBe("completed");
+    expect(engine.reminders.get(otherChat.id)?.status).toBe("scheduled");
+    const second = create("检查发票"), third = create("复核合同");
+    await connector.sendP2P("完成");
+    expect(connector.sent.at(-1)?.markdown).toContain("多条待处理提醒");
+    expect(engine.reminders.get(second.id)?.status).toBe("scheduled");
+    expect(engine.reminders.get(third.id)?.status).toBe("scheduled");
+    await connector.sendP2P("收到检查发票");
+    expect(engine.reminders.get(second.id)?.status).toBe("completed");
+    await connector.sendP2P("完成");
+    expect(engine.reminders.get(third.id)?.status).toBe("completed");
   });
 
   test("confirmation prefers the exact reminder title over an ambiguous partial match", async () => {
@@ -3026,8 +3091,9 @@ describe("orchestrator trunk (cli connector, no feishu)", () => {
     await connector.sendGroup("@agent 把去茶饼斋的提醒延后2小时", true);
 
     const updated = engine.reminders.get(reminder.id)!;
-    expect(updated.nextTriggerAt).toBeGreaterThanOrEqual(before + 2 * 3600_000);
-    expect(updated.nextTriggerAt).toBeLessThanOrEqual(Date.now() + 2 * 3600_000);
+    expect(updated.nextTriggerAt).toBe(before + 3 * 3600_000);
+    await connector.sendGroup("@agent 把去茶饼斋的提醒延后2小时", true);
+    expect(engine.reminders.get(reminder.id)?.nextTriggerAt).toBe(before + 5 * 3600_000);
     expect(connector.sent.at(-1)?.markdown).toContain("已延后提醒：去茶饼斋");
   });
 

@@ -1,6 +1,6 @@
 import { html, raw } from "hono/html";
 import type { HtmlEscapedString } from "hono/utils/html";
-import type { LarkProvisioningSession, LarkSetupStatus } from "@homeagent/shared";
+import { normalizeFeishuAppId, type LarkProvisioningSession, type LarkSetupStatus } from "@homeagent/shared";
 import type { SpaceMeta } from "@homeagent/core";
 import {
   providerSupportsOrdinaryCompletion,
@@ -132,8 +132,10 @@ const SETUP_STYLE = `
   .status-list { display:grid; gap:9px; margin:20px 0; }
   .status-row { display:flex; justify-content:space-between; gap:18px; padding:12px 0; border-bottom:1px solid var(--line); }
   .status-row span:last-child { color:var(--muted); font-size:13px; text-align:right; }
-  .bot-token { display:inline-flex; align-items:center; gap:9px; padding:8px 12px; border:1px solid var(--line);
-    background:rgba(255,255,255,.55); border-radius:999px; font-size:13px; }
+  .trial-examples { padding-left:22px; line-height:1.6; }
+  .trial-examples li { margin:10px 0; }
+  .trial-examples span { user-select:all; }
+  .trial-examples button { padding:7px 12px; font-size:12px; margin-left:6px; }
   @keyframes arrive { from { opacity:0; transform:translateY(14px); } to { opacity:1; transform:none; } }
   @media (max-width:760px) {
     .shell { display:block; width:min(100% - 24px,680px); padding:86px 0 24px; }
@@ -407,16 +409,47 @@ function activateStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEs
 
 function doneStep(input: SetupViewInput): HtmlEscapedString | Promise<HtmlEscapedString> {
   const botName = input.lark.botName ?? "HomeAgent";
-  return html`<div class="eyebrow">05 · Ready</div><h1 class="setup-title">一切就绪，记忆开始生长</h1>
-    <p class="lede">机器人和消息监听已经就绪。现在可以进入 HomeAgent；群聊连接不再阻塞首次设置。</p>
-    <div class="bot-token"><span>●</span><strong>${botName}</strong></div>
-    <div class="status-list">
+  const lark = input.lark.brand === "lark";
+  let chatUrl: string | undefined;
+  if (input.lark.verified) {
+    try {
+      const id = normalizeFeishuAppId(input.lark.appId);
+      if (id) chatUrl = `https://applink.${lark ? "larksuite.com" : "feishu.cn"}/client/bot/open?appId=${id}`;
+    } catch { /* Older connections can still be found by name in the client. */ }
+  }
+  const examples = ["记住：我的试用笔记叫《周五交接》。", "查一下已收录的原文，我的「试用笔记」叫什么名字？"];
+  return html`<div class="eyebrow">05 · Ready</div><h1 class="setup-title">一切就绪，私聊试一次</h1>
+    <p class="lede">在${lark ? "Lark" : "飞书"}搜索「${botName}」，打开机器人私聊。依次发送下面两句话，先记一条笔记，再看机器人能否从原始记录里找到它。</p>
+    ${chatUrl ? html`<a class="button primary-action" href="${chatUrl}" target="_blank" rel="noopener noreferrer">打开与${botName}的私聊</a>` : ""}
+    <ol class="trial-examples">${examples.map((example, i) => html`<li><span>${example}</span>
+      <button type="button" class="secondary-action" data-copy-trial aria-label="复制第 ${i + 1} 条示例">复制</button></li>`)}</ol>
+    <p id="trial-feedback" class="muted" role="status"></p>
+    <script>
+      document.querySelectorAll('[data-copy-trial]').forEach(function (button) {
+        button.addEventListener('click', async function () {
+          var example = button.previousElementSibling;
+          var feedback = document.getElementById('trial-feedback');
+          try {
+            await navigator.clipboard.writeText(example.textContent);
+            feedback.textContent = '已复制，可以粘贴到私聊。';
+          } catch {
+            var range = document.createRange();
+            range.selectNodeContents(example);
+            var selection = window.getSelection();
+            if (selection) { selection.removeAllRanges(); selection.addRange(range); }
+            feedback.textContent = '请手动复制这条示例。';
+          }
+        });
+      });
+    </script>
+    <details><summary>在群聊中使用</summary><div class="status-list">
       <div class="status-row"><span>1. 加入群聊</span><span>把机器人加入飞书群聊</span></div>
       <div class="status-row"><span>2. 管理员确认</span><span>@${botName} 启用群聊</span></div>
       <div class="status-row"><span>3. 开始使用</span><span>默认仅响应 @机器人，并在线程内回复</span></div>
     </div>
-    <p class="muted">确认前不会读取或记录群消息。之后也可以在 Integrations 查看待确认状态或重新发送提示。</p>
+    <p class="muted">确认前不会读取或记录群消息。之后可以在「飞书连接」查看待确认状态或重新发送提示。</p>
     ${input.groups.length ? html`<p class="muted">当前已有 ${input.groups.length} 个已启用群聊空间。</p>` : ""}
+    </details>
     <form method="post" action="/setup/finish" class="actions"><button class="primary-action">进入 HomeAgent</button></form>`;
 }
 

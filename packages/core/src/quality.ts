@@ -55,6 +55,8 @@ export interface AnswerTraceRetrievalPage {
   space: SpaceId;
   slug: string;
   contentHash: string;
+  /** Exact page and provenance at retrieval time; absent on older traces. */
+  revision?: string;
 }
 
 export interface AnswerTrace {
@@ -76,6 +78,7 @@ export interface AnswerTrace {
 }
 
 export interface AnswerTraceInput {
+  submissionTraceId?: string;
   spaces: SpaceId[];
   question: string;
   outcome: AnswerOutcome;
@@ -198,7 +201,7 @@ interface QualityFile {
   reruns: QualityRerun[];
 }
 
-const MAX_TRACES = 1000;
+export const MAX_ANSWER_TRACES = 1000;
 const MAX_FEEDBACK = 2000;
 const MAX_EVALUATION_CASES = 1000;
 const MAX_RERUNS = 1000;
@@ -292,7 +295,8 @@ function validTraceRetrievalPage(value: unknown): value is AnswerTraceRetrievalP
     && item.slug.length <= 500
     && typeof item.contentHash === "string"
     && item.contentHash.length > 0
-    && item.contentHash.length <= 200;
+    && item.contentHash.length <= 200
+    && (item.revision === undefined || (typeof item.revision === "string" && /^[a-f0-9]{64}$/u.test(item.revision)));
 }
 
 function validTrace(value: unknown): value is AnswerTrace {
@@ -428,8 +432,8 @@ export function parseQualityArchive(value: unknown): QualityArchive {
   if (!Array.isArray(root.traces) || !Array.isArray(root.reruns)) {
     throw new Error("quality archive collections must be arrays");
   }
-  if (root.traces.length > MAX_TRACES) {
-    throw new Error(`quality archive exceeds ${MAX_TRACES} traces`);
+  if (root.traces.length > MAX_ANSWER_TRACES) {
+    throw new Error(`quality archive exceeds ${MAX_ANSWER_TRACES} traces`);
   }
   if (root.reruns.length > MAX_RERUNS) {
     throw new Error(`quality archive exceeds ${MAX_RERUNS} reruns`);
@@ -552,7 +556,7 @@ export class QualityStore {
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as Partial<QualityFile>;
       const traces = Array.isArray(parsed.traces)
-        ? parsed.traces.filter(validTrace).slice(-MAX_TRACES).map(cloneTrace)
+        ? parsed.traces.filter(validTrace).slice(-MAX_ANSWER_TRACES).map(cloneTrace)
         : [];
       const traceIds = new Set(traces.map((trace) => trace.id));
       const feedback = Array.isArray(parsed.feedback)
@@ -631,6 +635,10 @@ export class QualityStore {
   }
 
   recordTrace(input: AnswerTraceInput): AnswerTrace {
+    if (input.submissionTraceId !== undefined && (!/^answer_[a-f0-9]{64}$/u.test(input.submissionTraceId)
+      || this.traces.some(trace => trace.id === input.submissionTraceId))) {
+      throw new Error("Invalid or duplicate answer submission trace id");
+    }
     const execution = input.execution
       ? {
           ...input.execution,
@@ -651,7 +659,7 @@ export class QualityStore {
       throw new Error("answer trace usage evidence is invalid");
     }
     const trace: AnswerTrace = {
-      id: `answer_${randomUUID()}`,
+      id: input.submissionTraceId ?? `answer_${randomUUID()}`,
       spaces: [...new Set(input.spaces.filter(isSpaceId))],
       question: input.question.slice(0, MAX_QUESTION_LENGTH),
       ...(input.question.length > MAX_QUESTION_LENGTH ? { questionTruncated: true } : {}),
@@ -667,7 +675,7 @@ export class QualityStore {
       error: bounded(input.error, MAX_ERROR_LENGTH),
       createdAt: input.createdAt ?? Date.now(),
     };
-    const traces = [...this.traces, trace].slice(-MAX_TRACES);
+    const traces = [...this.traces, trace].slice(-MAX_ANSWER_TRACES);
     const traceIds = new Set(traces.map((record) => record.id));
     const feedback = this.feedbackRecords
       .filter((record) => traceIds.has(record.traceId))
@@ -729,8 +737,8 @@ export class QualityStore {
     }
     const addedTraceCount = archive.traces.filter((trace) => !traceById.has(trace.id)).length;
     const addedRerunCount = archive.reruns.filter((rerun) => !rerunById.has(rerun.id)).length;
-    if (this.traces.length + addedTraceCount > MAX_TRACES) {
-      throw new Error(`quality store exceeds ${MAX_TRACES} traces`);
+    if (this.traces.length + addedTraceCount > MAX_ANSWER_TRACES) {
+      throw new Error(`quality store exceeds ${MAX_ANSWER_TRACES} traces`);
     }
     if (this.rerunRecords.length + addedRerunCount > MAX_RERUNS) {
       throw new Error(`quality store exceeds ${MAX_RERUNS} reruns`);

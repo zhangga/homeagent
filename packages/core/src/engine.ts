@@ -57,7 +57,7 @@ import {
   type RunInput,
 } from "@homeagent/llm";
 import type { Knowledge } from "./knowledge.ts";
-import { DreamRunTracker, type DreamRunSnapshot } from "./dream-progress.ts";
+import { DreamRunTracker, materialDreamRevision, type DreamRunSnapshot } from "./dream-progress.ts";
 import {
   SPACE_ARCHIVE_FORMAT,
   SPACE_ARCHIVE_VERSION,
@@ -90,6 +90,7 @@ import { readRawSourceBytes } from "./raw-source-files.ts";
 import { RawJournal } from "./raw-journal.ts";
 import { chatRawEntryUpdatedAt, chatRawImportId, createChatRawCapture, formatChatRawImportReceipt, isChatRawScopeSkip, parseChatRawImport, readChatRawCapture, resolveChatRawImportRequest, type ChatRawImportReceipt } from "./chat-raw-import.ts";
 import { createDocumentCapture, readDocumentCapture, resolveDocumentImportRequest } from "./chat-document-import.ts";
+import { prepareReplyFile, frozenReplyFileBytes, type ChatReplyFile } from "./chat-reply-file.ts";
 import { ChatSourceProgressStore, chatSourceProgressInstruction } from "./chat-source-progress.ts";
 import { assertLocalStatePath } from "./durable-file.ts";
 import { FeishuGroupBindingStore } from "./feishu-bindings.ts";
@@ -142,6 +143,7 @@ import {
 import {
   ChatRunStore,
   isChatRunDeliveryInFlight,
+  portableChatDelivery,
   type ChatRun,
 } from "./chat-runs.ts";
 import { RunEventStore } from "./run-events.ts";
@@ -152,6 +154,7 @@ import {
   type RunConcurrencyLayer,
 } from "./run-scheduler.ts";
 import { ReminderStore, type Reminder } from "./reminders.ts";
+import type { FeishuDeliveryReceipt } from "./feishu-delivery-receipt.ts";
 import {
   WorkItemStore,
   workActionBlockerMessage,
@@ -411,12 +414,12 @@ export type LearningDelivery = (
   source: LearningSource,
   session: LearningSession,
   skillWarnings?: SkillWarningView[],
-) => void | Promise<void>;
+) => void | FeishuDeliveryReceipt | Promise<void | FeishuDeliveryReceipt>;
 
 export type LearningFollowUpDelivery = (
   plan: LearningPlan,
   session: LearningSession,
-) => void | Promise<void>;
+) => void | FeishuDeliveryReceipt | Promise<void | FeishuDeliveryReceipt>;
 
 /** How long a research task may run before the CLI is killed (much longer than Q&A). */
 const TASK_TIMEOUT_MS = DEFAULT_TASK_TIMEOUT_MINUTES * 60_000;
@@ -1506,6 +1509,8 @@ export class KnowledgeEngine implements Knowledge {
   private providerRuns = new Map<ProviderId, ProviderRunHealth>();
   private dreamCycles = new Map<SpaceId, DreamCycleHealth>();
   private readonly dreamProgress = new DreamRunTracker();
+  private readonly materialDreams = new Map<string, { controller: AbortController; done: Promise<void> }>();
+  private stoppingMaterialDreams = false;
   private maintenanceCycles = new Map<SpaceId, MaintenanceCycleHealth>();
   private activeTaskRuns = new Map<string, string>();
   private taskRunControllers = new Map<string, AbortController>();
@@ -4378,13 +4383,13 @@ export class KnowledgeEngine implements Knowledge {
       const source = this.learning.source(planId);
       if (!source) throw new Error(`learning source is missing: ${planId}`);
       const preparedPlan = this.learning.get(planId) ?? plan;
-      await deliver(
+      const receipt = await deliver(
         { ...preparedPlan },
         { ...source, rawIds: [...source.rawIds] },
         { ...session },
         await this.skillWarningsForSpaceAsync(plan.space),
       );
-      return Boolean(this.learning.markDelivered(session.id, deliveredAt));
+      return Boolean(this.learning.markDelivered(session.id, deliveredAt, receipt));
     } finally {
       const remaining = (this.deliveringLearningCounts.get(planId) ?? 1) - 1;
       if (remaining > 0) this.deliveringLearningCounts.set(planId, remaining);
@@ -4413,8 +4418,8 @@ export class KnowledgeEngine implements Knowledge {
       (this.deliveringLearningCounts.get(planId) ?? 0) + 1,
     );
     try {
-      await deliver({ ...plan }, { ...session });
-      return Boolean(this.learning.markFollowedUp(sessionId, followedUpAt));
+      const receipt = await deliver({ ...plan }, { ...session });
+      return Boolean(this.learning.markFollowedUp(sessionId, followedUpAt, receipt));
     } finally {
       const remaining = (this.deliveringLearningCounts.get(planId) ?? 1) - 1;
       if (remaining > 0) this.deliveringLearningCounts.set(planId, remaining);
@@ -4427,7 +4432,7 @@ export class KnowledgeEngine implements Knowledge {
     actorId: string,
     reply: string,
     now = Date.now(),
-    options: { nextLessonRequest?: string } = {},
+    options: { nextLessonRequest?: string; expectedSessionId?: string } = {},
   ): Promise<LearningAnswerResult> {
     const plan = this.learning.get(planId);
     if (!plan) throw new Error(`unknown learning plan: ${planId}`);
@@ -4449,7 +4454,7 @@ export class KnowledgeEngine implements Knowledge {
       );
     }
     const session = this.learning.currentSession(planId);
-    if (!session || session.status !== "awaiting_reply") {
+    if (!session || session.status !== "awaiting_reply" || (options.expectedSessionId && session.id !== options.expectedSessionId)) {
       throw new Error("当前没有等待回答的课程");
     }
 
@@ -4497,6 +4502,9 @@ export class KnowledgeEngine implements Knowledge {
       feedback = appendLearningRecord(result.value.feedback, learningRecord);
       mastery = result.value.mastery;
       nextFocus = result.value.nextFocus;
+    }
+    if (this.learning.currentSession(planId)?.id !== session.id) {
+      throw new Error(`learning session changed while answering: ${session.id}`);
     }
     const rawId = learningRecord
       ? await this.remember({
@@ -4695,6 +4703,57 @@ export class KnowledgeEngine implements Knowledge {
       this.dreamProgress.finish(runId, undefined, opts.signal?.aborted);
       throw error;
     }
+  }
+
+  queueMaterialDream(space: SpaceId, batch: string, ids: string[], retryAfter?: string): void {
+    if (this.stoppingMaterialDreams) return;
+    const previous = this.dreamProgress.list(space).filter(run => run.materialImport?.batch === batch);
+    if (retryAfter && (previous.some(run => !run.finishedAt) || retryAfter !== materialDreamRevision(previous))) return;
+    const covered = new Set(retryAfter ? [] : previous.flatMap(run => run.materialImport!.rawIds));
+    const candidates = [...new Set(ids)].filter(id => !covered.has(id));
+    if (!candidates.length) return;
+    const pending = this.registry.store(space).index().pendingImportIds(candidates);
+    if (!pending.length) return;
+    const total = Math.ceil(pending.length / 40);
+    const chunks = Array.from({ length: total }, (_, index) => {
+      const rawIds = pending.slice(index * 40, (index + 1) * 40);
+      const number = { index: index + 1, total };
+      return { rawIds, number, id: this.dreamProgress.enqueue(space, "import", number, { batch, rawIds }) };
+    });
+    const key = chunks[0]!.id;
+    const controller = new AbortController();
+    const execute = async () => {
+      const model = this.agentForSpace(space)?.model || undefined;
+      for (const chunk of chunks) {
+        if (controller.signal.aborted) break;
+        const report = await this.serializer.run(space, () => this.executeDreamCycle(space,
+          { rawIds: chunk.rawIds, model, trigger: "import", batch: chunk.number, signal: controller.signal }, undefined, chunk.id));
+        if (report.errors.length) break;
+      }
+    };
+    // Reserve the observed batches before yielding. Duplicate submissions share their existing runs.
+    const done = Promise.resolve().then(() => {
+      if (!controller.signal.aborted) return this.scheduleBackgroundRun(key, space, execute);
+    }).catch(() => {
+      this.dreamProgress.finish(key, undefined, controller.signal.aborted);
+    }).finally(() => {
+      for (const chunk of chunks) this.dreamProgress.finish(chunk.id, undefined, true);
+      this.materialDreams.delete(key);
+    });
+    this.materialDreams.set(key, { controller, done });
+  }
+
+  async waitForMaterialDreams(): Promise<void> {
+    await Promise.all([...this.materialDreams.values()].map(run => run.done));
+  }
+
+  async stopMaterialDreams(): Promise<void> {
+    this.stoppingMaterialDreams = true;
+    for (const [key, run] of this.materialDreams) {
+      run.controller.abort();
+      this.runScheduler.cancel(key);
+    }
+    await this.waitForMaterialDreams();
   }
 
   /** Management-only metadata; deliberately separate from public health probes. */
@@ -5033,7 +5092,7 @@ export class KnowledgeEngine implements Knowledge {
         chatRuns: chatRuns.map(({ executionEvidence: _audit, sourceInputId: _sourceInput, dispatchKey: _dispatch, dispatchDigest: _digest,
           launchAdmission: _admission, cancelRequestedAt: _cancel, delivery, ...run }) => ({
           ...run,
-          delivery: (({ liveReply: _localLiveReply, messageId: _localMessageId, ...portableDelivery }) => portableDelivery)(delivery),
+          delivery: portableChatDelivery(delivery),
           executionPlan: run.executionPlan ? archiveExecutionPlan(run.executionPlan) : undefined,
         })),
         workItems: workItems.map(({ planDelivery: _localDelivery, childCancellation: _localCancellation, ...item }) => item),
@@ -5042,7 +5101,7 @@ export class KnowledgeEngine implements Knowledge {
         workActions: workContinuation.actions,
         workContinuationPolicies: workContinuation.policies,
         quality: this.quality.exportArchive(chatRuns),
-        reminders,
+        reminders: reminders.map(({ notificationReceipts: _localReceipts, ...reminder }) => reminder),
         learning: this.learning.exportBySpace(space),
         governanceAudit: listKnowledgeGovernanceAudit(store),
         agentKnowledgeFeedback: new KnowledgeConsumptionFeedbackStore(store).exportArchive(),
@@ -5299,7 +5358,7 @@ export class KnowledgeEngine implements Knowledge {
       let remindersDeleted = 0;
       let learningPlansDeleted = 0;
       let workItemsDeleted = 0;
-      const learningArchive = this.learning.exportBySpace(space);
+      const learningArchive = this.learning.localSnapshotBySpace(space);
       const chatRunSnapshot = this.chatRuns.snapshotLocalBySpace(space);
       const workInputSnapshot = this.workDispatch.list(space);
       const workNoticeSnapshot = this.workEvents.list(space);
@@ -5332,7 +5391,7 @@ export class KnowledgeEngine implements Knowledge {
           learningArchive.plans.length > 0
           && learningArchive.plans.every((plan) => !this.learning.has(plan.id))
         ) {
-          this.learning.restore(learningArchive);
+          this.learning.restore(learningArchive, true);
         }
         const missingWorkItems = workItems.filter((item) => !this.workItems.get(item.id));
         this.workItems.plans.restore(workPlanSnapshot);
@@ -5375,7 +5434,7 @@ export class KnowledgeEngine implements Knowledge {
   async deliverReminder(
     reminderId: string,
     notifiedAt: number,
-    deliver: (reminder: Reminder) => void | Promise<void>,
+    deliver: (reminder: Reminder) => void | FeishuDeliveryReceipt | Promise<void | FeishuDeliveryReceipt>,
   ): Promise<boolean> {
     const reminder = this.reminders.get(reminderId);
     if (!reminder || reminder.status !== "scheduled") return false;
@@ -5384,8 +5443,8 @@ export class KnowledgeEngine implements Knowledge {
       (this.deliveringReminderCounts.get(reminderId) ?? 0) + 1,
     );
     try {
-      await deliver({ ...reminder });
-      return Boolean(this.reminders.markNotified(reminderId, notifiedAt));
+      const receipt = await deliver(reminder);
+      return Boolean(this.reminders.markNotified(reminderId, notifiedAt, receipt, reminder.nextTriggerAt));
     } finally {
       const remaining = (this.deliveringReminderCounts.get(reminderId) ?? 1) - 1;
       if (remaining > 0) this.deliveringReminderCounts.set(reminderId, remaining);
@@ -7510,6 +7569,51 @@ export class KnowledgeEngine implements Knowledge {
   }
 
   /** A host-owned handoff scoped to one active Run. No generic filesystem import endpoint. */
+  private replyFileWorkdir(runId: string, epoch: string | undefined): string {
+    const run = this.chatRuns.get(runId);
+    const plan = run?.executionPlan;
+    const inputId = run?.sourceInputId ?? run?.dispatchKey;
+    const input = inputId ? this.workDispatch.get(inputId) : undefined;
+    if (!run || !["running", "succeeded"].includes(run.status) || run.cancelRequestedAt !== undefined || !run.chatId
+      || !input || input.connector !== "feishu" || input.space !== run.space || input.message.chatId !== run.chatId
+      || !this.registry.has(run.space) || this.registry.get(run.space)?.agentBindingEpoch !== epoch
+      || !isResolvedExecutionPlan(plan) || plan.resolutionError || !plan.workdir || !["write", "full"].includes(plan.execution?.permission ?? "")
+      || plan.execution?.workdir !== plan.workdir || this.localExecutionPlanError(run.space, run.agentId, plan, "chat")) throw new Error("当前运行无法交付这个文件。");
+    if (run.space.startsWith("team/")) {
+      const binding = this.feishuBindings.activeByChatId(run.chatId);
+      if (!binding || binding.spaceId !== run.space || binding.executionScopeEpoch !== input.bindingId) throw new Error("群绑定已变化。");
+    }
+    this.validateFrozenWorkdir(plan.workdir);
+    if (pathIsWithinOrEqual(plan.workdir, realpathSync(this.dataDir))) throw new Error("交付目录不能位于 HomeAgent 数据目录内。");
+    if (run.topicNativeSessionExpected || plan.execution?.executionMode === "local-full-access") this.validateNativeSessionFilesystemContract(plan.execution, plan.workdir);
+    return plan.workdir;
+  }
+
+  prepareChatReplyFile(runId: string, attach: boolean): { instruction: string; finish(): ChatReplyFile | undefined } | undefined {
+    const run = this.chatRuns.get(runId);
+    if (!run || run.inputTruncated || run.status !== "running") return undefined;
+    const epoch = this.registry.get(run.space)?.agentBindingEpoch;
+    try {
+      const workdir = this.replyFileWorkdir(runId, epoch);
+      const capture = prepareReplyFile(workdir, run.input, attach, epoch);
+      return { instruction: capture.instruction, finish: () => {
+        try { this.replyFileWorkdir(runId, epoch); return capture.finish(); } catch { return undefined; }
+      } };
+    } catch { return undefined; }
+  }
+
+  verifyReplyFileAccess(runId: string): void {
+    const file = this.chatRuns.get(runId)?.delivery.replyFile;
+    if (!file) throw new Error("交付文件不可用。");
+    this.replyFileWorkdir(runId, file.agentBindingEpoch);
+  }
+
+  readReplyFile(runId: string): Uint8Array {
+    const file = this.chatRuns.get(runId)?.delivery.replyFile;
+    if (!file) throw new Error("交付文件不可用。");
+    return frozenReplyFileBytes(this.replyFileWorkdir(runId, file.agentBindingEpoch), file);
+  }
+
   prepareChatRawImport(runId: string): { instruction: string; finish(signal?: AbortSignal): Promise<string> } | undefined {
     const run = this.chatRuns.get(runId);
     if (!run || run.inputTruncated) return undefined;
@@ -7839,6 +7943,7 @@ export class KnowledgeEngine implements Knowledge {
         : await asking;
       try {
         const trace = this.quality.recordTrace({
+          submissionTraceId: opts.submissionTraceId,
           spaces,
           question,
           outcome: "succeeded",
@@ -7867,6 +7972,7 @@ export class KnowledgeEngine implements Knowledge {
       try {
         const message = String(err);
         const trace = this.quality.recordTrace({
+          submissionTraceId: opts.submissionTraceId,
           spaces,
           question,
           outcome: isProviderTimeoutError(err) ? "timed_out" : "failed",

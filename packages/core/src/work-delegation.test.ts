@@ -160,7 +160,7 @@ test("v24 round trips parent links and dependencies without local cancellation o
   try {
     f.plan(); f.engine.cancelWorkChildren(f.item.id);
     const archive = await f.engine.exportSpace(SPACE);
-    expect(archive.version).toBe(24);
+    expect(archive.version).toBe(25);
     expect(JSON.stringify(archive)).not.toContain("childCancellation");
     await target.engine.deleteSpace(SPACE);
     await target.engine.restoreSpace(archive);

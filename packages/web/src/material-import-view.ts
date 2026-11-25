@@ -1,25 +1,26 @@
 import { html, raw } from "hono/html";
+import type { HtmlEscapedString } from "hono/utils/html";
+import { citedPageList, materialSourcesQuery, type CitedPage, type MaterialSources } from "./material-citations.ts";
 
-export interface MaterialReceipt {
-  name: string;
-  slot: number;
-  identity: string;
+export interface MaterialReceipt extends MaterialSources {
   expansionBudget: number;
-  confirmed: number;
   total: number;
-  firstId?: string;
 }
 
-export function materialReceiptView(spaceUrl: string, batch: string, rows: MaterialReceipt[], message: string, distillNow: boolean) {
+export function materialReceiptView(spaceUrl: string, batch: string, rows: MaterialReceipt[], message: string, distillNow: boolean,
+  citations: CitedPage[][], progress?: HtmlEscapedString) {
+  const query = materialSourcesQuery(batch, rows, distillNow);
   return html`<section class="card" data-material-receipt aria-label="资料导入回执">
     <h3>资料导入回执</h3>
-    <p data-material-count>已导入 ${rows.filter(row => row.confirmed === row.total).length} 份资料，共 ${rows.length} 份。</p>
+    <p data-material-count>已导入 ${rows.filter(row => row.rawIds.length === row.total).length} 份资料，共 ${rows.length} 份。</p>
     ${message ? html`<p data-material-detail>${message}</p>` : ""}
-    <ul>${rows.map(row => html`<li data-material-row="${row.slot}" data-complete="${String(row.confirmed === row.total)}">
-      <strong>${row.name}</strong> · ${row.confirmed === row.total ? "已导入" : `写入未完成，已确认 ${row.confirmed}/${row.total} 条原始记录`}
-      ${row.firstId ? html`<a href="${spaceUrl}/raw/${encodeURIComponent(row.firstId)}">查看原始条目</a>` : ""}
-      ${row.confirmed < row.total ? html`<form data-material-retry method="post" action="${spaceUrl}/materials" enctype="multipart/form-data">
+    <ul>${rows.map((row, index) => html`<li data-material-row="${row.slot}" data-complete="${String(row.rawIds.length === row.total)}">
+      <strong>${row.name}</strong> · ${row.rawIds.length === row.total ? "已导入" : `写入未完成，已确认 ${row.rawIds.length}/${row.total} 条原始记录`}
+      ${row.rawIds.length ? html`<a href="${spaceUrl}/raw/${encodeURIComponent(row.rawIds[0]!)}">查看原始条目</a>
+        <div>引用这份资料的知识页${citedPageList(spaceUrl, citations[index]!, "目前没有知识页引用这份资料。")}</div>` : ""}
+      ${row.rawIds.length < row.total ? html`<form data-material-retry method="post" action="${spaceUrl}/materials" enctype="multipart/form-data">
         <input type="hidden" name="materialBatch" value="${batch}" />
+        ${query.getAll("file").map(value => html`<input type="hidden" name="materialReturn" value="${value}" />`)}
         <input type="hidden" name="materialSlot" value="${row.slot}" />
         <input type="hidden" name="materialIdentity" value="${row.identity}" />
         <input type="hidden" name="materialBudget" value="${row.expansionBudget}" />
@@ -28,7 +29,8 @@ export function materialReceiptView(spaceUrl: string, batch: string, rows: Mater
         <button type="submit">重试此文件</button>
       </form>` : ""}
     </li>`)}</ul>
-    <a href="${spaceUrl}">返回空间</a>
+    <a data-material-history href="${spaceUrl}?${query}">查看最新关联页</a> · <a href="${spaceUrl}">返回空间</a>
+    ${progress ?? ""}
   </section>`;
 }
 
@@ -63,19 +65,10 @@ export const materialUploadScript = html`<script>${raw(`{
       const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
       const receipt = doc.querySelector('[data-material-receipt]');
       if (!receipt) throw Error();
-      if (retry) {
-        const row = receipt.querySelector('[data-material-row]');
-        if (!row) throw Error();
-        const summary = receipt.querySelector('[data-material-detail]');
-        if (summary) row.append(summary);
-        form.closest('[data-material-row]').replaceWith(row);
-        const all = result.querySelectorAll('[data-material-row]').length;
-        const done = result.querySelectorAll('[data-material-row][data-complete="true"]').length;
-        result.querySelector('[data-material-count]').textContent = '已导入 ' + done + ' 份资料，共 ' + all + ' 份。';
-      } else {
-        initial.hidden = true;
-        result.replaceChildren(receipt);
-      }
+      initial.hidden = true;
+      result.replaceChildren(receipt);
+      const historyLink = receipt.querySelector('[data-material-history]');
+      if (historyLink) history.replaceState(null, '', historyLink.href);
       result.querySelectorAll('[data-material-retry]').forEach(function (next) {
         if (files[Number(next.elements.materialSlot.value)]) {
           next.elements.material.required = false;
@@ -83,6 +76,7 @@ export const materialUploadScript = html`<script>${raw(`{
         }
       });
       status.textContent = '导入回执已更新';
+      document.dispatchEvent(new Event('material-receipt'));
     } catch {
       status.textContent = '未收到导入回执。可以重新提交，已写入的分段会按本次导入核对。';
     } finally { button.disabled = false; }

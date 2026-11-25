@@ -283,7 +283,7 @@ test("M2 replans a business blocker, preserves accepted evidence and completes t
     expect(f.engine.workItems.get(item.id)?.phase).toBe("completed");
     expect(f.transport.sent.filter(reply => reply.markdown.includes("全部步骤已验收"))).toHaveLength(1);
     const archive = await f.engine.exportSpace(SPACE);
-    expect(archive.version).toBe(24);
+    expect(archive.version).toBe(25);
     expect(parseSpaceArchive(archive).workPlans.at(-1)?.source.kind).toBe("recovery");
     expect(() => parseSpaceArchive({ ...archive, version: 22 })).toThrow("v23");
     expect(JSON.stringify(archive)).not.toContain("sourceInputId");
@@ -1427,7 +1427,7 @@ test("v23 archives restore revised plans with accepted evidence and reject broke
     const accepted = f.engine.workContinuations.list(item.id)[0]!;
     await f.send("archive-revised-change", "周报改成100字以内的摘要", { parentMessageId: "archive-revised-goal" });
     const archive = await f.engine.exportSpace(SPACE);
-    expect(archive.version).toBe(24);
+    expect(archive.version).toBe(25);
     expect(archive.workPlans).toHaveLength(2);
     expect(archive.workItems[0]?.planDelivery).toBeUndefined();
     const missing = structuredClone(archive);

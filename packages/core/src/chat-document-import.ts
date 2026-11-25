@@ -106,7 +106,7 @@ export function createDocumentCapture(workdir: string, urls: string[]): Document
 }
 
 /** Read each artifact once, by descriptor, inside the frozen canonical Workdir. */
-function readCaptureFile(workdir: string, path: string, maxBytes: number): { bytes: Uint8Array; path: string } {
+export function readCaptureFile(workdir: string, path: string, maxBytes: number): { bytes: Uint8Array; path: string } {
   const full = resolve(workdir, path);
   const suffix = relative(workdir, full);
   if (!suffix || isAbsolute(suffix) || suffix.split(/[\\/]/u).includes("..")

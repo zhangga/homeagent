@@ -87,6 +87,8 @@ export interface OutboundReceipt { messageId: string }
 
 /** How the orchestrator asks a connector to send a reply. */
 export interface OutboundReply {
+  /** An already uploaded file to include in this Markdown post. */
+  attachmentKey?: string;
   chatId: string;
   /** reply target message id (in-thread for groups when supported) */
   replyToMessageId?: string;
@@ -120,6 +122,7 @@ export interface LiveReplySnapshot {
   detailUrl?: string;
   canCancel: boolean;
   canRetry: boolean;
+  recovery?: { action: "retry" | "resend"; attempts: number };
 }
 
 export interface LiveReplyHandle {
@@ -177,6 +180,7 @@ export interface Connector {
   start(onEvent: InboundHandler): Promise<void>;
   stop(): Promise<void>;
   reply(out: OutboundReply): Promise<void | OutboundReceipt>;
+  uploadReplyFile?(name: string, bytes: Uint8Array): Promise<string>;
   /** Create a platform-native live reply when the transport supports updates. */
   createLiveReply?(out: OutboundReply, snapshot: LiveReplySnapshot): Promise<LiveReplyHandle>;
   /** Update the same live reply; implementations must ignore stale revisions. */
@@ -184,7 +188,7 @@ export interface Connector {
   /** Final update for a live reply. */
   finalizeLiveReply?(handle: LiveReplyHandle, snapshot: LiveReplySnapshot): Promise<void>;
   /** send a standalone message to a chat (e.g. group-added notice) */
-  notice(chatId: string, markdown: string, opts?: NoticeOptions): Promise<void>;
+  notice(chatId: string, markdown: string, opts?: NoticeOptions): Promise<void | OutboundReceipt>;
   /** Standalone interactive notification; transports without cards keep text notices. */
   noticeCard?(chatId: string, card: Record<string, unknown>, opts?: NoticeOptions): Promise<void>;
   /** Replace a card already sent by this application. */

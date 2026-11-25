@@ -8,7 +8,8 @@ import type { Page, PageRef, PageType } from "@homeagent/shared";
 import type { SpaceStore } from "./space.ts";
 import { slugifyName } from "./slug.ts";
 
-const NAVIGATION_TYPES = new Set<PageType>(["index", "overview", "log", "glossary", "map"]);
+export const NAVIGATION_PAGE_TYPES = ["index", "overview", "log", "glossary", "map"] as const satisfies readonly PageType[];
+const NAVIGATION_TYPES = new Set<PageType>(NAVIGATION_PAGE_TYPES);
 const MAX_EXPLICIT_TOPIC_MAPS = 24;
 const MAX_TOPIC_MAP_ENTRIES = 100;
 const TYPE_LABELS: Record<Exclude<PageType, "index" | "overview" | "log" | "glossary" | "map">, string> = {

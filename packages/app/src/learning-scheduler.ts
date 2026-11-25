@@ -4,6 +4,7 @@ import { logger, type SkillWarningView } from "@homeagent/shared";
 import type {
   KnowledgeEngine,
   LearningPlan,
+  FeishuDeliveryReceipt,
   LearningSession,
   LearningSource,
 } from "@homeagent/core";
@@ -26,13 +27,13 @@ export type LearningNotify = (
   session: LearningSession,
   skillWarnings: SkillWarningView[] | undefined,
   idempotencyKey: string,
-) => void | Promise<void>;
+) => void | FeishuDeliveryReceipt | Promise<void | FeishuDeliveryReceipt>;
 export type LearningFollowUpNotify = (
   plan: LearningPlan,
   session: LearningSession,
   message: string,
   idempotencyKey: string,
-) => void | Promise<void>;
+) => void | FeishuDeliveryReceipt | Promise<void | FeishuDeliveryReceipt>;
 
 function learningDeliveryKey(prefix: "lesson" | "follow", identity: string): string {
   const digest = createHash("sha256").update(identity).digest("hex").slice(0, 32);
@@ -247,7 +248,7 @@ export class LearningScheduler {
                   if (!this.notify) {
                     throw new Error("learning notification transport is unavailable");
                   }
-                  await this.notify(
+                  return this.notify(
                     currentPlan,
                     source,
                     session,

@@ -31,6 +31,7 @@ import type { AskOptions } from "./types.ts";
 import { gatewayClient, type LlmClient } from "./llm.ts";
 import { isKnowledgeContentRef } from "./digest.ts";
 import { buildKnowledgePageTrace } from "./traceability.ts";
+import { knowledgePageRevision } from "./local-agent-knowledge.ts";
 import { requestsStoredRawQuery } from "./chat-raw-import.ts";
 import { askStoredRaw } from "./ask-raw.ts";
 import { PUBLIC_PROGRESS_PREFIX } from "./public-progress.ts";
@@ -52,7 +53,7 @@ export interface AskDeps {
 }
 
 export interface AskRetrievalEvidence {
-  pages: Array<{ space: SpaceId; slug: string; contentHash: string }>;
+  pages: Array<{ space: SpaceId; slug: string; contentHash: string; revision: string }>;
 }
 
 /** A page plus the store it lives in — slugs are only unique within a space. */
@@ -795,6 +796,7 @@ export async function ask(
       space,
       slug,
       contentHash: page.contentHash,
+      revision: knowledgePageRevision(page),
     })),
   });
 

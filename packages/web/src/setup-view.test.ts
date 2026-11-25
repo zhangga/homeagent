@@ -292,4 +292,34 @@ describe("guided setup view", () => {
     expect(body).toContain("@HomeAgent 启用群聊");
     expect(body).toContain('action="/setup/finish"');
   });
+
+  test.each([
+    ["feishu", "applink.feishu.cn"],
+    ["lark", "applink.larksuite.com"],
+  ] as const)("opens the verified %s bot and offers ordered, copyable private trial messages", (brand, host) => {
+    const body = render("done", {
+      lark: { ...lark, state: "ready", verified: true, appId: "cli_demo", brand, botName: "小脑" },
+    });
+    expect(body).toContain(`href="https://${host}/client/bot/open?appId=cli_demo"`);
+    expect(body).toContain("打开与小脑的私聊");
+    const notes = [...body.matchAll(/<li><span>([^<]+)<\/span>\s*<button[^>]+data-copy-trial[^>]*>/gu)];
+    expect(notes.map(note => note[1])).toEqual([
+      "记住：我的试用笔记叫《周五交接》。", "查一下已收录的原文，我的「试用笔记」叫什么名字？",
+    ]);
+    expect(body.indexOf("我的试用笔记")).toBeLessThan(body.indexOf("@小脑 启用群聊"));
+    expect(body).toContain('action="/setup/finish"');
+  });
+
+  test("a legacy connection without a verified app ID offers name search and the same trial", () => {
+    for (const status of [
+      { ...lark, verified: true },
+      { ...lark, verified: true, appId: "cli_bad&secret=secret" },
+      { ...lark, verified: false, appId: "cli_demo" },
+    ]) {
+      const body = render("done", { lark: { ...status, botName: "小脑" } });
+      expect(body).toContain("搜索「小脑」");
+      expect(body).not.toContain("/client/bot/open");
+      expect(body).toContain('aria-label="复制第 2 条示例"');
+    }
+  });
 });

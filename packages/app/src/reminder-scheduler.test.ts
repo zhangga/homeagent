@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { KnowledgeEngine } from "@homeagent/core";
+import { FakeLlm, KnowledgeEngine, SkillCatalog } from "@homeagent/core";
+import { CliConnector, type Connector, type InboundMessage } from "@homeagent/connectors";
+import { Orchestrator } from "@homeagent/orchestrator";
 import type { SpaceId } from "@homeagent/shared";
 import { ReminderScheduler } from "./reminder-scheduler.ts";
 
@@ -15,7 +17,7 @@ describe("ReminderScheduler", () => {
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "hb-reminder-scheduler-"));
-    engine = new KnowledgeEngine({ dataDir: dir });
+    engine = new KnowledgeEngine({ dataDir: dir, llm: new FakeLlm(), skillCatalog: new SkillCatalog({ roots: [] }) });
     engine.ensureSpace(SPACE, { chatId: "oc_reminder_scheduler" });
   });
 
@@ -58,7 +60,8 @@ describe("ReminderScheduler", () => {
     });
 
     await scheduler.tick("test", new Date(NOW));
-    expect(notices[0]).toContain("回复并 @我“确认去大同”");
+    expect(notices[0]).toContain("直接回复这条通知“收到”");
+    expect(notices[0]).toContain("@我“确认去大同”");
     expect(engine.reminders.get(reminder.id)).toEqual(expect.objectContaining({
       status: "scheduled",
       nextTriggerAt: NOW + 3 * 3600_000,
@@ -83,6 +86,72 @@ describe("ReminderScheduler", () => {
       lastStatus: "error",
       lastError: expect.stringContaining("network unavailable"),
     }));
+  });
+
+  test("only the owner replying to a delivered notice confirms it after restart, including with two identical titles", async () => {
+    const chatId = "oc_reminder_scheduler", appId = "cli_reminder";
+    const binding = engine.feishuBindings.connect({ chatId, spaceId: SPACE, boundAppId: appId,
+      responseMode: "mentions_only", replyInThread: true });
+    const create = (repeat: boolean) => engine.reminders.create({
+      title: "去开会", space: SPACE, chatId, creatorId: "ou_me", triggerAt: NOW,
+      untilConfirmed: repeat, ...(repeat && { repeatEveryMs: 3 * 3600_000 }),
+    }, NOW)!;
+    const first = create(true);
+    const transport = new CliConnector();
+    let isAdmin = true;
+    const connector: Connector = {
+      name: "feishu", start: handler => transport.start(handler), stop: () => transport.stop(),
+      notice: async () => {}, reply: out => transport.reply(out), isChatAdministrator: async () => isAdmin,
+    };
+    const detect = (id: string) => ({ messageId: `om_${id}`, bindingId: binding.executionScopeEpoch, appId });
+    const scheduler = new ReminderScheduler(engine, { notify: async reminder => detect(reminder.id) });
+    await scheduler.tick("first", new Date(NOW));
+    const fake = new FakeLlm();
+    const runtime = () => new Orchestrator({ engine, connector, activeFeishuAppId: appId, llm: fake });
+    let orchestrator = runtime();
+    let sequence = 0;
+    const reply = (text: string, fields: Partial<InboundMessage> = {}) => {
+      const messageId = `om_in_${++sequence}`;
+      return transport.inject({ kind: "message", messageId, eventId: messageId, senderId: "ou_me",
+        chatId, chatType: "group", mentionsBot: false, text, createdAt: Date.now(), ...fields });
+    };
+    try {
+      await orchestrator.start();
+      await reply("@agent 收到", { mentionsBot: true });
+      await reply("收到", { parentMessageId: "om_unrelated", rootMessageId: detect(first.id).messageId });
+      expect(engine.reminders.get(first.id)?.status).toBe("scheduled");
+      const second = create(true), once = create(false);
+      await scheduler.tick("more", new Date(NOW));
+      expect(engine.reminders.get(once.id)?.status).toBe("completed");
+      const archive = await engine.exportSpace(SPACE);
+      expect(JSON.stringify(archive.reminders)).not.toContain("notificationReceipts");
+      await orchestrator.stop();
+      engine.close();
+      engine = new KnowledgeEngine({ dataDir: dir, llm: fake, skillCatalog: new SkillCatalog({ roots: [] }) });
+      orchestrator = runtime();
+      await orchestrator.start();
+      const original = { parentMessageId: detect(second.id).messageId };
+      await reply("收到", { ...original, senderId: "ou_other" });
+      isAdmin = false;
+      await reply("收到", original);
+      expect(engine.reminders.get(second.id)?.status).toBe("scheduled");
+      isAdmin = true;
+      await reply("收到", original);
+      expect(transport.sent.at(-1)?.markdown).toContain("已完成提醒：去开会");
+      expect(engine.reminders.get(second.id)?.status).toBe("completed");
+      expect(engine.reminders.get(first.id)?.status).toBe("scheduled");
+      for (const [reminder, command] of [[once, "10 分钟后再提醒我"], [first, "把去开会的提醒延后10分钟"]] as const) {
+        const now = Date.now();
+        await reply(command, { parentMessageId: detect(reminder.id).messageId });
+        const updated = engine.reminders.get(reminder.id)!;
+        expect(updated.status).toBe("scheduled");
+        expect(updated.nextTriggerAt).toBeGreaterThanOrEqual(now + 600_000);
+        expect(updated.nextTriggerAt).toBeLessThanOrEqual(Date.now() + 600_000);
+      }
+      expect(engine.reminders.list()).toHaveLength(3);
+    } finally {
+      await orchestrator.stop();
+    }
   });
 
   test("retries a post-send commit with the same occurrence idempotency key", async () => {

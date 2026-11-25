@@ -30,6 +30,7 @@ import type { MessageRetractionRecord } from "./governance.ts";
 import { RawJournal } from "./raw-journal.ts";
 import { chatRawEntryUpdatedAt, chatRawSourceName, chatRawVersionContent, normalizedRawSourceName } from "./chat-raw-import.ts";
 import { toMatchQuery, toSearchText } from "./tokenize.ts";
+import { NAVIGATION_PAGE_TYPES } from "./digest.ts";
 
 export const MAX_SEARCH_RESULTS = 100;
 
@@ -371,11 +372,13 @@ export class SpaceIndex {
 
   // ---- search --------------------------------------------------------------
 
-  search(query: string, limit = 10): Hit[] {
+  search(query: string, limit = 10, options: { contentOnly?: boolean } = {}): Hit[] {
     const safeLimit = normalizeSearchLimit(limit);
     if (safeLimit === 0) return [];
     const match = toMatchQuery(query);
     if (!match) return [];
+    const excludedTypes = options.contentOnly ? NAVIGATION_PAGE_TYPES : [];
+    const typeFilter = excludedTypes.length ? `AND p.type NOT IN (${excludedTypes.map(() => "?").join(",")})` : "";
     try {
       const rows = this.db
         .query(
@@ -383,11 +386,11 @@ export class SpaceIndex {
                   snippet(pages_fts, 2, '[', ']', '…', 12) snippet,
                   bm25(pages_fts, 5.0, 1.0) score
            FROM pages_fts f JOIN pages p ON p.slug = f.slug
-           WHERE pages_fts MATCH ?
+           WHERE pages_fts MATCH ? ${typeFilter}
            ORDER BY score
            LIMIT ?`,
         )
-        .all(match, safeLimit) as Record<string, unknown>[];
+        .all(match, ...excludedTypes, safeLimit) as Record<string, unknown>[];
       return rows.map((r) => ({
         slug: String(r.slug),
         title: String(r.title),
@@ -402,6 +405,42 @@ export class SpaceIndex {
   }
 
   // ---- raw -----------------------------------------------------------------
+
+  /** Resolve current citations for groups of source ids in this Space in one pass over page metadata. */
+  knowledgePagesForRawGroups(groups: readonly (readonly string[])[]): Array<Array<Pick<PageRef, "slug" | "title">>> {
+    const results = groups.map((): Array<Pick<PageRef, "slug" | "title">> => []);
+    if (!groups.some(ids => ids.length)) return results;
+    const rows = this.db.query<{ groupIndex: number; slug: string; title: string }, Array<string>>(
+      `WITH wanted AS MATERIALIZED (
+         SELECT g.key AS groupIndex, r.id FROM json_each(?) g, json_each(g.value) ids
+         JOIN raw r ON r.id = ids.value
+         WHERE r.admission = 'ready' AND NOT EXISTS (
+           SELECT 1 FROM message_retractions m WHERE m.chat_id = r.chat_id AND m.message_id = r.message_id)
+       )
+       SELECT DISTINCT w.groupIndex, p.slug, p.title
+       FROM pages p CROSS JOIN json_each(p.sources_json) source JOIN wanted w ON w.id = source.value
+       WHERE p.type NOT IN (${NAVIGATION_PAGE_TYPES.map(() => "?").join(",")})
+       ORDER BY w.groupIndex, p.title, p.slug`
+    ).all(JSON.stringify(groups), ...NAVIGATION_PAGE_TYPES);
+    for (const { groupIndex, slug, title } of rows) results[groupIndex]!.push({ slug, title });
+    return results;
+  }
+
+  /** Probe a chunk of deterministic upload part ids without loading file contents. */
+  importedFileNames(ids: readonly string[]): Map<string, string> {
+    const rows = this.db.query<{ id: string; name: string }, [string]>(
+      `SELECT id, json_extract(attachments_json, '$[0].name') AS name FROM raw
+       WHERE id IN (SELECT value FROM json_each(?)) AND source = 'manual' AND admission = 'ready'`
+    ).all(JSON.stringify(ids));
+    return new Map(rows.map(row => [row.id, row.name]));
+  }
+
+  pendingImportIds(ids: readonly string[]): string[] {
+    return this.db.query<{ id: string }, [string]>(
+      `SELECT r.id FROM json_each(?) input JOIN raw r ON r.id=input.value
+       WHERE r.source='manual' AND r.admission='ready' AND r.ingested=0 ORDER BY input.key`
+    ).all(JSON.stringify(ids)).map(row => row.id);
+  }
 
   /** FTS projection of admitted Raw, including records not yet distilled into pages. */
   searchRaw(query: string, limit = 20, filters: RawSearchFilters = {}, accept?: (raw: RawRecord) => boolean): RawRecord[] {

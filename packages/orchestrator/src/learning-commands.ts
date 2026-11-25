@@ -3,7 +3,9 @@ import {
   MAX_LEARNING_NEXT_LESSON_REQUEST_CHARACTERS,
   learningProgress,
   type KnowledgeEngine,
+  type FeishuDeliveryReceipt,
   type LearningPlan,
+  type LearningSession,
 } from "@homeagent/core";
 import type { SpaceId } from "@homeagent/shared";
 import { formatSkillWarnings } from "./format.ts";
@@ -328,10 +330,15 @@ export async function handleLearningCommand(
     : `学习计划「${target.name}」删除失败。`;
 }
 
+function closedLessonReply(plan: LearningPlan, session: LearningSession, current?: LearningSession): string {
+  const next = current?.status === "awaiting_reply" ? `请回复第 ${current.sequence} 课的推送提交该课回答。` : "可发送 /learn 查看学习进度。";
+  return `你回复的是「${plan.name}」第 ${session.sequence} 课，这一课已${session.status === "completed" ? "完成" : "归档"}。${next}`;
+}
+
 export async function handleLearningAnswer(
   engine: KnowledgeEngine,
   answer: string,
-  context: Omit<LearningCommandContext, "sourceMessageId">,
+  context: Omit<LearningCommandContext, "sourceMessageId"> & { quotedLesson?: FeishuDeliveryReceipt },
 ): Promise<string> {
   const details = learningAnswerDetails(answer);
   if (details.error) return details.error;
@@ -340,9 +347,22 @@ export async function handleLearningAnswer(
   const awaiting = ownedPlans(engine, context)
     .filter((plan) => engine.learning.currentSession(plan.id)?.status === "awaiting_reply");
   const candidates = [...assessing, ...awaiting];
+  const located = context.quotedLesson && engine.learning.lessonForReply(context.space, context.chatId, context.actorId, context.quotedLesson);
+  const quoted = located?.session;
+  if (located?.known && !quoted) return "请在自己的原飞书会话中回复当前课程推送，或另发带计划名称的「学习回答」。";
+  const quotedPlan = quoted && engine.learning.get(quoted.planId);
+  if (quoted && quotedPlan && (quoted.status !== "awaiting_reply" || quotedPlan.currentSessionId !== quoted.id)) {
+    return closedLessonReply(quotedPlan, quoted, engine.learning.currentSession(quoted.planId));
+  }
   if (candidates.length === 0) return "当前没有等待你回答的学习课程或入学诊断。";
   let target: LearningPlan | undefined;
-  if (details.planQuery) {
+  if (quotedPlan) {
+    if (details.planQuery && details.planQuery.toLocaleLowerCase() !== quotedPlan.name.toLocaleLowerCase()
+      && findPlan(candidates, details.planQuery)?.id !== quotedPlan.id) {
+      return `你回复的是「${quotedPlan.name}」第 ${quoted!.sequence} 课，和回答里指定的计划不同。请回复要回答的那一课。`;
+    }
+    target = quotedPlan;
+  } else if (details.planQuery) {
     target = findPlan(candidates, details.planQuery);
     if (!target) {
       return `没有找到正在等待回答的学习计划「${details.planQuery}」。请发送 \`/learn\` 查看计划。`;
@@ -381,13 +401,20 @@ export async function handleLearningAnswer(
       `下一课将在每天 ${assessed.hour}:00 推送；你也可以发送 \`/learn route ${assessed.name}\` 随时查看变化。`,
     ].filter(Boolean).join("\n"), engine, context.space);
   }
-  const result = await engine.answerLearningSession(
-    target!.id,
-    context.actorId,
-    details.answer,
-    Date.now(),
-    { nextLessonRequest: details.nextLessonRequest },
-  );
+  if (context.quotedLesson && !quoted) {
+    return `这条引用没有可核对的课程回执。要回答当前课程，请另发一条消息「学习回答：[${target!.name}] 你的回答」。`;
+  }
+  let result;
+  try {
+    result = await engine.answerLearningSession(target!.id, context.actorId, details.answer, Date.now(),
+      { nextLessonRequest: details.nextLessonRequest, expectedSessionId: quoted?.id });
+  } catch (error) {
+    if (quoted && quotedPlan && engine.learning.get(quoted.planId)?.currentSessionId !== quoted.id) {
+      const finished = engine.learning.lessonForReply(context.space, context.chatId, context.actorId, context.quotedLesson!).session;
+      if (finished) return closedLessonReply(quotedPlan, finished, engine.learning.currentSession(quoted.planId));
+    }
+    throw error;
+  }
   const completion = result.plan.status === "completed"
     ? result.plan.mode === "topic"
       ? "\n\n🎉 这个主题的学习路线已完成。"

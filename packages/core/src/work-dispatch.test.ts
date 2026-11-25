@@ -82,3 +82,23 @@ test("chat planning instructions are frozen and recovered with the accepted goal
     expect(() => store.update(input.id, committed.revision, { response })).toThrow("immutable");
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test("reopening a Feishu recovery command keeps its original target, card and delivery attempt", () => {
+  const directory = mkdtempSync(join(tmpdir(), "ha-chat-control-"));
+  try {
+    const store = new WorkDispatchStore(directory);
+    const control = { operation: "resend" as const, runId: "chat_run_saved", attempts: 2, cardMessageId: "om_card" };
+    const source = { connector: "feishu", appId: "cli_test", space: "personal/user" as const,
+      message: { ...message, parentMessageId: "om_card" } };
+    expect(() => store.accept({ ...source, chatRecovery: { ...control, attempts: -1 } })).toThrow();
+    expect(() => store.accept({ ...source, chatRecovery: { ...control, cardMessageId: "om_foreign" } })).toThrow();
+    const accepted = store.accept({ ...source, chatRecovery: control });
+    expect(accepted.operation).toBe("chat-recovery");
+    control.attempts = 3;
+    const reopened = new WorkDispatchStore(directory);
+    expect(reopened.get(accepted.id)?.chatRecovery?.attempts).toBe(2);
+    expect(reopened.accept({ ...source, chatRecovery: control }).chatRecovery).toEqual(accepted.chatRecovery);
+    expect(() => reopened.update(accepted.id, accepted.revision, { chatRecovery: control })).toThrow("immutable");
+    expect(() => reopened.update(accepted.id, accepted.revision, { operation: "chat" })).toThrow();
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

@@ -83,6 +83,28 @@ export interface TaskInput {
   timeoutMinutes?: number;
 }
 
+/** Scheduled instant against which the next scheduler tick is checked. */
+export function nextTaskScheduleAt(
+  task: Pick<Task, "cadence" | "hour" | "dayOfWeek" | "createdAt" | "lastRunAt">,
+  now: number,
+): number {
+  const hourMs = 3_600_000;
+  if (task.cadence === "hourly") return task.lastRunAt === undefined ? now : task.lastRunAt + hourMs;
+
+  const dayMs = 24 * hourMs;
+  // Keep the first daily occurrence eligible when the service was asleep at that hour.
+  const anchor = task.cadence === "daily" && task.lastRunAt === undefined ? task.createdAt ?? now : now;
+  const shanghai = new Date(anchor + 8 * hourMs);
+  const midnight = Date.UTC(shanghai.getUTCFullYear(), shanghai.getUTCMonth(), shanghai.getUTCDate()) - 8 * hourMs;
+  const weekly = task.cadence === "weekly";
+  const daysToSlot = weekly ? task.dayOfWeek - (shanghai.getUTCDay() || 7) : 0;
+  const slot = midnight + daysToSlot * dayMs + task.hour * hourMs;
+  if (task.createdAt > slot || (task.lastRunAt !== undefined && task.lastRunAt >= slot)) {
+    return slot + (weekly ? 7 : 1) * dayMs;
+  }
+  return slot;
+}
+
 /** Patch applied after a run to record its outcome. */
 export interface TaskRunResult {
   at: number;

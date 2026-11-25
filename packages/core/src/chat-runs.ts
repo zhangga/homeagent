@@ -21,6 +21,7 @@ import {
 } from "@homeagent/llm";
 import { isSpaceId, type SpaceId } from "@homeagent/shared";
 import { durableFsyncSync, durableRenameSync } from "./durable-file.ts";
+import { isChatReplyFile, type ChatReplyFile } from "./chat-reply-file.ts";
 import {
   cloneResolvedExecutionPlan,
   cloneStoredExecutionPlan,
@@ -74,6 +75,10 @@ export interface ChatRunLiveReply {
 }
 
 export interface ChatRunDelivery {
+  /** Local, verified output of this Chat Run; omitted from portable archives. */
+  replyFile?: ChatReplyFile;
+  /** Portable receipt only: the attachment needed for this pending answer was left on its original host. */
+  attachmentUnavailable?: true;
   messageId?: string;
   status: ChatRunDeliveryStatus;
   attempts: number;
@@ -127,13 +132,18 @@ export interface ChatRun {
   error?: ChatRunError;
 }
 
+export function portableChatDelivery(delivery: ChatRunDelivery): ChatRunDelivery {
+  const { liveReply: _liveReply, messageId: _localMessageId, replyFile, ...portable } = delivery;
+  if (replyFile?.attachToAnswer && delivery.status !== "sent") portable.attachmentUnavailable = true;
+  return portable;
+}
+
 /** A reply has crossed the durable delivery boundary but has not settled yet. */
 export function isChatRunDeliveryInFlight(
   run: Pick<ChatRun, "status" | "delivery">,
 ): boolean {
   return run.status === "succeeded"
-    && run.delivery.status === "pending"
-    && run.delivery.attempts > 0;
+    && ((run.delivery.status === "pending" && run.delivery.attempts > 0) || run.delivery.replyFile?.requestPending === true);
 }
 
 export interface StartChatRunInput {
@@ -168,6 +178,7 @@ export interface ChatRunStoreOptions {
 }
 
 export interface FinishChatRunSuccessInput {
+  replyFile?: ChatReplyFile;
   executionEvidence?: ExecutionEvidence;
   finishedAt: number;
   output: string;
@@ -211,7 +222,7 @@ interface TopicNativeSessionRecord {
 }
 
 interface ChatRunsFile {
-  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
+  version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
   runs: Record<string, ChatRun>;
   topicNativeSessionPlans?: Record<string, TopicNativeSessionPlan>;
   topicNativeSessions?: Record<string, TopicNativeSessionRecord>;
@@ -299,6 +310,7 @@ function clone(run: ChatRun): ChatRun {
       : undefined,
     delivery: {
       ...run.delivery,
+      ...(run.delivery.replyFile ? { replyFile: { ...run.delivery.replyFile } } : {}),
       liveReply: run.delivery.liveReply ? { ...run.delivery.liveReply } : undefined,
     },
     usage: run.usage ? cloneAggregatedRunUsage(run.usage) : undefined,
@@ -638,6 +650,9 @@ export function isChatRun(value: unknown): value is ChatRun {
     && delivery !== undefined
     && typeof delivery === "object"
     && !Array.isArray(delivery)
+    && (delivery.replyFile === undefined || (run.status === "succeeded" && isChatReplyFile(delivery.replyFile)))
+    && (delivery.attachmentUnavailable === undefined || (delivery.attachmentUnavailable === true && !delivery.replyFile
+      && run.status === "succeeded" && delivery.status !== "sent"))
     && ["pending", "sent", "failed"].includes(String(delivery.status))
     && Number.isInteger(delivery.attempts)
     && delivery.attempts >= 0
@@ -713,13 +728,13 @@ export class ChatRunStore {
     } catch {
       throw new Error("Chat Run history is corrupt; refusing to overwrite it");
     }
-    if (![1, 2, 3, 4, 5, 6, 7, 8, 9].some(version => version === parsed.version)) {
+    if (![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].some(version => version === parsed.version)) {
       throw new Error("Chat Run history uses an unsupported newer version");
     }
     if (!parsed.runs || typeof parsed.runs !== "object" || Array.isArray(parsed.runs)) {
       throw new Error("Chat Run history is corrupt; refusing to overwrite it");
     }
-    const hasNativeSessions = [6, 7, 8, 9].includes(parsed.version!);
+    const hasNativeSessions = parsed.version! >= 6;
     if (hasNativeSessions && (
       (parsed.topicNativeSessionPlans !== undefined && (
         !parsed.topicNativeSessionPlans
@@ -752,6 +767,7 @@ export class ChatRunStore {
           ? legacy
           : legacyWithoutTopicNativeSessionExpected;
         if (normalized.executionPlan?.version === 2 && parsed.version! < 8) throw new Error("Unexpected v2 execution plan");
+        if (normalized.delivery?.replyFile !== undefined && parsed.version! < 10) throw new Error("Unexpected generated file delivery");
         if (!isChatRun(normalized) || normalized.id !== id) {
           if (parsed.version! >= 8) throw new Error("Invalid Chat Run");
           continue;
@@ -819,7 +835,7 @@ export class ChatRunStore {
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const tempPath = `${this.configPath}.${process.pid}.${randomUUID()}.tmp`;
     const file: ChatRunsFile = {
-      version: 9,
+      version: 10,
       runs: Object.fromEntries(runs),
       topicNativeSessionPlans: Object.fromEntries(topicNativeSessionPlans),
       topicNativeSessions: Object.fromEntries(topicNativeSessions),
@@ -1261,6 +1277,10 @@ export class ChatRunStore {
       run.status = "succeeded";
       run.finishedAt = Math.max(result.finishedAt, run.runStartedAt ?? run.startedAt);
       run.output = result.output.slice(0, MAX_CHAT_RUN_OUTPUT_CHARACTERS);
+      if (result.replyFile) {
+        if (!isChatReplyFile(result.replyFile) || result.replyFile.fileKey || result.replyFile.delivered) throw new Error("Invalid generated reply file");
+        run.delivery.replyFile = { ...result.replyFile };
+      }
       run.outputTruncated =
         result.output.length > MAX_CHAT_RUN_OUTPUT_CHARACTERS || undefined;
       run.traceId = result.traceId;
@@ -1351,7 +1371,7 @@ export class ChatRunStore {
   }
 
   startDeliveryAttempt(id: string, attemptedAt: number): ChatRun | undefined {
-    if (!this.runs.has(id)) return undefined;
+    if (!this.runs.has(id) || this.runs.get(id)?.delivery.attachmentUnavailable) return undefined;
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
       run.delivery = {
@@ -1383,9 +1403,40 @@ export class ChatRunStore {
     });
   }
 
+  recordReplyFileUpload(id: string, digest: string, fileKey: string): void {
+    this.commit((candidate) => {
+      const file = candidate.get(id)?.delivery.replyFile;
+      if (!file || file.digest !== digest || !/^file_[A-Za-z0-9_-]{1,250}$/u.test(fileKey)
+        || (file.fileKey && file.fileKey !== fileKey)) throw new Error("Reply file upload record changed");
+      file.fileKey = fileKey;
+    });
+  }
+
+  markReplyFileDelivered(id: string, fileKey: string): void {
+    this.commit((candidate) => {
+      const file = candidate.get(id)?.delivery.replyFile;
+      if (!file || file.fileKey !== fileKey) throw new Error("Reply file upload record changed");
+      file.delivered = true;
+      delete file.requestPending;
+    });
+  }
+
+  setReplyFileRequestPending(id: string, fileKey: string, pending: boolean): void {
+    this.commit((candidate) => {
+      const run = candidate.get(id);
+      const file = run?.delivery.replyFile;
+      if (!run || !file || file.fileKey !== fileKey || (file.attachToAnswer && !(run.outputTruncated && run.delivery.status === "failed"))
+        || file.delivered || Boolean(file.requestPending) === pending) {
+        throw new Error("File delivery attempt changed");
+      }
+      if (pending) file.requestPending = true;
+      else delete file.requestPending;
+    });
+  }
+
   deliverySent(id: string, sentAt: number, messageId?: string): ChatRun | undefined {
     if (messageId !== undefined && (!messageId || messageId.length > 512)) throw new Error("Invalid delivery message id");
-    if (!this.runs.has(id)) return undefined;
+    if (!this.runs.has(id) || this.runs.get(id)?.delivery.attachmentUnavailable) return undefined;
     return this.commit((candidate) => {
       const run = candidate.get(id)!;
       run.delivery = {
@@ -1395,6 +1446,7 @@ export class ChatRunStore {
         ...(messageId ? { messageId } : {}),
         error: undefined,
       };
+      if (run.delivery.replyFile?.attachToAnswer && run.delivery.replyFile.fileKey) run.delivery.replyFile.delivered = true;
       return clone(run);
     });
   }
